@@ -1,0 +1,3 @@
+-- Migración idempotente. La definición ejecutable vive en report_documents.py
+-- para que el migrador principal y las pruebas utilicen exactamente el mismo SQL.
+-- Aplicar mediante apply_report_document_migration().

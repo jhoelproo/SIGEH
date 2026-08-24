@@ -1,0 +1,72 @@
+# Credenciales y configuracion local
+.env
+.env.*
+!.env.example
+config_local.py
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage*
+coverage.xml
+
+# Compilaciones y ejecutables
+build/
+dist/
+dist-preview/
+dist-preview-ux/
+dist-preview-reports/
+dist-preview-reports-v2/
+dist-preview-reports-v3/
+dist-preview-reports-v4/
+dist-preview-billing/
+build-preview-*/
+dist-preview-*/
+output/
+*.exe
+*.old
+*.zip
+*.rar
+packaging_metadata/
+.packaging_metadata/
+
+# Datos y documentos generados por la aplicacion
+*.db
+*.sqlite
+*.sqlite3
+recibos/
+reportes/
+respaldos/
+*.log
+lanzador_log.txt
+LOGS/
+outputs/
+test_artifacts/
+visual_evidence/
+database_url.bundle
+database_url.protected
+*.protected
+*.bundle
+*.pem
+*.key
+credentials*/
+secrets*/
+
+# Archivos temporales y del sistema
+tmp/
+temp/
+*.tmp
+Thumbs.db
+.DS_Store
+
+# Material local que no forma parte del codigo fuente
+CALCULO HOSP VIEJO.txt
+code 18-4-26.txt
+PRECIOS DE MEDICAMENTOS.docx
+test11.py
+CALCULOS_QT.spec
+node_modules

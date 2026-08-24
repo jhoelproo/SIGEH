@@ -1,0 +1,890 @@
+@page {
+  size: 216mm 324mm;
+  margin: 3.8mm 5.4mm 3.8mm 5.4mm;
+}
+
+:root {
+  --blue: #123f8c;
+  --blue-deep: #082f72;
+  --blue-mid: #1a56a8;
+  --blue-soft: #f2f7ff;
+  --blue-line: #aec5e5;
+  --blue-rule: #7ea4d9;
+  --text: #10131a;
+  --muted: #3d5d8d;
+  --green: #148a63;
+  --purple: #6a30aa;
+  --orange: #e96506;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #ffffff;
+  color: var(--text);
+  font-family: "Arial", "Segoe UI", Helvetica, sans-serif;
+  font-size: 9.7pt;
+  line-height: 1.18;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+body {
+  width: 100%;
+}
+
+.page {
+  position: relative;
+  width: 100%;
+  min-height: 0;
+}
+
+.preliminary-watermark {
+  position: fixed;
+  z-index: 0;
+  top: 42%;
+  left: 11%;
+  transform: rotate(-31deg);
+  color: rgba(177, 92, 0, .09);
+  font-size: 72pt;
+  font-weight: 900;
+  letter-spacing: 5pt;
+  pointer-events: none;
+}
+
+.document-state-banner {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4mm;
+  min-height: 7mm;
+  margin: 0 1mm 2.4mm;
+  padding: 1.2mm 3mm;
+  border: .3mm solid;
+  border-radius: 1.3mm;
+  font-size: 8.5pt;
+}
+
+.document-state-banner b {
+  font-size: 9.2pt;
+  letter-spacing: .5pt;
+  white-space: nowrap;
+}
+
+.preliminary-banner {
+  color: #7a4600;
+  background: #fff1ca;
+  border-color: #dcad49;
+}
+
+.ready-banner {
+  color: #075b43;
+  background: #e2f6ef;
+  border-color: #62b99c;
+}
+
+.final-banner {
+  color: #0a4a7d;
+  background: #e8f3ff;
+  border-color: #75a9d5;
+}
+
+.keep-together {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+/* =========================================================
+   HEADER
+   ========================================================= */
+.header {
+  display: grid;
+  grid-template-columns: 40mm minmax(0, 1fr) 49mm;
+  column-gap: 4mm;
+  align-items: center;
+  min-height: 27mm;
+  padding: 0 1mm 2.4mm 1mm;
+  margin-bottom: 3.1mm;
+  border-bottom: 1.15mm solid var(--blue);
+}
+
+.hospital-seal {
+  width: 39mm;
+  height: 18mm;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.hospital-seal img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+.hospital-heading {
+  min-width: 0;
+}
+
+.hospital-heading h1,
+.hospital-heading h2 {
+  margin: 0;
+  color: var(--blue);
+  font-size: 16.2pt;
+  line-height: 1.02;
+  font-weight: 900;
+  letter-spacing: .1pt;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.authorization-line {
+  margin-top: 1.7mm;
+  color: #315d96;
+  font-size: 7.2pt;
+  letter-spacing: 0;
+  line-height: 1.08;
+  white-space: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.authorization-line b {
+  display: block;
+  margin-top: .5mm;
+  color: var(--blue);
+  font-size: 9.2pt;
+  line-height: 1;
+  letter-spacing: .08pt;
+  white-space: nowrap;
+}
+
+.hospital-heading h2 {
+  margin-top: .4mm;
+}
+
+.document-subtitle {
+  margin-top: 2.6mm;
+  color: #4c78b8;
+  font-size: 10.8pt;
+  line-height: 1;
+  font-weight: 500;
+  letter-spacing: .7pt;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.receipt-card {
+  min-height: 24.8mm;
+  display: grid;
+  grid-template-columns: 12mm 1fr;
+  column-gap: 3mm;
+  align-items: center;
+  padding: 3.2mm 3.5mm;
+  border: .38mm solid #6d95ce;
+  border-radius: 2.3mm;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+}
+
+.receipt-svg-wrap {
+  width: 11mm;
+  height: 14mm;
+  color: var(--blue);
+}
+
+.receipt-svg-wrap svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.receipt-copy {
+  min-width: 0;
+}
+
+.receipt-number {
+  color: var(--blue);
+  font-size: 11.4pt;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.receipt-date-label {
+  margin-top: 2.6mm;
+  color: var(--blue);
+  font-size: 8.8pt;
+  font-weight: 700;
+}
+
+.receipt-date-value {
+  margin-top: .7mm;
+  color: var(--blue-deep);
+  font-size: 11.1pt;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* =========================================================
+   PATIENT CARD
+   ========================================================= */
+.patient-card {
+  padding: 2.8mm 4.2mm 3.2mm 4.2mm;
+  margin-bottom: 2.7mm;
+  border: .33mm solid var(--blue-line);
+  border-radius: 1.9mm;
+  background: #ffffff;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  gap: 2.8mm;
+  height: 7mm;
+  padding-bottom: 1.5mm;
+  margin-bottom: 2.3mm;
+  border-bottom: .32mm solid var(--blue-rule);
+  color: var(--blue);
+  font-size: 11.3pt;
+  font-weight: 900;
+  letter-spacing: .05pt;
+  text-transform: uppercase;
+}
+
+.heading-icon {
+  width: 7mm;
+  height: 6mm;
+  color: var(--blue);
+  flex: 0 0 auto;
+}
+
+.heading-icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.patient-grid {
+  display: grid;
+  grid-template-columns: 41.5% 31.5% 27%;
+  min-height: 25mm;
+  align-items: stretch;
+}
+
+.patient-column {
+  min-width: 0;
+  padding-right: 4mm;
+}
+
+.patient-middle {
+  padding-left: 1.5mm;
+}
+
+.patient-field {
+  display: grid;
+  grid-template-columns: 8.6mm minmax(0, 1fr);
+  column-gap: 2.7mm;
+  align-items: start;
+  min-height: 10.4mm;
+}
+
+.patient-field + .patient-field {
+  margin-top: 2mm;
+}
+
+.patient-divider {
+  padding-bottom: 2mm;
+  border-bottom: .22mm solid #d4e0ef;
+}
+
+.field-icon {
+  width: 8mm;
+  height: 8mm;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--blue);
+  border-radius: 1mm;
+}
+
+.field-icon.soft-bg {
+  background: #f1f6ff;
+}
+
+.field-icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.field-copy {
+  min-width: 0;
+}
+
+.field-label {
+  margin: 0 0 1.1mm 0;
+  color: #111111;
+  font-size: 8.5pt;
+  font-weight: 800;
+}
+
+.field-value {
+  color: #000000;
+  font-size: 10.7pt;
+  line-height: 1.18;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.field-value.strong {
+  font-weight: 900;
+}
+
+.field-value.diagnosis {
+  font-weight: 500;
+  line-height: 1.28;
+}
+
+.room-cost-panel {
+  display: grid;
+  grid-template-columns: 12mm minmax(0, 1fr);
+  column-gap: 2.5mm;
+  align-items: center;
+  padding-left: 4.2mm;
+  border-left: .31mm dashed #7da6dc;
+  min-width: 0;
+}
+
+.room-cost-icon {
+  width: 11mm;
+  height: 11mm;
+  color: var(--blue);
+}
+
+.room-cost-icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.room-cost-copy {
+  min-width: 0;
+}
+
+.room-cost-label {
+  margin-bottom: 2mm;
+  color: #111111;
+  font-size: 9.2pt;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.room-cost-value {
+  width: 100%;
+  min-height: 9.2mm;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 2.2mm;
+  border-radius: 1.2mm;
+  background: linear-gradient(180deg, #1c59a9 0%, #0b3e8f 100%);
+  color: #ffffff;
+  font-size: 11.5pt;
+  font-weight: 900;
+  white-space: nowrap;
+  box-shadow: inset 0 .25mm 0 rgba(255,255,255,.18);
+}
+
+/* =========================================================
+   CATEGORY CARDS
+   ========================================================= */
+.category-list {
+  margin-top: .8mm;
+}
+
+.category-card {
+  position: relative;
+  margin: 0 0 1.35mm 0;
+  padding: 6.4mm 2.3mm .65mm 11.2mm;
+  border: .31mm solid var(--blue-line);
+  border-radius: 1.8mm;
+  background: #ffffff;
+}
+
+.category-head {
+  position: absolute;
+  top: .85mm;
+  left: 2.6mm;
+  right: 2.6mm;
+  height: 5.2mm;
+  display: flex;
+  align-items: center;
+}
+
+.category-badge {
+  width: 7.4mm;
+  height: 7.4mm;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 2.6mm;
+  margin-top: .8mm;
+  border-radius: 1.35mm;
+  background: var(--accent, var(--blue));
+  color: #ffffff;
+  box-shadow: 0 .35mm .9mm rgba(0,0,0,.14);
+  flex: 0 0 auto;
+}
+
+.category-badge svg {
+  width: 5.6mm;
+  height: 5.6mm;
+  display: block;
+}
+
+.category-head h3 {
+  margin: 0;
+  color: var(--accent, var(--blue));
+  font-size: 9.8pt;
+  line-height: 1;
+  font-weight: 900;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.category-table-wrap {
+  width: 100%;
+}
+
+.items-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  font-size: 7.25pt;
+}
+
+.items-table th,
+.items-table td {
+  padding: .58mm 1.7mm;
+  vertical-align: top;
+  border-bottom: .18mm solid #d8e2ef;
+}
+
+.items-table th {
+  color: var(--blue);
+  font-size: 7.2pt;
+  font-weight: 900;
+  background: linear-gradient(180deg, #fbfdff 0%, #eef5ff 100%);
+  border-top: .27mm solid #99b8df;
+  border-bottom: .27mm solid #99b8df;
+}
+
+.items-table th:first-child {
+  border-left: .27mm solid #99b8df;
+  border-top-left-radius: 1mm;
+}
+
+.items-table th:last-child {
+  border-right: .27mm solid #99b8df;
+  border-top-right-radius: 1mm;
+}
+
+.items-table tbody tr:last-child td {
+  border-bottom: .27mm solid #99b8df;
+}
+
+.description-col {
+  width: 48%;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.quantity-col {
+  width: 11%;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.price-col,
+.total-col {
+  width: 20.5%;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.subtotal-strip {
+  display: grid;
+  grid-template-columns: 43mm 29mm;
+  justify-content: end;
+  min-height: 5.7mm;
+  margin-top: -.25mm;
+}
+
+.subtotal-caption,
+.subtotal-amount {
+  display: flex;
+  align-items: center;
+}
+
+.subtotal-caption {
+  justify-content: flex-end;
+  padding: 0 2.2mm;
+  border: .28mm solid #c3d4eb;
+  border-right: none;
+  border-radius: 1mm 0 0 1mm;
+  color: var(--accent, var(--blue));
+  background: linear-gradient(180deg, #ffffff 0%, #f4f8ff 100%);
+  font-size: 8.1pt;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.subtotal-amount {
+  justify-content: center;
+  padding: 0 2mm;
+  border-radius: 0 1mm 1mm 0;
+  color: #ffffff;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 87%, white 13%) 0%, var(--accent) 100%);
+  font-size: 9pt;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+/* Chromium and older engines may not support color-mix. */
+@supports not (background: color-mix(in srgb, red 50%, white)) {
+  .subtotal-amount {
+    background: var(--accent, var(--blue));
+  }
+}
+
+/* =========================================================
+   SUMMARY + TOTAL
+   ========================================================= */
+.billing-summary {
+  display: grid;
+  grid-template-columns: 47% 53%;
+  column-gap: 4mm;
+  margin: 2mm 2mm 2.3mm 2mm;
+  align-items: stretch;
+}
+
+.summary-card {
+  min-height: 35mm;
+  padding: 2.6mm 4mm 2.7mm 4mm;
+  border: .31mm solid var(--blue-line);
+  border-radius: 1.35mm;
+  background: #ffffff;
+}
+
+.summary-card h3 {
+  margin: 0 0 1.5mm 0;
+  padding-bottom: 1.3mm;
+  border-bottom: .24mm solid #b9cdea;
+  color: var(--blue);
+  font-size: 10.8pt;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.summary-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 31mm;
+  column-gap: 2mm;
+  min-height: 4.2mm;
+  align-items: center;
+  font-size: 8.1pt;
+}
+
+.summary-line span:last-child {
+  display: flex;
+  justify-content: flex-end;
+  gap: 3mm;
+  white-space: nowrap;
+}
+
+.summary-line b {
+  font-weight: 500;
+}
+
+.summary-grand-total {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 2mm;
+  align-items: center;
+  margin-top: 1.5mm;
+  padding-top: 1.7mm;
+  border-top: .31mm solid #95b4dd;
+  color: var(--blue);
+  font-size: 11.5pt;
+  font-weight: 900;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.grand-total-card {
+  position: relative;
+  min-height: 35mm;
+  overflow: hidden;
+  padding: 3mm 5mm 3.4mm 5mm;
+  border-radius: 1.35mm;
+  color: #ffffff;
+  text-align: center;
+  background:
+    radial-gradient(circle at 70% 44%, rgba(255,255,255,.11) 0, rgba(255,255,255,.05) 12%, transparent 32%),
+    linear-gradient(135deg, #003982 0%, #0e51a4 48%, #012f76 100%);
+}
+
+.grand-total-title {
+  position: relative;
+  z-index: 1;
+  padding-bottom: 2mm;
+  border-bottom: .45mm solid rgba(255,255,255,.82);
+  font-size: 13pt;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.grand-total-value {
+  position: relative;
+  z-index: 1;
+  margin-top: 5.1mm;
+  color: #ffffff;
+  font-size: 31.5pt;
+  line-height: .95;
+  font-weight: 900;
+  letter-spacing: .1pt;
+  white-space: nowrap;
+  text-shadow: 0 .6mm 1.1mm rgba(0,0,0,.25);
+}
+
+.grand-total-words {
+  position: relative;
+  z-index: 1;
+  margin-top: 3.5mm;
+  font-size: 7.8pt;
+  font-weight: 700;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* =========================================================
+   SIGNATURES
+   ========================================================= */
+.signature-card {
+  display: grid;
+  grid-template-columns: 32% 33% 35%;
+  min-height: 17.5mm;
+  padding: 2.3mm 3.4mm;
+  margin: 0 1mm 2.1mm 1mm;
+  border: .31mm solid var(--blue-line);
+  border-radius: 1.8mm;
+  background: #ffffff;
+}
+
+.signature-item {
+  display: flex;
+  align-items: center;
+  gap: 2.7mm;
+  min-width: 0;
+  padding: 0 3.2mm;
+}
+
+.signature-item + .signature-item {
+  border-left: .28mm dashed #b7c9e4;
+}
+
+.signature-item-icon {
+  width: 8.5mm;
+  height: 8.5mm;
+  flex: 0 0 auto;
+  color: var(--blue);
+}
+
+.signature-item-icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.signature-label {
+  color: var(--blue);
+  font-size: 7.7pt;
+}
+
+.signature-value {
+  margin-top: 1mm;
+  color: #07111f;
+  font-size: 8.8pt;
+  font-weight: 900;
+  line-height: 1.12;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.signature-right {
+  justify-content: center;
+  gap: 2.5mm;
+}
+
+.signature-line-wrap {
+  width: 32mm;
+  height: 11mm;
+  color: var(--blue);
+  flex: 0 0 auto;
+}
+
+.signature-mark {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.signature-right-copy {
+  min-width: 15mm;
+}
+
+.signature-role {
+  margin-top: 1mm;
+  color: var(--blue);
+  font-size: 8.5pt;
+  font-weight: 500;
+}
+
+/* =========================================================
+   FOOTER
+   ========================================================= */
+.footer-bar {
+  min-height: 8mm;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3mm;
+  padding: 0 4mm;
+  border-radius: 1.4mm;
+  background: linear-gradient(90deg, #0f4194 0%, #0a347c 100%);
+  color: #ffffff;
+  font-size: 8.6pt;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.footer-bar svg {
+  width: 5.2mm;
+  height: 5.2mm;
+  flex: 0 0 auto;
+}
+
+.footer-bar i {
+  width: .3mm;
+  height: 4.6mm;
+  display: inline-block;
+  margin: 0 2mm;
+  background: rgba(255,255,255,.78);
+}
+
+/* =========================================================
+   PRINT BEHAVIOR
+   ========================================================= */
+@media print {
+  html,
+  body,
+  .page,
+  .header,
+  .patient-card,
+  .category-card,
+  .billing-summary,
+  .summary-card,
+  .grand-total-card,
+  .signature-card,
+  .footer-bar,
+  .room-cost-value,
+  .subtotal-amount {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  .items-table thead {
+    display: table-header-group;
+  }
+
+  .items-table tr,
+  .subtotal-strip,
+  .billing-summary,
+  .signature-card,
+  .footer-bar {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}
+
+/* =========================================================
+   AJUSTES PUNTUALES FINALES
+   1) Evita que “RECIBO #...” salga del marco.
+   2) Mejora el icono de cama sin modificar el resto del panel.
+   3) Deja el espacio de firma completamente vacío.
+   ========================================================= */
+
+.receipt-card {
+  grid-template-columns: 9.5mm minmax(0, 1fr);
+  column-gap: 2mm;
+  padding-left: 2.5mm;
+  padding-right: 2.5mm;
+  overflow: hidden;
+}
+
+.receipt-svg-wrap {
+  width: 9mm;
+  height: 12.5mm;
+}
+
+.receipt-copy {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.receipt-number {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--blue);
+  font-size: 10.1pt;
+  line-height: 1.05;
+  font-weight: 900;
+  letter-spacing: -0.12pt;
+  white-space: nowrap;
+  text-overflow: clip;
+}
+
+.field-icon.bed-icon {
+  width: 9.2mm;
+  height: 8.3mm;
+  overflow: visible;
+}
+
+.field-icon.bed-icon svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.signature-line-wrap {
+  width: 32mm;
+  height: 11mm;
+  flex: 0 0 auto;
+  border-bottom: .42mm solid var(--blue);
+  background: transparent;
+}
+
+.signature-mark {
+  display: none !important;
+}
+

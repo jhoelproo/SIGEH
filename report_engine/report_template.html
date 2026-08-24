@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <style>{{ styles|safe }}</style>
+</head>
+<body>
+  <header class="institutional-header">
+    <div class="brand">
+      {% if logo_url %}<img src="{{ logo_url }}" alt="Logo del hospital">{% endif %}
+      <div>
+        <h1>HOSPITAL PROVINCIAL</h1>
+        <h2>DR. ÁNGEL CONTRERAS MEJÍA</h2>
+      </div>
+    </div>
+    <div class="report-badge">INFORME INSTITUCIONAL</div>
+  </header>
+
+  <section class="report-title">
+    <div>
+      <h3>{{ title }}</h3>
+      <p>{{ subtitle }}</p>
+    </div>
+    <div class="metadata">
+      <strong>Generado por:</strong> {{ generated_by }}<br>
+      <strong>Fecha:</strong> {{ generated_at }}
+    </div>
+  </section>
+
+  {% if mode == "shift_closure" %}
+    {% set closure = data.closure %}
+    <section class="filter-summary">
+      <strong>Turno cerrado:</strong> {{ closure.started_at }} al {{ closure.closed_at }} ·
+      <strong>Fecha operativa:</strong> {{ closure.operational_date|display_date }} ·
+      <strong>Usuario que cerró:</strong> {{ closure.closed_by or closure.actor or closure.representative }} ·
+      <strong>Horario:</strong> {{ closure.shift_type or 'Turno operativo' }}
+    </section>
+    <section class="kpi-grid three">
+      <article class="kpi blue"><span>Elegibles del turno</span><strong>{{ data.eligible_current }}</strong></article>
+      <article class="kpi green"><span>Autorizadas del turno</span><strong>{{ data.authorized_current }}</strong></article>
+      <article class="kpi orange"><span>Pendientes nuevas</span><strong>{{ data.new_pending }}</strong></article>
+      <article class="kpi purple"><span>Heredadas recibidas</span><strong>{{ data.inherited_received }}</strong></article>
+      <article class="kpi green"><span>Heredadas autorizadas</span><strong>{{ data.inherited_authorized }}</strong></article>
+      <article class="kpi orange"><span>Pendientes finales</span><strong>{{ data.pending_next }}</strong></article>
+    </section>
+    <section class="filter-summary">
+      <strong>Total trabajado aplicable:</strong> {{ data.worked_applicable }} ·
+      <strong>Total autorizado aplicable:</strong> {{ data.authorized_applicable }} ·
+      <strong>Porcentaje autorizado:</strong> {{ "{:.1f}%".format(data.authorization_rate) }}.
+    </section>
+    <section class="chart-grid">
+      <article class="chart-card"><h4>Estado al cierre</h4>{{ status_donut_svg|safe }}</article>
+      <article class="chart-card"><h4>Autorizaciones por ARS</h4>{{ ars_amount_svg|safe }}</article>
+    </section>
+    <div class="page-break"></div>
+    <section class="table-card page-break-avoid">
+      <h4>Control por ARS</h4>
+      <table><thead><tr><th>ARS</th><th>Trabajadas</th><th>Autorizadas</th><th>Pendientes</th></tr></thead>
+      <tbody>{% for row in data.by_ars %}<tr><td>{{ row.ars }}</td><td>{{ row.worked }}</td><td>{{ row.authorized }}</td><td>{{ row.pending }}</td></tr>{% else %}<tr><td colspan="4">No hubo atenciones aplicables.</td></tr>{% endfor %}</tbody></table>
+    </section>
+    <section class="table-card">
+      <h4>Detalle inmutable del cierre</h4>
+      <table><thead><tr><th>Atención</th><th>Paciente</th><th>ARS</th><th>Turno origen</th><th>Recibo</th><th>Autorización</th><th>Estado</th><th>Responsable</th><th>Actualizado</th></tr></thead>
+      <tbody>{% for row in data.details %}<tr><td>{{ row.attention_id }}</td><td>{{ row.patient_name }}</td><td>{{ row.ars }}</td><td>{{ row.original_turn_id }}</td><td>{{ row.receipt_number or '—' }}</td><td>{{ row.authorization_number or '—' }}</td><td>{{ row.classification }}</td><td>{{ row.responsible_username or '—' }}</td><td>{{ row.source_updated_at or '—' }}</td></tr>{% else %}<tr><td colspan="9">No hubo atenciones aseguradas aplicables.</td></tr>{% endfor %}</tbody></table>
+    </section>
+  {% elif mode == "comparison" %}
+    {% set period = data.get('period', {}) %}
+    <section class="period-comparison">
+      <article>
+        <span>PERÍODO ACTUAL</span>
+        <strong>{{ period.get('period_label', 'Período actual') }}</strong>
+        <small>{{ data.start_date|display_date }} al {{ data.end_date|display_date }}</small>
+      </article>
+      <div class="versus">VS</div>
+      <article>
+        <span>PERÍODO COMPARADO</span>
+        <strong>{{ period.get('comparison_label', 'Período anterior') }}</strong>
+        <small>{{ data.previous_start|display_date }} al {{ data.previous_end|display_date }}</small>
+      </article>
+    </section>
+    <section class="filter-summary">
+      <strong>Filtros aplicados:</strong>
+      Análisis: {{ analysis_label }} · Criterio: {{ date_basis_label }} ·
+      ARS: {{ filter_ars }} · Facturadores: {{ filter_users }} ·
+      Cobertura: {{ data.filters.coverage }} · Categoría: {{ data.filters.category }}
+    </section>
+    <section class="table-card">
+      <h4>Resumen comparativo</h4>
+      <table>
+        <thead><tr><th>Indicador</th><th>Actual</th><th>Anterior</th><th>Diferencia</th><th>Variación</th></tr></thead>
+        <tbody>
+          {% for row in comparison_rows %}
+          {% set difference = row.current - row.previous %}
+          {% set variation = (difference / row.previous * 100) if row.previous else none %}
+          <tr>
+            <td>{{ row.label }}</td>
+            <td>{% if row.currency %}RD$ {{ "{:,.2f}".format(row.current) }}{% else %}{{ "{:,}".format(row.current|int) }}{% endif %}</td>
+            <td>{% if row.currency %}RD$ {{ "{:,.2f}".format(row.previous) }}{% else %}{{ "{:,}".format(row.previous|int) }}{% endif %}</td>
+            <td class="{% if difference > 0 %}up{% elif difference < 0 %}down{% else %}flat{% endif %}">
+              {% if row.currency %}{{ difference|signed_money }}{% else %}{{ "{:+,}".format(difference|int) }}{% endif %}
+            </td>
+            <td class="{% if variation is none %}flat{% elif variation > 0 %}up{% elif variation < 0 %}down{% else %}flat{% endif %}">
+              {% if variation is none %}• Sin base{% elif variation > 0 %}▲ {{ "{:+.1f}%".format(variation) }}{% elif variation < 0 %}▼ {{ "{:+.1f}%".format(variation) }}{% else %}• 0.0%{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    <section class="chart-card full"><h4>Indicadores: actual frente al anterior</h4>{{ indicator_comparison_svg|safe }}</section>
+    <section class="table-card">
+      <h4>Comparación por categorías</h4>
+      <table>
+        <thead><tr><th>Categoría</th><th>Actual</th><th>Anterior</th><th>Diferencia</th><th>Variación</th></tr></thead>
+        <tbody>
+          {% for row in category_comparison_rows %}
+          {% set difference = row.current - row.previous %}
+          {% set variation = (difference / row.previous * 100) if row.previous else none %}
+          <tr>
+            <td>{{ row.label }}</td><td>RD$ {{ "{:,.2f}".format(row.current) }}</td><td>RD$ {{ "{:,.2f}".format(row.previous) }}</td>
+            <td class="{% if difference > 0 %}up{% elif difference < 0 %}down{% else %}flat{% endif %}">{{ difference|signed_money }}</td>
+            <td class="{% if variation is none %}flat{% elif variation > 0 %}up{% elif variation < 0 %}down{% else %}flat{% endif %}">{% if variation is none %}• Sin base{% elif variation > 0 %}▲ {{ "{:+.1f}%".format(variation) }}{% elif variation < 0 %}▼ {{ "{:+.1f}%".format(variation) }}{% else %}• 0.0%{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    <section class="chart-card full"><h4>Categorías: actual frente al anterior</h4>{{ category_comparison_svg|safe }}</section>
+    <section class="comparison-legend">▲ Aumento &nbsp;&nbsp; ▼ Disminución &nbsp;&nbsp; • Sin cambio o sin base comparable. Los símbolos mantienen la lectura al imprimir en blanco y negro.</section>
+  {% elif mode == "panel" %}
+    {% set summary = data.summary %}
+    <section class="filter-summary">
+      <strong>Filtros:</strong>
+      Análisis: {{ analysis_label }} · Criterio: {{ date_basis_label }} ·
+      ARS: {{ filter_ars }} · Facturadores: {{ filter_users }} · Cobertura: {{ data.filters.coverage }} ·
+      Categoría: {{ data.filters.category }} ·
+      Comparación: {{ "Sí" if data.filters.compare_previous else "No" }}
+    </section>
+    <section class="kpi-grid four">
+      <article class="kpi blue"><span>{{ data.filters.receipt_label }}</span><strong>{{ "{:,}".format(summary.receipts) }}</strong></article>
+      <article class="kpi green"><span>{{ data.filters.total_label }}</span><strong>RD$ {{ "{:,.2f}".format(summary.total) }}</strong></article>
+      <article class="kpi orange"><span>Promedio por recibo</span><strong>RD$ {{ "{:,.2f}".format(summary.average) }}</strong></article>
+      <article class="kpi blue"><span>Sala de emergencia</span><strong>RD$ {{ "{:,.2f}".format(summary.room) }}</strong></article>
+    </section>
+    {% if data.consultation_summary and data.consultation_summary.receipts %}
+    <section class="filter-summary">
+      <strong>Consultas (apartadas de Emergencias):</strong>
+      {{ data.consultation_summary.receipts }} recibos Â·
+      RD$ {{ "{:,.2f}".format(data.consultation_summary.total) }}
+      {% for row in data.consultations %} Â· {{ row.label }}: {{ row.receipts }}{% endfor %}
+    </section>
+    {% endif %}
+
+    {% if data.get('shift_billing', {}).get('by_ars') %}
+    {% set shift = data.shift_billing %}
+    <section class="table-card page-break-avoid">
+      <h4>Seguimiento de facturación del turno actual</h4>
+      <p>Admitidos: <strong>{{ shift.admitted }}</strong> · Facturados: <strong>{{ shift.invoiced }}</strong> ·
+         Pendientes: <strong>{{ shift.pending }}</strong> · Requieren corrección: <strong>{{ shift.correction }}</strong>.</p>
+      <p>Facturados desde listados anteriores: <strong>{{ shift.previous_day_invoiced }}</strong> ·
+         RD$ {{ "{:,.2f}".format(shift.previous_day_total) }}</p>
+      <table>
+        <thead><tr><th>ARS</th><th>Admitidos</th><th>Facturados</th><th>Pendientes</th><th>Requieren corrección</th></tr></thead>
+        <tbody>
+          {% for row in shift.by_ars %}
+          <tr><td>{{ row.ars }}</td><td>{{ row.admitted }}</td><td>{{ row.invoiced }}</td><td>{{ row.pending }}</td><td>{{ row.correction }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    {% endif %}
+
+    {% if data.filters.compare_previous %}
+    <section class="filter-summary">
+      <strong>Período anterior:</strong> {{ data.previous_start }} al {{ data.previous_end }} ·
+      Recibos: {{ data.previous.get('receipts', 0) }} ·
+      Total: RD$ {{ "{:,.2f}".format(data.previous.get('total', 0)) }} ·
+      Promedio: RD$ {{ "{:,.2f}".format(data.previous.get('average', 0)) }} ·
+      Sala: RD$ {{ "{:,.2f}".format(data.previous.get('room', 0)) }}
+    </section>
+    {% endif %}
+
+    <section class="chart-grid">
+      <article class="chart-card"><h4>Distribución porcentual por categoría</h4>{{ donut_svg|safe }}</article>
+      <article class="chart-card"><h4>Distribución por categorías - {{ data.filters.total_label|title }}</h4>{{ category_bar_svg|safe }}</article>
+      {% if data.view.show_ars_comparison %}
+      <article class="chart-card">
+        <h4>Distribución porcentual por ARS</h4>
+        <p class="chart-subtitle">Porcentaje según: {{ data.view.ars_metric_label }}</p>
+        {{ comparison_svg|safe }}
+      </article>
+      {% endif %}
+      <article class="chart-card{% if not data.view.show_ars_comparison %} full{% endif %}">
+        <h4>Evolución temporal</h4>
+        <p class="chart-subtitle">Métrica: {{ data.view.evolution_label }}</p>
+        {{ line_svg|safe }}
+      </article>
+      {% if data.coverage %}
+      <article class="chart-card full">
+        <h4>Distribución por tipo de cobertura</h4>{{ coverage_svg|safe }}
+      </article>
+      {% endif %}
+    </section>
+
+    {% if data.view.show_ars_comparison %}
+    <section class="table-card page-break-avoid">
+      <h4>Tabla resumen</h4>
+      <table>
+        <thead><tr><th>ARS</th><th>{{ data.filters.total_label|title }}</th><th>Recibos</th><th>% del dinero</th><th>% de recibos</th><th>Promedio / recibo</th></tr></thead>
+        <tbody>
+          {% for row in data.summary_table %}
+          <tr>
+            <td>{{ row.label }}</td><td>RD$ {{ "{:,.2f}".format(row.total) }}</td><td>{{ row.receipts }}</td>
+            <td>{{ "{:.1f}%".format(row.money_percentage * 100) }}</td>
+            <td>{{ "{:.1f}%".format(row.receipt_percentage * 100) }}</td>
+            <td>RD$ {{ "{:,.2f}".format(row.average) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    {% endif %}
+  {% else %}
+    {% if totals.get('_filter_summary') %}
+    <section class="filter-summary"><strong>Base financiera:</strong> {{ totals.get('_analysis_label', 'Facturación confirmada') }} ·
+      <strong>Criterio:</strong> {{ totals.get('_date_basis_label', 'Fecha de validación') }} ·
+      <strong>Filtros:</strong> {{ totals.get('_filter_summary') }}</section>
+    {% endif %}
+    <section class="kpi-grid three">
+      <article class="kpi blue"><span>Recibos incluidos</span><strong>{{ totals.get('_total_recibos', 0) }}</strong></article>
+      <article class="kpi green"><span>Monto incluido</span><strong>RD$ {{ "{:,.2f}".format(totals.get('Total General', 0)) }}</strong></article>
+      <article class="kpi orange"><span>Sala de emergencia</span><strong>RD$ {{ "{:,.2f}".format(totals.get('Sala Emergencia', 0)) }}</strong></article>
+    </section>
+    {% if not totals.get('_total_recibos', 0) %}
+    <section class="filter-summary"><strong>Sin datos para el período seleccionado</strong></section>
+    {% endif %}
+    <section class="table-card">
+      <h4>Resumen de cargos</h4>
+      <table>
+        <thead><tr><th>Categoría</th><th>Total facturado</th><th>Participación</th></tr></thead>
+        <tbody>
+          {% set grand = totals.get('Total General', 0) %}
+          {% for category, amount in category_rows %}
+          <tr><td>{{ category }}</td><td>RD$ {{ "{:,.2f}".format(amount) }}</td><td>{{ "{:.1f}%".format((amount / grand * 100) if grand else 0) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    <section class="breakdown-grid">
+      <article class="table-card">
+        <h4>Desglose por ARS</h4>
+        <table><thead><tr><th>ARS</th><th>Recibos</th></tr></thead><tbody>
+          {% for label, count in ars_rows %}<tr><td>{{ label }}</td><td>{{ count }}</td></tr>{% endfor %}
+        </tbody></table>
+      </article>
+      <article class="table-card">
+        <h4>Desglose por auxiliar / usuario</h4>
+        <table><thead><tr><th>Usuario</th><th>Recibos</th></tr></thead><tbody>
+          {% for label, count in user_rows %}<tr><td>{{ label }}</td><td>{{ count }}</td></tr>{% endfor %}
+        </tbody></table>
+      </article>
+    </section>
+  {% endif %}
+
+  {% if mode not in ("comparison", "panel", "shift_closure") %}<footer class="report-footer">
+    <span>Criterio: {% if mode in ('panel', 'comparison') %}{{ date_basis_label }}{% else %}{{ totals.get('_date_basis_label', 'Fecha de validación') }}{% endif %}.</span>
+    <span>Documento para control y auditoría.</span>
+  </footer>{% endif %}
+</body>
+</html>
