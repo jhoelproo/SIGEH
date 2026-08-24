@@ -19,6 +19,7 @@ from sigeh_update import (
     verify_archive,
     version_tuple,
 )
+from updater import merge_preserved
 
 
 def _release(repository=GITHUB_REPOSITORY, version="1.0.1"):
@@ -180,3 +181,22 @@ def test_release_rejects_nonstable_and_invalid_manifest(monkeypatch):
     install(base, "c" * 64 + f" *{release.archive_name}\n")
     with pytest.raises(UpdateError, match="no coinciden"):
         resolve_release_payload(release)
+
+
+def test_onedir_update_preserves_local_data_and_private_config(tmp_path):
+    backup = tmp_path / "backup"
+    install = tmp_path / "install"
+    data = backup / "_internal" / "data"
+    data.mkdir(parents=True)
+    (data / "pacientes.db").write_bytes(b"local-history")
+    private_config = backup / "_internal" / "database_url.bundle"
+    private_config.write_bytes(b"private-local-config")
+
+    merge_preserved(backup, install)
+
+    assert (
+        install / "_internal" / "data" / "pacientes.db"
+    ).read_bytes() == b"local-history"
+    assert (
+        install / "_internal" / "database_url.bundle"
+    ).read_bytes() == b"private-local-config"

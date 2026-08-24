@@ -70,7 +70,6 @@ REQUIRED_FILES = [
     ROOT / "private_insurance_exporter.py",
     ROOT / "lanzador.py",
     ROOT / "updater.py",
-    ROOT / "migrador_onedir.py",
     ROOT / "config_local.py",
     ROOT / "database_config.py",
     ROOT / "sigeh_product.py",
@@ -330,43 +329,6 @@ launcher_exe = EXE(
 )
 
 
-# Una sola distribución onedir: ambos ejecutables quedan juntos y comparten
-# todas sus dependencias y recursos dentro de la carpeta _internal.
-migrator_analysis = Analysis(
-    [str(ROOT / "migrador_onedir.py")],
-    pathex=[str(ROOT)],
-    binaries=[],
-    datas=[],
-    hiddenimports=[],
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
-    noarchive=False,
-    optimize=0,
-)
-migrator_pyz = PYZ(migrator_analysis.pure)
-migrator_exe = EXE(
-    migrator_pyz,
-    migrator_analysis.scripts,
-    migrator_analysis.binaries,
-    migrator_analysis.datas,
-    [],
-    name="MIGRAR_A_ONEDIR",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon=[str(ASSETS / "favicon.ico")],
-)
-
-
 updater_analysis = Analysis(
     [str(ROOT / "updater.py")],
     pathex=[str(ROOT)],
@@ -405,7 +367,6 @@ updater_exe = EXE(
 distribution = COLLECT(
     launcher_exe,
     main_exe,
-    migrator_exe,
     updater_exe,
     launcher_analysis.binaries,
     launcher_analysis.datas,
