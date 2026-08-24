@@ -19,7 +19,7 @@ from sigeh_update import (
     verify_archive,
     version_tuple,
 )
-from updater import merge_preserved
+from updater import apply_update, merge_preserved
 
 
 def _release(repository=GITHUB_REPOSITORY, version="1.0.1"):
@@ -200,3 +200,38 @@ def test_onedir_update_preserves_local_data_and_private_config(tmp_path):
     assert (
         install / "_internal" / "database_url.bundle"
     ).read_bytes() == b"private-local-config"
+
+
+def test_onedir_update_replaces_program_and_preserves_local_state(
+    tmp_path, monkeypatch
+):
+    install = tmp_path / "SIGEH"
+    payload = tmp_path / "payload"
+    (install / "_internal" / "data").mkdir(parents=True)
+    (install / "_internal" / "data" / "pacientes.db").write_bytes(b"history")
+    (install / "_internal" / "database_url.bundle").write_bytes(b"private")
+    (install / "old.txt").write_text("old", encoding="utf-8")
+    (payload / "_internal").mkdir(parents=True)
+    for executable in ("CALCULOS_QT.exe", "INICIAR_SISTEMA.exe"):
+        (payload / executable).write_bytes(b"new")
+    manifest = tmp_path / "update.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "product": PRODUCT_ID,
+                "version": "1.0.1",
+                "install_dir": str(install),
+                "payload_dir": str(payload),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("updater.wait_for_process", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("updater.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("updater.start_launcher", lambda *_args, **_kwargs: None)
+
+    assert apply_update(manifest, 0) == 0
+    assert (install / "CALCULOS_QT.exe").read_bytes() == b"new"
+    assert (install / "_internal" / "data" / "pacientes.db").read_bytes() == b"history"
+    assert (install / "_internal" / "database_url.bundle").read_bytes() == b"private"
+    assert not (install / "old.txt").exists()
