@@ -1,0 +1,169 @@
+PRODUCT_NAME = SIGEH
+PRODUCT_ID = SIGEH
+VERSION = 1.0.0
+
+==================================================
+RESET
+==================================================
+TEST_TURNS_AUDITED = PASS
+TEST_TURNS_NOT_OPERATIONAL = PASS
+NO_ACTIVE_TURN_AFTER_BOOTSTRAP = PASS
+NO_ACTIVE_OPERATIONAL_SESSION = PASS
+NO_PRIMARY_AFTER_BOOTSTRAP = PASS
+NO_ACTIVE_REP_AFTER_BOOTSTRAP = PASS
+CENTRAL_STATE_RESET = PASS
+LOCAL_CACHE_RESET = PASS
+NO_DESTRUCTIVE_HISTORY_DELETE = PASS
+NO_TEST_REPORT_GENERATED = PASS
+
+CENTRAL_PRODUCTION_EPOCH = 2145733c-827f-4453-a615-d219f3314544
+CENTRAL_ACTIVE_SESSIONS_AFTER = 0
+CENTRAL_OPEN_INTERVALS_AFTER = 0
+CENTRAL_ACTIVE_PRIMARY_AFTER = 0
+LOCAL_OPEN_TURNS_AFTER = 0
+LOCAL_ATTENTIONS_PRESERVED = 13969
+LOCAL_PATIENTS_PRESERVED = 38486
+
+==================================================
+PRIMER TURNO REAL
+==================================================
+FIRST_REAL_TURN_NEW_ID = PASS
+FIRST_REAL_TURN_NEW_OPERATIONAL_SESSION = PASS
+FIRST_REAL_TURN_COUNTS_ZERO = PASS
+FIRST_REAL_TURN_NO_TEST_ROWS = PASS
+
+TRANSACTIONAL_FIRST_TURN_ID = 3941
+TRANSACTIONAL_FIRST_TURN_COUNT = 0
+TRANSACTIONAL_TEST_ROLLED_BACK = YES
+
+==================================================
+CAMBIO DE TURNO
+==================================================
+NEXT_TURN_CLOSES_ONLY_REAL_PREVIOUS = PASS
+NEXT_TURN_NEW_ID = PASS
+NEXT_TURN_COUNTS_ZERO = PASS
+NO_GHOST_SHIFT = PASS
+FACTURACION_NO_GHOST_SHIFT = PASS
+
+TRANSACTIONAL_NEXT_TURN_ID = 3942
+TRANSACTIONAL_NEXT_TURN_COUNT = 0
+TRANSACTIONAL_TEST_ROLLED_BACK = YES
+
+==================================================
+SINCRONIZACION
+==================================================
+RESTART_REAL_TURN = PASS
+SECOND_PC_SAME_TURN = PASS
+REP_CHANGE_PRESERVES_TURN = PASS
+PRIMARY_CHANGE_PRESERVES_TURN = PASS
+LOGIN_PRESERVES_TURN = PASS
+
+==================================================
+BOOTSTRAP
+==================================================
+BOOTSTRAP_ONE_TIME_ONLY = PASS
+BOOTSTRAP_IDEMPOTENT_BEFORE_PRODUCTION = PASS
+BOOTSTRAP_PROTECTS_PRODUCTION = PASS
+UPDATE_DOES_NOT_RERUN_BOOTSTRAP = PASS
+
+==================================================
+GITHUB
+==================================================
+NEW_REPOSITORY_NAME = SIGEH
+GITHUB_REPO_NEW = PASS
+OLD_REPOSITORY_UNCHANGED = PASS
+NO_OLD_RELEASE_MODIFIED = PASS
+SECRETS_SCAN = PASS
+GITIGNORE = PASS
+INITIAL_COMMIT = PASS
+INITIAL_PUSH = PASS
+INITIAL_TAG = PASS
+INITIAL_RELEASE = PASS
+
+OLD_REPOSITORY = jhoelproo/Hospital-Contreras-Facturacion1
+OLD_REPOSITORY_HEAD_BEFORE = 6741ddc3d70ca530790f27809f9685677ea0f156
+OLD_REPOSITORY_HEAD_AFTER = 6741ddc3d70ca530790f27809f9685677ea0f156
+
+==================================================
+UPDATER
+==================================================
+SIGEH_UPDATE_CHANNEL = PASS
+OLD_UPDATE_CHANNEL_ISOLATED = PASS
+REMOTE_UPDATE_CHECK = PASS
+VERSION_COMPARE = PASS
+SHA256_CHECK = PASS
+ONEDIR_UPDATE = PASS
+LOCAL_DATA_PRESERVED = PASS
+UPDATE_PRESERVES_LOCAL_CONFIG = PASS
+UPDATE_DOES_NOT_RESET_TURN = PASS
+
+REMOTE_VERSION = 1.0.0
+REMOTE_EQUAL_VERSION_IGNORED = PASS
+REMOTE_SHA256 = ff790b799c4c9045ad8ae37a0924be16978508620f1f2ecad81ab82d21803591
+
+==================================================
+BUILD
+==================================================
+PY_COMPILE = PASS
+SOURCE_TESTS = PASS
+PYINSTALLER_BUILD = PASS
+DIST_SMOKE_TEST = PASS
+
+PYTHON = 3.12.10
+PYINSTALLER = 6.19.0
+SPEC = build_app.spec
+PACKAGING = ONEDIR
+SOURCE_TESTS_SPECIFIC = 22 PASS
+SOURCE_TESTS_RELATED = 27 PASS
+CRITICAL_SIGEH_LINE_BRANCH_COVERAGE = 94 PERCENT
+TARGETED_RUFF = PASS
+MAX_NEW_CYCLOMATIC_COMPLEXITY = 9
+PACKAGED_DATABASE_CHECK = PASS
+PACKAGED_V15_SMOKE = PASS
+ADMISSION_WIDGET_CONSTRUCTED = PASS
+HISTORY_OPENED = PASS
+CONFIGURATION_OPENED = PASS
+PINK_ADMISSION_ERROR_PANEL = NO
+RELEASE_LOG_FILES = 0
+RELEASE_DATABASE_FILES = 0
+RELEASE_SECRET_FILES = 0
+
+==================================================
+FILES MODIFIED
+==================================================
+FILES_MODIFIED =
+.gitignore
+README.md
+CALCULOS_QT.py
+admission_hybrid.py
+admission_source/emergency_core/paths.py
+admission_source/emergency_core/updater.py
+admission_source/facturacion_tabs.py
+build_app.spec
+lanzador.py
+updater.py
+version_config.json
+sigeh_product.py
+sigeh_update.py
+tests/test_sigeh_production.py
+tests/test_sigeh_update.py
+
+==================================================
+GITHUB
+==================================================
+GITHUB_REPOSITORY = jhoelproo/SIGEH
+GITHUB_REPOSITORY_URL = https://github.com/jhoelproo/SIGEH
+GITHUB_RELEASE = v1.0.0
+GITHUB_RELEASE_URL = https://github.com/jhoelproo/SIGEH/releases/tag/v1.0.0
+GITHUB_ASSET = SIGEH-1.0.0-windows-x64.zip
+
+==================================================
+DELIVERY
+==================================================
+BUILD_OUTPUT = C:\Users\ampar\OneDrive\Desktop\PROYECTOS\dist_sigeh_1_0_0_20260824\SIGEH
+DESKTOP_FOLDER = C:\Users\ampar\OneDrive\Desktop\SIGEH_1.0.0_20260824_102636
+
+==================================================
+FINAL
+==================================================
+FINAL_RESULT = APPROVED
