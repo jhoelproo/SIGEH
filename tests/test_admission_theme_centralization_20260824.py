@@ -7,10 +7,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from types import SimpleNamespace
 
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QWidget
+
 import CALCULOS_QT as shell
-from ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6 import App
 from ADMISION_PYSIDE6_V15 import qt_compat
-from PySide6.QtWidgets import QApplication, QPushButton
+from ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6 import App
 
 
 def test_host_tokens_cover_all_admission_visual_roles():
@@ -28,6 +30,23 @@ def test_host_tokens_cover_all_admission_visual_roles():
         assert tokens["root"] in stylesheet
         assert tokens["entry"] in stylesheet
         assert tokens["text"] in stylesheet
+        for selector in (
+            "QCheckBox",
+            "QRadioButton",
+            "QComboBox QAbstractItemView",
+            "QMenu",
+            "QScrollBar:vertical",
+            "QToolTip",
+        ):
+            assert selector in stylesheet
+        for token_name in (
+            "popup_bg",
+            "selection_bg",
+            "scrollbar_track",
+            "scrollbar_handle",
+            "tooltip_bg",
+        ):
+            assert tokens[token_name] in stylesheet
 
 
 def test_embedded_theme_refresh_uses_the_host_token_set_without_persistence():
@@ -120,3 +139,93 @@ def test_admission_action_icons_are_not_fixed_white_assets():
     ):
         assert f'"{icon_name}"' in source
     assert "theme_icon(icon_map.get" in source
+
+
+def test_preferences_popup_and_semantic_buttons_follow_live_host_theme():
+    application = QApplication.instance() or QApplication([])
+
+    class Host(QWidget):
+        theme_toggled = Signal(bool)
+
+        def __init__(self):
+            super().__init__()
+            self.is_dark_mode = True
+            self.display_layout = None
+
+    host = Host()
+    dialog = shell.PreferencesDialog(
+        {
+            "theme": "claro",
+            "auto_add_guantes": True,
+            "auto_print": False,
+            "auto_add_bajante_cateter": True,
+        },
+        host,
+    )
+    try:
+        dark = shell.visual_theme_tokens(True)
+        assert dialog.chk_theme_dark.isChecked() is True
+        for combo in dialog.findChildren(QComboBox):
+            popup_qss = combo.view().styleSheet() + combo.view().viewport().styleSheet()
+            assert dark["popup_bg"] in popup_qss
+            assert dark["selection_bg"] in popup_qss
+        for text in (
+            "Restablecer diseño recomendado",
+            "Restablecer proporciones",
+            "Cancelar",
+        ):
+            button = next(
+                button
+                for button in dialog.findChildren(QPushButton)
+                if button.text() == text
+            )
+            assert dark["button_neutral_bg"] in button.styleSheet()
+
+        for index in range(20):
+            host.theme_toggled.emit(bool(index % 2))
+        assert dialog.chk_theme_dark.isChecked() is True
+        assert dialog.styleSheet().count("QComboBox QAbstractItemView") == 1
+    finally:
+        dialog.close()
+        host.close()
+        dialog.deleteLater()
+        host.deleteLater()
+        application.processEvents()
+
+
+def test_admission_responsive_fallbacks_preserve_standalone_preferences():
+    admission = object.__new__(App)
+    admission._host_theme_controlled = False
+    calls = []
+    admission._aplicar_modo_responsivo = lambda: calls.append("responsive")
+    assert admission.apply_embedded_responsive_layout(1600, 860) is None
+    assert calls == ["responsive"]
+
+    admission._responsive_layout_profile = None
+    admission._host_layout_snapshot = None
+    admission._font_size_pref = lambda: 11
+    for settings, expected_profile, expected_density in (
+        (
+            {"small_screen_mode": True, "compact_mode": False},
+            "MUY_COMPACTO",
+            "MUY_COMPACTA",
+        ),
+        (
+            {"small_screen_mode": False, "compact_mode": True},
+            "COMPACTO",
+            "COMPACTA",
+        ),
+        (
+            {"small_screen_mode": False, "compact_mode": False},
+            "AUTO",
+            "AUTOMATICA",
+        ),
+    ):
+        admission.app_settings = settings
+        assert admission._standalone_responsive_preferences() == (
+            expected_profile,
+            expected_density,
+        )
+        resolved = admission._resolve_current_responsive_profile(1366, 768)
+        assert resolved.available_width == 1366
+        admission._responsive_layout_profile = None

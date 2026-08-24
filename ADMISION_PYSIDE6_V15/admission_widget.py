@@ -43,6 +43,7 @@ class AdmissionWidget(QWidget):
         self._layout_sync_force = False
         self._layout_sync_reason = "construction"
         self._last_layout_sync_size = None
+        self._host_layout_snapshot = None
         self._first_layout_sync_done = False
         self._application_state_connected = False
         if not isinstance(context, AdmissionContext):
@@ -135,6 +136,12 @@ class AdmissionWidget(QWidget):
         else:
             self.request_layout_stabilization("host_theme", force=True)
         return changed
+
+    def apply_layout_profile(self, snapshot) -> None:
+        """Receive the host preference/DPI snapshot without owning its geometry."""
+        self._host_layout_snapshot = snapshot
+        if self.isVisible():
+            self._schedule_embedded_layout_sync(force=True, reason="host_profile")
 
     def request_layout_stabilization(self, reason="visual", *, force=True):
         """Queue one GUI-only layout pass after a visual state transition."""
@@ -233,9 +240,19 @@ class AdmissionWidget(QWidget):
         self._layout_sync_in_progress = True
         self._last_layout_sync_size = available_size
         try:
-            # V15 may have selected its one-column profile while the parent was
-            # still hidden. Re-evaluate it against the actual embedded width.
-            self.admission._aplicar_modo_responsivo()
+            # The main shell owns the outside geometry. V15 resolves density
+            # against this actual embedded viewport, not the monitor size.
+            apply_responsive = getattr(
+                self.admission, "apply_embedded_responsive_layout", None
+            )
+            if callable(apply_responsive):
+                apply_responsive(
+                    available_size[0],
+                    available_size[1],
+                    self._host_layout_snapshot,
+                )
+            else:
+                self.admission._aplicar_modo_responsivo()
             ensure_entry_geometry = getattr(
                 self.admission, "ensure_embedded_entry_geometry", None
             )

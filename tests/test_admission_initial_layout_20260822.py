@@ -16,8 +16,16 @@ from PySide6.QtWidgets import (
 from ADMISION_PYSIDE6_V15 import qt_compat as compat
 from ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6 import App, theme_icon
 from admission_v15_adapter import AdmissionV15EventBus, AdmissionV15Factory
-from CALCULOS_QT import EmergencyWorkspacePage, visual_theme_tokens
-from CALCULOS_QT import validate_visual_theme_contrast
+from CALCULOS_QT import (
+    EmergencyWorkspacePage,
+    validate_visual_theme_contrast,
+    visual_theme_tokens,
+)
+from display_layout import (
+    DENSITY_VERY_COMPACT,
+    PROFILE_VERY_COMPACT,
+    DisplaySnapshot,
+)
 
 
 def _build_admission_widget(tmp_path, monkeypatch, *, host_theme_is_dark=None):
@@ -171,6 +179,89 @@ def test_first_show_matches_geometry_after_tab_reactivation(tmp_path, monkeypatc
         assert tuple(id(entry) for entry in widget.admission.all_entries) == entry_identities
         assert widget.sizePolicy().horizontalPolicy().name == "Expanding"
         assert widget.root.sizePolicy().horizontalPolicy().name == "Expanding"
+    finally:
+        widget.shutdown()
+        shell.close()
+        shell.deleteLater()
+        application.processEvents()
+
+
+def test_hospital_viewport_applies_host_density_without_clipping_labels(
+    tmp_path, monkeypatch
+):
+    application, shell, stack, _billing, widget = _build_admission_widget(
+        tmp_path, monkeypatch
+    )
+    try:
+        snapshot = DisplaySnapshot(
+            width=1600,
+            height=900,
+            logical_dpi=96.0,
+            device_pixel_ratio=1.0,
+            windows_scale=1.0,
+            recommended_profile=PROFILE_VERY_COMPACT,
+            applied_profile=PROFILE_VERY_COMPACT,
+            density=DENSITY_VERY_COMPACT,
+            text_percent=100,
+        )
+        shell.resize(1600, 860)
+        stack.setCurrentWidget(widget)
+        widget.apply_layout_profile(snapshot)
+        shell.show()
+        QTest.qWait(140)
+
+        profile = widget.admission._responsive_layout_profile
+        assert profile.available_width == widget.width()
+        assert profile.available_height == widget.root.height()
+        assert profile.two_columns is True
+        assert widget.admission.quick_panel.width() <= 320
+        widget.apply_layout_profile(snapshot)
+        QTest.qWait(30)
+
+        responsive_applier = widget.admission.apply_embedded_responsive_layout
+        widget.admission.apply_embedded_responsive_layout = None
+        assert widget.sync_embedded_layout(force=True, reason="legacy_profile") is True
+        widget.admission.apply_embedded_responsive_layout = responsive_applier
+
+        for label_name in (
+            "lbl_nombre",
+            "lbl_edad",
+            "lbl_cedula",
+            "lbl_telefono",
+            "lbl_direccion",
+            "lbl_nacionalidad",
+            "lbl_ars",
+            "lbl_nss",
+            "lbl_sexo",
+        ):
+            label = getattr(widget.admission, label_name)
+            assert label.wordWrap() is False
+            assert label.fontMetrics().horizontalAdvance(label.text()) <= label.width()
+
+        entries = tuple(
+            getattr(widget.admission, name)
+            for name in (
+                "entry_nombre",
+                "entry_edad",
+                "entry_cedula",
+                "entry_telefono",
+                "entry_direccion",
+                "entry_nacionalidad",
+                "entry_ars",
+                "entry_nss",
+            )
+        )
+        for entry in entries:
+            assert entry.height() >= entry.fontMetrics().height() + 14
+
+        for width, height in ((1366, 768), (1600, 900), (1920, 1080)):
+            shell.resize(width, height)
+            QTest.qWait(100)
+            assert widget.admission.entry_nombre.width() > 0
+            assert widget.admission.entry_direccion.width() > 0
+            assert widget.admission.entry_nombre.geometry().intersects(
+                widget.admission.entry_cedula.geometry()
+            ) is False
     finally:
         widget.shutdown()
         shell.close()

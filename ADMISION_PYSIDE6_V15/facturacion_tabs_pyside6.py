@@ -37,6 +37,11 @@ PROJECT_ROOT = bootstrap_project_root()
 
 from sqlite_write_coordinator import connect_local_sqlite, prepare_sqlite_database
 from admission_refresh_coordinator import CoalescedRefreshGate, history_rows_fingerprint
+from display_layout import (
+    DENSITY_AUTO,
+    PROFILE_AUTO,
+    resolve_admission_layout_profile,
+)
 
 SELF_TEST_MODE = "--self-test" in sys.argv
 OFFLINE_MODE = str(os.environ.get("HOSPITAL_OFFLINE", "")).strip().lower() in {
@@ -5987,6 +5992,9 @@ class App:
         self._embedded_theme_indicators = []
         self._embedded_entry_height_floor = {}
         self._entry_geometry_sync_scheduled = False
+        self._responsive_layout_profile = None
+        self._host_layout_snapshot = None
+        self._last_responsive_log_signature = None
         self._asegurar_preferencias_impresion_hoja()
         verificar_o_crear_excel()
         self._excel_pendiente_turno_manual = excel_requiere_turno_manual()
@@ -6493,7 +6501,6 @@ class App:
                 pass
 
         self._aplicar_preferencias_en_vivo()
-        self._aplicar_paridad_visual_inicio()
         self._set_turn_change_controls_enabled(True)
         self._responsive_after_id = None
         self.root.bind("<Configure>", self._programar_modo_responsivo, add="+")
@@ -7426,12 +7433,8 @@ class App:
         except Exception:
             pass
         self._aplicar_modo_responsivo()
-        try:
-            self._aplicar_paridad_visual_inicio()
-        except Exception:
-            pass
 
-    def _aplicar_paridad_visual_inicio(self):
+    def _aplicar_paridad_visual_inicio(self, profile=None):
         """
         Paridad visual del inicio sobre PySide6.
 
@@ -7460,22 +7463,42 @@ class App:
                 alto_root = max(1, int(self.root.winfo_height() or 0))
             except Exception:
                 ancho_root, alto_root = 1365, 768
-            vista_grande = ancho_root >= 1600 or alto_root >= 900
+            profile = profile or self._responsive_layout_profile
+            if profile is None:
+                profile = resolve_admission_layout_profile(
+                    ancho_root,
+                    alto_root,
+                    profile_preference=PROFILE_AUTO,
+                    density_preference=DENSITY_AUTO,
+                    text_percent=max(
+                        85,
+                        min(125, int(self._font_size_pref() / 11 * 100)),
+                    ),
+                )
+                self._responsive_layout_profile = profile
+            vista_grande = profile.layout_mode in ("WIDE", "NORMAL")
 
-            form_gap_y = 8 if vista_grande else 5
-            form_gap_x = 10 if vista_grande else 8
-            entry_h = 36 if vista_grande else 32
-            title_size = 18 if vista_grande else 16
-            label_size = 11 if vista_grande else 10
-            value_size = 11 if vista_grande else 10
-            side_width = 380 if vista_grande else 350
+            form_gap_y = profile.vertical_gap
+            form_gap_x = profile.horizontal_gap
+            entry_h = profile.input_min_height
+            title_size = profile.title_point_size
+            label_size = profile.label_point_size
+            value_size = profile.value_point_size
+            side_width = profile.side_panel_width
 
             self.content_area.configure(background=root_bg)
             self.frame.configure(style="Card.TFrame", background=card_bg)
             self.form_host.configure(style="Card.TFrame", background=card_bg)
             self.quick_panel.configure(style="Card.TFrame", background=card_bg)
-            self.quick_panel.setMinimumWidth(side_width)
-            self.quick_panel.setMaximumWidth(side_width + 25)
+            self.quick_panel.setMinimumWidth(profile.side_panel_min_width)
+            self.quick_panel.setMaximumWidth(
+                profile.side_panel_max_width or 16777215
+            )
+            self.quick_panel.setSizePolicy(
+                QSizePolicy.Preferred, QSizePolicy.Expanding
+            )
+            if side_width:
+                self.quick_panel.configure(width=side_width)
             self.quick_panel.setStyleSheet(f"background-color: {card_bg};")
             if getattr(self, "quick_separator", None) is not None:
                 self.quick_separator.setStyleSheet(f"background-color: {panel_border}; border: none;")
@@ -7491,15 +7514,25 @@ class App:
                     form_layout.setAlignment(Qt.AlignTop)
                     form_layout.setVerticalSpacing(form_gap_y)
                     form_layout.setHorizontalSpacing(form_gap_x)
-                    form_layout.setContentsMargins(12, 10, 12, 10)
+                    form_layout.setContentsMargins(
+                        profile.form_padding,
+                        max(5, profile.form_padding - 2),
+                        profile.form_padding,
+                        max(5, profile.form_padding - 2),
+                    )
                 except Exception:
                     pass
             quick_layout = getattr(self.quick_panel, "_compat_layout", None)
             if quick_layout is not None:
                 try:
                     quick_layout.setAlignment(Qt.AlignTop)
-                    quick_layout.setSpacing(6 if vista_grande else 4)
-                    quick_layout.setContentsMargins(16, 8, 8, 8)
+                    quick_layout.setSpacing(max(4, form_gap_y))
+                    quick_layout.setContentsMargins(
+                        max(9, profile.form_padding),
+                        max(5, profile.vertical_gap),
+                        max(7, profile.form_padding - 2),
+                        max(5, profile.vertical_gap),
+                    )
                 except Exception:
                     pass
 
@@ -7530,8 +7563,23 @@ class App:
                         _qt_transparent=True, foreground=text_fg,
                         font=("Segoe UI", label_size, "bold")
                     )
+                    lab.setWordWrap(False)
+                    lab.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred)
+                    required_width = lab.fontMetrics().horizontalAdvance(
+                        lab.text()
+                    ) + 8
+                    form_width = max(
+                        240,
+                        profile.available_width
+                        - profile.side_panel_width
+                        - (profile.outer_margin + profile.form_padding) * 2,
+                    )
+                    label_limit = form_width if not profile.two_columns else form_width // 2
+                    lab.setMinimumWidth(min(required_width, label_limit))
                 except Exception:
                     pass
+            if not profile.two_columns:
+                self.lbl_nss.setWordWrap(True)
 
             self.section_patient_label.configure(
                 _qt_transparent=True, foreground=accent,
@@ -7548,7 +7596,7 @@ class App:
 
             entry_qss = (
                 f"QLineEdit{{background:{entry_bg};color:{text_fg};border:1px solid {border};"
-                f"border-radius:2px;padding:6px 9px;min-height:{entry_h}px;font-family:'Segoe UI';font-size:{value_size}pt;}}"
+                f"border-radius:2px;padding:5px 8px;font-family:'Segoe UI';font-size:{value_size}pt;}}"
                 f"QLineEdit:focus{{border:1px solid {accent};background:{entry_bg};}}"
                 f"QLineEdit:disabled{{color:{muted};background:{elevated_bg};}}"
             )
@@ -7559,6 +7607,7 @@ class App:
             ):
                 widget.setStyleSheet(entry_qss)
                 try:
+                    widget.setMinimumHeight(entry_h)
                     widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
                 except Exception:
                     pass
@@ -7567,12 +7616,13 @@ class App:
 
             self.combo_unidad.setStyleSheet(
                 f"QComboBox{{background:{entry_bg};color:{text_fg};border:1px solid {border};"
-                f"border-radius:2px;padding:6px 34px 6px 9px;min-height:{entry_h}px;font-family:'Segoe UI';font-size:{value_size}pt;}}"
+                f"border-radius:2px;padding:5px 32px 5px 8px;font-family:'Segoe UI';font-size:{value_size}pt;}}"
                 f"QComboBox:focus{{border:1px solid {accent};}}"
                 "QComboBox::drop-down{border:0;width:30px;subcontrol-origin:padding;subcontrol-position:top right;}"
                 f"QComboBox QAbstractItemView{{background:{entry_bg};color:{text_fg};border:1px solid {border};"
                 f"selection-background-color:{selected_bg};selection-color:{selected_fg};}}"
             )
+            self.combo_unidad.setMinimumHeight(entry_h)
             self.combo_unidad.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
             radio_qss = (
@@ -7617,10 +7667,18 @@ class App:
                 self.title_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             except Exception:
                 pass
-            self.title_lbl.setMinimumWidth(500 if vista_grande else 460)
-            self.title_lbl.setMaximumWidth(620 if vista_grande else 560)
-            self.title_lbl.setMinimumHeight(58 if vista_grande else 54)
-            self.subtitle_lbl.configure(_qt_transparent=True, font=("Segoe UI", 11 if vista_grande else 10, "normal"), foreground=muted)
+            title_min_width = max(
+                280,
+                min(460, int(profile.available_width * 0.34)),
+            )
+            self.title_lbl.setMinimumWidth(title_min_width)
+            self.title_lbl.setMaximumWidth(max(title_min_width, 560))
+            self.title_lbl.setMinimumHeight(58 if vista_grande else 52)
+            self.subtitle_lbl.configure(
+                _qt_transparent=True,
+                font=("Segoe UI", max(9, value_size), "normal"),
+                foreground=muted,
+            )
 
             # Botones: QSS deliberadamente simple para evitar warnings del parser
             # Qt en Windows. Tipografía/tamaño se aplican con QFont/geometry.
@@ -7646,8 +7704,10 @@ class App:
                 self.boton_cambiar_turno.setStyleSheet(header_btn_qss)
                 self.boton_cambiar_turno.setText("Cambiar Turno")
                 try:
-                    self.boton_cambiar_turno.setMinimumWidth(170)
-                    self.boton_cambiar_turno.setMinimumHeight(42)
+                    self.boton_cambiar_turno.setMinimumWidth(
+                        142 if profile.compact_labels else 170
+                    )
+                    self.boton_cambiar_turno.setMinimumHeight(profile.button_height)
                     self.boton_cambiar_turno.setIcon(theme_icon("turno.svg", header_button_text))
                     self.boton_cambiar_turno.setIconSize(QSize(16, 16))
                 except Exception:
@@ -7656,8 +7716,10 @@ class App:
                 _set_button_font(self.actions_menu_button, 10, True)
                 self.actions_menu_button.setStyleSheet(header_btn_qss)
                 try:
-                    self.actions_menu_button.setMinimumWidth(112)
-                    self.actions_menu_button.setMinimumHeight(42)
+                    self.actions_menu_button.setMinimumWidth(
+                        92 if profile.compact_labels else 112
+                    )
+                    self.actions_menu_button.setMinimumHeight(profile.button_height)
                     self.actions_menu_button.setIcon(theme_icon("menu.svg", header_button_text))
                     self.actions_menu_button.setIconSize(QSize(16, 16))
                 except Exception:
@@ -7676,7 +7738,7 @@ class App:
             self.boton_historial.setStyleSheet(history_qss)
             self.boton_historial.setText("Historial")
             try:
-                self.boton_historial.setMinimumHeight(38)
+                self.boton_historial.setMinimumHeight(profile.button_height)
                 self.boton_historial.setIcon(theme_icon("history.svg", history_text))
                 self.boton_historial.setIconSize(QSize(16, 16))
             except Exception:
@@ -7743,7 +7805,7 @@ class App:
                 btn.setText(texts.get(role, btn.text()))
                 _set_button_font(btn, value_size, True)
                 try:
-                    btn.setMinimumHeight(48 if vista_grande else 44)
+                    btn.setMinimumHeight(profile.button_height)
                 except Exception:
                     pass
                 btn.setStyleSheet(
@@ -7784,7 +7846,9 @@ class App:
                     try:
                         lab.setAlignment(Qt.AlignLeft | Qt.AlignTop)
                         lab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                        lab.setMinimumWidth(300)
+                        lab.setMinimumWidth(0)
+                        if profile.side_panel_max_width:
+                            lab.setMaximumWidth(profile.side_panel_max_width)
                     except Exception:
                         pass
 
@@ -7797,7 +7861,11 @@ class App:
                     )
                     self.quick_total_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                     self.quick_total_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                    self.quick_total_label.setMinimumWidth(300)
+                    self.quick_total_label.setMinimumWidth(0)
+                    if profile.side_panel_max_width:
+                        self.quick_total_label.setMaximumWidth(
+                            profile.side_panel_max_width
+                        )
                 except Exception:
                     pass
 
@@ -7805,7 +7873,11 @@ class App:
                 self.quick_representante_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
                 self.quick_turno_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
                 self.quick_summary_label.setWordWrap(True)
-                self.quick_summary_label.setMinimumWidth(300)
+                self.quick_summary_label.setMinimumWidth(0)
+                if profile.side_panel_max_width:
+                    self.quick_summary_label.setMaximumWidth(
+                        profile.side_panel_max_width
+                    )
                 self.quick_summary_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
             except Exception:
                 pass
@@ -7815,6 +7887,55 @@ class App:
             self.status_label.configure(_qt_transparent=True, font=("Segoe UI", 10 if vista_grande else 9, "bold"), foreground=accent)
         except Exception:
             pass
+
+    def apply_embedded_responsive_layout(
+        self, available_width, available_height, host_snapshot=None
+    ):
+        """Resolve V15 geometry from the embedded viewport and host preference."""
+        if not self._host_theme_controlled:
+            return self._aplicar_modo_responsivo()
+        self._host_layout_snapshot = host_snapshot
+        profile_preference = getattr(
+            host_snapshot, "configured_profile", None
+        ) or getattr(host_snapshot, "applied_profile", PROFILE_AUTO)
+        density_preference = getattr(
+            host_snapshot, "configured_density", None
+        ) or getattr(host_snapshot, "density", DENSITY_AUTO)
+        text_percent = int(getattr(host_snapshot, "text_percent", 100) or 100)
+        logical_dpi = float(
+            getattr(host_snapshot, "logical_dpi", 96.0) or 96.0
+        )
+        self._responsive_layout_profile = resolve_admission_layout_profile(
+            available_width,
+            available_height,
+            logical_dpi=logical_dpi,
+            profile_preference=profile_preference,
+            density_preference=density_preference,
+            text_percent=text_percent,
+        )
+        profile = self._responsive_layout_profile
+        signature = (
+            profile.available_width,
+            profile.available_height,
+            round(profile.dpi_scale, 2),
+            profile.layout_mode,
+            profile.density,
+            profile.text_percent,
+        )
+        if signature != self._last_responsive_log_signature:
+            APP_LOG.info(
+                "ADMISSION_RESPONSIVE_PROFILE viewport=%sx%s dpi=%.2f "
+                "profile=%s density=%s font_scale=%.2f input_height=%s",
+                profile.available_width,
+                profile.available_height,
+                profile.dpi_scale,
+                profile.layout_mode,
+                profile.density,
+                profile.font_scale,
+                profile.input_min_height,
+            )
+            self._last_responsive_log_signature = signature
+        return self._aplicar_modo_responsivo()
 
     def _programar_modo_responsivo(self, event=None):
         if self._shutdown_complete or not self._admission_visible:
@@ -7829,54 +7950,110 @@ class App:
                 pass
         self._responsive_after_id = self.root.after(80, self._aplicar_modo_responsivo)
 
+    def _standalone_responsive_preferences(self):
+        if bool(self.app_settings.get("small_screen_mode", False)):
+            return "MUY_COMPACTO", "MUY_COMPACTA"
+        if bool(self.app_settings.get("compact_mode", False)):
+            return "COMPACTO", "COMPACTA"
+        return PROFILE_AUTO, DENSITY_AUTO
+
+    def _resolve_current_responsive_profile(self, width, height):
+        current = self._responsive_layout_profile
+        if (
+            current is not None
+            and current.available_width == width
+            and current.available_height == height
+        ):
+            return current
+        host_snapshot = self._host_layout_snapshot
+        if self._host_theme_controlled and host_snapshot is not None:
+            profile_preference = getattr(
+                host_snapshot, "configured_profile", None
+            ) or getattr(host_snapshot, "applied_profile", PROFILE_AUTO)
+            density_preference = getattr(
+                host_snapshot, "configured_density", None
+            ) or getattr(host_snapshot, "density", DENSITY_AUTO)
+            text_percent = int(
+                getattr(host_snapshot, "text_percent", 100) or 100
+            )
+            logical_dpi = float(
+                getattr(host_snapshot, "logical_dpi", 96.0) or 96.0
+            )
+        else:
+            profile_preference, density_preference = (
+                self._standalone_responsive_preferences()
+            )
+            text_percent = max(
+                85,
+                min(125, int(self._font_size_pref() / 11 * 100)),
+            )
+            logical_dpi = 96.0
+        return resolve_admission_layout_profile(
+            width,
+            height,
+            logical_dpi=logical_dpi,
+            profile_preference=profile_preference,
+            density_preference=density_preference,
+            text_percent=text_percent,
+        )
+
+    @staticmethod
+    def _set_grid_visibility(widget, visible):
+        widget.grid() if visible else widget.grid_remove()
+
     def _aplicar_modo_responsivo(self):
         try:
             self._responsive_after_id = None
             if self._shutdown_complete or not self._admission_visible:
                 return
             ancho = max(1, int(self.root.winfo_width()))
+            alto = max(1, int(self.root.winfo_height()))
             forzar_pequeno = bool(self.app_settings.get("small_screen_mode", False))
-            compacto = bool(self.app_settings.get("compact_mode", False)) or ancho < 1050
+            profile = self._resolve_current_responsive_profile(ancho, alto)
+            self._responsive_layout_profile = profile
             mostrar_panel = (
                 bool(self.app_settings.get("show_side_panel", True))
-                and ancho >= 1180
+                and profile.show_side_panel
                 and not forzar_pequeno
             )
 
-            if mostrar_panel:
-                self.quick_panel.grid()
-            else:
-                self.quick_panel.grid_remove()
+            self._set_grid_visibility(self.quick_panel, mostrar_panel)
+            self._set_grid_visibility(
+                self.info_header,
+                profile.show_header_info and not forzar_pequeno,
+            )
 
-            if ancho >= 1040 and not forzar_pequeno:
-                self.info_header.grid()
-            else:
-                self.info_header.grid_remove()
-
-            margen = 8 if compacto else 14
-            padding_form = 10 if compacto else 18
-            self.main.configure(padding=margen)
-            self.frame.configure(padding=padding_form)
-            self.form_host.grid_configure(padx=(0, 8 if mostrar_panel else 0))
-            self.title_lbl.configure(wraplength=430 if compacto else 560)
-            self._configurar_columnas_formulario(una_columna=ancho < 850)
+            self.main.configure(padding=profile.outer_margin)
+            self.frame.configure(padding=profile.form_padding)
+            self.form_host.grid_configure(
+                padx=(0, profile.horizontal_gap if mostrar_panel else 0)
+            )
+            self.title_lbl.configure(wraplength=0)
+            self._configurar_columnas_formulario(
+                una_columna=not profile.two_columns,
+                profile=profile,
+            )
 
             pal = self._paleta_visual_actual()
             self.form_canvas.configure(background=pal["card"])
-            tamano = str(self.app_settings.get("button_size", "Normal"))
-            padding_boton = {
-                "Compacto": (8, 3),
-                "Normal": (10, 5),
-                "Grande": (12, 7),
-            }.get(tamano, (10, 5))
+            padding_boton = (
+                max(6, profile.horizontal_gap),
+                max(3, profile.vertical_gap - 1),
+            )
             self.style.configure("TButton", padding=padding_boton)
-            self._aplicar_paridad_visual_inicio()
+            self._aplicar_paridad_visual_inicio(profile)
         except (AttributeError, tk.TclError):
             pass
 
-    def _configurar_columnas_formulario(self, una_columna=False):
-        if getattr(self, "_formulario_una_columna", None) is bool(una_columna):
+    def _configurar_columnas_formulario(self, una_columna=False, profile=None):
+        layout_signature = (
+            bool(una_columna),
+            getattr(profile, "horizontal_gap", None),
+            getattr(profile, "vertical_gap", None),
+        )
+        if getattr(self, "_formulario_layout_signature", None) == layout_signature:
             return
+        self._formulario_layout_signature = layout_signature
         self._formulario_una_columna = bool(una_columna)
         if una_columna:
             layout = (
@@ -7928,8 +8105,8 @@ class App:
                 (self.entry_ars, 11, 3, 3, "ew", (4, 4)),
                 (self.ars_detectado_label, 12, 3, 3, "w", (4, 4)),
                 (self.ars_suggestions, 13, 3, 3, "ew", (4, 4)),
-                (self.lbl_nss, 13, 0, 1, "w", (4, 10)),
-                (self.nss_detectado_label, 13, 1, 2, "w", (4, 24)),
+                (self.lbl_nss, 13, 0, 2, "w", (4, 10)),
+                (self.nss_detectado_label, 13, 2, 1, "w", (4, 24)),
                 (self.entry_nss, 14, 0, 3, "ew", (4, 24)),
                 (self.form_actions_separator, 15, 0, 6, "ew", (4, 4)),
                 (self.form_buttons, 16, 0, 6, "e", (4, 4)),
@@ -7943,6 +8120,37 @@ class App:
                 sticky=sticky,
                 padx=padx,
             )
+        if profile is not None:
+            gap_x = max(6, int(profile.horizontal_gap))
+            gap_y = max(3, int(profile.vertical_gap))
+            left_entries = (
+                self.entry_nombre,
+                self.entry_edad,
+                self.combo_unidad,
+                self.entry_cedula,
+                self.entry_nacionalidad,
+                self.entry_nss,
+            )
+            for entry in left_entries:
+                entry.grid_configure(padx=(4, gap_x), pady=(0, gap_y))
+            for entry in (
+                self.entry_telefono,
+                self.entry_direccion,
+                self.entry_ars,
+            ):
+                entry.grid_configure(padx=(4, 4), pady=(0, gap_y))
+            for label in (
+                self.lbl_nombre,
+                self.lbl_sexo,
+                self.lbl_edad,
+                self.lbl_cedula,
+                self.lbl_telefono,
+                self.lbl_direccion,
+                self.lbl_nacionalidad,
+                self.lbl_ars,
+                self.lbl_nss,
+            ):
+                label.grid_configure(pady=(1, 2))
         if not suggestions_visible:
             self.ars_suggestions.grid_remove()
 

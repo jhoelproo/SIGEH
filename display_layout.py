@@ -7,29 +7,26 @@ ventanas Qt.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
-from typing import Iterable
 
 from PySide6.QtCore import QEvent, QObject, QSettings, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QApplication,
     QAbstractButton,
     QAbstractItemView,
+    QApplication,
     QComboBox,
-    QDialog,
+    QDoubleSpinBox,
     QLineEdit,
-    QMainWindow,
     QSizePolicy,
     QSpinBox,
-    QDoubleSpinBox,
     QTabBar,
     QTableWidget,
     QWidget,
 )
-
 
 PROFILE_AUTO = "AUTO"
 PROFILE_VERY_COMPACT = "MUY_COMPACTO"
@@ -60,6 +57,13 @@ VALID_DENSITIES = (
 TEXT_AUTO = "AUTO"
 VALID_TEXT_SCALES = (TEXT_AUTO, "85", "90", "100", "110", "125")
 
+_ADMISSION_DENSITY_METRICS = {
+    DENSITY_VERY_COMPACT: (4, 8, 34, 8, 6, 32),
+    DENSITY_COMPACT: (6, 10, 36, 10, 8, 34),
+    DENSITY_NORMAL: (8, 12, 40, 12, 10, 36),
+    DENSITY_COMFORTABLE: (10, 14, 44, 16, 12, 40),
+}
+
 
 @dataclass(frozen=True)
 class DisplaySnapshot:
@@ -72,10 +76,182 @@ class DisplaySnapshot:
     applied_profile: str
     density: str
     text_percent: int
+    configured_profile: str = PROFILE_AUTO
+    configured_density: str = DENSITY_AUTO
+    configured_text_scale: str = TEXT_AUTO
 
     @property
     def compact(self) -> bool:
         return self.applied_profile in (PROFILE_VERY_COMPACT, PROFILE_COMPACT)
+
+
+@dataclass(frozen=True)
+class ResponsiveLayoutProfile:
+    """Resolved geometry contract for the embedded Admission viewport."""
+
+    available_width: int
+    available_height: int
+    dpi_scale: float
+    layout_mode: str
+    applied_profile: str
+    density: str
+    text_percent: int
+    font_scale: float
+    input_min_height: int
+    vertical_gap: int
+    horizontal_gap: int
+    button_height: int
+    side_panel_min_width: int
+    side_panel_width: int
+    side_panel_max_width: int
+    form_padding: int
+    outer_margin: int
+    label_point_size: int
+    value_point_size: int
+    title_point_size: int
+    two_columns: bool
+    show_side_panel: bool
+    show_header_info: bool
+    compact_labels: bool
+
+
+def _valid_preference(value, valid_values, fallback):
+    normalized = str(value or fallback).upper()
+    return normalized if normalized in valid_values else fallback
+
+
+def _admission_layout_mode(width: int, height: int) -> str:
+    if width >= 1760 and height >= 820:
+        return "WIDE"
+    if width >= 1450 and height >= 720:
+        return "NORMAL"
+    if width >= 1120 and height >= 650:
+        return "COMPACT"
+    return "NARROW"
+
+
+def _admission_text_percent(requested, layout_mode: str) -> int:
+    requested = max(85, min(125, int(requested or 100)))
+    ceilings = {"NARROW": 110, "COMPACT": 115}
+    return min(requested, ceilings.get(layout_mode, 125))
+
+
+def _admission_spacing(density: str, height: int):
+    metrics = _ADMISSION_DENSITY_METRICS.get(
+        density, _ADMISSION_DENSITY_METRICS[DENSITY_NORMAL]
+    )
+    vertical_gap, horizontal_gap, button_height, form_padding, outer_margin, base_height = metrics
+    if height < 760:
+        vertical_gap = min(vertical_gap, 4)
+        outer_margin = min(outer_margin, 7)
+    return (
+        vertical_gap,
+        horizontal_gap,
+        button_height,
+        form_padding,
+        outer_margin,
+        base_height,
+    )
+
+
+def _admission_side_panel(layout_mode: str):
+    side_width = {"WIDE": 330, "NORMAL": 300, "COMPACT": 270}.get(
+        layout_mode, 0
+    )
+    if not side_width:
+        return 0, 0, 0
+    return side_width - 20, side_width, side_width + 20
+
+
+def _admission_font_sizes(density: str, font_scale: float):
+    base = 9 if density == DENSITY_VERY_COMPACT else 10
+    label_size = max(9, min(12, round(base * font_scale)))
+    value_size = max(9, min(12, round(base * font_scale)))
+    title_size = max(15, min(20, round(17 * font_scale)))
+    return label_size, value_size, title_size
+
+
+def resolve_admission_layout_profile(
+    available_width: int,
+    available_height: int,
+    *,
+    logical_dpi: float = 96.0,
+    profile_preference: str = PROFILE_AUTO,
+    density_preference: str = DENSITY_AUTO,
+    text_percent: int = 100,
+) -> ResponsiveLayoutProfile:
+    """Resolve Admission from its real host viewport, never screen geometry."""
+
+    width = max(1, int(available_width or 0))
+    height = max(1, int(available_height or 0))
+    dpi_scale = max(1.0, float(logical_dpi or 96.0) / 96.0)
+
+    configured_profile = _valid_preference(
+        profile_preference, VALID_PROFILES, PROFILE_AUTO
+    )
+    recommended = recommend_layout_profile(width, height, logical_dpi, 1.0)
+    applied_profile = (
+        recommended if configured_profile == PROFILE_AUTO else configured_profile
+    )
+
+    configured_density = _valid_preference(
+        density_preference, VALID_DENSITIES, DENSITY_AUTO
+    )
+    density = (
+        recommended_density(applied_profile, logical_dpi)
+        if configured_density == DENSITY_AUTO
+        else configured_density
+    )
+
+    layout_mode = _admission_layout_mode(width, height)
+    effective_text = _admission_text_percent(text_percent, layout_mode)
+    font_scale = effective_text / 100.0
+    (
+        vertical_gap,
+        horizontal_gap,
+        button_height,
+        form_padding,
+        outer_margin,
+        density_height,
+    ) = _admission_spacing(density, height)
+    input_min_height = density_height + round(
+        max(0.0, dpi_scale - 1.0) * 6.0
+    )
+    side_min, side_width, side_max = _admission_side_panel(layout_mode)
+    show_side_panel = side_width > 0
+    label_size, value_size, title_size = _admission_font_sizes(
+        density, font_scale
+    )
+
+    return ResponsiveLayoutProfile(
+        available_width=width,
+        available_height=height,
+        dpi_scale=dpi_scale,
+        layout_mode=layout_mode,
+        applied_profile=applied_profile,
+        density=density,
+        text_percent=effective_text,
+        font_scale=font_scale,
+        input_min_height=input_min_height,
+        vertical_gap=vertical_gap,
+        horizontal_gap=horizontal_gap,
+        button_height=button_height,
+        side_panel_min_width=side_min,
+        side_panel_width=side_width,
+        side_panel_max_width=side_max,
+        form_padding=form_padding,
+        outer_margin=outer_margin,
+        label_point_size=label_size,
+        value_point_size=value_size,
+        title_point_size=title_size,
+        two_columns=width >= 1040,
+        show_side_panel=show_side_panel,
+        show_header_info=width >= 1420,
+        compact_labels=(
+            density in (DENSITY_VERY_COMPACT, DENSITY_COMPACT)
+            or layout_mode in ("COMPACT", "NARROW")
+        ),
+    )
 
 
 def recommend_layout_profile(
@@ -410,6 +586,9 @@ class DisplayLayoutManager(QObject):
             applied_profile=applied,
             density=density,
             text_percent=text_percent,
+            configured_profile=configured_profile,
+            configured_density=configured_density,
+            configured_text_scale=configured_text,
         )
 
     def _bind_window_screen(self) -> None:

@@ -933,6 +933,11 @@ def get_stylesheet(is_dark=False):
     QSpinBox:disabled, QDoubleSpinBox:disabled, QDateEdit:disabled {{
         background: {tokens['input_disabled_bg']}; color: {disabled};
     }}
+    QComboBox QAbstractItemView {{
+        background-color: {tokens['popup_bg']}; color: {text};
+        border: 1px solid {border}; outline: 0; padding: 2px;
+        selection-background-color: {sel_bg}; selection-color: {sel_text};
+    }}
     QWidget#MonthlyConfigurationContent,
     QWidget#MonthlyPatientsPage,
     QWidget#MonthlyExportPage {{
@@ -12704,6 +12709,7 @@ def set_button_role(button: QPushButton, role: str, *, is_dark: bool = False):
         "neutral": "neutral",
         "secondary": "secondary",
     }.get(str(role or "").lower(), "primary")
+    button.setProperty("visualRole", role_key)
     base = tokens[f"button_{role_key}_bg"]
     hover = tokens[f"button_{role_key}_hover"]
     text = tokens[f"button_{role_key}_text"]
@@ -12721,6 +12727,37 @@ def set_button_role(button: QPushButton, role: str, *, is_dark: bool = False):
         f"QPushButton:focus {{ outline: none; border: 2px solid {tokens['border_focus']}; }}"
         f"QPushButton:disabled {{ background-color: {disabled_bg}; color: {disabled_text}; border-color: {disabled_border}; }}"
     )
+
+
+def apply_combo_popup_theme(combo: QComboBox, is_dark: bool) -> None:
+    """Theme the native popup container owned by a QComboBox."""
+    tokens = visual_theme_tokens(bool(is_dark))
+    view_qss = (
+        f"QAbstractItemView {{ background-color: {tokens['popup_bg']}; "
+        f"color: {tokens['text_primary']}; border: 1px solid {tokens['border']}; "
+        "outline: 0; padding: 2px; "
+        f"selection-background-color: {tokens['selection_bg']}; "
+        f"selection-color: {tokens['selection_text']}; }}"
+    )
+    view = combo.view()
+    view.setStyleSheet(view_qss)
+    view.viewport().setStyleSheet(
+        f"background-color: {tokens['popup_bg']}; color: {tokens['text_primary']};"
+    )
+    popup = view.window()
+    if popup is not None:
+        popup.setStyleSheet(
+            f"background-color: {tokens['popup_bg']}; "
+            f"border: 1px solid {tokens['border']};"
+        )
+
+
+def refresh_button_roles(root: QWidget, is_dark: bool) -> None:
+    """Reapply semantic button roles after a live theme transition."""
+    for button in root.findChildren(QPushButton):
+        role = button.property("visualRole")
+        if role:
+            set_button_role(button, str(role), is_dark=bool(is_dark))
 
 
 class NoWheelTabBar(QTabBar):
@@ -35756,15 +35793,20 @@ class PreferencesDialog(QDialog):
         )
 
     def apply_preferences_theme(self, is_dark):
-        tokens = visual_theme_tokens(bool(is_dark))
+        is_dark = bool(is_dark)
         self.setStyleSheet(
-            get_stylesheet(bool(is_dark))
-            + modern_module_stylesheet(bool(is_dark))
+            get_stylesheet(is_dark)
+            + modern_module_stylesheet(is_dark)
             + f"""
             QCheckBox {{ spacing: 11px; min-height: 30px; font-size: 11pt; font-weight: 750; }}
             QCheckBox::indicator {{ width: 20px; height: 20px; }}
             """
         )
+        with QSignalBlocker(self.chk_theme_dark):
+            self.chk_theme_dark.setChecked(is_dark)
+        for combo in self.findChildren(QComboBox):
+            apply_combo_popup_theme(combo, is_dark)
+        refresh_button_roles(self, is_dark)
 
     def values(self) -> dict:
         return {
