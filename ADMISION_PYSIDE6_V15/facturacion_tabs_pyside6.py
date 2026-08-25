@@ -7744,6 +7744,7 @@ class App:
                 "indicator_bg": entry_bg,
                 "indicator_border": pal.get("checkbox_indicator_border", border),
                 "indicator_checked": pal.get("checkbox_checked_bg", accent),
+                "radio_checkmark": True,
                 "focus_border": pal.get("border_focus", accent),
                 "disabledforeground": pal.get("text_disabled", muted),
                 "disabled_background": pal.get("input_disabled_bg", elevated_bg),

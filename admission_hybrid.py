@@ -5826,11 +5826,16 @@ class AdmissionWriteGuard:
     ) -> WriteDecision:
         """Guardia final: Admin no depende de la identidad del representante."""
         role_name = canonical_role({"role": login_role})
+        if not role_name:
+            # Callers from the pre-role API authenticated the actor by matching
+            # it to the central representative.  Preserve that contract as an
+            # identity-bound Auxiliary; a missing role must never grant Admin.
+            role_name = ADMISSION_ROLE_AUXILIARY
         is_admin = role_name == ADMISSION_ROLE_ADMINISTRATOR
         is_aux = role_name == ADMISSION_ROLE_AUXILIARY
 
         access = evaluate_admission_access(
-            {"role": login_role},
+            {"role": role_name},
             {
                 "base_write_allowed": True,
                 "device_role": role,

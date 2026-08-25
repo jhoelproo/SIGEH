@@ -142,10 +142,11 @@ def _choice_control_qss(values: dict[str, Any], *, radio: bool) -> str:
     focus = values.get("focus_border", accent)
     disabled_bg = values.get("disabled_background", values.get("background", input_bg))
     control = "QRadioButton" if radio else "QCheckBox"
-    radius = "8px" if radio else "3px"
+    radio_checkmark = bool(values.get("radio_checkmark", False))
+    radius = "8px" if radio and not radio_checkmark else "3px"
     checked = (
         f"{control}::indicator:checked{{background:{input_bg};border:4px solid {accent};}}"
-        if radio
+        if radio and not radio_checkmark
         else (
             f"{control}::indicator:checked{{background:{accent};border:1px solid {accent};"
             f"image:url({_checkmark_asset_url()});}}"
@@ -159,7 +160,7 @@ def _choice_control_qss(values: dict[str, Any], *, radio: bool) -> str:
         f"{control}::indicator:hover{{border-color:{focus};}}"
         f"{checked}"
         f"{control}:focus{{border:none;outline:none;}}"
-        f"{control}:focus::indicator{{border:2px solid {focus};}}"
+        f"{control}::indicator:focus{{border:2px solid {focus};}}"
         f"{control}:disabled{{background:transparent;color:{muted};}}"
         f"{control}::indicator:disabled{{background:{disabled_bg};border-color:{border};}}"
     )
