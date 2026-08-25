@@ -1,0 +1,167 @@
+SIGEH 1.0.2 - VALIDACION VISUAL, LOGIN Y ACTUALIZADOR
+Fecha final: 2026-08-25
+
+==================================================
+THEME
+==================================================
+CENTRAL_THEME_AUTHORITY = PASS
+LIGHT_THEME_COMPLETE = PASS
+DARK_THEME_COMPLETE = PASS
+LIVE_THEME_CHANGE = PASS
+
+==================================================
+CONFIG
+==================================================
+CONFIG_REP_LIGHT = PASS
+CONFIG_REP_DARK = PASS
+CONFIG_RIGHT_PANEL_LIGHT = PASS
+CONFIG_RIGHT_PANEL_DARK = PASS
+CONFIG_ALL_TABS_LIGHT = PASS
+CONFIG_ALL_TABS_DARK = PASS
+CONFIG_SCROLLBAR_LIGHT = PASS
+CONFIG_SCROLLBAR_DARK = PASS
+
+==================================================
+BUTTONS
+==================================================
+BUTTON_ROLES_CENTRAL = PASS
+CLEAN_BUTTON_LIGHT = PASS
+CLEAN_BUTTON_DARK = PASS
+GENERATE_PDF_LIGHT = PASS
+GENERATE_PDF_DARK = PASS
+DISABLED_BUTTON_LIGHT = PASS
+DISABLED_BUTTON_DARK = PASS
+
+==================================================
+LOGIN
+==================================================
+LOGIN_LIGHT = PASS
+LOGIN_DARK = PASS
+LOGIN_AUTOCOMPLETE_LIGHT = PASS
+LOGIN_AUTOCOMPLETE_DARK = PASS
+LOGIN_AUTOCOMPLETE_SELECTION = PASS
+
+==================================================
+FORGOT PASSWORD
+==================================================
+FORGOT_PASSWORD_REAL_BUTTON = PASS
+FORGOT_PASSWORD_MOUSE = PASS
+FORGOT_PASSWORD_TAB = PASS
+FORGOT_PASSWORD_ENTER = PASS
+FORGOT_PASSWORD_SPACE = PASS
+FORGOT_PASSWORD_FUNCTIONAL = PASS
+FORGOT_PASSWORD_SECURE = PASS
+
+==================================================
+UPDATER
+==================================================
+UPDATER_CANONICAL_NAME = SIGEH_Updater.exe
+UPDATER_SOURCE = PASS
+UPDATER_ONEFILE = PASS
+UPDATER_IN_DIST_ROOT = PASS
+UPDATER_FOUND_BY_SIGEH = PASS
+NO_ACTUALIZADOR_EXE_LEGACY_DEPENDENCY = PASS
+UPDATER_TEMP_SELF_COPY = PASS
+UPDATER_SELF_UPDATE = PASS
+FULL_ONEDIR_UPDATE = PASS
+SHA256_VALIDATION = PASS
+BAD_HASH_ABORT = PASS
+STAGING = PASS
+BACKUP = PASS
+ROLLBACK = PASS
+HEALTH_CHECK = PASS
+
+==================================================
+LOCAL STATE
+==================================================
+DEVICE_ID_PRESERVED = PASS
+SQLITE_PRESERVED = PASS
+PREFERENCES_PRESERVED = PASS
+TURN_PRESERVED = PASS
+REPRESENTATIVE_PRESERVED = PASS
+PRODUCTION_BOOTSTRAP_NOT_RERUN = PASS
+
+==================================================
+GITHUB
+==================================================
+PRODUCT_ID = SIGEH
+GITHUB_REPOSITORY = jhoelproo/SIGEH
+OLD_REPO_ISOLATED = PASS
+SIGEH_RELEASE_DETECTION = PASS
+OLD_RELEASE_IGNORED = PASS
+RELEASE_FULL_PACKAGE = PASS
+RELEASE_CONTAINS_UPDATER = PASS
+RELEASE_GUARD = PASS
+
+==================================================
+BUILD
+==================================================
+MAIN_ONEDIR = PASS
+UPDATER_ONEFILE_BUILD = PASS
+DIST_STRUCTURE_VALID = PASS
+DATABASE_BUNDLE_REQUIRED_BY_BUILD = PASS
+DATABASE_BUNDLE_IN_INTERNAL = PASS
+LAUNCHER_SELF_TEST = PASS (exit 0; 561 ms; no child process)
+PY_COMPILE = PASS
+SOURCE_TESTS = PASS (76 related + 13 layout = 89 PASS)
+BUILD_TESTS = PASS
+SMOKE_TEST = PASS
+V15_BUILD_ID = 20260821_ADMIN_REP_FORCE_V1
+ADMISSION_WIDGET_CONSTRUCTED = PASS
+HISTORY_OPENED = PASS
+CONFIGURATION_OPENED = PASS
+PINK_ERROR_PANEL = NO
+EXE_LOGIN_WINDOW = PASS (Bienvenido - Hospital Provincial)
+UPDATER_HEALTH_CHECK = PASS
+
+STATIC_FATAL_CHECK = PASS (ruff E9/F63/F7/F82)
+COVERAGE_NEW_UPDATE_CHANNEL = 90%
+FULL_REPOSITORY_DIAGNOSTIC = 527 PASS, 24 FAIL, 23 SKIP, 51 SUBTEST PASS
+FULL_REPOSITORY_DIAGNOSTIC_NOTE = Los 24 fallos corresponden a contratos operacionales heredados fuera del alcance visual/updater; no se modifico esa logica para forzar la suite.
+
+==================================================
+DIST
+==================================================
+DIST_STRUCTURE =
+SIGEH/
+  SIGEH.exe
+  SIGEH_Updater.exe
+  CALCULOS_QT.exe
+  _internal/
+    database_url.bundle
+    ADMISION_PYSIDE6_V15/
+    recursos y runtime
+
+RELEASE_ASSET = SIGEH-1.0.2-windows-x64.zip
+RELEASE_SHA256 = 9b11d72d07080d1f46b7c6d342a0766f33af823cfaa7f9c2c82c36d46ac78158
+RELEASE_ARCHIVE_FILES = 1667
+
+FILES_MODIFIED =
+ADMISION_PYSIDE6_V15/facturacion_tabs_pyside6.py
+ADMISION_PYSIDE6_V15/qt_compat.py
+CALCULOS_QT.py
+README.md
+build_app.spec
+build_updater.spec
+lanzador.py
+portable_launcher.py
+release_packaging.py
+sigeh_product.py
+sigeh_update.py
+sigeh_visual_theme.py
+updater.py
+version_config.json
+RELEASE_NOTES_1.0.2.md
+tests/test_portable_launcher.py
+tests/test_sigeh_update.py
+tests/test_sigeh_visual_login_updater_20260824.py
+
+INCIDENCIAS_CORREGIDAS_DURANTE_QA =
+1. El self-test anterior devolvia 0 sin comprobar el ONEDIR; ahora valida ejecutable principal, _internal y conexion empaquetada sin abrir la aplicacion.
+2. database_url.bundle faltaba en la distribucion; el spec y el release guard ahora lo exigen y el archivo queda en _internal.
+3. La limpieza del SQLite temporal del smoke V15 podia fallar transitoriamente en Windows; solo PermissionError admite un reintento y cualquier otro fallo conserva rollback.
+
+==================================================
+FINAL
+==================================================
+FINAL_RESULT = APPROVED

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 
 from sigeh_product import PRODUCT_ID
@@ -81,7 +82,7 @@ def merge_preserved(backup_dir: Path, install_dir: Path) -> None:
 
 
 def start_launcher(install_dir: Path) -> None:
-    launcher = install_dir / "INICIAR_SISTEMA.exe"
+    launcher = install_dir / "SIGEH.exe"
     if not launcher.is_file():
         raise FileNotFoundError(f"No existe el nuevo lanzador: {launcher}")
     creationflags = 0
@@ -97,6 +98,62 @@ def start_launcher(install_dir: Path) -> None:
     )
 
 
+def update_storage_root() -> Path:
+    base = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+    return base / PRODUCT_ID / "updates"
+
+
+def health_check_install(install_dir: Path) -> bool:
+    """Verify the new launcher and the packaged Admisión bootstrap without login."""
+    launcher = install_dir / "SIGEH.exe"
+    main_app = install_dir / "CALCULOS_QT.exe"
+    updater = install_dir / "SIGEH_Updater.exe"
+    internal = install_dir / "_internal"
+    if not all(path.exists() for path in (launcher, main_app, updater, internal)):
+        return False
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+    try:
+        launcher_result = subprocess.run(
+            [str(launcher), "--self-test"],
+            cwd=str(install_dir),
+            timeout=30,
+            check=False,
+            creationflags=flags,
+        )
+        if launcher_result.returncode != 0:
+            return False
+        environment = os.environ.copy()
+        environment["QT_QPA_PLATFORM"] = "offscreen"
+        for attempt in range(2):
+            with tempfile.TemporaryDirectory(prefix="sigeh-health-") as temp_dir:
+                result_path = Path(temp_dir) / "v15.json"
+                main_result = subprocess.run(
+                    [str(main_app), "--check-v15-package", str(result_path)],
+                    cwd=str(install_dir),
+                    env=environment,
+                    timeout=60,
+                    check=False,
+                    creationflags=flags,
+                )
+                if not result_path.is_file():
+                    return False
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+                if (
+                    main_result.returncode == 0
+                    and str(payload.get("status") or "").upper() == "PASS"
+                ):
+                    return True
+                transient_cleanup_error = (
+                    attempt == 0
+                    and str(payload.get("exception_type") or "") == "PermissionError"
+                )
+                if not transient_cleanup_error:
+                    return False
+        return False
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def apply_update(manifest_path: Path, wait_pid: int) -> int:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     install_dir = Path(manifest["install_dir"]).resolve()
@@ -105,12 +162,15 @@ def apply_update(manifest_path: Path, wait_pid: int) -> int:
     if str(manifest.get("product") or "") != PRODUCT_ID:
         raise ValueError("El paquete de actualización no pertenece a SIGEH.")
     parent = install_dir.parent
-    log_path = parent / "actualizador.log"
-    backup_dir = parent / f".{install_dir.name}-backup-{int(time.time())}"
+    storage_root = update_storage_root()
+    backup_dir = storage_root / "backup" / version
+    rollback_dir = parent / f".{install_dir.name}-rollback-{int(time.time())}"
+    log_path = storage_root / "actualizador.log"
 
     required = (
         payload_dir / "CALCULOS_QT.exe",
-        payload_dir / "INICIAR_SISTEMA.exe",
+        payload_dir / "SIGEH.exe",
+        payload_dir / "SIGEH_Updater.exe",
         payload_dir / "_internal",
     )
     if not all(path.exists() for path in required):
@@ -127,15 +187,21 @@ def apply_update(manifest_path: Path, wait_pid: int) -> int:
     new_installed = False
     try:
         if install_dir.exists():
-            os.replace(install_dir, backup_dir)
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            backup_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(install_dir, backup_dir)
+            os.replace(install_dir, rollback_dir)
             old_moved = True
         shutil.move(str(payload_dir), str(install_dir))
         new_installed = True
         if old_moved:
-            merge_preserved(backup_dir, install_dir)
-        write_log(
-            log_path, f"Version {version} instalada; respaldo: {backup_dir.name}."
-        )
+            merge_preserved(rollback_dir, install_dir)
+        if not health_check_install(install_dir):
+            raise RuntimeError("La nueva versión no superó el health check.")
+        write_log(log_path, f"Version {version} instalada; respaldo: {backup_dir}.")
+        if rollback_dir.exists():
+            shutil.rmtree(rollback_dir, ignore_errors=True)
         start_launcher(install_dir)
         return 0
     except Exception as exc:
@@ -144,8 +210,8 @@ def apply_update(manifest_path: Path, wait_pid: int) -> int:
             if new_installed and install_dir.exists():
                 failed_dir = parent / f".{install_dir.name}-failed-{int(time.time())}"
                 os.replace(install_dir, failed_dir)
-            if old_moved and backup_dir.exists():
-                os.replace(backup_dir, install_dir)
+            if old_moved and rollback_dir.exists():
+                os.replace(rollback_dir, install_dir)
                 start_launcher(install_dir)
                 write_log(log_path, "Se restauro y reinicio la version anterior.")
         except Exception as rollback_error:

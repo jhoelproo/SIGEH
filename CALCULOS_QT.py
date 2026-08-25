@@ -56,6 +56,7 @@ from display_layout import (
 from app_icons import APP_ICONS
 from app_resources import get_app_logo_path
 from offline_auth import OfflineAuthCache
+from sigeh_visual_theme import visual_theme_tokens as shared_visual_theme_tokens
 
 def application_base_dir() -> Path:
     """Carpeta externa de la aplicación, estable para código fuente y EXE."""
@@ -83,7 +84,7 @@ except ImportError:
     psycopg2 = None
     pool = None
 
-from PySide6.QtCore import Qt, QSize, QDate, QTimer, QObject, QEvent, Signal, Slot, QThread, QRect, QRectF, QPoint, QPointF, QLocale, QSignalBlocker  # type: ignore
+from PySide6.QtCore import Qt, QSize, QDate, QTimer, QObject, QEvent, Signal, Slot, QThread, QRect, QRectF, QPoint, QPointF, QLocale, QSignalBlocker, QSettings  # type: ignore
 from PySide6.QtGui import QPixmap, QColor, QAction, QCursor, QKeySequence, QShortcut, QPainter, QBrush, QPen, QPolygonF, QTextDocument, QTextCursor, QIcon, QPageLayout, QFontMetrics, QPalette, QFont  # type: ignore
 from PySide6.QtPdf import QPdfDocument  # type: ignore
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog, QPrintPreviewDialog  # type: ignore
@@ -665,176 +666,8 @@ CAT_COLORS = {
 # GENERADOR DE TEMA DINÁMICO (Claro / Oscuro)
 # =========================================================
 def visual_theme_tokens(is_dark=False):
-    """Return the semantic visual contract shared by Billing and Admisión.
-
-    The legacy names at the end of each palette deliberately remain aliases.
-    Admisión V15 still consumes them while its Qt-compat widgets are migrated,
-    but no surface is allowed to invent a second light/dark palette.
-    """
-    if is_dark:
-        tokens = {
-            "mode": "oscuro",
-            "window_bg": "#0A1420",
-            "content_bg": "#0D1927",
-            "panel_bg": "#111E2E",
-            "panel_elevated_bg": "#16283A",
-            "input_bg": "#0F1B2A",
-            "input_hover_bg": "#142437",
-            "input_disabled_bg": "#182636",
-            "table_bg": "#0F1B2A",
-            "table_alt_bg": "#142235",
-            "table_header_bg": "#1B3650",
-            "popup_bg": "#16283A",
-            "menu_bg": "#16283A",
-            "tooltip_bg": "#21384D",
-            "border": "#36516A",
-            "border_strong": "#58728B",
-            "border_focus": "#72C7F5",
-            "text_primary": "#E5EEF8",
-            "text_secondary": "#B8C6D6",
-            "text_muted": "#AAB8C8",
-            "text_disabled": "#8EA1B2",
-            "text_on_accent": "#FFFFFF",
-            "selection_bg": "#28577E",
-            "selection_text": "#FFFFFF",
-            "accent": "#49B8F2",
-            "accent_hover": "#72C7F5",
-            "success": "#228B5A",
-            "warning": "#C88A2C",
-            "danger": "#D25160",
-            "info": "#2E9DC2",
-            "success_bg": "#163A2D",
-            "warning_bg": "#3A2E14",
-            "danger_bg": "#3A2027",
-            "info_bg": "#17354A",
-            "success_text": "#C0F5D9",
-            "warning_text": "#FFE3A3",
-            "danger_text": "#FFB9C0",
-            "info_text": "#D0ECFF",
-            "button_primary_bg": "#1976B9",
-            "button_primary_hover": "#258FDC",
-            "button_primary_text": "#FFFFFF",
-            "button_secondary_bg": "#233A50",
-            "button_secondary_hover": "#2D4A64",
-            "button_secondary_text": "#F2F6FA",
-            "button_neutral_bg": "#283847",
-            "button_neutral_hover": "#34495C",
-            "button_neutral_text": "#F2F6FA",
-            "button_success_bg": "#237A4A",
-            "button_success_hover": "#2E915C",
-            "button_success_text": "#FFFFFF",
-            "button_warning_bg": "#8C5A0A",
-            "button_warning_hover": "#A66E19",
-            "button_warning_text": "#FFFFFF",
-            "button_danger_bg": "#B83B48",
-            "button_danger_hover": "#D25160",
-            "button_danger_text": "#FFFFFF",
-            "checkbox_indicator_bg": "#0F1B2A",
-            "checkbox_indicator_border": "#6A8299",
-            "checkbox_checked_bg": "#49B8F2",
-            "checkbox_checkmark": "#07111F",
-            "scrollbar_track": "#0D1927",
-            "scrollbar_handle": "#3F5C75",
-            "scrollbar_hover": "#58728B",
-        }
-    else:
-        tokens = {
-            "mode": "claro",
-            "window_bg": "#EEF2F6",
-            "content_bg": "#F5F8FB",
-            "panel_bg": "#FFFFFF",
-            "panel_elevated_bg": "#E8F0F7",
-            "input_bg": "#FFFFFF",
-            "input_hover_bg": "#F7FAFD",
-            "input_disabled_bg": "#E5EBF1",
-            "table_bg": "#FFFFFF",
-            "table_alt_bg": "#F7FAFD",
-            "table_header_bg": "#DCE9F5",
-            "popup_bg": "#FFFFFF",
-            "menu_bg": "#FFFFFF",
-            "tooltip_bg": "#24364C",
-            "border": "#A9BACB",
-            "border_strong": "#7B91A7",
-            "border_focus": "#1769AA",
-            "text_primary": "#1F2A37",
-            "text_secondary": "#405267",
-            "text_muted": "#566678",
-            "text_disabled": "#7C8B9A",
-            "text_on_accent": "#FFFFFF",
-            "selection_bg": "#276FB8",
-            "selection_text": "#FFFFFF",
-            "accent": "#1769AA",
-            "accent_hover": "#0F5D9B",
-            "success": "#237A4A",
-            "warning": "#A16207",
-            "danger": "#B42318",
-            "info": "#0E7490",
-            "success_bg": "#E6F5EC",
-            "warning_bg": "#FFF3D6",
-            "danger_bg": "#FDECEC",
-            "info_bg": "#EDF4FD",
-            "success_text": "#175C36",
-            "warning_text": "#704600",
-            "danger_text": "#8D1914",
-            "info_text": "#17445A",
-            "button_primary_bg": "#1769AA",
-            "button_primary_hover": "#0F5D9B",
-            "button_primary_text": "#FFFFFF",
-            "button_secondary_bg": "#E8F0F7",
-            "button_secondary_hover": "#D8E5F0",
-            "button_secondary_text": "#25384C",
-            "button_neutral_bg": "#E7EDF3",
-            "button_neutral_hover": "#D5E0EA",
-            "button_neutral_text": "#263238",
-            "button_success_bg": "#237A4A",
-            "button_success_hover": "#1A663C",
-            "button_success_text": "#FFFFFF",
-            "button_warning_bg": "#A16207",
-            "button_warning_hover": "#975800",
-            "button_warning_text": "#FFFFFF",
-            "button_danger_bg": "#B42318",
-            "button_danger_hover": "#8D1914",
-            "button_danger_text": "#FFFFFF",
-            "checkbox_indicator_bg": "#FFFFFF",
-            "checkbox_indicator_border": "#61788E",
-            "checkbox_checked_bg": "#1769AA",
-            "checkbox_checkmark": "#FFFFFF",
-            "scrollbar_track": "#E4EAF0",
-            "scrollbar_handle": "#9CB0C2",
-            "scrollbar_hover": "#718AA1",
-        }
-
-    tokens.update(
-        {
-            # Compatibility aliases for the existing billing/Admisión callers.
-            "bg": tokens["window_bg"],
-            "root": tokens["window_bg"],
-            "text": tokens["text_primary"],
-            "muted": tokens["text_muted"],
-            "muted_text": tokens["text_muted"],
-            "entry": tokens["input_bg"],
-            "card": tokens["panel_bg"],
-            "card2": tokens["panel_elevated_bg"],
-            "surface": tokens["panel_elevated_bg"],
-            "tree": tokens["table_bg"],
-            "heading": tokens["table_header_bg"],
-            "alt_bg": tokens["table_alt_bg"],
-            "separator": tokens["border"],
-            "sel_bg": tokens["selection_bg"],
-            "selected_bg": tokens["selection_bg"],
-            "sel_text": tokens["selection_text"],
-            "selected_fg": tokens["selection_text"],
-            "title_color": tokens["accent"],
-            "button_fg": tokens["text_on_accent"],
-            "button_text": tokens["text_on_accent"],
-            "accent2": tokens["info"],
-            "audit_bg": tokens["info_bg"],
-            "audit_text": tokens["info_text"],
-        }
-    )
-    return tokens
-
-
+    """Return the shared semantic visual contract for every SIGEH process."""
+    return shared_visual_theme_tokens(bool(is_dark))
 def _theme_rgb(hex_color):
     """Convert an opaque six-digit Qt colour to a normalized RGB triplet."""
     value = str(hex_color or "").strip().lstrip("#")
@@ -12752,6 +12585,35 @@ def apply_combo_popup_theme(combo: QComboBox, is_dark: bool) -> None:
         )
 
 
+def apply_completer_popup_theme(completer: QCompleter, is_dark: bool) -> None:
+    """Apply the shared palette to the real popup owned by ``QCompleter``."""
+    tokens = visual_theme_tokens(bool(is_dark))
+    view = completer.popup()
+    view.setStyleSheet(
+        f"QAbstractItemView {{ background-color: {tokens['popup_bg']}; "
+        f"color: {tokens['text_primary']}; border: 1px solid {tokens['border']}; "
+        "outline: 0; padding: 3px; "
+        f"selection-background-color: {tokens['selection_bg']}; "
+        f"selection-color: {tokens['selection_text']}; }}"
+        f"QAbstractItemView::item {{ min-height: 28px; padding: 4px 8px; }}"
+        f"QAbstractItemView::item:hover {{ background: {tokens['input_hover_bg']}; "
+        f"color: {tokens['text_primary']}; }}"
+    )
+    view.viewport().setStyleSheet(
+        f"background-color: {tokens['popup_bg']}; color: {tokens['text_primary']};"
+    )
+
+
+def load_boot_theme_preference() -> bool:
+    """Read only the last visual mode needed before a user can authenticate."""
+    return bool(QSettings("SIGEH", "Visual").value("dark_mode", False, type=bool))
+
+
+def store_boot_theme_preference(is_dark: bool) -> None:
+    """Mirror the current theme for the next pre-login frame."""
+    QSettings("SIGEH", "Visual").setValue("dark_mode", bool(is_dark))
+
+
 def refresh_button_roles(root: QWidget, is_dark: bool) -> None:
     """Reapply semantic button roles after a live theme transition."""
     for button in root.findChildren(QPushButton):
@@ -17239,25 +17101,14 @@ class PressToRevealPasswordEdit(QLineEdit):
 
 
 class RecoverPasswordDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, is_dark=None):
         super().__init__(parent)
+        self._is_dark = bool(
+            load_boot_theme_preference() if is_dark is None else is_dark
+        )
         self.setWindowTitle("Recuperar Contraseña")
         self.setMinimumSize(520, 620)
         self.resize(560, 660)
-        self.setStyleSheet(
-            "QDialog { background: #F4F8FF; }"
-            "QWidget#RecoveryCard { background: white; border: 1px solid #D8E4F3; border-radius: 18px; }"
-            "QLineEdit { min-height: 38px; padding: 5px 10px; border: 1px solid #C7D7ED; border-radius: 8px; background: #FFFFFF; }"
-            "QLineEdit:focus { border: 2px solid #1B72E8; }"
-            "QPushButton#RecoveryPrimary { background: #0B5ED7; color: white; border: none; border-radius: 9px; padding: 10px 14px; font-weight: 800; }"
-            "QPushButton#RecoveryPrimary:hover { background: #084FB8; }"
-            "QPushButton#RecoveryPrimary:pressed { background: #063E91; }"
-            "QPushButton#RecoveryConfirm { background: #178B47; color: white; border: 1px solid #107538; border-radius: 9px; padding: 10px 14px; font-weight: 800; }"
-            "QPushButton#RecoveryConfirm:hover { background: #107A3D; }"
-            "QPushButton#RecoveryConfirm:pressed { background: #0B6130; }"
-            "QPushButton#RecoveryConfirm:disabled { background: #C9D7CF; color: #6D7D73; border-color: #C9D7CF; }"
-        )
-
         outer = QVBoxLayout(self)
         outer.setContentsMargins(26, 24, 26, 24)
         outer.addStretch(1)
@@ -17275,16 +17126,14 @@ class RecoverPasswordDialog(QDialog):
                 logo.setAlignment(Qt.AlignCenter)
                 main_lay.addWidget(logo)
 
-        title = QLabel("Recuperación de Acceso")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 20pt; font-weight: 900; color: #123F83; border: none;")
-        main_lay.addWidget(title)
+        self.title_label = QLabel("Recuperación de Acceso")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        main_lay.addWidget(self.title_label)
 
-        subtitle = QLabel("Restablece tu contraseña de forma segura")
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #5A6C85; font-size: 10.5pt;")
-        main_lay.addWidget(subtitle)
+        self.subtitle_label = QLabel("Restablece tu contraseña de forma segura")
+        self.subtitle_label.setAlignment(Qt.AlignCenter)
+        self.subtitle_label.setWordWrap(True)
+        main_lay.addWidget(self.subtitle_label)
 
         form = QFormLayout()
         form.setSpacing(10)
@@ -17310,7 +17159,6 @@ class RecoverPasswordDialog(QDialog):
         
         self.question_lbl = QLabel("<i>(Escribe tu usuario y busca la pregunta)</i>")
         self.question_lbl.setWordWrap(True)
-        self.question_lbl.setStyleSheet("color: #365780; background: #F2F7FF; border: 1px solid #D7E5F8; border-radius: 7px; padding: 8px;")
         
         self.answer = QLineEdit(); self.answer.setEchoMode(QLineEdit.Password)
         self.answer.setPlaceholderText("Tu respuesta secreta")
@@ -17343,13 +17191,11 @@ class RecoverPasswordDialog(QDialog):
         self.btn_reset.setEnabled(False)
         self.btn_cancel.setText("Cancelar")
         self.btn_cancel.setMinimumHeight(40)
-        self.btn_cancel.setStyleSheet("background-color: #FFFFFF; color: #31445D; border: 1px solid #AFC2D9; border-radius: 9px; font-weight: 700;")
 
         self._loaded_username = ""
         self._question_loaded = False
         self.password_hint = QLabel("")
         self.password_hint.setAlignment(Qt.AlignCenter)
-        self.password_hint.setStyleSheet("color: #B04040; font-size: 9.5pt;")
         self.password_hint.hide()
         main_lay.insertWidget(main_lay.indexOf(btns), self.password_hint)
         self.answer.textChanged.connect(self._update_reset_state)
@@ -17358,6 +17204,35 @@ class RecoverPasswordDialog(QDialog):
 
         outer.addWidget(card)
         outer.addStretch(1)
+        self.apply_theme(self._is_dark)
+
+    def apply_theme(self, is_dark: bool) -> None:
+        self._is_dark = bool(is_dark)
+        tokens = visual_theme_tokens(self._is_dark)
+        self.setStyleSheet(
+            f"QDialog {{ background: {tokens['window_bg']}; color: {tokens['text_primary']}; }}"
+            f"QWidget#RecoveryCard {{ background: {tokens['panel_bg']}; border: 1px solid {tokens['border']}; border-radius: 18px; }}"
+            f"QLabel {{ color: {tokens['text_primary']}; background: transparent; }}"
+            f"QLineEdit {{ min-height: 38px; padding: 5px 10px; border: 1px solid {tokens['border']}; border-radius: 8px; background: {tokens['input_bg']}; color: {tokens['text_primary']}; }}"
+            f"QLineEdit:focus {{ border: 2px solid {tokens['border_focus']}; }}"
+        )
+        self.title_label.setStyleSheet(
+            f"font-size:20pt;font-weight:900;color:{tokens['accent']};border:none;"
+        )
+        self.subtitle_label.setStyleSheet(
+            f"color:{tokens['text_secondary']};font-size:10.5pt;"
+        )
+        self.question_lbl.setStyleSheet(
+            f"color:{tokens['info_text']};background:{tokens['info_bg']};"
+            f"border:1px solid {tokens['border']};border-radius:7px;padding:8px;"
+        )
+        self.password_hint.setStyleSheet(
+            f"color:{tokens['danger_text']};font-size:9.5pt;"
+        )
+        set_button_role(self.btn_load, "primary", is_dark=self._is_dark)
+        set_button_role(self.btn_reset, "success", is_dark=self._is_dark)
+        set_button_role(self.btn_cancel, "neutral", is_dark=self._is_dark)
+        apply_completer_popup_theme(self.username_completer, self._is_dark)
 
     def _clear_recovery_data(self):
         self._loaded_username = ""
@@ -17584,8 +17459,11 @@ class LoginAuthenticationWorker(QThread):
 
 
 class LoginDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, is_dark=None):
         super().__init__(parent)
+        self._is_dark = bool(
+            load_boot_theme_preference() if is_dark is None else is_dark
+        )
         self.user = None
         self.session_id = ""
         self.startup_data = {}
@@ -17593,21 +17471,6 @@ class LoginDialog(QDialog):
         self.setWindowTitle("Bienvenido - Hospital Provincial")
         self.setMinimumSize(500, 610)
         self.resize(530, 650)
-
-        self.setStyleSheet("""
-            QDialog { background: #F4F8FF; }
-            QWidget#LoginCard { background: #FFFFFF; border: 1px solid #D8E4F3; border-radius: 20px; }
-            QLineEdit { min-height: 42px; padding: 5px 12px; border: 1px solid #C7D7ED; border-radius: 9px; background: #FFFFFF; font-size: 11pt; }
-            QLineEdit:focus { border: 2px solid #1B72E8; }
-            QToolButton#PasswordRevealButton { background: #F1F5FA; border: 1px solid #D7E1ED; border-radius: 8px; }
-            QToolButton#PasswordRevealButton:hover { background: #E4EEF9; }
-            QPushButton#LoginBtn { background-color: #0B5ED7; color: white; font-size: 13pt; font-weight: 800; border: 1px solid #0752C2; border-radius: 10px; padding: 14px 18px; }
-            QPushButton#LoginBtn:hover { background-color: #084FB8; }
-            QPushButton#LoginBtn:pressed { background-color: #063E91; }
-            QPushButton#LoginBtn:disabled { background-color: #C4D2E3; color: #71829A; border-color: #C4D2E3; }
-            QPushButton#LinkBtn { color: #0B5ED7; background: transparent; border: none; font-weight: 700; font-size: 10.5pt; padding: 6px; }
-            QPushButton#LinkBtn:hover { text-decoration: underline; color: #084FB8; }
-        """)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 24, 28, 24)
@@ -17626,20 +17489,17 @@ class LoginDialog(QDialog):
                 logo.setAlignment(Qt.AlignCenter)
                 main_lay.addWidget(logo)
 
-        title = QLabel("Iniciar Sesión")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 24pt; font-weight: 900; color: #123F83; margin-top: 4px; border: none;")
-        main_lay.addWidget(title)
+        self.title_label = QLabel("Iniciar Sesión")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        main_lay.addWidget(self.title_label)
 
-        subtitle = QLabel("Accede de forma segura al Sistema de Facturación Médica")
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #60718A; font-size: 10.5pt; margin-bottom: 7px;")
-        main_lay.addWidget(subtitle)
+        self.subtitle_label = QLabel("Accede de forma segura al Sistema de Facturación Médica")
+        self.subtitle_label.setAlignment(Qt.AlignCenter)
+        self.subtitle_label.setWordWrap(True)
+        main_lay.addWidget(self.subtitle_label)
 
-        lbl_user = QLabel("Usuario")
-        lbl_user.setStyleSheet("color: #2A3E5D; font-size: 11pt; font-weight: 700;")
-        main_lay.addWidget(lbl_user)
+        self.lbl_user = QLabel("Usuario")
+        main_lay.addWidget(self.lbl_user)
         self.username = QLineEdit()
         self.username.setPlaceholderText("Ingresa tu usuario")
         initial_usernames = (
@@ -17650,12 +17510,12 @@ class LoginDialog(QDialog):
         self.username_completer = QCompleter(initial_usernames)
         self.username_completer.setCaseSensitivity(Qt.CaseInsensitive)
         self.username_completer.setFilterMode(Qt.MatchContains)
+        self.username_completer.setCompletionMode(QCompleter.PopupCompletion)
         self.username.setCompleter(self.username_completer)
         main_lay.addWidget(self.username)
 
-        lbl_pass = QLabel("Contraseña")
-        lbl_pass.setStyleSheet("color: #2A3E5D; font-size: 11pt; font-weight: 700;")
-        main_lay.addWidget(lbl_pass)
+        self.lbl_pass = QLabel("Contraseña")
+        main_lay.addWidget(self.lbl_pass)
         self.password = PressToRevealPasswordEdit()
         self.password.setPlaceholderText("Ingresa tu contraseña")
         main_lay.addWidget(self.password)
@@ -17677,6 +17537,8 @@ class LoginDialog(QDialog):
         self.btn_recover = QPushButton("¿Olvidaste tu contraseña?")
         self.btn_recover.setObjectName("LinkBtn")
         self.btn_recover.setCursor(QCursor(Qt.PointingHandCursor))
+        self.btn_recover.setFocusPolicy(Qt.StrongFocus)
+        self.btn_recover.installEventFilter(self)
         if CENTRAL_OFFLINE_BOOT:
             self.btn_register.setEnabled(False)
             self.btn_recover.setEnabled(False)
@@ -17699,6 +17561,44 @@ class LoginDialog(QDialog):
         self.password.returnPressed.connect(self.try_login)
         outer.addWidget(login_card)
         outer.addStretch(1)
+        self.apply_theme(self._is_dark)
+
+    def apply_theme(self, is_dark: bool) -> None:
+        self._is_dark = bool(is_dark)
+        tokens = visual_theme_tokens(self._is_dark)
+        self.setStyleSheet(
+            f"QDialog {{ background: {tokens['window_bg']}; color: {tokens['text_primary']}; }}"
+            f"QWidget#LoginCard {{ background: {tokens['panel_bg']}; border: 1px solid {tokens['border']}; border-radius: 20px; }}"
+            f"QLabel {{ color: {tokens['text_primary']}; background: transparent; }}"
+            f"QLineEdit {{ min-height:42px;padding:5px 12px;border:1px solid {tokens['border']};border-radius:9px;background:{tokens['input_bg']};color:{tokens['text_primary']};font-size:11pt; }}"
+            f"QLineEdit:focus {{ border:2px solid {tokens['border_focus']}; }}"
+            f"QToolButton#PasswordRevealButton {{ background:{tokens['panel_elevated_bg']};border:1px solid {tokens['border']};border-radius:8px; }}"
+            f"QToolButton#PasswordRevealButton:hover {{ background:{tokens['input_hover_bg']}; }}"
+            f"QPushButton#LinkBtn {{ color:{tokens['accent']};background:transparent;border:none;font-weight:700;font-size:10.5pt;padding:6px; }}"
+            f"QPushButton#LinkBtn:hover {{ text-decoration:underline;color:{tokens['accent_hover']}; }}"
+            f"QPushButton#LinkBtn:pressed {{ color:{tokens['text_primary']}; }}"
+            f"QPushButton#LinkBtn:focus {{ border:1px solid {tokens['border_focus']};border-radius:6px; }}"
+            f"QPushButton#LinkBtn:disabled {{ color:{tokens['text_disabled']}; }}"
+        )
+        self.title_label.setStyleSheet(
+            f"font-size:24pt;font-weight:900;color:{tokens['accent']};margin-top:4px;border:none;"
+        )
+        self.subtitle_label.setStyleSheet(
+            f"color:{tokens['text_secondary']};font-size:10.5pt;margin-bottom:7px;"
+        )
+        for label in (self.lbl_user, self.lbl_pass):
+            label.setStyleSheet(
+                f"color:{tokens['text_primary']};font-size:11pt;font-weight:700;"
+            )
+        set_button_role(self.btn_login, "primary", is_dark=self._is_dark)
+        apply_completer_popup_theme(self.username_completer, self._is_dark)
+
+    def eventFilter(self, watched, event):
+        if watched is self.btn_recover and event.type() == QEvent.KeyPress:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+                self.btn_recover.click()
+                return True
+        return super().eventFilter(watched, event)
 
     def try_login(self):
         self.password.hide_password()
@@ -17706,10 +17606,7 @@ class LoginDialog(QDialog):
             return
         self.btn_login.setEnabled(False)
         self.lbl_error.setText("Comprobando credenciales...")
-        self.lbl_error.setStyleSheet(
-            "background-color:#E8F2FF;color:#124A88;padding:10px;"
-            "border-radius:6px;font-weight:bold;font-size:11pt;"
-        )
+        self._style_status_message(is_error=False)
         self.lbl_error.show()
         worker = LoginAuthenticationWorker(
             self.username.text().strip(), self.password.text(), self
@@ -17766,12 +17663,19 @@ class LoginDialog(QDialog):
         self.btn_login.setEnabled(True)
 
     def _show_login_error(self, message: str):
-        self.lbl_error.setStyleSheet(
-            "background-color:#d32f2f;color:white;padding:10px;"
-            "border-radius:6px;font-weight:bold;font-size:11pt;"
-        )
+        self._style_status_message(is_error=True)
         self.lbl_error.setText(str(message or "Error de inicio de sesión."))
         self.lbl_error.show()
+
+    def _style_status_message(self, *, is_error: bool) -> None:
+        tokens = visual_theme_tokens(self._is_dark)
+        background = tokens["danger"] if is_error else tokens["info_bg"]
+        foreground = tokens["text_on_accent"] if is_error else tokens["info_text"]
+        self.lbl_error.setStyleSheet(
+            f"background-color:{background};color:{foreground};padding:10px;"
+            f"border:1px solid {tokens['border']};border-radius:6px;"
+            "font-weight:bold;font-size:11pt;"
+        )
 
     def event(self, event):
         if event.type() == QEvent.WindowDeactivate:
@@ -17786,7 +17690,7 @@ class LoginDialog(QDialog):
             self.username_completer.model().setStringList(list_usernames())
 
     def recover_password(self):
-        RecoverPasswordDialog(self).exec()
+        RecoverPasswordDialog(self, is_dark=self._is_dark).exec()
 
 class AddCatalogItemDialog(QDialog):
     def __init__(
@@ -32240,6 +32144,7 @@ class MainWindow(QMainWindow):
 
     def toggle_theme(self):
         self.is_dark_mode = not self.is_dark_mode
+        store_boot_theme_preference(self.is_dark_mode)
         QApplication.instance().setStyleSheet(get_stylesheet(self.is_dark_mode))
         self.apply_button_colors()
         self._restore_billing_original_icons()
@@ -35512,11 +35417,12 @@ class AppController(QObject):
         self.idle_filter.activity.connect(self._on_activity)
         self.app.installEventFilter(self.idle_filter)
         
-        self.app.setStyleSheet(get_stylesheet(False))
+        self._is_dark = load_boot_theme_preference()
+        self.app.setStyleSheet(get_stylesheet(self._is_dark))
 
     def run(self):
         while True:
-            dlg = LoginDialog()
+            dlg = LoginDialog(is_dark=self._is_dark)
             if dlg.exec() != QDialog.Accepted: return 0
             user = dlg.user
             try:
@@ -35547,6 +35453,8 @@ class AppController(QObject):
 
 
     def _on_theme_toggled(self, is_dark):
+        self._is_dark = bool(is_dark)
+        store_boot_theme_preference(self._is_dark)
         self.app.setStyleSheet(get_stylesheet(is_dark))
 
     def _on_activity(self):

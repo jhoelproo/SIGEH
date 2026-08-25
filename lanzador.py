@@ -4,34 +4,9 @@ import os
 
 def _fast_launch_main_before_gui_imports() -> int:
     """Camino normal: abre la app antes de importar red, Qt o el actualizador."""
-    real_dir = (
-        os.path.dirname(sys.executable)
-        if getattr(sys, "frozen", False)
-        else os.path.dirname(os.path.abspath(__file__))
-    )
-    main_path = os.path.join(real_dir, "CALCULOS_QT.exe")
-    if not os.path.isfile(main_path):
-        message = "No se encontró CALCULOS_QT.exe junto al lanzador."
-        if sys.platform.startswith("win"):
-            try:
-                import ctypes
+    from portable_launcher import main as launch_portable_main
 
-                ctypes.windll.user32.MessageBoxW(
-                    None, message, "Sistema Hospitalario", 0x10
-                )
-            except Exception:
-                pass
-        return 2
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(main_path)
-        else:
-            import subprocess as _subprocess
-
-            _subprocess.Popen([main_path], cwd=real_dir)
-        return 0
-    except Exception:
-        return 1
+    return launch_portable_main()
 
 
 _EARLY_ARGS = list(sys.argv[1:])
@@ -41,10 +16,11 @@ _EARLY_UPDATE_OPT_IN = (
 )
 if __name__ == "__main__" and _EARLY_ARGS == ["--self-test-fast-launch"]:
     raise SystemExit(0)
+if __name__ == "__main__" and _EARLY_ARGS == ["--self-test"]:
+    raise SystemExit(_fast_launch_main_before_gui_imports())
 if (
     __name__ == "__main__"
     and not _EARLY_UPDATE_OPT_IN
-    and _EARLY_ARGS != ["--self-test"]
 ):
     raise SystemExit(_fast_launch_main_before_gui_imports())
 
@@ -54,15 +30,19 @@ import hashlib
 import shutil
 import subprocess
 import tempfile
+import uuid
 import zipfile
 import requests
+from pathlib import Path
 from sigeh_product import APP_VERSION, PRODUCT_ID
+from sigeh_visual_theme import visual_theme_tokens
 from sigeh_update import get_latest_release, is_newer, resolve_release_payload
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QSettings
 from PySide6.QtWidgets import QApplication, QDialog, QVBoxLayout, QLabel, QProgressBar, QMessageBox
 
 MAIN_APP_NAME = "CALCULOS_QT.exe"
-UPDATER_NAME = "APLICAR_ACTUALIZACION.exe"
+LAUNCHER_NAME = "SIGEH.exe"
+UPDATER_NAME = "SIGEH_Updater.exe"
 CONFIG_FILE = "version_config.json"
 LOG_FILE = "lanzador_log.txt"
 DEFAULT_VERSION = APP_VERSION
@@ -355,10 +335,11 @@ class DownloadWorker(QThread):
     progress_update = Signal(int, int)
     error_download = Signal(str)
 
-    def __init__(self, url, expected_sha256=""):
+    def __init__(self, url, expected_sha256="", version="pending"):
         super().__init__()
         self.url = url
         self.expected_sha256 = expected_sha256
+        self.version = str(version or "pending")
 
     def run(self):
         new_zip_path = ""
@@ -367,7 +348,11 @@ class DownloadWorker(QThread):
             response.raise_for_status()
             total_size = int(response.headers.get('content-length', 0))
 
-            update_dir = tempfile.mkdtemp(prefix="hospital_update_")
+            local_root = Path(
+                os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+            ) / PRODUCT_ID / "updates" / "staging" / self.version
+            local_root.mkdir(parents=True, exist_ok=True)
+            update_dir = tempfile.mkdtemp(prefix="download-", dir=str(local_root))
             new_zip_path = os.path.join(update_dir, "SIGEH-update.zip")
 
             downloaded_size = 0
@@ -407,22 +392,36 @@ class DownloadWorker(QThread):
 class LauncherDialog(QDialog):
     def __init__(self):
         super().__init__()
+        self._is_dark = bool(
+            QSettings("SIGEH", "Visual").value("dark_mode", False, type=bool)
+        )
+        tokens = visual_theme_tokens(self._is_dark)
         self.setWindowTitle("Iniciando Sistema...")
         self.setFixedSize(450, 150)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setStyleSheet("background-color: #ffffff; border: 2px solid #1565c0; border-radius: 8px;")
+        self.setStyleSheet(
+            f"QDialog{{background-color:{tokens['window_bg']};color:{tokens['text_primary']};"
+            f"border:2px solid {tokens['accent']};border-radius:8px;}}"
+            f"QLabel{{color:{tokens['text_primary']};background:transparent;border:none;}}"
+            f"QProgressBar{{background:{tokens['input_bg']};color:{tokens['text_primary']};"
+            f"border:1px solid {tokens['border']};border-radius:4px;text-align:center;font-weight:bold;}}"
+            f"QProgressBar::chunk{{background:{tokens['success']};border-radius:4px;}}"
+            f"QMessageBox{{background:{tokens['window_bg']};color:{tokens['text_primary']};}}"
+            f"QMessageBox QLabel{{color:{tokens['text_primary']};}}"
+            f"QMessageBox QPushButton{{background:{tokens['button_primary_bg']};"
+            f"color:{tokens['button_primary_text']};border:1px solid {tokens['border']};"
+            "border-radius:6px;padding:6px 12px;min-width:80px;}}"
+        )
 
         lay = QVBoxLayout(self)
         self.lbl_status = QLabel("Comprobando actualización...")
         self.lbl_status.setAlignment(Qt.AlignCenter)
-        self.lbl_status.setStyleSheet("font-size: 12pt; font-weight: bold; color: #1565c0; border: none;")
+        self.lbl_status.setStyleSheet(
+            f"font-size:12pt;font-weight:bold;color:{tokens['accent']};border:none;"
+        )
         lay.addWidget(self.lbl_status)
 
         self.progress = QProgressBar()
-        self.progress.setStyleSheet("""
-            QProgressBar { border: 1px solid #d1d9e6; border-radius: 4px; text-align: center; font-weight: bold; }
-            QProgressBar::chunk { background-color: #2e7d32; border-radius: 4px; }
-        """)
         self.progress.hide()
         lay.addWidget(self.progress)
 
@@ -453,7 +452,7 @@ class LauncherDialog(QDialog):
         self.lbl_status.setText(f"Descargando actualización {version}...")
         self.progress.show()
 
-        self.downloader = DownloadWorker(url, expected_sha256)
+        self.downloader = DownloadWorker(url, expected_sha256, version)
         self.downloader.progress_update.connect(self.update_progress)
         self.downloader.finished_download.connect(self.apply_update)
         self.downloader.error_download.connect(self.handle_download_error)
@@ -544,7 +543,8 @@ class LauncherDialog(QDialog):
                     path
                     for path in candidates
                     if os.path.isfile(os.path.join(path, MAIN_APP_NAME))
-                    and os.path.isfile(os.path.join(path, "INICIAR_SISTEMA.exe"))
+                    and os.path.isfile(os.path.join(path, LAUNCHER_NAME))
+                    and os.path.isfile(os.path.join(path, UPDATER_NAME))
                     and os.path.isdir(os.path.join(path, "_internal"))
                 ),
                 "",
@@ -555,7 +555,11 @@ class LauncherDialog(QDialog):
             installed_updater = os.path.join(current_dir, UPDATER_NAME)
             if not os.path.isfile(installed_updater):
                 raise FileNotFoundError(f"No se encontro {UPDATER_NAME}.")
-            temporary_updater = os.path.join(update_root, UPDATER_NAME)
+            updater_temp_dir = os.path.join(
+                tempfile.gettempdir(), "SIGEH-Updater", str(uuid.uuid4())
+            )
+            os.makedirs(updater_temp_dir, exist_ok=True)
+            temporary_updater = os.path.join(updater_temp_dir, UPDATER_NAME)
             shutil.copy2(installed_updater, temporary_updater)
 
             manifest_path = os.path.join(update_root, "update_manifest.json")
@@ -575,7 +579,7 @@ class LauncherDialog(QDialog):
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
             subprocess.Popen(
                 [temporary_updater, "--manifest", manifest_path, "--wait-pid", str(os.getpid())],
-                cwd=update_root,
+                cwd=updater_temp_dir,
                 close_fds=True,
                 creationflags=creationflags,
             )

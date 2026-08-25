@@ -6,6 +6,7 @@ def test_launcher_uses_bundled_database_configuration_without_env_file(
 ):
     executable = tmp_path / "CALCULOS_QT.exe"
     executable.write_bytes(b"test")
+    (tmp_path / "_internal").mkdir()
     captured = {}
 
     monkeypatch.setattr(portable_launcher, "portable_root", lambda: tmp_path)
@@ -35,6 +36,7 @@ def test_launcher_fails_when_database_configuration_cannot_be_resolved(
     tmp_path, monkeypatch
 ):
     (tmp_path / "CALCULOS_QT.exe").write_bytes(b"test")
+    (tmp_path / "_internal").mkdir()
     errors = []
 
     monkeypatch.setattr(portable_launcher, "portable_root", lambda: tmp_path)
@@ -47,3 +49,32 @@ def test_launcher_fails_when_database_configuration_cannot_be_resolved(
 
     assert portable_launcher.main() == 5
     assert errors and "base de datos central" in errors[0]
+
+
+def test_self_test_validates_install_without_launching(tmp_path, monkeypatch):
+    (tmp_path / "CALCULOS_QT.exe").write_bytes(b"test")
+    (tmp_path / "_internal").mkdir()
+    launched = []
+    monkeypatch.setattr(portable_launcher, "portable_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        portable_launcher,
+        "install_database_url_for_child",
+        lambda environment, base_dir: True,
+    )
+    monkeypatch.setattr(portable_launcher.sys, "argv", ["SIGEH.exe", "--self-test"])
+    monkeypatch.setattr(
+        portable_launcher.subprocess,
+        "Popen",
+        lambda *args, **kwargs: launched.append((args, kwargs)),
+    )
+
+    assert portable_launcher.main() == 0
+    assert launched == []
+
+
+def test_self_test_rejects_missing_internal_directory(tmp_path, monkeypatch):
+    (tmp_path / "CALCULOS_QT.exe").write_bytes(b"test")
+    monkeypatch.setattr(portable_launcher, "portable_root", lambda: tmp_path)
+    monkeypatch.setattr(portable_launcher.sys, "argv", ["SIGEH.exe", "--self-test"])
+
+    assert portable_launcher.main() == 3

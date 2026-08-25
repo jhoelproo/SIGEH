@@ -348,8 +348,8 @@ class _CompatEvent:
 
 class _EventFilter(QObject):
     def __init__(self, owner):
-        super().__init__(owner)
         self.owner = owner
+        super().__init__(owner)
 
     def eventFilter(self, obj, event):
         owner = self.owner
@@ -1065,6 +1065,23 @@ class _WidgetMixin:
             qss.append("padding: 6px 10px; border-radius: 4px;")
             if not fg:
                 qss.append("color: #FFFFFF;")
+            control = "QPushButton"
+            hover_bg = values.get("hoverbackground", bg or color)
+            pressed_bg = values.get("pressedbackground", hover_bg)
+            disabled_bg = values.get("disabled_background", bg or color)
+            disabled_fg = values.get("disabled_foreground", fg or "#FFFFFF")
+            focus_border = values.get("focus_border", border)
+            if hover_bg:
+                qss.append(f"{control}:hover{{background-color:{hover_bg};}}")
+            if pressed_bg:
+                qss.append(f"{control}:pressed{{background-color:{pressed_bg};}}")
+            if disabled_bg:
+                qss.append(
+                    f"{control}:disabled{{background-color:{disabled_bg};"
+                    f"color:{disabled_fg};border:1px solid {border or focus_border};}}"
+                )
+            if focus_border:
+                qss.append(f"{control}:focus{{border:2px solid {focus_border};}}")
         elif isinstance(self, (Entry, Combobox)):
             qss.append("padding: 5px 7px; border-radius: 3px;")
             sel_bg = values.get("selectbackground")
@@ -2369,7 +2386,7 @@ class _MessageBoxNS:
         return parent.window()
 
     @classmethod
-    def _show(cls, icon, title, message, buttons, default=None, *, parent=None, high_contrast=False):
+    def _show(cls, icon, title, message, buttons, default=None, *, parent=None, high_contrast=False, extra_qss=""):
         box = QMessageBox(cls._parent(parent))
         box.setIcon(icon)
         box.setWindowTitle(str(title))
@@ -2380,7 +2397,7 @@ class _MessageBoxNS:
             box.setDefaultButton(default)
         if high_contrast:
             box.setMinimumWidth(560)
-        box.setStyleSheet(_message_box_qss())
+        box.setStyleSheet(_message_box_qss() + str(extra_qss or ""))
         return box.exec()
 
     @classmethod
@@ -2390,6 +2407,12 @@ class _MessageBoxNS:
     @classmethod
     def showwarning(cls,title,message,parent=None,**kwargs):
         _ensure_app()
+        # Keep the body width independent from QMessageBox's warning icon;
+        # the selectors are theme-neutral and use colors from _message_box_qss.
+        notice_layout_qss = (
+            "QLabel#qt_msgbox_label{min-width:420px;}"
+            "QLabel#qt_msgboxex_icon_label{min-width:48px;max-width:48px;}"
+        )
         return cls._show(
             QMessageBox.Warning,
             title,
@@ -2397,6 +2420,7 @@ class _MessageBoxNS:
             QMessageBox.Ok,
             parent=parent,
             high_contrast=bool(kwargs.get("high_contrast")),
+            extra_qss=notice_layout_qss,
         )
     @classmethod
     def showerror(cls,title,message,parent=None,**kwargs):

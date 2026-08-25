@@ -7010,13 +7010,34 @@ class App:
             style.configure("Subtitle.TLabel", font=("Arial", fs + 1), foreground=pal["muted"], _qt_transparent=True)
             style.configure("Section.TLabel", font=("Arial", fs + 2, "bold"), foreground=pal["accent"], _qt_transparent=True)
 
-            style.configure("TButton", font=("Arial", fs, "bold"), foreground=pal["button_fg"])
-            style.configure("primary.TButton", font=("Arial", fs, "bold"), background=pal.get("button_primary_bg", COLOR_PRIMARY), foreground=pal.get("button_primary_text", pal["button_fg"]))
-            style.configure("success.TButton", font=("Arial", fs, "bold"), background=pal.get("button_success_bg", COLOR_SUCCESS), foreground=pal.get("button_success_text", pal["button_fg"]))
-            style.configure("warning.TButton", font=("Arial", fs, "bold"), background=pal.get("button_warning_bg", COLOR_WARNING), foreground=pal.get("button_warning_text", pal["button_fg"]))
-            style.configure("danger.TButton", font=("Arial", fs, "bold"), background=pal.get("button_danger_bg", COLOR_DANGER), foreground=pal.get("button_danger_text", pal["button_fg"]))
-            style.configure("info.TButton", font=("Arial", fs, "bold"), background=pal.get("button_primary_bg", COLOR_INFO), foreground=pal.get("button_primary_text", pal["button_fg"]))
-            style.configure("secondary.TButton", font=("Arial", fs, "bold"), background=pal.get("button_secondary_bg", pal["card2"]), foreground=pal.get("button_secondary_text", pal["text"]))
+            button_common = {
+                "font": ("Arial", fs, "bold"),
+                "disabled_background": pal.get("input_disabled_bg", pal["card2"]),
+                "disabled_foreground": pal.get("text_disabled", pal["muted"]),
+                "focus_border": pal.get("border_focus", pal["accent"]),
+                "bordercolor": pal["border"],
+            }
+            style.configure("TButton", foreground=pal["button_fg"], **button_common)
+            for style_name, role_key, fallback in (
+                ("primary.TButton", "primary", COLOR_PRIMARY),
+                ("success.TButton", "success", COLOR_SUCCESS),
+                ("warning.TButton", "warning", COLOR_WARNING),
+                ("danger.TButton", "danger", COLOR_DANGER),
+                ("info.TButton", "primary", COLOR_INFO),
+                ("secondary.TButton", "secondary", pal["card2"]),
+            ):
+                style.configure(
+                    style_name,
+                    background=pal.get(f"button_{role_key}_bg", fallback),
+                    foreground=pal.get(f"button_{role_key}_text", pal["button_fg"]),
+                    hoverbackground=pal.get(
+                        f"button_{role_key}_hover", pal.get("accent_hover", pal["accent"])
+                    ),
+                    pressedbackground=pal.get(
+                        f"button_{role_key}_hover", pal.get("accent_hover", pal["accent"])
+                    ),
+                    **button_common,
+                )
 
             style.configure(
                 "TEntry",
@@ -7253,6 +7274,21 @@ class App:
 
             if isinstance(w, (tk.Tk, tk.Toplevel)):
                 safe_conf(w, background=pal["root"], bg=pal["root"])
+
+            elif isinstance(w, tk.Canvas):
+                safe_conf(w, background=pal["root"], bg=pal["root"])
+                try:
+                    w.viewport().setStyleSheet(
+                        f"background:{pal['root']};border:none;"
+                    )
+                    w.verticalScrollBar().setStyleSheet(
+                        f"QScrollBar:vertical{{background:{pal.get('scrollbar_track', pal['root'])};width:12px;margin:0;}}"
+                        f"QScrollBar::handle:vertical{{background:{pal.get('scrollbar_handle', pal['border'])};min-height:24px;border-radius:5px;}}"
+                        f"QScrollBar::handle:vertical:hover{{background:{pal.get('scrollbar_hover', pal['accent'])};}}"
+                        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+                    )
+                except Exception:
+                    pass
 
             elif isinstance(w, tk.Frame):
                 safe_conf(
@@ -8651,31 +8687,26 @@ class App:
             )
             return
         install_dir = os.path.dirname(os.path.abspath(sys.executable))
-        updater = os.path.join(install_dir, "ACTUALIZADOR.exe")
+        updater = os.path.join(install_dir, "SIGEH_Updater.exe")
+        launcher = os.path.join(install_dir, "SIGEH.exe")
         if not os.path.isfile(updater):
             messagebox.showerror(
                 "Actualizaciones",
-                "No se encontro ACTUALIZADOR.exe junto a la aplicacion.",
+                "No se encontró SIGEH_Updater.exe junto a SIGEH.",
+                parent=self.root,
+            )
+            return
+        if not os.path.isfile(launcher):
+            messagebox.showerror(
+                "Actualizaciones",
+                "No se encontró SIGEH.exe junto a la aplicación.",
                 parent=self.root,
             )
             return
         try:
-            temp_updater = os.path.join(
-                tempfile.gettempdir(),
-                f"GeneradorHojas_Actualizador_{os.getpid()}.exe",
-            )
-            shutil.copy2(updater, temp_updater)
             subprocess.Popen(
-                [
-                    temp_updater,
-                    "--install-dir",
-                    install_dir,
-                    "--current-version",
-                    APP_VERSION,
-                    "--wait-pid",
-                    str(os.getpid()),
-                ],
-                cwd=tempfile.gettempdir(),
+                [launcher, "--check-updates"],
+                cwd=install_dir,
                 close_fds=True,
             )
             self.on_close()

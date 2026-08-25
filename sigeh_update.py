@@ -165,6 +165,14 @@ def _validate_manifest(manifest: dict, release: ReleaseInfo) -> str:
         raise UpdateError("La versión del manifest no coincide con el release.")
     if str(manifest.get("asset") or "") != release.archive_name:
         raise UpdateError("El asset del manifest no coincide con el release.")
+    if str(manifest.get("entrypoint") or "") != "SIGEH.exe":
+        raise UpdateError("El manifest no declara el entrypoint SIGEH.exe.")
+    if str(manifest.get("updater") or "") != "SIGEH_Updater.exe":
+        raise UpdateError("El manifest no declara SIGEH_Updater.exe.")
+    if not str(manifest.get("published_at") or "").strip():
+        raise UpdateError("El manifest no declara la fecha de publicación.")
+    minimum_version = str(manifest.get("minimum_supported_version") or "")
+    version_tuple(minimum_version)
     manifest_checksum = str(manifest.get("sha256") or "").strip().lower()
     if not re.fullmatch(r"[a-f0-9]{64}", manifest_checksum):
         raise UpdateError("El manifest no contiene un SHA-256 válido.")

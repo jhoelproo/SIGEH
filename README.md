@@ -27,6 +27,7 @@ recibos, PDFs o Excel con datos de pacientes.
 SIGEH se distribuye como PyInstaller `onedir`:
 
 ```powershell
+python -m PyInstaller --noconfirm --clean build_updater.spec
 python -m PyInstaller --noconfirm --clean build_app.spec
 ```
 
@@ -35,11 +36,12 @@ carpeta completa; nunca debe publicarse solo `CALCULOS_QT.exe`.
 
 ## Actualizaciones automáticas
 
-`INICIAR_SISTEMA.exe` consulta exclusivamente releases de
+`SIGEH.exe` consulta exclusivamente releases de
 `jhoelproo/SIGEH`, valida producto, versión, manifest y SHA-256 del ZIP, y
 delega la sustitución completa de `onedir` a
-`APLICAR_ACTUALIZACION.exe`. El instalador conserva configuración, documentos
-y réplica local, y restaura la versión anterior si la instalación falla.
+`SIGEH_Updater.exe`, un ejecutable autónomo ONEFILE. El instalador conserva
+configuración, documentos y réplica local, ejecuta un health check sin login y
+restaura la versión anterior si la instalación falla.
 
 Los assets usan el formato `SIGEH-<version>-windows-x64.zip`, acompañado por
 un `.sha256` y `SIGEH-<version>-manifest.json` con `product: SIGEH`.

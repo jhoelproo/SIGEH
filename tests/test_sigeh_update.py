@@ -22,7 +22,7 @@ from sigeh_update import (
 from updater import apply_update, merge_preserved
 
 
-def _release(repository=GITHUB_REPOSITORY, version="1.0.2"):
+def _release(repository=GITHUB_REPOSITORY, version="1.0.3"):
     archive, checksum, manifest = release_asset_names(version)
     return {
         "tag_name": f"v{version}",
@@ -41,15 +41,15 @@ def _release(repository=GITHUB_REPOSITORY, version="1.0.2"):
 
 def test_product_and_channel_are_sigeh_only():
     assert PRODUCT_ID == "SIGEH"
-    assert APP_VERSION == "1.0.1"
+    assert APP_VERSION == "1.0.2"
     assert LATEST_RELEASE_API.endswith(f"/{GITHUB_REPOSITORY}/releases/latest")
     assert "Hospital-Contreras-Facturacion1" not in LATEST_RELEASE_API
 
 
 def test_release_parser_accepts_complete_sigeh_release():
     release = parse_release(_release())
-    assert release.version == "1.0.2"
-    assert release.archive_name == "SIGEH-1.0.2-windows-x64.zip"
+    assert release.version == "1.0.3"
+    assert release.archive_name == "SIGEH-1.0.3-windows-x64.zip"
     assert is_newer(release.version, APP_VERSION)
     assert not is_newer(APP_VERSION, APP_VERSION)
 
@@ -70,7 +70,7 @@ def test_invalid_versions_are_rejected(value):
 
 
 def test_checksum_and_archive_validation(tmp_path):
-    archive = tmp_path / "SIGEH-1.0.1-windows-x64.zip"
+    archive = tmp_path / "SIGEH-1.0.2-windows-x64.zip"
     archive.write_bytes(b"PK\x03\x04SIGEH")
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     assert parse_checksum(f"{digest} *{archive.name}\n", archive.name) == digest
@@ -107,6 +107,10 @@ def test_remote_release_manifest_and_checksum_are_cross_validated(monkeypatch):
                 "version": parsed.version,
                 "asset": parsed.archive_name,
                 "sha256": digest,
+                "entrypoint": "SIGEH.exe",
+                "updater": "SIGEH_Updater.exe",
+                "published_at": "2026-08-24T00:00:00Z",
+                "minimum_supported_version": "1.0.0",
             }
         ).encode(),
         parsed.checksum_url: f"{digest} *{parsed.archive_name}\n".encode(),
@@ -165,6 +169,10 @@ def test_release_rejects_nonstable_and_invalid_manifest(monkeypatch):
         "version": release.version,
         "asset": release.archive_name,
         "sha256": checksum,
+        "entrypoint": "SIGEH.exe",
+        "updater": "SIGEH_Updater.exe",
+        "published_at": "2026-08-24T00:00:00Z",
+        "minimum_supported_version": "1.0.0",
     }
     for field, value, message in (
         ("product", "OLD", "otro producto"),
@@ -212,14 +220,14 @@ def test_onedir_update_replaces_program_and_preserves_local_state(
     (install / "_internal" / "database_url.bundle").write_bytes(b"private")
     (install / "old.txt").write_text("old", encoding="utf-8")
     (payload / "_internal").mkdir(parents=True)
-    for executable in ("CALCULOS_QT.exe", "INICIAR_SISTEMA.exe"):
+    for executable in ("CALCULOS_QT.exe", "SIGEH.exe", "SIGEH_Updater.exe"):
         (payload / executable).write_bytes(b"new")
     manifest = tmp_path / "update.json"
     manifest.write_text(
         json.dumps(
             {
                 "product": PRODUCT_ID,
-                "version": "1.0.1",
+                "version": "1.0.2",
                 "install_dir": str(install),
                 "payload_dir": str(payload),
             }
@@ -228,6 +236,8 @@ def test_onedir_update_replaces_program_and_preserves_local_state(
     )
     monkeypatch.setattr("updater.wait_for_process", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("updater.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("updater.health_check_install", lambda *_args: True)
+    monkeypatch.setattr("updater.update_storage_root", lambda: tmp_path / "local")
     monkeypatch.setattr("updater.start_launcher", lambda *_args, **_kwargs: None)
 
     assert apply_update(manifest, 0) == 0

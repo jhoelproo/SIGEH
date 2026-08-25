@@ -20,6 +20,13 @@ V15_PACKAGE = "ADMISION_PYSIDE6_V15"
 V15_SOURCE = (ROOT / V15_PACKAGE).resolve()
 V15_ASSETS = V15_SOURCE / "assets"
 V15_TEMPLATES = V15_SOURCE / "HOJAS"
+DATABASE_BUNDLE = Path(
+    os.environ.get("SIGEH_DATABASE_BUNDLE", ROOT / "database_url.bundle")
+).resolve()
+if not DATABASE_BUNDLE.is_file():
+    raise FileNotFoundError(
+        "Falta database_url.bundle. Defina SIGEH_DATABASE_BUNDLE para el build de producción."
+    )
 V15_MODULE_FILES = tuple(
     V15_SOURCE / name
     for name in (
@@ -191,6 +198,7 @@ ADMISSION_PYSIDE6_HIDDEN_IMPORTS = collect_submodules("admission_pyside6")
 TTKBOOTSTRAP_HIDDEN_IMPORTS = collect_submodules("ttkbootstrap")
 
 main_datas = [
+    (str(DATABASE_BUNDLE), "."),
     (str(ASSETS / "logo.jpg"), "assets"),
     (str(ASSETS / "favicon.ico"), "assets"),
     (str(PDF_ENGINE / "template.html"), "pdf_engine"),
@@ -312,7 +320,7 @@ launcher_exe = EXE(
     launcher_analysis.scripts,
     [],
     exclude_binaries=True,
-    name="INICIAR_SISTEMA",
+    name="SIGEH",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -329,45 +337,9 @@ launcher_exe = EXE(
 )
 
 
-updater_analysis = Analysis(
-    [str(ROOT / "updater.py")],
-    pathex=[str(ROOT)],
-    binaries=[],
-    datas=[],
-    hiddenimports=[],
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
-    noarchive=False,
-    optimize=0,
-)
-updater_pyz = PYZ(updater_analysis.pure)
-updater_exe = EXE(
-    updater_pyz,
-    updater_analysis.scripts,
-    updater_analysis.binaries,
-    updater_analysis.datas,
-    [],
-    name="APLICAR_ACTUALIZACION",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon=[str(ASSETS / "favicon.ico")],
-)
-
-
 distribution = COLLECT(
     launcher_exe,
     main_exe,
-    updater_exe,
     launcher_analysis.binaries,
     launcher_analysis.datas,
     main_analysis.binaries,
