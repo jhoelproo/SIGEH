@@ -138,7 +138,9 @@ def test_admission_action_icons_are_not_fixed_white_assets():
         "config.svg",
     ):
         assert f'"{icon_name}"' in source
-    assert "theme_icon(icon_map.get" in source
+    assert "apply_admission_button_icon(" in source
+    assert "theme_mode=theme_mode" in source
+    assert "role=role_name" in source
 
 
 def test_preferences_popup_and_semantic_buttons_follow_live_host_theme():
