@@ -731,7 +731,10 @@ def get_stylesheet(is_dark=False):
     QMainWindow, QDialog {{ background-color: {bg}; color: {text}; }}
     QWidget {{ color: {text}; }}
     QLabel {{ color: {text}; background: transparent; border: none; }}
-    QCheckBox, QRadioButton {{ color: {text}; background: transparent; spacing: 7px; }}
+    QCheckBox, QRadioButton {{
+        color: {text}; background: transparent; spacing: 7px;
+        border: none; outline: none; padding: 0; margin: 0;
+    }}
     QCheckBox::indicator {{
         width: 15px; height: 15px; border-radius: 3px;
         background: {tokens['checkbox_indicator_bg']};
@@ -752,7 +755,11 @@ def get_stylesheet(is_dark=False):
     }}
     QRadioButton::indicator:checked {{
         background: {tokens['checkbox_indicator_bg']};
-        border: 5px solid {tokens['checkbox_checked_bg']};
+        border: 4px solid {tokens['checkbox_checked_bg']};
+    }}
+    QCheckBox:focus, QRadioButton:focus {{ border: none; outline: none; }}
+    QCheckBox:focus::indicator, QRadioButton:focus::indicator {{
+        border: 2px solid {tokens['border_focus']};
     }}
     QCheckBox:disabled, QRadioButton:disabled {{ color: {disabled}; }}
     QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit {{
@@ -12612,6 +12619,22 @@ def load_boot_theme_preference() -> bool:
 def store_boot_theme_preference(is_dark: bool) -> None:
     """Mirror the current theme for the next pre-login frame."""
     QSettings("SIGEH", "Visual").setValue("dark_mode", bool(is_dark))
+
+
+def resolve_startup_theme_is_dark(startup_data=None, *, fallback=None) -> bool:
+    """Resolve one visual mode before MainWindow builds any child widgets.
+
+    The authenticated user's setting has priority.  When no user setting is
+    available, retain the already painted boot preference so a child is never
+    constructed against a temporary opposite palette.
+    """
+    preferences = dict((startup_data or {}).get("preferences") or {})
+    theme = str(preferences.get("theme") or "").strip().casefold()
+    if theme in {"oscuro", "dark"}:
+        return True
+    if theme in {"claro", "light"}:
+        return False
+    return load_boot_theme_preference() if fallback is None else bool(fallback)
 
 
 def refresh_button_roles(root: QWidget, is_dark: bool) -> None:
@@ -30897,7 +30920,9 @@ class MainWindow(QMainWindow):
         self._validation_claim_worker = None
         self._validation_flow_started_at = 0.0
         self.service_type = "EMERGENCIA"
-        self.is_dark_mode = False
+        # The application stylesheet and the embedded Admission context must
+        # agree before either one creates a visual child.
+        self.is_dark_mode = resolve_startup_theme_is_dark(startup_data)
         self.bajante_added_for_solucion = False
         self._reverting_ars_change = False
         self._honorarium_prompted_ars = set()
@@ -30937,18 +30962,20 @@ class MainWindow(QMainWindow):
         self._active_layout_profile = None
 
         username = self.current_user.get("username", "") if self.current_user else ""
-        self.preferences = dict(
-            startup_data.get("preferences") or {"theme": "claro"}
+        self.preferences = dict(startup_data.get("preferences") or {})
+        self.preferences.setdefault(
+            "theme", "oscuro" if self.is_dark_mode else "claro"
         )
         self.catalog_favorites = set(
             startup_data.get("catalog_favorites") or set()
         )
-        if self.preferences.get("theme") == "oscuro":
-            self.is_dark_mode = True
         device_id, _device_name = _local_device_identity()
         self.display_layout = DisplayLayoutManager(self, device_id, self)
         self.display_layout.layout_changed.connect(self._apply_display_layout)
 
+        application = QApplication.instance()
+        if application is not None:
+            application.setStyleSheet(get_stylesheet(self.is_dark_mode))
         self._build_ui()
         self._setup_hotkeys()
         self._build_timers()
@@ -35425,6 +35452,14 @@ class AppController(QObject):
             dlg = LoginDialog(is_dark=self._is_dark)
             if dlg.exec() != QDialog.Accepted: return 0
             user = dlg.user
+            effective_dark = resolve_startup_theme_is_dark(
+                dlg.startup_data,
+                fallback=self._is_dark,
+            )
+            if effective_dark != self._is_dark:
+                # This occurs before MainWindow/Admisión construction, never
+                # as a post-show repair of its first frame.
+                self._on_theme_toggled(effective_dark)
             try:
                 self.main_window = MainWindow(
                     user,

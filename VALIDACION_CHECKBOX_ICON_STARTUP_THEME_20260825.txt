@@ -1,0 +1,84 @@
+VALIDACION CHECKBOX / ICONOS / TEMA INICIAL — 2026-08-25
+
+ALCANCE = Admisión PySide6: controles de selección e iconos de acciones
+
+ROOT_CAUSE_CHECKBOX_SHADOW = Dos escritores de QSS competían sobre los mismos
+QCheckBox/QRadioButton: qt_compat definía el indicador y V15 reemplazaba el
+estilo completo. El segundo estilo no anulaba explícitamente borde, margen ni
+outline del control raíz, permitiendo el marco nativo externo de Windows.
+
+ROOT_CAUSE_INITIAL_ICON_MISSING = La ventana podía construir los botones bajo
+el tema de arranque antes de adoptar la preferencia autenticada; los iconos se
+asignaban en una pasada visual posterior. El caché anterior tampoco distinguía
+tema, rol semántico ni escala DPI.
+
+CHECKBOX_WIDGET_TRANSPARENT = PASS
+CHECKBOX_OUTER_BORDER_NONE = PASS
+CHECKBOX_INDICATOR_ONLY_BORDER = PASS
+CHECKBOX_CHECKED_VISIBLE = PASS
+CHECKBOX_FOCUS_VISIBLE = PASS
+CHECKBOX_DISABLED_READABLE = PASS
+
+RADIO_WIDGET_TRANSPARENT = PASS
+RADIO_OUTER_BORDER_NONE = PASS
+RADIO_INDICATOR_ONLY_BORDER = PASS
+RADIO_CHECKED_VISIBLE = PASS
+RADIO_FOCUS_VISIBLE = PASS
+RADIO_DISABLED_READABLE = PASS
+
+ICON_THEME_AWARE = PASS
+ICON_ROLE_AWARE = PASS
+ICON_DPI_AWARE = PASS
+ICON_DPR_100 = PASS
+ICON_DPR_125 = PASS
+ICON_DPR_150 = PASS
+ICON_LIGHT_CONTRAST = PASS
+ICON_DARK_CONTRAST = PASS
+CLEAR_ICON_VISIBLE_ON_COLD_LIGHT_START = PASS
+PDF_ICON_VISIBLE_ON_COLD_LIGHT_START = PASS
+COLD_START_EQUALS_TOGGLED_LIGHT = PASS
+THEME_TOGGLE_20X_STABLE = PASS
+NO_FIXED_WHITE_ICON_FALLBACK = PASS
+
+THEME_KNOWN_BEFORE_MAIN_WINDOW_BUILD = PASS
+INITIAL_EMBEDDED_THEME_APPLIED_BEFORE_SHOW = PASS
+NO_THEME_FLASH = PASS
+NO_TIMER_OR_PROCESSEVENTS_HACK = PASS
+NO_REBUILD_ON_THEME_CHANGE = PASS
+CONFIG_HISTORY_REPORT_INITIAL_THEME = PASS
+
+LAYOUT_1366x768 = PASS
+LAYOUT_1600x900 = PASS
+LAYOUT_1920x1080 = PASS
+
+PY_COMPILE = PASS
+BUILD_SPEC_COMPILE = PASS
+RUFF_NEW_CHANGED_TESTS = PASS
+RUFF_EXISTING_TOUCHED_MODULES = PASS (597 inherited findings in current and baseline; no new findings)
+DIFF_CHECK = PASS
+COVERAGE = NO VERIFICADO — la herramienta coverage/pytest-cov no está instalada en este entorno.
+
+PYINSTALLER_ONEDIR = PASS
+TCL_TK_RUNTIME_DATA = PASS
+PACKAGE_STRUCTURE = PASS
+PACKAGE_LAUNCHER_SELF_TEST = PASS
+PACKAGE_V15_CHECK = PASS
+PACKAGE_UPDATER_HEALTH = PASS
+PACKAGE_ARCHIVE_SHA256 = 9ac2fd779a745ef934c36b66eac852fb1841792c9a9faa13f1401a9dc138b56b
+
+TESTS_EXECUTED =
+- 38 passed: checkbox/icon, tema central, iconografía, historial, inicio y producción.
+- 16 passed: arquitectura de Admisión PySide6.
+- 13 passed: geometría inicial, host embebido y actualizaciones semánticas.
+
+FILES_MODIFIED =
+- CALCULOS_QT.py
+- ADMISION_PYSIDE6_V15/admission_widget.py
+- ADMISION_PYSIDE6_V15/facturacion_tabs_pyside6.py
+- ADMISION_PYSIDE6_V15/qt_compat.py
+- build_app.spec
+- tests/test_admission_theme_centralization_20260824.py
+- tests/test_checkbox_icon_startup_theme_20260825.py
+
+SOURCE_TESTS = PASS
+FINAL_RESULT = APPROVED

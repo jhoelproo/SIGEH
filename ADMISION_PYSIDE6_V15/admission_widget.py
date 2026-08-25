@@ -58,6 +58,11 @@ class AdmissionWidget(QWidget):
         self.root = EmbeddedWindowRoot(self, themename="superhero")
         layout.addWidget(self.root)
         self.admission = App(standalone=False, root=self.root, context=context)
+        # The host's visual snapshot belongs to the context before V15 is
+        # constructed.  Reapply that same snapshot to the completed button
+        # tree now, while the root is still hidden, so the first frame never
+        # depends on a later theme_toggled signal.
+        self._apply_initial_host_theme()
         visual_notifier = getattr(self.admission, "set_embedded_visual_notifier", None)
         if callable(visual_notifier):
             visual_notifier(self._on_embedded_visual_event)
@@ -70,6 +75,18 @@ class AdmissionWidget(QWidget):
         preferred_focus = getattr(self.admission, "entry_nombre", None)
         if preferred_focus is not None:
             self.setFocusProxy(preferred_focus)
+
+    def _apply_initial_host_theme(self) -> None:
+        """Polish V15 controls with the host snapshot before the first show."""
+        configuration = dict(getattr(self.context, "configuration", {}) or {})
+        if "host_theme_is_dark" not in configuration:
+            return
+        apply_theme = getattr(self.admission, "apply_host_theme", None)
+        if callable(apply_theme):
+            apply_theme(
+                bool(configuration.get("host_theme_is_dark")),
+                theme_tokens=configuration.get("host_visual_theme"),
+            )
 
     def remember_focus(self, widget=None):
         """Remember an editable descendant before the host changes page."""

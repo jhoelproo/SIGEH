@@ -127,7 +127,13 @@ def _checkmark_asset_url() -> str:
 
 
 def _choice_control_qss(values: dict[str, Any], *, radio: bool) -> str:
-    """Build one transparent, theme-driven QSS contract for choice controls."""
+    """Build the sole visual contract for checkbox and radio controls.
+
+    The widget itself is deliberately transparent and borderless.  Only the
+    indicator owns a border; assigning a border to the full control makes Qt
+    paint an unwanted rectangular frame around the label on some Windows
+    styles.
+    """
     text = values.get("foreground", values.get("fg", "#1F2A37"))
     muted = values.get("disabledforeground", values.get("disabled_fg", "#7C8B9A"))
     input_bg = values.get("indicator_bg", values.get("fieldbackground", "#FFFFFF"))
@@ -138,7 +144,7 @@ def _choice_control_qss(values: dict[str, Any], *, radio: bool) -> str:
     control = "QRadioButton" if radio else "QCheckBox"
     radius = "8px" if radio else "3px"
     checked = (
-        f"{control}::indicator:checked{{background:{input_bg};border:5px solid {accent};}}"
+        f"{control}::indicator:checked{{background:{input_bg};border:4px solid {accent};}}"
         if radio
         else (
             f"{control}::indicator:checked{{background:{accent};border:1px solid {accent};"
@@ -146,12 +152,14 @@ def _choice_control_qss(values: dict[str, Any], *, radio: bool) -> str:
         )
     )
     return (
-        f"{control}{{background:transparent;color:{text};spacing:7px;}}"
+        f"{control}{{background:transparent;color:{text};spacing:7px;"
+        "border:none;outline:none;padding:0px;margin:0px;}"
         f"{control}::indicator{{width:15px;height:15px;border-radius:{radius};"
         f"background:{input_bg};border:1px solid {border};}}"
         f"{control}::indicator:hover{{border-color:{focus};}}"
         f"{checked}"
-        f"{control}:focus::indicator{{border-color:{focus};}}"
+        f"{control}:focus{{border:none;outline:none;}}"
+        f"{control}:focus::indicator{{border:2px solid {focus};}}"
         f"{control}:disabled{{background:transparent;color:{muted};}}"
         f"{control}::indicator:disabled{{background:{disabled_bg};border-color:{border};}}"
     )

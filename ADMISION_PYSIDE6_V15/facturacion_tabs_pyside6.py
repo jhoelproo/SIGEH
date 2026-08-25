@@ -106,7 +106,7 @@ except ImportError:  # Ejecución directa del entrypoint standalone.
     )
 from PySide6.QtCore import Qt, QSize, QSignalBlocker, QTimer  # type: ignore
 from PySide6.QtWidgets import QSizePolicy  # type: ignore
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap  # type: ignore
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -156,33 +156,109 @@ def resource_path(relative_path):
 _THEMED_ICON_CACHE = {}
 
 
-def theme_icon(icon_name, foreground, *, size=18):
-    """Render a monochrome Admisión asset with the active semantic colour.
+def _theme_icon_device_pixel_ratio() -> float:
+    """Use the active screen DPR without depending on an already shown window."""
+    from PySide6.QtWidgets import QApplication
 
-    The bundled SVGs were authored in fixed white.  Rendering them through a
-    mask is what makes the same icon readable on an outlined light button and
-    a dark surface without duplicating assets.
+    application = QApplication.instance()
+    screen = application.primaryScreen() if application is not None else None
+    return max(1.0, float(screen.devicePixelRatio() if screen is not None else 1.0))
+
+
+def _render_themed_svg_icon(path, foreground, size, device_pixel_ratio):
+    """Rasterize an SVG only after its semantic foreground is known."""
+    from PySide6.QtSvg import QSvgRenderer
+
+    renderer = QSvgRenderer(str(path))
+    if not renderer.isValid():
+        return QPixmap()
+    pixel_size = max(1, int(round(int(size) * float(device_pixel_ratio))))
+    image = QImage(
+        pixel_size,
+        pixel_size,
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    renderer.render(painter)
+    painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    painter.fillRect(image.rect(), QColor(str(foreground)))
+    painter.end()
+    pixmap = QPixmap.fromImage(image)
+    pixmap.setDevicePixelRatio(float(device_pixel_ratio))
+    return pixmap
+
+
+def theme_icon(
+    icon_name,
+    foreground,
+    *,
+    size=18,
+    theme_mode="",
+    role="",
+    device_pixel_ratio=None,
+):
+    """Return a readable, DPR-aware semantic icon for the current theme.
+
+    SVGs in V15 are intentionally monochrome source masks.  The cache key
+    keeps every output dimension that can alter a rendered asset, preventing a
+    cold-start light icon from reusing a pixmap made for another role, mode or
+    scale factor.
     """
     path = resource_path(os.path.join("assets", str(icon_name or "")))
-    key = (os.path.normcase(os.path.abspath(path)), str(foreground), int(size))
+    dpr = (
+        _theme_icon_device_pixel_ratio()
+        if device_pixel_ratio is None
+        else max(1.0, float(device_pixel_ratio))
+    )
+    key = (
+        os.path.normcase(os.path.abspath(path)),
+        str(theme_mode or ""),
+        str(role or ""),
+        str(foreground),
+        int(size),
+        round(dpr, 3),
+    )
     cached = _THEMED_ICON_CACHE.get(key)
     if cached is not None:
         return cached
-    source = QPixmap(path)
-    if source.isNull():
-        return QIcon(path)
-    target = source.scaled(
-        int(size), int(size), Qt.KeepAspectRatio, Qt.SmoothTransformation
-    )
-    coloured = QPixmap(target.size())
-    coloured.fill(Qt.transparent)
-    painter = QPainter(coloured)
-    painter.drawPixmap(0, 0, target)
-    painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
-    painter.fillRect(coloured.rect(), QColor(str(foreground)))
-    painter.end()
-    icon = QIcon(coloured)
+    pixmap = _render_themed_svg_icon(path, foreground, size, dpr)
+    if pixmap.isNull():
+        # Do not reintroduce the historical fixed-white SVG fallback: a
+        # damaged asset must not silently become white-on-light.  Bundled
+        # resources are validated by the production smoke test.
+        return QIcon()
+    icon = QIcon(pixmap)
     _THEMED_ICON_CACHE[key] = icon
+    return icon
+
+
+def apply_admission_button_icon(button, icon_name, palette, role, *, size=18):
+    """Apply one semantic V15 icon without changing the button's geometry."""
+    role_name = str(role or "primary").lower()
+    foreground = str(
+        palette.get(f"button_{role_name}_text")
+        or palette.get("button_fg")
+        or "#FFFFFF"
+    )
+    theme_mode = str(palette.get("mode") or "")
+    icon = theme_icon(
+        icon_name,
+        foreground,
+        size=int(size),
+        theme_mode=theme_mode,
+        role=role_name,
+    )
+    button.setProperty("preserveOriginalIcons", True)
+    button.setProperty("admissionVisualRole", role_name)
+    button.setProperty("admissionIconSource", str(icon_name or ""))
+    button.setProperty("admissionThemeMode", theme_mode)
+    button.setProperty(
+        "admissionIconFingerprint",
+        f"{theme_mode}:{role_name}:{icon_name}:{foreground}:{int(size)}",
+    )
+    button.setIcon(icon)
+    button.setIconSize(QSize(int(size), int(size)))
     return icon
 
 
@@ -7661,15 +7737,22 @@ class App:
             self.combo_unidad.setMinimumHeight(entry_h)
             self.combo_unidad.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-            radio_qss = (
-                f"QRadioButton,QCheckBox{{color:{text_fg};background:transparent;spacing:7px;"
-                f"font-family:'Segoe UI';font-size:{value_size}pt;}}"
-                f"QRadioButton::indicator,QCheckBox::indicator{{width:15px;height:15px;border:1px solid {border};"
-                f"background:{entry_bg};border-radius:2px;}}"
-                f"QRadioButton::indicator:checked,QCheckBox::indicator:checked{{background:{accent};border:1px solid {accent};image:url({resource_path("assets/checkmark.svg").replace(os.sep,"/")});}}"
-            )
+            choice_style = {
+                "_qt_transparent": True,
+                "foreground": text_fg,
+                "font": ("Segoe UI", value_size),
+                "indicator_bg": entry_bg,
+                "indicator_border": pal.get("checkbox_indicator_border", border),
+                "indicator_checked": pal.get("checkbox_checked_bg", accent),
+                "focus_border": pal.get("border_focus", accent),
+                "disabledforeground": pal.get("text_disabled", muted),
+                "disabled_background": pal.get("input_disabled_bg", elevated_bg),
+            }
             for widget in (self.lbl_sexo_m, self.lbl_sexo_f, self.check_urgencia, self.check_embarazada):
-                widget.setStyleSheet(radio_qss)
+                # qt_compat owns the full-control/indicator boundary.  Do not
+                # replace it with a second compound QSS here: doing so made
+                # Windows compose a native outer frame around the label.
+                widget.configure(**choice_style)
             self.sexo_frame.configure(background=card_bg)
             self.form_buttons.configure(background=card_bg)
 
@@ -7744,8 +7827,13 @@ class App:
                         142 if profile.compact_labels else 170
                     )
                     self.boton_cambiar_turno.setMinimumHeight(profile.button_height)
-                    self.boton_cambiar_turno.setIcon(theme_icon("turno.svg", header_button_text))
-                    self.boton_cambiar_turno.setIconSize(QSize(16, 16))
+                    apply_admission_button_icon(
+                        self.boton_cambiar_turno,
+                        "turno.svg",
+                        pal,
+                        "secondary",
+                        size=16,
+                    )
                 except Exception:
                     pass
             if getattr(self, "actions_menu_button", None) is not None:
@@ -7756,8 +7844,13 @@ class App:
                         92 if profile.compact_labels else 112
                     )
                     self.actions_menu_button.setMinimumHeight(profile.button_height)
-                    self.actions_menu_button.setIcon(theme_icon("menu.svg", header_button_text))
-                    self.actions_menu_button.setIconSize(QSize(16, 16))
+                    apply_admission_button_icon(
+                        self.actions_menu_button,
+                        "menu.svg",
+                        pal,
+                        "secondary",
+                        size=16,
+                    )
                 except Exception:
                     pass
 
@@ -7775,8 +7868,13 @@ class App:
             self.boton_historial.setText("Historial")
             try:
                 self.boton_historial.setMinimumHeight(profile.button_height)
-                self.boton_historial.setIcon(theme_icon("history.svg", history_text))
-                self.boton_historial.setIconSize(QSize(16, 16))
+                apply_admission_button_icon(
+                    self.boton_historial,
+                    "history.svg",
+                    pal,
+                    "primary",
+                    size=16,
+                )
             except Exception:
                 pass
 
@@ -7805,10 +7903,20 @@ class App:
             self.boton_limpiar.setText("Limpiar")
             self.boton_generar_pdf.setText("Generar PDF")
             try:
-                self.boton_limpiar.setIcon(theme_icon("clear.svg", clear_text))
-                self.boton_limpiar.setIconSize(QSize(18, 18))
-                self.boton_generar_pdf.setIcon(theme_icon("pdf.svg", pdf_text))
-                self.boton_generar_pdf.setIconSize(QSize(16, 16))
+                apply_admission_button_icon(
+                    self.boton_limpiar,
+                    "clear.svg",
+                    pal,
+                    "danger",
+                    size=18,
+                )
+                apply_admission_button_icon(
+                    self.boton_generar_pdf,
+                    "pdf.svg",
+                    pal,
+                    "primary",
+                    size=16,
+                )
             except Exception:
                 pass
 
@@ -7852,8 +7960,13 @@ class App:
                     f"QPushButton:disabled {{ background-color: {pal.get('input_disabled_bg', elevated_bg)}; color: {pal.get('text_disabled', muted)}; border-color: {border}; }}"
                 )
                 try:
-                    btn.setIcon(theme_icon(icon_map.get(role, "report.svg"), button_text))
-                    btn.setIconSize(QSize(16, 16))
+                    apply_admission_button_icon(
+                        btn,
+                        icon_map.get(role, "report.svg"),
+                        pal,
+                        button_role,
+                        size=16,
+                    )
                 except Exception:
                     pass
 

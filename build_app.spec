@@ -2,10 +2,13 @@
 
 import json
 import os
+import shutil
 import sys
 from importlib.util import find_spec
 from pathlib import Path
+from zipfile import ZipFile
 
+from PyInstaller.config import CONF
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
@@ -57,6 +60,44 @@ ARS_HONORARIUM_MIGRATION = (
 PRIMARY_LEASE_MIGRATION = (
     ROOT / "migrations" / "20260820_admission_primary_lease_generation.sql"
 )
+
+
+def collect_embedded_tcl_tk_data():
+    """Bundle Tcl/Tk explicitly when Python ships its Tcl library as a zip.
+
+    Python 3.14's Windows distribution stores Tcl in ``libtcl*.zip``.  The
+    generic PyInstaller tkinter hook expects an unpacked ``_tcl_data`` tree,
+    so the launcher fails before executing our self-test if that tree is not
+    materialized.  The build work directory is used deliberately: source and
+    user data remain untouched.
+    """
+    tcl_root = Path(sys.base_prefix) / "tcl"
+    archive = next(iter(sorted(tcl_root.glob("libtcl*.zip"))), None)
+    tk_data = tcl_root / "tk9.0"
+    if archive is None or not tk_data.is_dir():
+        raise FileNotFoundError(
+            "No se encontraron los recursos Tcl/Tk requeridos por Python para el empaquetado."
+        )
+    extract_root = Path(CONF["workpath"]).resolve() / "embedded_tcl_data"
+    init_file = extract_root / "init.tcl"
+    if not init_file.is_file():
+        extract_root.mkdir(parents=True, exist_ok=True)
+        with ZipFile(archive) as source_archive:
+            for member in source_archive.infolist():
+                relative = Path(member.filename)
+                if not relative.parts or relative.parts[0] != "tcl_library":
+                    continue
+                destination = extract_root.joinpath(*relative.parts[1:])
+                if member.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with source_archive.open(member) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+    return [(str(extract_root), "_tcl_data"), (str(tk_data), "_tk_data")]
+
+
+TCL_TK_DATAS = collect_embedded_tcl_tk_data()
 
 REQUIRED_FILES = [
     ROOT / "CALCULOS_QT.py",
@@ -226,7 +267,7 @@ main_datas = [
         str(PLAYWRIGHT_BROWSER),
         f"playwright-browsers/{PLAYWRIGHT_BROWSER.name}",
     ),
-] + PLAYWRIGHT_DATAS + OPENPYXL_DATAS
+] + PLAYWRIGHT_DATAS + OPENPYXL_DATAS + TCL_TK_DATAS
 
 main_hidden_imports = sorted(
     set(
