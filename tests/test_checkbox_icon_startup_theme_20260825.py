@@ -11,7 +11,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 import CALCULOS_QT as shell
 from ADMISION_PYSIDE6_V15 import qt_compat
@@ -61,12 +67,40 @@ def _choice_host(is_dark: bool):
     layout.setContentsMargins(20, 20, 20, 20)
     check = qt_compat.Checkbutton(host, text="Embarazada")
     radio = qt_compat.Radiobutton(host, text="Femenino")
+    plain_check = QCheckBox(
+        "Guardar estos datos institucionales como predeterminados para esta ARS",
+        host,
+    )
     layout.addWidget(check)
     layout.addWidget(radio)
-    host.resize(360, 120)
+    layout.addWidget(plain_check)
+    check.show()
+    radio.show()
+    host.resize(560, 150)
     host.show()
     QTest.qWait(20)
-    return application, host, check, radio, tokens
+    return application, host, check, radio, plain_check, tokens
+
+
+def _assert_no_full_control_focus_frame(control, focus_colour: str):
+    """Keep keyboard focus on the indicator, never around the entire label."""
+    image = control.grab().toImage()
+    wanted = QColor(focus_colour).rgb()
+    right_of_indicator = min(24, max(0, image.width() - 1))
+    for x in range(right_of_indicator, image.width()):
+        assert image.pixelColor(x, 0).rgb() != wanted
+        assert image.pixelColor(x, image.height() - 1).rgb() != wanted
+
+
+def _indicator_contains_colour(control, colour: str) -> bool:
+    image = control.grab().toImage()
+    wanted = QColor(colour).rgb()
+    limit_x = min(22, image.width())
+    return any(
+        image.pixelColor(x, y).rgb() == wanted
+        for y in range(image.height())
+        for x in range(limit_x)
+    )
 
 
 def _build_admission_widget(tmp_path, monkeypatch, *, is_dark: bool):
@@ -126,38 +160,93 @@ def _button_visual_snapshot(button):
 
 def test_checkbox_and_radio_use_only_indicator_borders_in_light_and_dark():
     for is_dark in (False, True):
-        application, host, check, radio, tokens = _choice_host(is_dark)
+        application, host, check, radio, plain_check, tokens = _choice_host(is_dark)
         try:
             global_qss = shell.get_stylesheet(is_dark)
             assert "border: none; outline: none; padding: 0; margin: 0;" in global_qss
-            assert "QCheckBox:focus::indicator, QRadioButton:focus::indicator" in global_qss
+            assert (
+                "QCheckBox::indicator:focus, QRadioButton::indicator:focus"
+                in global_qss
+            )
+            assert "QCheckBox:focus::indicator" not in global_qss
             for control, selector in ((check, "QCheckBox"), (radio, "QRadioButton")):
                 qss = control.styleSheet()
                 assert f"{selector}{{background:transparent" in qss
                 assert "border:none;outline:none;padding:0px;margin:0px;" in qss
                 assert f"{selector}::indicator{{" in qss
-                assert f"{selector}:focus::indicator" in qss
+                assert f"{selector}::indicator:focus" in qss
+                assert f"{selector}:focus::indicator" not in qss
                 assert "box-shadow" not in qss
                 # Both unused outer corners stay equal to the host panel;
                 # only the indicator is allowed to differ.
                 image = host.grab().toImage()
-                assert image.pixelColor(
-                    control.geometry().right(), control.geometry().top()
-                ).rgb() == QColor(tokens["panel_bg"]).rgb()
+                assert (
+                    image.pixelColor(
+                        control.geometry().right(), control.geometry().top()
+                    ).rgb()
+                    == QColor(tokens["panel_bg"]).rgb()
+                )
                 control.setChecked(True)
                 assert "indicator:checked" in control.styleSheet()
                 control.setFocus(Qt.TabFocusReason)
                 application.processEvents()
+                _assert_no_full_control_focus_frame(control, tokens["border_focus"])
                 # Offscreen backends do not always grant window focus, but
                 # controls remain keyboard-focusable and style that focus on
                 # their indicator rather than on a permanent outer frame.
                 assert control.focusPolicy() != Qt.NoFocus
                 control.setEnabled(False)
                 assert "indicator:disabled" in control.styleSheet()
+
+            plain_check.setFocus(Qt.TabFocusReason)
+            application.processEvents()
+            _assert_no_full_control_focus_frame(plain_check, tokens["border_focus"])
         finally:
             host.close()
             host.deleteLater()
             application.processEvents()
+
+
+def test_admission_sex_radio_uses_checkbox_checkmark_without_changing_radio_logic():
+    application, host, _check, radio, _plain_check, _tokens = _choice_host(True)
+    try:
+        radio.configure(radio_checkmark=True)
+        radio.setChecked(True)
+        application.processEvents()
+        qss = radio.styleSheet()
+        assert "QRadioButton::indicator{width:15px;height:15px;border-radius:3px" in qss
+        assert "QRadioButton::indicator:checked" in qss
+        assert "image:url(" in qss
+        assert _indicator_contains_colour(radio, "#FFFFFF")
+        assert radio.isChecked() is True
+    finally:
+        host.close()
+        host.deleteLater()
+        application.processEvents()
+
+
+def test_embedded_admission_applies_checkmarks_to_both_sex_options(
+    tmp_path, monkeypatch
+):
+    application, host, _stack, widget = _build_admission_widget(
+        tmp_path, monkeypatch, is_dark=True
+    )
+    try:
+        app = widget.admission
+        app.lbl_sexo_f.setChecked(True)
+        application.processEvents()
+        for option in (app.lbl_sexo_m, app.lbl_sexo_f):
+            qss = option.styleSheet()
+            assert "QRadioButton::indicator{width:15px;height:15px;border-radius:3px" in qss
+            assert "QRadioButton::indicator:checked" in qss
+            assert "image:url(" in qss
+        assert app.lbl_sexo_f.isChecked() is True
+        assert app.lbl_sexo_m.isChecked() is False
+    finally:
+        widget.shutdown()
+        host.close()
+        host.deleteLater()
+        application.processEvents()
 
 
 def test_svg_icons_are_theme_role_and_dpi_aware_with_visible_pixels():

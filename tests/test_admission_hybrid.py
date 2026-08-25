@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import timedelta
 from contextlib import closing
 import sqlite3
 import tempfile
@@ -105,6 +104,30 @@ class HybridAdmissionTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
         self.assertTrue(decision.offline)
+
+    def test_guard_never_treats_missing_role_as_administrator(self):
+        decision = AdmissionWriteGuard().can_write_admission(
+            login_user="ADMIN",
+            device_id="PC-2",
+            session=session(),
+            generation=2,
+            role=StationRole.SECONDARY,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "SECONDARY_USER_MISMATCH")
+
+    def test_guard_keeps_explicit_auditor_read_only_even_when_identity_matches(self):
+        decision = AdmissionWriteGuard().can_write_admission(
+            login_user="FERNANDO",
+            login_user_id="7",
+            login_role="facturador de auditoria",
+            device_id="PC-1",
+            session=session(),
+            generation=2,
+            role=StationRole.PRIMARY,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "READONLY_AUDIT_DEFAULT")
 
     def test_attention_mutation_creates_outbox_in_same_sqlite_database(self):
         with tempfile.TemporaryDirectory() as directory:

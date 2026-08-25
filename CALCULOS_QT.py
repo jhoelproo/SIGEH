@@ -758,7 +758,7 @@ def get_stylesheet(is_dark=False):
         border: 4px solid {tokens['checkbox_checked_bg']};
     }}
     QCheckBox:focus, QRadioButton:focus {{ border: none; outline: none; }}
-    QCheckBox:focus::indicator, QRadioButton:focus::indicator {{
+    QCheckBox::indicator:focus, QRadioButton::indicator:focus {{
         border: 2px solid {tokens['border_focus']};
     }}
     QCheckBox:disabled, QRadioButton:disabled {{ color: {disabled}; }}
