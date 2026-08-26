@@ -238,6 +238,30 @@ V15_HIDDEN_IMPORTS = collect_submodules(V15_PACKAGE) if V15_AVAILABLE else []
 ADMISSION_PYSIDE6_HIDDEN_IMPORTS = collect_submodules("admission_pyside6")
 TTKBOOTSTRAP_HIDDEN_IMPORTS = collect_submodules("ttkbootstrap")
 
+
+def collect_qt_icu_runtime():
+    """Place the ICU ABI used by QtCore beside Qt6Core.dll on Windows.
+
+    Keeping these DLLs only at the frozen application's internal root lets
+    Windows prefer an incompatible system ICU and produces WinError 127 while
+    importing PySide6.QtCore on other PCs.
+    """
+    if os.name != "nt":
+        return []
+    search_dirs = [Path(part) for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    search_dirs.extend((Path(sys.base_prefix), Path(sys.base_prefix) / "DLLs"))
+    for directory in search_dirs:
+        icuuc = directory / "icuuc.dll"
+        data_files = sorted(directory.glob("icudt*.dll")) if directory.is_dir() else []
+        if icuuc.is_file() and data_files:
+            return [(str(icuuc), "PySide6"), (str(data_files[-1]), "PySide6")]
+    raise FileNotFoundError(
+        "No se encontraron icuuc.dll e icudt*.dll compatibles para QtCore."
+    )
+
+
+QT_ICU_BINARIES = collect_qt_icu_runtime()
+
 main_datas = [
     (str(DATABASE_BUNDLE), "."),
     (str(ASSETS / "logo.jpg"), "assets"),
@@ -309,7 +333,7 @@ main_hidden_imports = sorted(
 main_analysis = Analysis(
     [str(ROOT / "CALCULOS_QT.py")],
     pathex=[str(ROOT), str(ADMISSION_SOURCE), str(V15_SOURCE.parent)],
-    binaries=[],
+    binaries=QT_ICU_BINARIES,
     datas=main_datas,
     hiddenimports=main_hidden_imports,
     hookspath=[],
