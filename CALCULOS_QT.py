@@ -4715,6 +4715,9 @@ def evaluate_attention_billing_eligibility(
         return _evaluate_hybrid_eligibility(None, dict(user_context or {}))
     source = str(source_instance_id or "").strip()
     global_id = str(global_attention_id or "").strip()
+    allow_claim_override = can_override_admission_billing_claim(
+        dict(user_context or {})
+    )
     with db_connect() as con:
         projection = con.execute(
             """SELECT p.*,
@@ -4735,9 +4738,10 @@ def evaluate_attention_billing_eligibility(
                           SELECT 1 FROM admission_billing_claims claim
                           WHERE claim.source_instance_id=p.source_instance_id
                             AND claim.attention_id=p.attention_id
-                            AND claim.expires_at>NOW()
-                            AND claim.session_id<>%s
-                      ) AS claimed_elsewhere
+                             AND claim.expires_at>NOW()
+                             AND claim.session_id<>%s
+                             AND NOT %s
+                       ) AS claimed_elsewhere
                FROM admission_attention_projection p
                LEFT JOIN LATERAL (
                    SELECT id,estado_facturacion,estado_documento
@@ -4762,7 +4766,8 @@ def evaluate_attention_billing_eligibility(
                       AND (%s='' OR p.source_instance_id=%s))
                ORDER BY p.synced_at DESC LIMIT 1""",
             (
-                str(session_id or ""), global_id, global_id, global_id,
+                str(session_id or ""), bool(allow_claim_override),
+                global_id, global_id, global_id,
                 identity, source, source,
             ),
         ).fetchone()
@@ -5218,6 +5223,7 @@ class BillingAdmissionQueryService:
         session_id: str = "",
         turn_filter: str = "ACTUAL",
         allow_uninsured: bool = False,
+        allow_claim_override: bool = False,
         limit: int = 500,
         offset: int = 0,
     ):
@@ -5288,12 +5294,15 @@ class BillingAdmissionQueryService:
                              AND COALESCE(r.admission_source_instance_id,'LEGACY')=p.source_instance_id
                              AND r.is_deleted=0
                      )
-                     AND NOT EXISTS (
-                           SELECT 1 FROM admission_billing_claims c
-                           WHERE c.source_instance_id=p.source_instance_id
-                             AND c.attention_id=p.attention_id
-                             AND c.expires_at>NOW()
-                             AND c.session_id<>%s
+                     AND (
+                           %s
+                           OR NOT EXISTS (
+                               SELECT 1 FROM admission_billing_claims c
+                               WHERE c.source_instance_id=p.source_instance_id
+                                 AND c.attention_id=p.attention_id
+                                 AND c.expires_at>NOW()
+                                 AND c.session_id<>%s
+                           )
                      )
                      AND NOT EXISTS (
                            SELECT 1 FROM admission_quick_list_dismissals d
@@ -5323,6 +5332,7 @@ class BillingAdmissionQueryService:
                     turn_filter, turn_filter, turn_filter,
                     READINESS_READY,
                     bool(allow_uninsured), COVERAGE_UNINSURED_DECLARED,
+                    bool(allow_claim_override),
                     str(session_id or ""),
                     search_text,
                     bool(numeric_search), search_like,
@@ -5589,6 +5599,7 @@ def list_projected_current_and_previous_billable_attentions(
     session_id: str = "",
     turn_filter: str = "ACTUAL",
     allow_uninsured: bool = False,
+    allow_claim_override: bool = False,
     limit: int = 500,
     offset: int = 0,
     repository=None,
@@ -5599,6 +5610,7 @@ def list_projected_current_and_previous_billable_attentions(
         session_id=session_id,
         turn_filter=turn_filter,
         allow_uninsured=allow_uninsured,
+        allow_claim_override=allow_claim_override,
         limit=limit,
         offset=offset,
     )
@@ -5616,12 +5628,19 @@ def invalidate_admission_validation_cache() -> None:
 
 
 def _validation_cache_key(
-    *, session_id: str, turn_filter: str, allow_uninsured: bool, limit: int, offset: int
+    *,
+    session_id: str,
+    turn_filter: str,
+    allow_uninsured: bool,
+    allow_claim_override: bool,
+    limit: int,
+    offset: int,
 ) -> tuple:
     return (
         str(session_id or ""),
         str(turn_filter or "ACTUAL").upper(),
         bool(allow_uninsured),
+        bool(allow_claim_override),
         int(limit),
         int(offset),
     )
@@ -5662,11 +5681,14 @@ def load_admission_validation_attentions(
     offset: int = 0,
 ):
     """Carga la cola compartida exclusivamente desde PostgreSQL."""
-    allow_uninsured = can_view_uninsured_patients(dict(current_user or {}))
+    user = dict(current_user or {})
+    allow_uninsured = can_view_uninsured_patients(user)
+    allow_claim_override = can_override_admission_billing_claim(user)
     cache_key = _validation_cache_key(
         session_id=session_id,
         turn_filter=turn_filter,
         allow_uninsured=allow_uninsured,
+        allow_claim_override=allow_claim_override,
         limit=limit,
         offset=offset,
     )
@@ -5687,6 +5709,7 @@ def load_admission_validation_attentions(
         session_id=session_id,
         turn_filter=turn_filter,
         allow_uninsured=allow_uninsured,
+        allow_claim_override=allow_claim_override,
         limit=limit,
         offset=offset,
         repository=repository,
@@ -6847,6 +6870,9 @@ def claim_projected_billable_attention(
 ):
     """Reserva central transitoria para impedir selección simultánea."""
     full_history = _is_privileged_billing_role(dict(current_user or {}))
+    allow_claim_override = can_override_admission_billing_claim(
+        dict(current_user or {})
+    )
     station_id = str(os.environ.get("COMPUTERNAME", "") or "ESTACION")
     ars_exclusion = admission_ars_sql_exclusion("p.canonical_ars")
     allow_uninsured = can_view_uninsured_patients(dict(current_user or {}))
@@ -6924,8 +6950,19 @@ def claim_projected_billable_attention(
                        receipt_id=NULL,
                        claimed_at=EXCLUDED.claimed_at,
                        expires_at=EXCLUDED.expires_at
-                   WHERE admission_billing_claims.expires_at<=NOW()
-                      OR admission_billing_claims.session_id=EXCLUDED.session_id
+                    WHERE admission_billing_claims.expires_at<=NOW()
+                       OR admission_billing_claims.session_id=EXCLUDED.session_id
+                       OR (
+                            admission_billing_claims.station_id=EXCLUDED.station_id
+                        AND admission_billing_claims.claimed_by=EXCLUDED.claimed_by
+                        AND admission_billing_claims.receipt_id IS NULL
+                        AND admission_billing_claims.processed_at IS NULL
+                       )
+                       OR (
+                            %s
+                        AND admission_billing_claims.receipt_id IS NULL
+                        AND admission_billing_claims.processed_at IS NULL
+                       )
                    RETURNING source_instance_id,attention_id
                )
                SELECT e.* FROM eligible e
@@ -6940,6 +6977,7 @@ def claim_projected_billable_attention(
                 str(username or ""),
                 str(session_id or ""),
                 station_id,
+                bool(allow_claim_override),
             ),
         ).fetchone()
         if (
@@ -9651,15 +9689,15 @@ def _lock_and_validate_admission_processing(
 
     eligible = con.execute(
         """WITH current_shift AS (
-               SELECT %s::TEXT AS source_instance_id,
-                      %s::BIGINT AS turn_id
+               SELECT %s::TEXT AS operational_source_id,
+                       %s::BIGINT AS turn_id
            )
            SELECT p.turn_id AS turno_origen_id,
                   cs.turn_id AS turno_procesamiento_id,
                   (p.turn_id<>cs.turn_id) AS is_inherited
-           FROM admission_attention_projection p
-           JOIN current_shift cs
-             ON cs.source_instance_id=p.source_instance_id
+            FROM admission_attention_projection p
+            JOIN current_shift cs
+              ON p.operational_source_id::TEXT=cs.operational_source_id
            LEFT JOIN admission_shift_inheritances inheritance
              ON inheritance.source_instance_id=p.source_instance_id
             AND inheritance.attention_id=p.attention_id
@@ -9676,7 +9714,11 @@ def _lock_and_validate_admission_processing(
                  IN ('ACTIVA','PENDIENTE')
            LIMIT 1""",
         (
-            str(shift["source_instance_id"]), int(shift["turn_id"]),
+            str(
+                shift.get("operational_source_id")
+                or shift["source_instance_id"]
+            ),
+            int(shift["turn_id"]),
             attention_id, source_instance_id, READINESS_READY,
         ),
     ).fetchone()
@@ -13481,6 +13523,11 @@ def user_is_admin(user: dict) -> bool:
 
 def _is_privileged_billing_role(user: dict) -> bool:
     return normalize_role((user or {}).get("role")) in {ROLE_ADMIN, ROLE_AUDIT}
+
+
+def can_override_admission_billing_claim(user: dict) -> bool:
+    """Admin/Auditor may recover an unfinished claim without a linked receipt."""
+    return _is_privileged_billing_role(user)
 
 
 def can_access_billing_admission_history(user: dict) -> bool:

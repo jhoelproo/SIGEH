@@ -22,7 +22,7 @@ from sigeh_update import (
 from updater import apply_update, merge_preserved
 
 
-def _release(repository=GITHUB_REPOSITORY, version="1.0.3"):
+def _release(repository=GITHUB_REPOSITORY, version="1.0.4"):
     archive, checksum, manifest = release_asset_names(version)
     return {
         "tag_name": f"v{version}",
@@ -41,15 +41,15 @@ def _release(repository=GITHUB_REPOSITORY, version="1.0.3"):
 
 def test_product_and_channel_are_sigeh_only():
     assert PRODUCT_ID == "SIGEH"
-    assert APP_VERSION == "1.0.2"
+    assert APP_VERSION == "1.0.3"
     assert LATEST_RELEASE_API.endswith(f"/{GITHUB_REPOSITORY}/releases/latest")
     assert "Hospital-Contreras-Facturacion1" not in LATEST_RELEASE_API
 
 
 def test_release_parser_accepts_complete_sigeh_release():
     release = parse_release(_release())
-    assert release.version == "1.0.3"
-    assert release.archive_name == "SIGEH-1.0.3-windows-x64.zip"
+    assert release.version == "1.0.4"
+    assert release.archive_name == "SIGEH-1.0.4-windows-x64.zip"
     assert is_newer(release.version, APP_VERSION)
     assert not is_newer(APP_VERSION, APP_VERSION)
 

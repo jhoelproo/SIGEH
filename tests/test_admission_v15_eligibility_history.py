@@ -143,6 +143,32 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
             readiness_index = params.index(app.READINESS_READY)
             self.assertEqual(params[readiness_index + 1], allowed)
 
+    def test_admin_and_auditor_can_recover_unprocessed_claims(self):
+        for role, allowed in (
+            (app.ROLE_ADMIN, True),
+            (app.ROLE_AUDIT, True),
+            (app.ROLE_AUX, False),
+        ):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    app.can_override_admission_billing_claim({"role": role}),
+                    allowed,
+                )
+
+                connection = _Connection()
+                with patch.object(app, "db_connect", return_value=connection):
+                    app.load_admission_validation_attentions(
+                        current_user={"role": role},
+                        session_id=f"session-{role}",
+                    )
+                queue_sql, queue_params = connection.calls[-1]
+                self.assertIn(
+                    "AND ( %s OR NOT EXISTS ( SELECT 1 FROM admission_billing_claims",
+                    queue_sql,
+                )
+                coverage_index = queue_params.index(app.COVERAGE_UNINSURED_DECLARED)
+                self.assertEqual(queue_params[coverage_index + 1], allowed)
+
     def test_final_claim_revalidates_all_billing_rules(self):
         connection = _Connection()
         with patch.object(app, "db_connect", return_value=connection):
@@ -161,7 +187,65 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
         self.assertIn("p.source_status", sql)
         self.assertIn("p.coverage_status", sql)
         self.assertIn("SENASASUB", sql)
-        self.assertIn(True, params)
+        self.assertIn(
+            "admission_billing_claims.station_id=EXCLUDED.station_id",
+            sql,
+        )
+        self.assertIn(
+            "admission_billing_claims.claimed_by=EXCLUDED.claimed_by",
+            sql,
+        )
+        self.assertIn("admission_billing_claims.receipt_id IS NULL", sql)
+        self.assertIs(params[-1], True)
+
+    def test_auxiliary_cannot_take_over_another_active_claim(self):
+        connection = _Connection()
+        with patch.object(app, "db_connect", return_value=connection):
+            app.claim_projected_billable_attention(
+                901,
+                "V15-CENTRAL",
+                username="aux",
+                session_id="session-aux",
+                current_user={"role": app.ROLE_AUX},
+            )
+        sql, params = connection.calls[-1]
+        self.assertIn(
+            "( %s AND admission_billing_claims.receipt_id IS NULL",
+            sql,
+        )
+        self.assertIs(params[-1], False)
+
+    def test_history_recheck_ignores_claim_only_for_privileged_roles(self):
+        for role, allowed in (
+            (app.ROLE_ADMIN, True),
+            (app.ROLE_AUDIT, True),
+            (app.ROLE_AUX, False),
+        ):
+            with self.subTest(role=role):
+                row = _projection_row(901)
+                row.update(
+                    active_turn_id=22,
+                    active_operational_source_id="V15-CENTRAL",
+                    ars_billing_enabled=True,
+                )
+                connection = _Connection([row])
+                with (
+                    patch.object(app, "db_connect", return_value=connection),
+                    patch.object(
+                        app,
+                        "_evaluate_hybrid_eligibility",
+                        return_value={"eligible": True},
+                    ),
+                ):
+                    app.evaluate_attention_billing_eligibility(
+                        901,
+                        {"role": role},
+                        source_instance_id="V15-CENTRAL",
+                        session_id=f"session-{role}",
+                    )
+                sql, params = connection.calls[-1]
+                self.assertIn("AND NOT %s ) AS claimed_elsewhere", sql)
+                self.assertIs(params[1], allowed)
 
     def test_billing_history_matches_active_v15_universe_and_left_joins_billing(self):
         connection = _Connection()

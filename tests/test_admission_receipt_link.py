@@ -42,6 +42,20 @@ class StrictConnection:
             )
 
 
+class SequentialConnection:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.calls = []
+
+    def execute(self, sql, params=None):
+        compact = " ".join(str(sql).split())
+        params = tuple(params or ())
+        StrictConnection.assert_placeholder_count(compact, params)
+        self.calls.append((compact, params))
+        row = self.rows.pop(0) if self.rows else None
+        return Cursor(row)
+
+
 class AdmissionReceiptLinkTests(unittest.TestCase):
     def attention(self):
         return {
@@ -141,6 +155,54 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
             app._billing_month_bounds(2026, 12),
             ("2026-12-01 00:00:00", "2027-01-01 00:00:00"),
         )
+
+    def test_final_save_validates_pc_source_against_shared_operational_source(self):
+        connection = SequentialConnection(
+            [
+                None,
+                None,
+                {
+                    "turno_origen_id": 3942,
+                    "turno_procesamiento_id": 3942,
+                    "is_inherited": False,
+                },
+                {"session_id": "login-session", "expires_at": "future"},
+            ]
+        )
+        attention = {
+            "attention_id": 1,
+            "source_instance_id": "PC-PRIVATE-SOURCE",
+        }
+        central_shift = {
+            "operational_source_id": "SHARED-OPERATIONAL-SOURCE",
+            "source_instance_id": "SHARED-OPERATIONAL-SOURCE",
+            "turn_id": 3942,
+        }
+
+        with patch.object(
+            app.BillingAdmissionQueryService,
+            "current_shift",
+            return_value=central_shift,
+        ):
+            result = app._lock_and_validate_admission_processing(
+                connection,
+                attention,
+                session_id="login-session",
+            )
+
+        eligible_sql, eligible_params = next(
+            call
+            for call in connection.calls
+            if "FROM admission_attention_projection p" in call[0]
+        )
+        self.assertIn(
+            "p.operational_source_id::TEXT=cs.operational_source_id",
+            eligible_sql,
+        )
+        self.assertNotIn("cs.source_instance_id=p.source_instance_id", eligible_sql)
+        self.assertEqual(eligible_params[0], "SHARED-OPERATIONAL-SOURCE")
+        self.assertEqual(result["turno_origen_id"], 3942)
+        self.assertEqual(result["turno_procesamiento_id"], 3942)
 
 
 if __name__ == "__main__":
