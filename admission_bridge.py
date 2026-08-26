@@ -11,6 +11,7 @@ import os
 import logging
 import re
 import sqlite3
+import sys
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -36,22 +37,18 @@ _LOGGER = logging.getLogger(__name__)
 def _default_admission_db() -> Path:
     configured = str(os.environ.get("ADMISSION_DB_PATH", "") or "").strip()
     if configured:
-        configured_path = Path(configured).expanduser().resolve(strict=False)
-        appdata_roots = [
-            Path(str(os.environ.get(name, "") or "")).expanduser().resolve(strict=False)
-            for name in ("APPDATA", "LOCALAPPDATA")
-            if str(os.environ.get(name, "") or "").strip()
-        ]
-        if not any(
-            configured_path == root or root in configured_path.parents
-            for root in appdata_roots
-        ):
-            return configured_path
-        _LOGGER.warning(
-            "Se ignoró ADMISSION_DB_PATH heredado de AppData como fuente compartida."
-        )
-    program_data = str(os.environ.get("PROGRAMDATA", r"C:\ProgramData") or r"C:\ProgramData")
-    return Path(program_data) / "Hospital" / "GeneradorHojasEmergencia" / "pacientes.db"
+        return Path(configured).expanduser().resolve(strict=False)
+
+    data_root = str(os.environ.get("EMERGENCIAS_DATA_DIR", "") or "").strip()
+    if data_root:
+        return Path(data_root).expanduser().resolve(strict=False) / "pacientes.db"
+
+    distribution_root = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent
+    )
+    return distribution_root / "_internal" / "data" / "pacientes.db"
 
 
 DEFAULT_ADMISSION_DB = _default_admission_db()
@@ -200,8 +197,10 @@ class AdmissionReadOnlyRepository:
         "turno_id",
     }
 
-    def __init__(self, db_path: os.PathLike | str = DEFAULT_ADMISSION_DB):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: os.PathLike | str | None = None):
+        # Resolve at construction time: the launcher/embedded V15 runtime can
+        # establish its private data directory after this module was imported.
+        self.db_path = Path(db_path) if db_path is not None else _default_admission_db()
         self._source_instance_id = ""
         self._source_schema_version = 0
 

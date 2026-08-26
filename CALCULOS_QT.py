@@ -4838,6 +4838,29 @@ def is_active_session(session_id: str) -> bool:
         return bool(row)
 
 
+def _central_turn_ids_by_operational_session(attentions) -> dict[str, int]:
+    session_ids = sorted({
+        str(data.get("operational_session_id") or "").strip()
+        for data in attentions
+        if str(data.get("operational_session_id") or "").strip()
+    })
+    if not session_ids:
+        return {}
+    with db_connect() as con:
+        rows = con.execute(
+            """SELECT operational_session_id::TEXT AS operational_session_id,
+                      turn_id
+               FROM admission_operational_sessions
+               WHERE operational_session_id::TEXT=ANY(%s)""",
+            (session_ids,),
+        ).fetchall()
+    return {
+        str(row["operational_session_id"]): int(row["turn_id"])
+        for row in rows
+        if row.get("turn_id") is not None
+    }
+
+
 def sync_admission_projection(
     attentions,
     *,
@@ -4846,15 +4869,26 @@ def sync_admission_projection(
     """Actualiza la proyección local sin modificar la base clínica de origen."""
     rows = []
     stamp = synced_at or now_str()
-    for attention in attentions:
-        data = (
+    payloads = [
+        (
             attention.snapshot()
             if isinstance(attention, AdmissionAttention)
             else dict(attention)
         )
+        for attention in attentions
+    ]
+    central_turn_ids = _central_turn_ids_by_operational_session(payloads)
+    for data in payloads:
         source_instance_id = str(data.get("source_instance_id") or "LEGACY")
         attention_id = int(data["attention_id"])
         patient_id = int(data["patient_id"])
+        operational_session_id = str(
+            data.get("operational_session_id") or ""
+        ).strip()
+        canonical_turn_id = central_turn_ids.get(
+            operational_session_id,
+            int(data.get("turn_id") or 0),
+        )
         # Las filas V15 previas no se reescriben: reciben UUIDs deterministas
         # para que dos estaciones no creen identidades distintas al migrarlas.
         global_attention_id = str(
@@ -4874,7 +4908,7 @@ def sync_admission_projection(
                 source_instance_id,
                 attention_id,
                 patient_id,
-                int(data.get("turn_id") or 0),
+                canonical_turn_id,
                 str(data.get("service_date") or ""),
                 str(data.get("service_time") or ""),
                 str(data.get("name") or ""),
@@ -4902,7 +4936,7 @@ def sync_admission_projection(
                 operational_source_id,
                 int(data.get("version") or 1),
                 str(data.get("origin_device_id") or ""),
-                str(data.get("operational_session_id") or "") or None,
+                operational_session_id or None,
                 int(data.get("generation") or 0) or None,
             )
         )
@@ -4978,16 +5012,15 @@ def sync_admission_projection(
 
 
 _ADMISSION_HISTORY_RECONCILE_LOCK = threading.Lock()
-_ADMISSION_HISTORY_RECONCILED_SIGNATURE = None
 
 
 def ensure_admission_history_projection(repository=None, *, page_size=500):
     """Reconcile the complete V15 source into the PostgreSQL read projection.
 
-    This runs only from the advanced history worker.  V15 is opened read-only,
-    each source batch is bounded, and no clinical source row is modified.
+    This runs from Billing's background selector/history workers. V15 is opened
+    read-only, each source batch is bounded, and no clinical source row is
+    modified.
     """
-    global _ADMISSION_HISTORY_RECONCILED_SIGNATURE
     source = repository or AdmissionReadOnlyRepository()
     with _ADMISSION_HISTORY_RECONCILE_LOCK:
         state = dict(source.history_source_state() or {})
@@ -5003,9 +5036,6 @@ def ensure_admission_history_projection(repository=None, *, page_size=500):
             int(state.get("max_attention_id") or 0),
             str(state.get("max_updated_at") or ""),
         )
-        if signature == _ADMISSION_HISTORY_RECONCILED_SIGNATURE:
-            return {"synced": 0, "source": state, "already_current": True}
-
         with db_connect() as con:
             row = con.execute(
                 """SELECT COUNT(*) AS total_count,
@@ -5013,9 +5043,16 @@ def ensure_admission_history_projection(repository=None, *, page_size=500):
                               WHERE UPPER(TRIM(COALESCE(source_status,'')))='ACTIVA'
                           ) AS active_count,
                           COALESCE(MAX(attention_id),0) AS max_attention_id,
-                          COALESCE(MAX(source_updated_at),'') AS max_updated_at
-                   FROM admission_attention_projection
-                   WHERE source_instance_id=%s""",
+                          COALESCE(MAX(p.source_updated_at),'') AS max_updated_at,
+                          COUNT(*) FILTER (
+                              WHERE p.operational_session_id IS NOT NULL
+                                AND session.turn_id IS NOT NULL
+                                AND p.turn_id<>session.turn_id
+                          ) AS turn_mismatch_count
+                   FROM admission_attention_projection p
+                   LEFT JOIN admission_operational_sessions session
+                     ON session.operational_session_id=p.operational_session_id
+                   WHERE p.source_instance_id=%s""",
                 (source_id,),
             ).fetchone()
         projected = dict(row or {})
@@ -5026,8 +5063,10 @@ def ensure_admission_history_projection(repository=None, *, page_size=500):
             int(projected.get("max_attention_id") or 0),
             str(projected.get("max_updated_at") or ""),
         )
-        if projection_signature == signature:
-            _ADMISSION_HISTORY_RECONCILED_SIGNATURE = signature
+        if (
+            projection_signature == signature
+            and int(projected.get("turn_mismatch_count") or 0) == 0
+        ):
             return {"synced": 0, "source": state, "already_current": True}
 
         synced = 0
@@ -5052,9 +5091,16 @@ def ensure_admission_history_projection(repository=None, *, page_size=500):
                               WHERE UPPER(TRIM(COALESCE(source_status,'')))='ACTIVA'
                           ) AS active_count,
                           COALESCE(MAX(attention_id),0) AS max_attention_id,
-                          COALESCE(MAX(source_updated_at),'') AS max_updated_at
-                   FROM admission_attention_projection
-                   WHERE source_instance_id=%s""",
+                          COALESCE(MAX(p.source_updated_at),'') AS max_updated_at,
+                          COUNT(*) FILTER (
+                              WHERE p.operational_session_id IS NOT NULL
+                                AND session.turn_id IS NOT NULL
+                                AND p.turn_id<>session.turn_id
+                          ) AS turn_mismatch_count
+                   FROM admission_attention_projection p
+                   LEFT JOIN admission_operational_sessions session
+                     ON session.operational_session_id=p.operational_session_id
+                   WHERE p.source_instance_id=%s""",
                 (source_id,),
             ).fetchone()
         verified_signature = (
@@ -5064,11 +5110,13 @@ def ensure_admission_history_projection(repository=None, *, page_size=500):
             int(verified["max_attention_id"] or 0),
             str(verified["max_updated_at"] or ""),
         )
-        if verified_signature != signature:
+        if (
+            verified_signature != signature
+            or int(verified.get("turn_mismatch_count") or 0) != 0
+        ):
             raise AdmissionBridgeError(
                 "La proyección histórica no coincide con la fuente V15."
             )
-        _ADMISSION_HISTORY_RECONCILED_SIGNATURE = signature
         return {"synced": synced, "source": state, "already_current": False}
 
 
@@ -5173,6 +5221,7 @@ class BillingAdmissionQueryService:
         limit: int = 500,
         offset: int = 0,
     ):
+        ensure_admission_history_projection(self.repository)
         search_text = str(identifier or "").strip()
         digits = re.sub(r"\D", "", search_text)
         numeric_search = bool(digits) and not bool(
@@ -5317,6 +5366,7 @@ class BillingAdmissionQueryService:
             raise PermissionError(
                 "Tu rol no puede consultar el Historial de Admisión para Facturación."
             )
+        ensure_admission_history_projection(self.repository)
         full_history = _is_privileged_billing_role(user)
         shift = self.current_shift()
         turn_filter = str(turn_filter or "TODOS").strip().upper()
