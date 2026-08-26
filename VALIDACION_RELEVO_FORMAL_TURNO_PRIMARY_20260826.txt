@@ -59,6 +59,8 @@ COVERAGE_MODIFIED_ONLY = NO VERIFICADO - no existe diff-cover configurado.
 PRODUCTION_DATABASE_WRITES = NO
 
 BUILD_EXE = PASS - PyInstaller 6.19.0, build_app.spec, ONEDIR, una ejecucion.
+QTCORE_REMOTE_PC_ROOT_CAUSE = PASS - ICU ABI incompatible por orden de carga de DLL.
+QT_ICU_COLOCATED_WITH_QTCORE = PASS - icuuc.dll e icudt78.dll en _internal/PySide6.
 PACKAGING = PASS - ZIP 299414544 bytes; SHA256 verificado.
 SMOKE_TEST = PASS - SIGEH.exe despacho CALCULOS_QT.exe y permanecio activo 12 s.
 GITHUB_PRODUCTION_RELEASE = PASS - v1.0.2, ZIP remoto 299414544 bytes,
