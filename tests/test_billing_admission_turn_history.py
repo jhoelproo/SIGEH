@@ -75,6 +75,12 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
 
     def setUp(self):
         app.invalidate_admission_validation_cache()
+        self.projection_reconcile_patch = patch.object(
+            app,
+            "ensure_admission_history_projection",
+            return_value={"synced": 0, "already_current": True},
+        )
+        self.projection_reconcile = self.projection_reconcile_patch.start()
         self.central_context = patch.object(
             app,
             "get_central_operational_context",
@@ -89,6 +95,7 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
 
     def tearDown(self):
         self.central_context.stop()
+        self.projection_reconcile_patch.stop()
 
     def test_operational_query_uses_one_central_shift_query_and_explicit_inheritance(self):
         connection = _Connection()
@@ -106,6 +113,14 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         self.assertNotIn("turn_rank", sql)
         self.assertNotIn("MAX(p2.turn_id)", sql)
 
+    def test_selector_reconciles_real_admission_history_before_querying_projection(self):
+        connection = _Connection()
+        repository = _Repository()
+        service = app.BillingAdmissionQueryService(repository)
+        with patch.object(app, "db_connect", return_value=connection):
+            service.get_operational_candidates()
+        self.projection_reconcile.assert_called_with(repository)
+
     def test_history_fetches_only_fifty_and_returns_keyset_cursor(self):
         rows = [_history_row(value) for value in range(100, 49, -1)]
         connection = _Connection(rows)
@@ -122,6 +137,16 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         self.assertNotIn("COUNT(*) OVER", sql)
         self.assertIn("NULLIF(p.synced_at,'')::TIMESTAMPTZ", sql)
         self.assertEqual(params[-1], 51)
+
+    def test_history_reconciles_real_admission_history_before_querying_projection(self):
+        connection = _Connection()
+        repository = _Repository()
+        service = app.BillingAdmissionQueryService(repository)
+        with patch.object(app, "db_connect", return_value=connection):
+            service.load_admission_history_batch(
+                current_user={"role": app.ROLE_ADMIN}, limit=50
+            )
+        self.projection_reconcile.assert_called_with(repository)
 
     def test_typed_validation_search_reuses_the_short_lived_queue_snapshot(self):
         row = _history_row(17)
