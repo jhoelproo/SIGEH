@@ -1,0 +1,53 @@
+SIGEH 1.0.3 - VALIDACION DE COLA DE ADMISION PARA FACTURACION
+FECHA = 2026-08-26
+
+CAUSA_RAIZ = La cola rapida excluia toda reserva activa creada por otra sesion, incluso para Administrador y Facturador de Auditoria. Adicionalmente, la validacion final comparaba la identidad operacional compartida contra la identidad privada de la PC.
+
+ADMIN_VISUALIZA_TURNO_ACTUAL = PASS
+AUDITOR_VISUALIZA_TURNO_ACTUAL = PASS
+ADMIN_PUEDE_RECUPERAR_RESERVA_INCONCLUSA = PASS
+AUDITOR_PUEDE_RECUPERAR_RESERVA_INCONCLUSA = PASS
+AUXILIAR_MANTIENE_BLOQUEO_ENTRE_SESIONES = PASS
+RECIBO_VINCULADO_NO_PUEDE_SER_RECLAMADO = PASS
+ATENCION_PROCESADA_NO_PUEDE_SER_RECLAMADA = PASS
+IDENTIDAD_OPERACIONAL_COMPARTIDA_EN_VALIDACION_FINAL = PASS
+CACHE_SEPARADA_POR_POLITICA_DE_ROL = PASS
+
+POSTGRES_READ_ONLY_CURRENT_READY = 3
+POSTGRES_READ_ONLY_ACTIVE_UNPROCESSED_CLAIMS = 1
+POSTGRES_READ_ONLY_LINKED_RECEIPTS = 0
+POSTGRES_READ_ONLY_ACTIVE_DISMISSALS = 0
+POSTGRES_MUTATIONS_DURING_QA = 0
+
+TARGETED_AND_RELATED_TESTS = PASS
+TEST_RESULT = 89 passed, 11 skipped, 15 subtests passed
+DIFF_LINE_COVERAGE = 100% (68/68)
+PY_COMPILE = PASS
+RUFF_MODIFIED_FILES = PASS
+GIT_DIFF_CHECK = PASS
+
+FULL_REPOSITORY_SUITE = FAIL
+FULL_SUITE_NOTE_1 = Un hang heredado aparece en test_billing_ars_profiles_and_trash_ui al combinarlo con la suite; aislado pasa.
+FULL_SUITE_NOTE_2 = test_operational_primary_transition: 19 fallos reproducibles tambien en aislamiento sobre semantica de PRIMARY no modificada por esta tarea.
+FULL_SUITE_NOTE_3 = Dos fallos heredados adicionales: guard de SQLite bajo OneDrive y expectativa de log de Excel vacio; modulos no modificados por esta tarea.
+
+PYINSTALLER_ONEDIR = PASS
+DIRECT_CALCULOS_QT_SMOKE = PASS
+SIGEH_LAUNCHER_SMOKE = PASS
+ZIP_INTEGRITY = PASS
+ZIP_SHA256 = ebed3248e6c2056864158333f1b8a488b19f59afb4f7f5cc7529c1de8bd75b59
+
+FILES_MODIFIED =
+- CALCULOS_QT.py
+- sigeh_product.py
+- version_config.json
+- tests/test_admission_receipt_link.py
+- tests/test_admission_v15_eligibility_history.py
+- tests/test_sigeh_update.py
+- RELEASE_NOTES_1.0.3.md
+- VALIDACION_SIGEH_1_0_3_ADMIN_AUDIT_BILLING_20260826.txt
+
+SCOPED_FUNCTIONALITY = PASS
+SCOPED_BUILD_AND_SMOKE = PASS
+GLOBAL_QUALITY_GATE = FAIL
+FINAL_RESULT = BLOCKED (por fallos heredados de la suite global fuera del alcance; la correccion y el artefacto 1.0.3 pasan su suite relacionada)
