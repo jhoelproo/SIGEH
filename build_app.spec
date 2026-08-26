@@ -248,15 +248,12 @@ def collect_qt_icu_runtime():
     """
     if os.name != "nt":
         return []
-    search_dirs = [Path(part) for part in os.environ.get("PATH", "").split(os.pathsep) if part]
-    search_dirs.extend((Path(sys.base_prefix), Path(sys.base_prefix) / "DLLs"))
-    for directory in search_dirs:
-        icuuc = directory / "icuuc.dll"
-        data_files = sorted(directory.glob("icudt*.dll")) if directory.is_dir() else []
-        if icuuc.is_file() and data_files:
-            return [(str(icuuc), "PySide6"), (str(data_files[-1]), "PySide6")]
+    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    runtime = tuple(system32 / name for name in ("icu.dll", "icuuc.dll", "icuin.dll"))
+    if all(path.is_file() for path in runtime):
+        return [(str(path), "PySide6") for path in runtime]
     raise FileNotFoundError(
-        "No se encontraron icuuc.dll e icudt*.dll compatibles para QtCore."
+        "No se encontro el runtime ICU de Windows compatible con QtCore."
     )
 
 
