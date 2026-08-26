@@ -61,8 +61,10 @@ PRODUCTION_DATABASE_WRITES = NO
 BUILD_EXE = PASS - PyInstaller 6.19.0, build_app.spec, ONEDIR, una ejecucion.
 PACKAGING = PASS - ZIP 299414544 bytes; SHA256 verificado.
 SMOKE_TEST = PASS - SIGEH.exe despacho CALCULOS_QT.exe y permanecio activo 12 s.
-GITHUB_PRODUCTION_RELEASE = PENDIENTE
+GITHUB_PRODUCTION_RELEASE = PASS - v1.0.2, ZIP remoto 299414544 bytes,
+  digest sha256:2b97005298415e8f3c70770237bf3c266dac6d1915cc95c0f4a9549d6cb2af61.
 DESKTOP_FOLDER = PASS - C:\Users\ampar\OneDrive\Desktop\SIGEH_1.0.2_RELEVO_CHECKBOX_20260826_084220
 
 ESTADO FINAL: NO APROBADO PARA ENTREGA
-MOTIVO: build, smoke y publicacion aun pendientes en esta ejecucion.
+MOTIVO: la funcionalidad, build, smoke, empaquetado y publicacion estan en PASS,
+pero los gates globales heredados de lint y cobertura del repositorio no cumplen AGENTS.md.
