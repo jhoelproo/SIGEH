@@ -1,0 +1,68 @@
+VALIDACION RELEVO FORMAL DE TURNO PRIMARY Y CHECKBOX - 2026-08-26
+
+ALCANCE
+- Login en PRIMARY no modifica por si solo representante, turno ni generacion.
+- Un operador autorizado distinto queda en PRIMARY con relevo pendiente y solo lectura.
+- La accion explicita Cambiar turno usa una politica separada de la escritura de pacientes.
+- Confirmar el relevo crea un nuevo turn_id, cambia el representante y conserva PRIMARY.
+- Solo se invalida la secundaria autenticada como el representante saliente.
+- La correccion manual del representante sigue separada y protegida por credencial Admin.
+- Checkbutton y Radiobutton reservan 4 px para que el ultimo glifo no se recorte al marcar.
+
+ARCHIVOS MODIFICADOS
+- admission_hybrid.py
+- admission_v15_adapter.py
+- ADMISION_PYSIDE6_V15/facturacion_tabs_pyside6.py
+- ADMISION_PYSIDE6_V15/qt_compat.py
+- CALCULOS_QT.py
+- tests/test_primary_formal_shift_handover_20260826.py
+- tests/test_checkbox_icon_startup_theme_20260825.py
+
+RESULTADOS FUNCIONALES
+LOGIN_PRIMARY_DOES_NOT_CHANGE_TURN = PASS
+LOGIN_PRIMARY_DOES_NOT_CHANGE_REPRESENTATIVE = PASS
+DIFFERENT_AUTHORIZED_USER_PRIMARY_CAN_CHANGE_TURN = PASS
+PATIENT_WRITE_REMAINS_READ_ONLY_BEFORE_HANDOVER = PASS
+TURN_GUARD_DOES_NOT_REUSE_PATIENT_WRITE_POLICY = PASS
+SECONDARY_CANNOT_CHANGE_TURN = PASS
+AUDIT_CANNOT_START_HANDOVER = PASS
+UNCONFIGURED_SESSION_CANNOT_START_AUX_HANDOVER = PASS
+FORMAL_HANDOVER_ALLOCATES_NEW_CENTRAL_TURN_ID = PASS
+FORMAL_HANDOVER_CHANGES_REPRESENTATIVE = PASS
+FORMAL_HANDOVER_PRESERVES_PRIMARY_DEVICE = PASS
+OLD_REP_SECONDARY_INVALIDATED = PASS
+OTHER_USER_SECONDARY_PRESERVED = PASS
+OLD_REP_SECONDARY_FORCE_LOGOUT = PASS
+ADMIN_SCHEDULE_OVERRIDE_REMAINS_TURN_ONLY = PASS
+ADMIN_REPRESENTATIVE_CORRECTION_REMAINS_SEPARATE = PASS
+CHECKBOX_LAST_GLYPH_VISIBLE = PASS
+RADIO_LAST_GLYPH_VISIBLE = PASS
+CHECKED_UNCHECKED_SIZE_STABLE = PASS
+
+PRUEBAS EJECUTADAS
+- Relevo/turno/sincronizacion/permisos: 82 passed.
+- Apariencia previa checkbox/radio: 3 passed.
+- Regresion especifica de ancho al marcar: 1 passed.
+- TOTAL RELACIONADO: 86 passed, 0 failed.
+- Suite completa: NO VERIFICADO; existe un bloqueo heredado en pruebas GUI al ejecutarlas
+  todas en un mismo proceso. Las pruebas afectadas se ejecutaron separadas y finalizaron.
+
+CALIDAD
+PY_COMPILE_MODIFIED = PASS
+GIT_DIFF_CHECK = PASS
+RUFF_REPOSITORY = FAIL - 600 incidencias heredadas en modulos legacy; no se introdujo
+  una supresion ni se amplio el alcance para reformatear 35 mil lineas.
+FORMATTER_BLACK = N/A - modulo black no instalado.
+TYPE_CHECKER = N/A - proyecto dinamico sin configuracion de tipos.
+COVERAGE_REPOSITORY_TOTAL = 34 % (medicion existente; inferior al gate global).
+COVERAGE_MODIFIED_ONLY = NO VERIFICADO - no existe diff-cover configurado.
+PRODUCTION_DATABASE_WRITES = NO
+
+BUILD_EXE = PASS - PyInstaller 6.19.0, build_app.spec, ONEDIR, una ejecucion.
+PACKAGING = PENDIENTE
+SMOKE_TEST = PASS - SIGEH.exe despacho CALCULOS_QT.exe y permanecio activo 12 s.
+GITHUB_PRODUCTION_RELEASE = PENDIENTE
+DESKTOP_FOLDER = PENDIENTE
+
+ESTADO FINAL: NO APROBADO PARA ENTREGA
+MOTIVO: build, smoke y publicacion aun pendientes en esta ejecucion.

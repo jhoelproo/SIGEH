@@ -1061,6 +1061,21 @@ class _HybridAdmissionRuntime:
             )
         return allowed
 
+    def is_primary_shift_handover(self) -> bool:
+        """Whether the next normal turn change is an explicit operator handover."""
+        from admission_hybrid import is_primary_shift_handover
+
+        state = self._operational_state
+        return bool(
+            state is not None
+            and not self.offline
+            and is_primary_shift_handover(
+                self.current_user,
+                state,
+                state.device_role,
+            )
+        )
+
     def require_primary_turn_change(self):
         """Guard the normal turn command without treating it as a user transition."""
         attachment = self.attachment
@@ -1069,8 +1084,8 @@ class _HybridAdmissionRuntime:
             from admission_hybrid import AdmissionWriteBlocked
 
             raise AdmissionWriteBlocked(
-                "Solo un Administrador o el representante operativo en la "
-                "estación PRIMARY puede cambiar el turno de Admisión."
+                "Solo un usuario operativo autorizado en la estación PRIMARY "
+                "puede cambiar el turno de Admisión."
             )
         return self.guard.require_primary_turn_change(
             login_user=self.username,
@@ -1165,26 +1180,56 @@ class _HybridAdmissionRuntime:
             import uuid
             self._pending_transition_id = str(uuid.uuid4())
 
-        # El cambio de turno es independiente del representante. La identidad
-        # operacional vigente se conserva y el Administrador queda como actor.
         administrative_override = bool(metadata.get("administrative_override"))
         override_reason = str(metadata.get("override_reason") or "").strip()
-        result = self.session_service.admin_set_admission_turn(
-            actor_user=self.current_user,
-            operational_session_id=session.operational_session_id,
-            primary_device_id=self.device_id,
-            new_turn_id=turn_id,
-            allocate_central_turn_id=True,
-            new_turn_code=str(metadata.get("turno_codigo") or ""),
-            expected_generation=session.generation,
-            transition_id=self._pending_transition_id,
-            reason=(
-                override_reason
-                if administrative_override and override_reason
-                else "Cambio de turno principal V15"
-            ),
-            administrative_override=administrative_override,
-        )
+        formal_handover = self.is_primary_shift_handover() and not administrative_override
+        if formal_handover:
+            self.logger.info(
+                "PRIMARY_SHIFT_HANDOVER_START device_id=%s revision=%s",
+                self.device_id,
+                session.generation,
+            )
+            result = self.session_service.transition_primary_user(
+                operational_session_id=session.operational_session_id,
+                primary_device_id=self.device_id,
+                new_login_session_id=self.login_session_id,
+                new_user=self.current_user,
+                new_turn_id=turn_id,
+                allocate_central_turn_id=True,
+                new_turn_code=str(metadata.get("turno_codigo") or ""),
+                expected_generation=session.generation,
+                transition_id=self._pending_transition_id,
+                changed_by=self.username,
+                reason="Relevo formal de turno PRIMARY V15",
+                invalidate_secondaries=True,
+                invalidate_only_previous_user_secondaries=True,
+            )
+            self.logger.info(
+                "PRIMARY_SHIFT_HANDOVER_COMMIT device_id=%s revision=%s invalidated=%s",
+                self.device_id,
+                result.new_generation,
+                len(result.invalidated_login_session_ids),
+            )
+        else:
+            # Same representative and administrative schedule corrections keep
+            # the representative unchanged. Manual representative correction is
+            # a separate, Admin-authorized operation.
+            result = self.session_service.admin_set_admission_turn(
+                actor_user=self.current_user,
+                operational_session_id=session.operational_session_id,
+                primary_device_id=self.device_id,
+                new_turn_id=turn_id,
+                allocate_central_turn_id=True,
+                new_turn_code=str(metadata.get("turno_codigo") or ""),
+                expected_generation=session.generation,
+                transition_id=self._pending_transition_id,
+                reason=(
+                    override_reason
+                    if administrative_override and override_reason
+                    else "Cambio de turno principal V15"
+                ),
+                administrative_override=administrative_override,
+            )
         changed = result.operational_session
         if result.committed:
             self._pending_transition_id = ""
@@ -1749,15 +1794,16 @@ class _HybridAdmissionRuntime:
         invalidated_reason = str(
             getattr(self._operational_state, "invalidated_reason", "") or ""
         )
-        # Un cambio/corrección de representante nunca debe expulsar una
-        # estación. Los Auxiliares que no coincidan quedan en solo lectura y
-        # recuperan escritura automáticamente cuando vuelven a coincidir.
-        # Sólo una transferencia administrativa real del PRIMARY revoca el
-        # login anterior desde este canal híbrido.
+        # Una corrección manual de representante no expulsa estaciones. A
+        # diferencia de ella, un relevo formal de turno sí invalida de forma
+        # explícita la secundaria del responsable saliente.
         force_logout = bool(
             self.role == self.StationRole.DETACHED
             and self.login_session_id
-            and invalidated_reason == "PRIMARY_TRANSFERRED_ADMINISTRATIVELY"
+            and invalidated_reason in {
+                "PRIMARY_TRANSFERRED_ADMINISTRATIVELY",
+                "PRIMARY_USER_CHANGED",
+            }
         )
         result.update({
             "role": self.role.value,
@@ -2476,9 +2522,9 @@ class _HybridDatabaseProxy:
                     "obtener_o_crear_turno",
                     "notify_shift_changed",
                 }:
-                    # A normal turn change is not a representative/user
-                    # transition. The PRIMARY operational representative may
-                    # perform it under the same policy as the central command.
+                    # The turn guard decides whether this is a same-user turn
+                    # change or a formal handover by another operator on the
+                    # same PRIMARY. The runtime performs the matching command.
                     self._runtime.require_primary_turn_change()
                 else:
                     self._runtime.require_primary_transition()

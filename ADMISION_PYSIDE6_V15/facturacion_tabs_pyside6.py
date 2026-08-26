@@ -15624,8 +15624,8 @@ class App:
             return (
                 False,
                 "ROLE_NOT_ALLOWED" if is_primary else "NOT_PRIMARY",
-                "Solo un Administrador o el representante operativo autorizado "
-                "en la estación PRIMARY puede cambiar el turno de Admisión."
+                "Solo un usuario operativo autorizado en la estación PRIMARY "
+                "puede cambiar el turno de Admisión."
                 if is_primary
                 else "Solo la estación PRIMARY activa puede cambiar el turno.",
             )
@@ -15841,18 +15841,31 @@ class App:
         cont = tb.Frame(win, padding=14, style="Root.TFrame")
         cont.pack(fill="both", expand=True)
 
+        runtime_turno = getattr(self.db, "_runtime", None)
+        snapshot_turno = dict(runtime_turno.state() or {}) if runtime_turno is not None else {}
+        relevo_formal = bool(
+            runtime_turno is not None
+            and runtime_turno.is_primary_shift_handover()
+        )
+        usuario_autenticado = limpiar_nombre_representante(
+            getattr(self.session_context, "display_name", "")
+            or getattr(self.session_context, "username", "")
+        )
+        subtitulo_turno = (
+            "Confirma el horario. El usuario autenticado asumirá el nuevo turno."
+            if relevo_formal
+            else "Selecciona el horario. El representante operacional actual se conserva."
+        )
         self._crear_header_ventana(
             cont,
             "Configurar turno",
-            "Selecciona el horario. El representante operacional actual se conserva.",
+            subtitulo_turno,
             "⚙"
         )
 
         form_card = tb.Frame(cont, padding=12, style="Card.TFrame")
         form_card.pack(fill="both", expand=True)
 
-        runtime_turno = getattr(self.db, "_runtime", None)
-        snapshot_turno = dict(runtime_turno.state() or {}) if runtime_turno is not None else {}
         usuario_sesion = limpiar_nombre_representante(
             snapshot_turno.get("active_user_display_name")
             or snapshot_turno.get("active_username")
@@ -15868,14 +15881,20 @@ class App:
         ).pack(anchor="w")
         tb.Label(
             rep_box,
-            text=usuario_sesion or "Representante no configurado",
+            text=(usuario_autenticado if relevo_formal else usuario_sesion)
+            or "Representante no configurado",
             font=("Arial", 13, "bold"),
             foreground="#FFFFFF",
             background="#0E1B2B",
         ).pack(anchor="w", pady=(3, 2))
         tb.Label(
             rep_box,
-            text="El cambio de horario no modifica al representante operacional actual.",
+            text=(
+                "Relevo formal: al confirmar, este usuario será el responsable del "
+                "nuevo turno y se cerrará la sesión secundaria del responsable saliente."
+                if relevo_formal
+                else "El cambio de horario no modifica al representante operacional actual."
+            ),
             wraplength=560,
             justify="left",
             foreground="#BDD6F4",
@@ -15950,8 +15969,13 @@ class App:
                 "8:00 PM → 8:00 AM",
             ])
             aviso_var.set(
-                "El nuevo conteo quedará separado y conservará al representante operacional actual. "
-                "Los tres turnos canónicos están disponibles todos los días."
+                (
+                    "El nuevo conteo quedará separado y el usuario autenticado asumirá "
+                    "el nuevo turno. Los tres turnos canónicos están disponibles todos los días."
+                    if relevo_formal
+                    else "El nuevo conteo quedará separado y conservará al representante "
+                    "operacional actual. Los tres turnos canónicos están disponibles todos los días."
+                )
             )
             actualizar_vista_previa()
 
@@ -15988,6 +16012,25 @@ class App:
             administrative_override = not turno_config_es_vigente(
                 candidato, momento=momento_cambio
             )
+            relevo_formal_actual = bool(
+                runtime_actual is not None
+                and runtime_actual.is_primary_shift_handover()
+                and not administrative_override
+            )
+            if relevo_formal_actual:
+                nuevo_representante = limpiar_nombre_representante(
+                    getattr(self.session_context, "display_name", "")
+                    or getattr(self.session_context, "username", "")
+                )
+                if not es_representante_valido(nuevo_representante):
+                    messagebox.showwarning(
+                        "Cambio de turno",
+                        "No fue posible identificar al usuario operativo autenticado.",
+                        parent=win,
+                    )
+                    return
+                representante = nuevo_representante
+                candidato["representante"] = representante
             override_reason = ""
             if administrative_override:
                 if normalize_role(self.session_context.role) != ROLE_ADMIN:
@@ -16141,7 +16184,11 @@ class App:
                             "Corrección administrativa de turno aplicada. "
                             "No se generó reporte de cierre."
                             if administrative_override
-                            else "Cambio de turno aplicado. Actualizando Excel en segundo plano."
+                            else (
+                                "Relevo de turno aplicado. Actualizando Excel en segundo plano."
+                                if relevo_formal_actual
+                                else "Cambio de turno aplicado. Actualizando Excel en segundo plano."
+                            )
                         ),
                         "ok",
                     )
@@ -16154,9 +16201,15 @@ class App:
                         "Corrección administrativa de turno aplicada correctamente.\n\n"
                         "El representante y PRIMARY se conservaron. No se generó reporte de cierre."
                         if administrative_override
-                        else "Cambio de turno aplicado correctamente.\n\n"
-                        "El conteo del nuevo turno comenzará desde la hora real del cambio. "
-                        "El listado de Excel se actualizará en segundo plano."
+                        else (
+                            "Relevo formal aplicado correctamente.\n\n"
+                            "El usuario autenticado quedó como responsable del nuevo turno y "
+                            "la sesión secundaria del responsable saliente fue cerrada."
+                            if relevo_formal_actual
+                            else "Cambio de turno aplicado correctamente.\n\n"
+                            "El conteo del nuevo turno comenzará desde la hora real del cambio. "
+                            "El listado de Excel se actualizará en segundo plano."
+                        )
                     ),
                     parent=self.root,
                 )

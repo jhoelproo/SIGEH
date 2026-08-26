@@ -28652,6 +28652,19 @@ class EmergencyWorkspacePage(QWidget):
                 )
             return
 
+        if reason == "PRIMARY_USER_CHANGED":
+            QMessageBox.information(
+                self,
+                "Relevo de turno aplicado",
+                "Se confirmó un nuevo turno formal en la computadora principal.\n\n"
+                "La sesión secundaria del responsable saliente fue cerrada.",
+            )
+            main_window = self.window()
+            force_logout = getattr(main_window, "force_logout", None)
+            if callable(force_logout):
+                force_logout(reason, source_module="Admisión")
+            return
+
         # ---------------------------------------------------------
         # ADMINISTRADOR
         # ---------------------------------------------------------

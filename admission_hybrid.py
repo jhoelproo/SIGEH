@@ -522,17 +522,16 @@ def same_user(first: Any, second: Any) -> bool:
     return bool(first_username and first_username == second_username)
 
 
-def can_change_admission_turn(
+def is_primary_shift_handover(
     authenticated_user: Any,
     operational_state: Mapping[str, Any] | Any,
     station_role: StationRole | str | None = None,
 ) -> bool:
-    """Return whether this login may change the live Admission turn.
+    """Detect a formal operator handover pending on the current PRIMARY.
 
-    A turn change is a PRIMARY command. Administrators may issue it from
-    PRIMARY without becoming the representative; an Auxiliary may issue it
-    only when it is the representative recorded by the central operational
-    snapshot. Display names never participate in this comparison.
+    Merely logging in never changes the representative or turn.  This predicate
+    only enables the explicit turn command when an already configured PRIMARY
+    is being used by a different authorized operator.
     """
     state = (
         dict(operational_state)
@@ -542,6 +541,58 @@ def can_change_admission_turn(
             for name in (
                 "active_user_id",
                 "active_username",
+                "turn_id",
+                "device_role",
+                "role",
+                "status",
+                "connection_state",
+                "offline",
+            )
+        }
+    )
+    resolved_station_role = station_role or state.get(
+        "device_role", state.get("role", StationRole.NONE.value)
+    )
+    if isinstance(resolved_station_role, StationRole):
+        resolved_station_role = resolved_station_role.value
+    if str(resolved_station_role or "").upper() != StationRole.PRIMARY.value:
+        return False
+    if bool(state.get("offline")) or str(
+        state.get("connection_state", ConnectivityState.CONNECTED.value)
+    ).upper() in {ConnectivityState.OFFLINE.value, "DISCONNECTED"}:
+        return False
+    if str(state.get("status") or "ACTIVE").upper() != "ACTIVE":
+        return False
+    if not user_can_be_assigned_admission_operator(authenticated_user):
+        return False
+    if not canonical_user_id(state) and not canonical_username(state):
+        return False
+    if _as_int_or_none(state.get("turn_id")) is None:
+        return False
+    return not same_user(authenticated_user, state)
+
+
+def can_change_admission_turn(
+    authenticated_user: Any,
+    operational_state: Mapping[str, Any] | Any,
+    station_role: StationRole | str | None = None,
+) -> bool:
+    """Return whether this login may change the live Admission turn.
+
+    A turn change is a PRIMARY command. Administrators and the current
+    representative may issue it normally.  A different authorized operator on
+    the same PRIMARY may issue it as an explicit formal handover; login alone
+    still cannot modify the central representative or turn.
+    """
+    state = (
+        dict(operational_state)
+        if isinstance(operational_state, Mapping)
+        else {
+            name: getattr(operational_state, name, None)
+            for name in (
+                "active_user_id",
+                "active_username",
+                "turn_id",
                 "device_role",
                 "role",
                 "status",
@@ -570,7 +621,9 @@ def can_change_admission_turn(
         return False
     if role == ADMISSION_ROLE_ADMINISTRATOR:
         return True
-    return same_user(authenticated_user, state)
+    return same_user(authenticated_user, state) or is_primary_shift_handover(
+        authenticated_user, state, resolved_station_role
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3881,7 +3934,11 @@ class OperationalSessionService:
         username = str(login_username or "").strip()
         device = str(device_id or "").strip()
         login_session = str(login_session_id or "").strip()
-        login_identity = {"user_id": login_user_id, "username": username}
+        login_identity = {
+            "user_id": login_user_id,
+            "username": username,
+            "role": login_role,
+        }
         login_role_canonical = canonical_role({"role": login_role})
         login_is_admin = login_role_canonical == ADMISSION_ROLE_ADMINISTRATOR
         login_is_aux = login_role_canonical == ADMISSION_ROLE_AUXILIARY
@@ -3959,9 +4016,15 @@ class OperationalSessionService:
                 identity_matches = same_user(current, login_identity)
                 primary_is_active = self._primary_attachment_is_active(con, current)
                 if current.primary_device_id == device:
-                    if not identity_matches and not login_is_admin:
-                        # Un Auxiliar diferente no puede reutilizar el lease PRIMARY
-                        # ni reemplazar el login_session_id del operador vigente.
+                    handover_pending = bool(
+                        login_is_aux
+                        and is_primary_shift_handover(
+                            login_identity,
+                            current,
+                            StationRole.PRIMARY,
+                        )
+                    )
+                    if not identity_matches and not login_is_admin and not handover_pending:
                         return DeviceAttachment(
                             current,
                             StationRole.DETACHED,
@@ -3974,8 +4037,9 @@ class OperationalSessionService:
                             ),
                         )
                     role = StationRole.PRIMARY
-                    # Admin o el mismo Auxiliar pueden reasociar el login de
-                    # esta misma PC sin tocar representante, turno ni generation.
+                    # La misma PC conserva PRIMARY. Un nuevo Auxiliar queda
+                    # adjunto en modo de relevo: el login por sí solo no cambia
+                    # representante, turno ni generación.
                     con.execute(
                         """UPDATE admission_operational_sessions
                               SET primary_login_session_id=%s,
@@ -4135,7 +4199,16 @@ class OperationalSessionService:
                 raise AdmissionWriteBlocked("No hay una sesión operativa activa de Admisión.")
 
             identity_matches = same_user(current, current_user)
-            if not identity_matches and not is_admin:
+            handover_pending = bool(
+                current.primary_device_id == device
+                and is_aux
+                and is_primary_shift_handover(
+                    current_user,
+                    current,
+                    StationRole.PRIMARY,
+                )
+            )
+            if not identity_matches and not is_admin and not handover_pending:
                 return DeviceAttachment(
                     current, StationRole.DETACHED, False,
                     "Admisión está operando actualmente con "
@@ -4390,6 +4463,7 @@ class OperationalSessionService:
                 "reason_code": reason_code,
                 "active_user_id": session.active_user_id,
                 "active_username": session.active_username,
+                "turn_id": session.turn_id,
             },
         )
         if authenticated_role == ADMISSION_ROLE_AUDIT:
@@ -4962,10 +5036,13 @@ class OperationalSessionService:
         new_user: Mapping[str, Any] | Any,
         new_turn_id: int | None,
         expected_generation: int,
+        new_turn_code: str = "",
         transition_id: str | None = None,
         changed_by: str = "",
         reason: str = "Cambio de usuario principal",
         invalidate_secondaries: bool = True,
+        invalidate_only_previous_user_secondaries: bool = False,
+        allocate_central_turn_id: bool = False,
     ) -> PrimaryTransitionResult:
         """Cambio central idempotente; PRIMARY pertenece al device, no al login."""
         if not user_can_be_assigned_admission_operator(new_user):
@@ -5044,9 +5121,14 @@ class OperationalSessionService:
             primary_data = _mapping(primary_row)
             if not primary_row or str(primary_data.get("station_role") or "") != "PRIMARY":
                 raise AdmissionWriteBlocked("El dispositivo principal no está adjunto.")
+            target_turn_id = (
+                self._allocate_next_central_turn_id(con)
+                if allocate_central_turn_id
+                else _as_int_or_none(new_turn_id)
+            )
             if (
                 same_user(current, new_user)
-                and _as_int_or_none(new_turn_id) == current.turn_id
+                and target_turn_id == current.turn_id
             ):
                 con.execute(
                     """UPDATE admission_operational_sessions SET
@@ -5095,29 +5177,65 @@ class OperationalSessionService:
                     old_username=current.active_username,
                     new_username=current.active_username,
                 )
-            secondaries = con.execute(
-                """SELECT device_id,login_session_id FROM admission_operational_devices
-                   WHERE operational_session_id=%s AND device_id<>%s
-                     AND detached_at IS NULL ORDER BY device_id FOR UPDATE""",
-                (operational_session_id, primary_device_id),
-            ).fetchall()
+            if (
+                invalidate_secondaries
+                and invalidate_only_previous_user_secondaries
+                and self._active_sessions_available(con)
+            ):
+                secondaries = con.execute(
+                    """SELECT d.device_id,d.login_session_id,
+                              s.username AS login_username
+                         FROM admission_operational_devices d
+                         LEFT JOIN active_sessions s
+                           ON s.session_id=d.login_session_id
+                        WHERE d.operational_session_id=%s AND d.device_id<>%s
+                          AND d.detached_at IS NULL
+                        ORDER BY d.device_id FOR UPDATE OF d""",
+                    (operational_session_id, primary_device_id),
+                ).fetchall()
+            elif invalidate_secondaries and not invalidate_only_previous_user_secondaries:
+                secondaries = con.execute(
+                    """SELECT device_id,login_session_id
+                         FROM admission_operational_devices
+                        WHERE operational_session_id=%s AND device_id<>%s
+                          AND detached_at IS NULL
+                        ORDER BY device_id FOR UPDATE""",
+                    (operational_session_id, primary_device_id),
+                ).fetchall()
+            else:
+                secondaries = []
+            selected_secondaries = []
+            for item in secondaries:
+                data = _mapping(item)
+                if invalidate_only_previous_user_secondaries and not same_user(
+                    current,
+                    {"username": data.get("login_username")},
+                ):
+                    continue
+                selected_secondaries.append(data)
+            secondary_device_ids = tuple(
+                str(item.get("device_id") or "")
+                for item in selected_secondaries
+                if str(item.get("device_id") or "")
+            )
             secondary_logins = tuple(
-                str(_mapping(item).get("login_session_id") or "")
-                for item in secondaries
-                if str(_mapping(item).get("login_session_id") or "")
+                str(item.get("login_session_id") or "")
+                for item in selected_secondaries
+                if str(item.get("login_session_id") or "")
             )
             new_generation = current.generation + 1
             con.execute(
                 """UPDATE admission_operational_sessions SET
                        active_username=%s,active_user_id=%s,active_user_display_name=%s,
-                       primary_login_session_id=%s,turn_id=%s,generation=%s,
+                       primary_login_session_id=%s,turn_id=%s,
+                       turn_code=COALESCE(NULLIF(%s,''),turn_code),generation=%s,
                        operational_revision=operational_revision+1,
                        turn_started_at=NOW(),turn_ends_at=NOW()+INTERVAL '12 hours',
                        changed_by=%s,change_reason=%s,updated_at=NOW(),primary_last_seen=NOW()
                    WHERE operational_session_id=%s""",
                 (
                     new_username,new_user_id,display_name,new_login_session_id,
-                    _as_int_or_none(new_turn_id),new_generation,
+                    target_turn_id,str(new_turn_code or "").strip(),new_generation,
                     str(changed_by or new_username),str(reason),operational_session_id,
                 ),
             )
@@ -5138,8 +5256,12 @@ class OperationalSessionService:
                               WHERE operational_session_id=%s))
                    ON CONFLICT(operational_session_id,generation) DO NOTHING""",
                 (
-                    operational_session_id,new_generation,_as_int_or_none(new_turn_id),
-                    new_user_id,new_username,operational_session_id,
+                    operational_session_id,
+                    new_generation,
+                    target_turn_id,
+                    new_user_id,
+                    new_username,
+                    operational_session_id,
                 ),
             )
             con.execute(
@@ -5150,16 +5272,19 @@ class OperationalSessionService:
                    WHERE operational_session_id=%s AND device_id=%s""",
                 (new_login_session_id, operational_session_id, primary_device_id),
             )
-            if invalidate_secondaries:
+            if invalidate_secondaries and secondary_device_ids:
                 con.execute(
                     """UPDATE admission_operational_devices SET
                            detached_at=NOW(),invalidated_at=NOW(),
                            invalidated_reason='PRIMARY_USER_CHANGED',
                            invalidated_generation=%s,new_active_username=%s
-                       WHERE operational_session_id=%s AND device_id<>%s
-                         AND detached_at IS NULL""",
+                       WHERE operational_session_id=%s AND device_id=ANY(%s)
+                          AND detached_at IS NULL""",
                     (
-                        new_generation,new_username,operational_session_id,primary_device_id,
+                        new_generation,
+                        new_username,
+                        operational_session_id,
+                        list(secondary_device_ids),
                     ),
                 )
             sessions_to_close = {
@@ -5912,7 +6037,39 @@ class AdmissionWriteGuard:
             raise AdmissionWriteBlocked("Se requiere conexión para cambiar el turno.")
         if role != StationRole.PRIMARY:
             raise AdmissionWriteBlocked("Solo la estaci\u00f3n principal puede cambiar o cerrar el turno.")
-        return self.require_write(role=role, **kwargs)
+        session = kwargs.get("session")
+        if not session or session.status != "ACTIVE":
+            raise AdmissionWriteBlocked("No hay una sesión operativa activa para cambiar el turno.")
+        if session.primary_device_id != str(kwargs.get("device_id") or ""):
+            raise AdmissionWriteBlocked("La identidad de la estación principal no coincide.")
+        if int(kwargs.get("generation") or 0) != session.generation:
+            raise AdmissionWriteBlocked(
+                "La sesión principal cambió. Actualice antes de cambiar el turno."
+            )
+        role_name = canonical_role({"role": kwargs.get("login_role")})
+        if not role_name:
+            role_name = ADMISSION_ROLE_AUXILIARY
+        authenticated_user = {
+            "user_id": kwargs.get("login_user_id"),
+            "username": kwargs.get("login_user"),
+            "role": role_name,
+        }
+        if not can_change_admission_turn(authenticated_user, session, role):
+            raise AdmissionWriteBlocked(
+                "Solo un usuario operativo autorizado en la estación PRIMARY "
+                "puede cambiar el turno de Admisión."
+            )
+        handover_pending = is_primary_shift_handover(
+            authenticated_user, session, role
+        )
+        return WriteDecision(
+            True,
+            "PRIMARY_SHIFT_HANDOVER_ALLOWED" if handover_pending else "ALLOWED",
+            "Relevo formal pendiente de confirmación."
+            if handover_pending else "Conectado.",
+            role,
+            False,
+        )
 
     def require_primary_transition(
         self, *, device_id: str, session: OperationalSession | None,

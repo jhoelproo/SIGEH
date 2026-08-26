@@ -249,6 +249,28 @@ def test_embedded_admission_applies_checkmarks_to_both_sex_options(
         application.processEvents()
 
 
+def test_checked_choice_controls_keep_stable_width_and_text_guard():
+    application, host, check, radio, _plain_check, _tokens = _choice_host(False)
+    try:
+        radio.configure(radio_checkmark=True)
+        for control in (check, radio):
+            control.setChecked(False)
+            application.processEvents()
+            unchecked_width = control.sizeHint().width()
+            minimum_width = control.minimumSizeHint().width()
+            control.setChecked(True)
+            application.processEvents()
+            checked_width = control.sizeHint().width()
+            font_width = control.fontMetrics().horizontalAdvance(control.text())
+            assert checked_width == unchecked_width
+            assert minimum_width >= checked_width
+            assert checked_width >= font_width + 15 + 7 + 4
+    finally:
+        host.close()
+        host.deleteLater()
+        application.processEvents()
+
+
 def test_svg_icons_are_theme_role_and_dpi_aware_with_visible_pixels():
     for is_dark in (False, True):
         tokens = shell.visual_theme_tokens(is_dark)

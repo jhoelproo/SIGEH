@@ -68,6 +68,7 @@ _BOOT_COLORS = {
 
 _STYLE_REGISTRY: dict[str, dict[str, Any]] = {}
 _STYLE_WIDGETS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+_CHOICE_TEXT_GUARD_PX = 4
 _COMPAT_THEME_TOKENS: dict[str, str] = {
     "window_bg": "#0A1420",
     "panel_bg": "#111E2E",
@@ -164,6 +165,11 @@ def _choice_control_qss(values: dict[str, Any], *, radio: bool) -> str:
         f"{control}:disabled{{background:transparent;color:{muted};}}"
         f"{control}::indicator:disabled{{background:{disabled_bg};border-color:{border};}}"
     )
+
+
+def _guard_choice_text_width(hint: QSize) -> QSize:
+    """Keep the last glyph visible when Windows repaints a checked indicator."""
+    return QSize(hint.width() + _CHOICE_TEXT_GUARD_PX, hint.height())
 
 
 def _ensure_app() -> QApplication:
@@ -1909,6 +1915,12 @@ class Checkbutton(QCheckBox, _WidgetMixin):
         if font is not None:
             self.setFont(font)
 
+    def sizeHint(self):
+        return _guard_choice_text_width(QCheckBox.sizeHint(self))
+
+    def minimumSizeHint(self):
+        return _guard_choice_text_width(QCheckBox.minimumSizeHint(self))
+
 
 class Radiobutton(QRadioButton, _WidgetMixin):
     def __init__(self, parent=None, text="", variable=None, value=None, command=None, **kwargs):
@@ -1932,6 +1944,12 @@ class Radiobutton(QRadioButton, _WidgetMixin):
         font = _font_from(values.get("font"))
         if font is not None:
             self.setFont(font)
+
+    def sizeHint(self):
+        return _guard_choice_text_width(QRadioButton.sizeHint(self))
+
+    def minimumSizeHint(self):
+        return _guard_choice_text_width(QRadioButton.minimumSizeHint(self))
 
 
 class Menubutton(QPushButton, _WidgetMixin):
