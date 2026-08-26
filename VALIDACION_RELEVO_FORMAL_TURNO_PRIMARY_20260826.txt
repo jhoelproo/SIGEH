@@ -59,10 +59,10 @@ COVERAGE_MODIFIED_ONLY = NO VERIFICADO - no existe diff-cover configurado.
 PRODUCTION_DATABASE_WRITES = NO
 
 BUILD_EXE = PASS - PyInstaller 6.19.0, build_app.spec, ONEDIR, una ejecucion.
-PACKAGING = PENDIENTE
+PACKAGING = PASS - ZIP 299414544 bytes; SHA256 verificado.
 SMOKE_TEST = PASS - SIGEH.exe despacho CALCULOS_QT.exe y permanecio activo 12 s.
 GITHUB_PRODUCTION_RELEASE = PENDIENTE
-DESKTOP_FOLDER = PENDIENTE
+DESKTOP_FOLDER = PASS - C:\Users\ampar\OneDrive\Desktop\SIGEH_1.0.2_RELEVO_CHECKBOX_20260826_084220
 
 ESTADO FINAL: NO APROBADO PARA ENTREGA
 MOTIVO: build, smoke y publicacion aun pendientes en esta ejecucion.
