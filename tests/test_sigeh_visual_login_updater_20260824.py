@@ -427,6 +427,21 @@ def test_launcher_uses_compiled_version_when_metadata_is_stale(monkeypatch, tmp_
     assert lanzador.get_local_version() == "1.0.5"
 
 
+def test_launcher_accepts_matching_metadata_without_warning(monkeypatch, tmp_path):
+    (tmp_path / lanzador.CONFIG_FILE).write_text(
+        json.dumps({"product": lanzador.PRODUCT_ID, "version": "1.0.5"}),
+        encoding="utf-8",
+    )
+    warnings = []
+    monkeypatch.setattr(lanzador, "DEFAULT_VERSION", "1.0.5")
+    monkeypatch.setattr(lanzador, "get_real_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(lanzador, "get_bundle_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(lanzador, "write_launcher_log", warnings.append)
+
+    assert lanzador.get_local_version() == "1.0.5"
+    assert warnings == []
+
+
 def test_release_packaging_helpers_and_cli(tmp_path, monkeypatch):
     source = tmp_path / "payload.bin"
     source.write_bytes(b"payload")
