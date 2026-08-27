@@ -256,6 +256,12 @@ def is_remote_newer(remote_version: str, local_version: str) -> bool:
 
 
 def get_local_version():
+    """Return the version compiled into this launcher.
+
+    ``version_config.json`` is retained as package metadata, but it must not
+    downgrade the executable that is actually running. A stale bundled file
+    previously made an already-installed 1.0.5 download itself forever.
+    """
     config_paths = [
         os.path.join(get_real_dir(), CONFIG_FILE),
         os.path.join(get_bundle_dir(), CONFIG_FILE),
@@ -268,7 +274,13 @@ def get_local_version():
                 config = json.load(f)
                 if str(config.get("product") or "") != PRODUCT_ID:
                     continue
-                return config.get("version", DEFAULT_VERSION)
+                metadata_version = str(config.get("version") or "").strip()
+                if metadata_version and metadata_version != DEFAULT_VERSION:
+                    write_launcher_log(
+                        "Metadatos de version discordantes ignorados: "
+                        f"ejecutable={DEFAULT_VERSION}, metadata={metadata_version}."
+                    )
+                break
         except Exception as e:
             write_launcher_log(f"No se pudo leer version_config.json: {e}")
     return DEFAULT_VERSION

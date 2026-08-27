@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from zipfile import ZipFile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -414,6 +415,18 @@ def test_portable_root_uses_frozen_executable(monkeypatch, tmp_path):
     assert portable_launcher.portable_root() == tmp_path
 
 
+def test_launcher_uses_compiled_version_when_metadata_is_stale(monkeypatch, tmp_path):
+    (tmp_path / lanzador.CONFIG_FILE).write_text(
+        json.dumps({"product": lanzador.PRODUCT_ID, "version": "1.0.4"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(lanzador, "DEFAULT_VERSION", "1.0.5")
+    monkeypatch.setattr(lanzador, "get_real_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(lanzador, "get_bundle_dir", lambda: str(tmp_path))
+
+    assert lanzador.get_local_version() == "1.0.5"
+
+
 def test_release_packaging_helpers_and_cli(tmp_path, monkeypatch):
     source = tmp_path / "payload.bin"
     source.write_bytes(b"payload")
@@ -464,6 +477,22 @@ def test_release_guard_requires_updater_and_builds_complete_assets(tmp_path):
     (dist / "_internal" / "database_url.bundle").write_bytes(b"protected")
     result = prepare_release(dist, updater_exe, tmp_path / "release", version="1.0.2")
     assert result["archive"].is_file()
+    expected_version = {"product": "SIGEH", "version": "1.0.2"}
+    assert json.loads(
+        (dist / "version_config.json").read_text(encoding="utf-8")
+    ) == expected_version
+    assert json.loads(
+        (dist / "_internal" / "version_config.json").read_text(encoding="utf-8")
+    ) == expected_version
+    with ZipFile(result["archive"]) as archive:
+        packaged_version = json.loads(
+            archive.read("SIGEH/version_config.json").decode("utf-8")
+        )
+        bundled_version = json.loads(
+            archive.read("SIGEH/_internal/version_config.json").decode("utf-8")
+        )
+    assert packaged_version == expected_version
+    assert bundled_version == expected_version
     manifest = json.loads(result["manifest"].read_text(encoding="utf-8"))
     assert manifest["entrypoint"] == "SIGEH.exe"
     assert manifest["updater"] == "SIGEH_Updater.exe"
