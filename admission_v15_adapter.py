@@ -2041,7 +2041,7 @@ class _HybridDatabaseProxy:
                     if str(row.get("hoja") or row.get("specialty") or "").upper()
                     == specialty
                 ]
-            rows = sorted(rows, key=self._history_sort_key, reverse=False)
+            rows = sorted(rows, key=self._history_sort_key, reverse=True)
             offset = max(0, int(values.get("offset") or 0))
             limit = max(1, min(int(values.get("limite") or 200), 500))
             return rows[offset:offset + limit]
@@ -2109,7 +2109,7 @@ class _HybridDatabaseProxy:
             return sorted(
                 local_method(*args, **kwargs) or [],
                 key=self._history_sort_key,
-                reverse=False,
+                reverse=True,
             )
 
         values = dict(kwargs or {})
@@ -2219,10 +2219,10 @@ class _HybridDatabaseProxy:
                    ORDER BY COALESCE(
                                 p.created_at_effective_utc,
                                 NULLIF(p.synced_at,'')::TIMESTAMPTZ
-                            ) ASC,
-                            COALESCE(p.origin_device_id,'') ASC,
-                            COALESCE(p.device_local_sequence,0) ASC,
-                            COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) ASC
+                            ) DESC,
+                            COALESCE(p.origin_device_id,'') DESC,
+                            COALESCE(p.device_local_sequence,0) DESC,
+                            COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) DESC
                    LIMIT %s OFFSET %s"""
         params.extend((limit + offset, 0))
         with self._runtime.host.connection_factory() as con:
@@ -2287,7 +2287,7 @@ class _HybridDatabaseProxy:
             key = str(row.get("global_attention_id") or "").replace("-", "").lower()
             if key and key not in by_uuid:
                 by_uuid[key] = row
-        merged = sorted(by_uuid.values(), key=self._history_sort_key, reverse=False)
+        merged = sorted(by_uuid.values(), key=self._history_sort_key, reverse=True)
         result = merged[offset:offset + limit]
         if logger is not None:
             logger.info(
@@ -2318,7 +2318,7 @@ class _HybridDatabaseProxy:
         rows = sorted(
             self.list_history_cache_local(method_name, **values),
             key=self._history_sort_key,
-            reverse=False,
+            reverse=True,
         )
         if logger is not None:
             logger.info(

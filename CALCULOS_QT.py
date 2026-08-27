@@ -5405,10 +5405,10 @@ class BillingAdmissionQueryService:
         turn_filter: str = "ACTUAL",
         allow_uninsured: bool = False,
         allow_claim_override: bool = False,
+        allow_all_unbilled: bool = False,
         limit: int = 500,
         offset: int = 0,
     ):
-        ensure_admission_history_projection(self.repository)
         search_text = str(identifier or "").strip()
         digits = re.sub(r"\D", "", search_text)
         numeric_search = bool(digits) and not bool(
@@ -5454,14 +5454,15 @@ class BillingAdmissionQueryService:
                     AND inheritance.turno_origen_id=p.turn_id
                     AND inheritance.estado='PENDIENTE'
                    WHERE (
-                          p.turn_id=cs.turn_id
-                          OR inheritance.attention_id IS NOT NULL
-                         )
-                     AND (
                            %s='TODOS'
                         OR (%s='ACTUAL' AND p.turn_id=cs.turn_id)
                         OR (%s='HEREDADO' AND p.turn_id<>cs.turn_id
-                            AND inheritance.attention_id IS NOT NULL)
+                            AND (inheritance.attention_id IS NOT NULL OR %s))
+                     )
+                     AND (
+                          p.turn_id=cs.turn_id
+                          OR inheritance.attention_id IS NOT NULL
+                          OR (%s AND p.turn_id<>cs.turn_id)
                      )
                      AND p.readiness=%s
                      AND {ars_exclusion}
@@ -5512,6 +5513,7 @@ class BillingAdmissionQueryService:
                    LIMIT %s OFFSET %s""",
                 (
                     turn_filter, turn_filter, turn_filter,
+                    bool(allow_all_unbilled), bool(allow_all_unbilled),
                     READINESS_READY,
                     bool(allow_uninsured), COVERAGE_UNINSURED_DECLARED,
                     bool(allow_claim_override),
@@ -5558,7 +5560,6 @@ class BillingAdmissionQueryService:
             raise PermissionError(
                 "Tu rol no puede consultar el Historial de Admisión para Facturación."
             )
-        ensure_admission_history_projection(self.repository)
         full_history = _is_privileged_billing_role(user)
         shift = self.current_shift()
         turn_filter = str(turn_filter or "TODOS").strip().upper()
@@ -5783,6 +5784,7 @@ def list_projected_current_and_previous_billable_attentions(
     turn_filter: str = "ACTUAL",
     allow_uninsured: bool = False,
     allow_claim_override: bool = False,
+    allow_all_unbilled: bool = False,
     limit: int = 500,
     offset: int = 0,
     repository=None,
@@ -5794,6 +5796,7 @@ def list_projected_current_and_previous_billable_attentions(
         turn_filter=turn_filter,
         allow_uninsured=allow_uninsured,
         allow_claim_override=allow_claim_override,
+        allow_all_unbilled=allow_all_unbilled,
         limit=limit,
         offset=offset,
     )
@@ -5816,6 +5819,7 @@ def _validation_cache_key(
     turn_filter: str,
     allow_uninsured: bool,
     allow_claim_override: bool,
+    allow_all_unbilled: bool,
     limit: int,
     offset: int,
 ) -> tuple:
@@ -5824,6 +5828,7 @@ def _validation_cache_key(
         str(turn_filter or "ACTUAL").upper(),
         bool(allow_uninsured),
         bool(allow_claim_override),
+        bool(allow_all_unbilled),
         int(limit),
         int(offset),
     )
@@ -5867,11 +5872,13 @@ def load_admission_validation_attentions(
     user = dict(current_user or {})
     allow_uninsured = can_view_uninsured_patients(user)
     allow_claim_override = can_override_admission_billing_claim(user)
+    allow_all_unbilled = _is_privileged_billing_role(user)
     cache_key = _validation_cache_key(
         session_id=session_id,
         turn_filter=turn_filter,
         allow_uninsured=allow_uninsured,
         allow_claim_override=allow_claim_override,
+        allow_all_unbilled=allow_all_unbilled,
         limit=limit,
         offset=offset,
     )
@@ -5893,6 +5900,7 @@ def load_admission_validation_attentions(
         turn_filter=turn_filter,
         allow_uninsured=allow_uninsured,
         allow_claim_override=allow_claim_override,
+        allow_all_unbilled=allow_all_unbilled,
         limit=limit,
         offset=offset,
         repository=repository,
@@ -29203,6 +29211,8 @@ class AdmissionValidationDialog(QDialog):
         self.turn_filter_combo.addItem("Turno actual", "ACTUAL")
         self.turn_filter_combo.addItem("Atenciones heredadas", "HEREDADO")
         self.turn_filter_combo.addItem("Turno actual + heredadas", "TODOS")
+        if _is_privileged_billing_role(self.current_user):
+            self.turn_filter_combo.setCurrentIndex(2)
         self.turn_filter_combo.setToolTip("Filtrar por turno operativo")
         self.search_button = QPushButton("Buscar")
         self.refresh_button = QPushButton("Actualizar")
