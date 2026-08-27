@@ -1,0 +1,93 @@
+VALIDACION SIGEH 1.0.5 - HOTFIX DEL CICLO DE ACTUALIZACION
+Fecha: 2026-08-27
+
+CAUSA RAIZ
+- APP_VERSION y el codigo empaquetado declaraban 1.0.5.
+- version_config.json incluido en _internal declaraba 1.0.4.
+- get_local_version() priorizaba el JSON obsoleto sobre la version compilada.
+- El updater instalaba 1.0.5 correctamente, pero en el siguiente arranque el lanzador volvia a considerarse 1.0.4 y descargaba 1.0.5 otra vez.
+
+EVIDENCIA EN LA INSTALACION REPORTADA
+- Carpeta: C:\Users\ampar\OneDrive\Desktop\SIGEH_1.0.5_ESTABLE_20260827_133342
+- lanzador_log.txt contenia dos entregas consecutivas de la actualizacion 1.0.5.
+- actualizador.log confirmaba dos instalaciones exitosas de 1.0.5.
+- _internal\version_config.json contenia version 1.0.4 antes del arreglo.
+
+IMPLEMENTACION
+- version_config.json fuente alineado a 1.0.5.
+- El lanzador usa la version compilada como autoridad y solo trata version_config.json como metadato; un JSON atrasado no puede degradar el ejecutable.
+- release_packaging.py genera version_config.json en la raiz y en _internal con la version exacta del release.
+- validate_dist exige que ambos metadatos existan antes de producir el ZIP.
+- La carpeta reportada fue corregida directamente y su SIGEH.exe fue reemplazado por el lanzador protegido.
+- No se tocaron datos de Admision, Facturacion, pacientes, recibos ni PostgreSQL.
+
+ARCHIVOS MODIFICADOS
+- lanzador.py
+- release_packaging.py
+- version_config.json
+- tests/test_sigeh_update.py
+- tests/test_sigeh_visual_login_updater_20260824.py
+
+PRUEBAS
+- TDD RED: 3 FAILED, 0 PASSED. Se reprodujeron metadata fuente atrasada, downgrade del lanzador y ZIP sin metadata sincronizada.
+- TDD GREEN inicial: 3 PASSED.
+- Suite updater final: 36 PASSED, 0 FAILED, 1 warning heredado de PyPDF2.
+- Suite relacionada con Admision y updater: 117 PASSED, 0 FAILED, 1 warning heredado de PyPDF2.
+- PY_COMPILE: PASS.
+- RUFF archivos modificados excepto lanzador: PASS.
+- RUFF lanzador: 15 E402 heredados antes y despues; 0 errores nuevos.
+- GIT DIFF CHECK: PASS.
+
+COBERTURA
+- Lineas nuevas/modificadas: 100% PASS.
+- Ramas nuevas de metadata coincidente/discordante: 100% PASS.
+- release_packaging.py total en corrida dirigida: 97%.
+- lanzador.py total en corrida dirigida: 21%; el resto corresponde principalmente a GUI/red no ejercitada por estas pruebas unitarias.
+
+BUILD Y QA
+- PyInstaller ONEDIR: PASS.
+- Ejecuciones PyInstaller de este hotfix: 1.
+- SIGEH.exe --self-test: PASS.
+- Arranque normal desde dist contra canal real: PASS.
+- Arranque normal desde la carpeta reportada: PASS.
+- CALCULOS_QT.exe abierto por el lanzador: PASS.
+- Invocacion del updater despues del arreglo: NO.
+- Log final: Producto SIGEH | Version Local 1.0.5 | Version SIGEH 1.0.5 | Sin actualizacion pendiente.
+- Metadata raiz de dist: 1.0.5 PASS.
+- Metadata _internal de dist: 1.0.5 PASS.
+- Metadata raiz dentro del ZIP: 1.0.5 PASS.
+- Metadata _internal dentro del ZIP: 1.0.5 PASS.
+
+PUBLICACION
+- Pull request funcional: https://github.com/jhoelproo/SIGEH/pull/14
+- Pull request cobertura: https://github.com/jhoelproo/SIGEH/pull/15
+- Commit final etiquetado: 5b80be533cb78ef87c7011cbcf0348c1045c522d
+- Release estable reemplazada: https://github.com/jhoelproo/SIGEH/releases/tag/v1.0.5
+- Draft: NO.
+- Prerelease: NO.
+- ZIP remoto: 304329772 bytes.
+- SHA-256 local/remoto/manifiesto: b57e8eecd649da00d2baf4fa4e90cae3b3fb96a300cd33e4f34226cbd0f51fad
+- Canal automatico resuelve version 1.0.5 y el SHA nuevo: PASS.
+
+QUALITY GATES
+- Funcionalidad: PASS
+- Unit tests: PASS
+- Integracion updater/paquete: PASS
+- Regresion relacionada: PASS
+- Cobertura modificada: PASS
+- Boundary metadata igual/atrasada: PASS
+- Formatter: PASS en archivos aplicables
+- Lint dirigido: PASS
+- Errores nuevos de lint: PASS (0)
+- Type checker: N/A - no configurado
+- Complejidad nueva: PASS
+- Duplicacion nueva: PASS
+- Build: PASS
+- Smoke test: PASS
+- Seguridad: PASS - canal, producto, manifiesto y SHA continúan validados
+- Publicacion: PASS
+
+PROBLEMAS PENDIENTES
+- Ninguno dentro del alcance del ciclo de actualizacion 1.0.5.
+
+ESTADO FINAL: APROBADO PARA ENTREGA
