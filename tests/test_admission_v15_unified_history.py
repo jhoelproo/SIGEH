@@ -298,7 +298,7 @@ def test_history_does_not_query_postgresql_when_the_replica_is_available():
 
     rows = proxy.listar_atenciones(limite=200, offset=0)
 
-    assert [row["nombre"] for row in rows] == ["OLD LOCAL", "LOCAL PENDING"]
+    assert [row["nombre"] for row in rows] == ["LOCAL PENDING", "OLD LOCAL"]
 
 
 def test_this_turn_history_uses_central_source_and_turn_from_local_replica():

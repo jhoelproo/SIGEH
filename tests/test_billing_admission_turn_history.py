@@ -113,13 +113,17 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         self.assertNotIn("turn_rank", sql)
         self.assertNotIn("MAX(p2.turn_id)", sql)
 
-    def test_selector_reconciles_real_admission_history_before_querying_projection(self):
+    def test_selector_uses_central_projection_when_local_reconcile_fails(self):
         connection = _Connection()
         repository = _Repository()
         service = app.BillingAdmissionQueryService(repository)
+        self.projection_reconcile.side_effect = app.AdmissionBridgeError(
+            "réplica local no disponible"
+        )
         with patch.object(app, "db_connect", return_value=connection):
             service.get_operational_candidates()
-        self.projection_reconcile.assert_called_with(repository)
+        self.projection_reconcile.assert_not_called()
+        self.assertTrue(connection.calls)
 
     def test_history_fetches_only_fifty_and_returns_keyset_cursor(self):
         rows = [_history_row(value) for value in range(100, 49, -1)]
@@ -138,15 +142,32 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         self.assertIn("NULLIF(p.synced_at,'')::TIMESTAMPTZ", sql)
         self.assertEqual(params[-1], 51)
 
-    def test_history_reconciles_real_admission_history_before_querying_projection(self):
+    def test_history_uses_central_projection_when_local_reconcile_fails(self):
         connection = _Connection()
         repository = _Repository()
         service = app.BillingAdmissionQueryService(repository)
+        self.projection_reconcile.side_effect = app.AdmissionBridgeError(
+            "réplica local no disponible"
+        )
         with patch.object(app, "db_connect", return_value=connection):
-            service.load_admission_history_batch(
+            result = service.load_admission_history_batch(
                 current_user={"role": app.ROLE_ADMIN}, limit=50
             )
-        self.projection_reconcile.assert_called_with(repository)
+        self.projection_reconcile.assert_not_called()
+        self.assertEqual(result["rows"], [])
+        self.assertTrue(connection.calls)
+
+    def test_privileged_queue_recovers_every_active_unbilled_prior_turn(self):
+        connection = _Connection()
+        service = app.BillingAdmissionQueryService(_Repository())
+        with patch.object(app, "db_connect", return_value=connection):
+            service.get_operational_candidates(
+                turn_filter="TODOS", allow_all_unbilled=True
+            )
+        sql, params = connection.calls[-1]
+        self.assertIn("OR (%s AND p.turn_id<>cs.turn_id)", sql)
+        self.assertIn(True, params)
+        self.assertIn("ELSE 'HEREDADA' END AS turn_scope", sql)
 
     def test_typed_validation_search_reuses_the_short_lived_queue_snapshot(self):
         row = _history_row(17)

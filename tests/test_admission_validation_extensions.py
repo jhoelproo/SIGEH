@@ -219,9 +219,21 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
                 [dialog.turn_filter_combo.itemData(i) for i in range(3)],
                 ["ACTUAL", "HEREDADO", "TODOS"],
             )
+            self.assertEqual(dialog.turn_filter_combo.currentData(), "TODOS")
             self.assertTrue(dialog.history_button.isVisibleTo(dialog))
             self.assertFalse(dialog.bypass_button.isHidden())
             self.assertFalse(dialog.dismiss_button.isHidden())
+        finally:
+            dialog.close()
+
+    def test_auxiliary_validation_starts_with_current_turn_only(self):
+        with patch.object(app.QTimer, "singleShot", return_value=None):
+            dialog = app.AdmissionValidationDialog(
+                current_user={"username": "aux", "role": app.ROLE_AUX},
+                session_id="test",
+            )
+        try:
+            self.assertEqual(dialog.turn_filter_combo.currentData(), "ACTUAL")
         finally:
             dialog.close()
 
