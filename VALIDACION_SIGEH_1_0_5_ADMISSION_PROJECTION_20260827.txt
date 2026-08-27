@@ -1,0 +1,101 @@
+VALIDACION SIGEH 1.0.5 - PROYECCION DE ADMISION EN FACTURACION
+Fecha: 2026-08-27
+
+ALCANCE
+- Historial de Admision dentro de Facturacion.
+- Lista de pacientes pendientes para iniciar Facturacion desde Admision.
+- Persistencia de las atenciones visibles durante el intervalo previo al ciclo normal de sincronizacion.
+- No se vacio, elimino, reasigno ni restauro el historial.
+
+CAUSA RAIZ
+- La version 1.0.4 habia retirado la reconciliacion previa de ensure_admission_history_projection() en las dos lecturas de Facturacion.
+- Una atencion ya confirmada en la SQLite de Admision podia tardar hasta el ciclo normal de outbox en materializarse en admission_attention_projection.
+- Durante ese intervalo, Historial de Admision y la lista de validacion consultaban correctamente PostgreSQL, pero recibian cero filas. Por eso los pacientes aparecian inicialmente y luego podian desaparecer o no estar disponibles en ambos dialogos.
+- La consulta del turno activo tampoco restringia la sesion al production_epoch vigente, permitiendo que una sesion ACTIVE obsoleta contaminara el criterio de turno.
+
+IMPLEMENTACION
+- Se agrego repair_admission_projection_before_billing().
+- Ambas consultas ejecutan esa reparacion best-effort antes de leer la proyeccion central.
+- PostgreSQL continua siendo el dataset autoritativo consumido por Facturacion.
+- Si la replica local no esta disponible, la consulta central continua y no convierte Facturacion en un flujo local-only.
+- La sesion actual ahora se une a sigeh_product_state mediante production_epoch_id.
+- Las filas anuladas/eliminadas siguen excluidas por is_deleted y source_status.
+- Version actualizada de 1.0.4 a 1.0.5.
+
+ARCHIVOS MODIFICADOS
+- CALCULOS_QT.py
+- sigeh_product.py
+- tests/test_billing_admission_turn_history.py
+- tests/test_sigeh_update.py
+
+PRUEBAS
+- TDD RED: 2 FAILED, 7 PASSED antes de restaurar la reparacion previa.
+- TDD GREEN enfocada: 9 PASSED.
+- Suite relacionada final: 96 PASSED, 0 FAILED, 1 WARNING deprecado de PyPDF2.
+- PY_COMPILE: PASS
+- RUFF dirigido: PASS
+- GIT DIFF CHECK: PASS
+- Suite global: NO VERIFICADO. Se detuvo tras 7 min 18 s al quedar bloqueada en pruebas GUI/import no relacionadas; no habia fallos informados hasta ese punto.
+
+COBERTURA
+- Lineas modificadas: 100% PASS.
+- Ramas modificadas: 100% PASS.
+- Helper de reparacion: camino exitoso y camino AdmissionBridgeError cubiertos.
+- Cobertura total del archivo heredado CALCULOS_QT.py en la corrida dirigida: 11%; no se declara como cobertura global suficiente.
+
+CALIDAD
+- Formatter dirigido (ruff format en pruebas modificadas): PASS.
+- Lint dirigido: PASS.
+- Lint global CALCULOS_QT.py: 327 incidencias heredadas antes y despues; 0 errores nuevos.
+- Type checker: N/A - no hay type checker configurado para este proyecto.
+- Complejidad nueva: PASS - helper pequeno, sin anidamiento complejo.
+- Duplicacion nueva: PASS - una unica funcion de reparacion reutilizada.
+- Seguridad: PASS - SQL parametrizado, sin PII en logs y permiso de historial evaluado antes de la reparacion.
+
+BUILD Y PAQUETE
+- PyInstaller ONEDIR: PASS.
+- Ejecuciones de PyInstaller para esta entrega: 1.
+- SIGEH.exe --self-test en dist: PASS, exit code 0.
+- SIGEH.exe --self-test en copia del Escritorio: PASS, exit code 0.
+- Check profundo --check-v15-package: FAIL por PermissionError WinError 32 al limpiar pacientes.db temporal; la aplicacion habia alcanzado el chequeo, pero Windows mantenia el archivo temporal abierto. No se corrigio por estar fuera del alcance de proyeccion solicitado.
+- SHA-256 local/remoto/manifiesto: PASS.
+- SHA-256: a347e64193e244d392444cd4ae5f2dead9b9bc4e11800fc6a3f77eff860a39bd
+
+PUBLICACION
+- Pull request funcional: https://github.com/jhoelproo/SIGEH/pull/12
+- Commit de merge: 1929d5067c056b2e5909d65255a3c9d57af4a258
+- Tag: v1.0.5
+- Release estable: https://github.com/jhoelproo/SIGEH/releases/tag/v1.0.5
+- Release draft: NO
+- Release prerelease: NO
+- Canal latest resuelve version 1.0.5: PASS.
+- Archive remoto: SIGEH-1.0.5-windows-x64.zip, 304348919 bytes, digest PASS.
+- Copia ONEDIR: C:\Users\ampar\OneDrive\Desktop\SIGEH_1.0.5_ESTABLE_20260827_133342
+
+QUALITY GATES
+- Funcionalidad solicitada: PASS
+- Unit tests relacionados: PASS
+- Integracion relacionada: PASS
+- Regresion relacionada: PASS
+- Boundary/error paths modificados: PASS
+- Cobertura de codigo modificado: PASS
+- Formatter dirigido: PASS
+- Lint dirigido: PASS
+- Errores nuevos de lint: PASS (0)
+- Static analysis adicional: N/A
+- Type checker: N/A
+- Complejidad: PASS
+- Duplicacion: PASS
+- Build: PASS
+- Smoke test principal: PASS
+- Check profundo V15: FAIL
+- Suite global: NO VERIFICADO
+- Seguridad aplicable: PASS
+- Publicacion estable: PASS
+
+PROBLEMAS PENDIENTES
+- El comprobador --check-v15-package no libera a tiempo su SQLite temporal en Windows y termina con WinError 32 durante cleanup.
+- La suite completa contiene una prueba GUI/import que no concluyo en 7 min 18 s; la suite relacionada si termino con 96 PASS.
+
+ESTADO FINAL: NO APROBADO PARA ENTREGA
+Motivo: aunque la correccion solicitada, el build, el smoke principal y la publicacion 1.0.5 estan en PASS, no se puede declarar aprobacion total mientras el check profundo V15 este en FAIL y la suite global permanezca NO VERIFICADO.
