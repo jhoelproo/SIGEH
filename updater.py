@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
-import time
 import tempfile
+import time
 from pathlib import Path
 
 from sigeh_product import PRODUCT_ID
-
 
 WAIT_SECONDS = 60
 PRESERVE_NAMES = ("recibos", "reportes", "respaldos")
@@ -26,6 +26,51 @@ PRESERVE_RELATIVE_FILES = (
     Path("_internal") / "database_url.protected",
     Path("_internal") / "database_url.bundle",
 )
+UPDATE_PRESERVE_PATHS = (
+    *(Path(name) for name in PRESERVE_NAMES),
+    *PRESERVE_RELATIVE_DIRECTORIES,
+    *(Path(name) for name in PRESERVE_FILES),
+    *PRESERVE_RELATIVE_FILES,
+)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def snapshot_preserved_local_state(install_dir: Path) -> dict[str, str]:
+    """Fingerprint operational data that an update must preserve byte for byte."""
+    data_dir = Path(install_dir) / "_internal" / "data"
+    if not data_dir.is_dir():
+        return {}
+    candidates = {path for path in data_dir.iterdir() if path.is_file()}
+    database_suffixes = (".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm")
+    candidates.update(
+        path
+        for path in data_dir.rglob("*")
+        if path.is_file() and path.name.lower().endswith(database_suffixes)
+    )
+    return {
+        path.relative_to(install_dir).as_posix(): _sha256_file(path)
+        for path in sorted(candidates)
+    }
+
+
+def verify_preserved_local_state(expected: dict[str, str], install_dir: Path) -> None:
+    actual = {
+        relative: _sha256_file(Path(install_dir) / Path(relative))
+        for relative in expected
+        if (Path(install_dir) / Path(relative)).is_file()
+    }
+    if actual != expected:
+        raise RuntimeError(
+            "La actualización no conservó exactamente el estado local; se restaurará "
+            "la instalación anterior."
+        )
 
 
 def write_log(log_path: Path, message: str) -> None:
@@ -182,6 +227,7 @@ def apply_update(manifest_path: Path, wait_pid: int) -> int:
     # Da tiempo a que el lanzador onefile antiguo termine despues de iniciar
     # el puente de migracion. El helper ya se ejecuta fuera de install_dir.
     time.sleep(2.0)
+    preserved_state = snapshot_preserved_local_state(install_dir)
 
     old_moved = False
     new_installed = False
@@ -197,6 +243,11 @@ def apply_update(manifest_path: Path, wait_pid: int) -> int:
         new_installed = True
         if old_moved:
             merge_preserved(rollback_dir, install_dir)
+            verify_preserved_local_state(preserved_state, install_dir)
+            write_log(
+                log_path,
+                f"Estado local preservado y verificado: {len(preserved_state)} archivo(s).",
+            )
         if not health_check_install(install_dir):
             raise RuntimeError("La nueva versión no superó el health check.")
         write_log(log_path, f"Version {version} instalada; respaldo: {backup_dir}.")
