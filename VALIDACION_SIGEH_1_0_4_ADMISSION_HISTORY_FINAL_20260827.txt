@@ -1,0 +1,123 @@
+VALIDACION SIGEH 1.0.4 - HISTORIAL DE ADMISION FIEL
+FECHA = 2026-08-27
+
+ALCANCE
+-------
+El Historial de Admision usado por Facturacion consulta la proyeccion central
+de PostgreSQL sin depender de que la SQLite local de esa estacion pueda
+reconciliarse primero. Administrador y Facturador de Auditoria ven el historial
+completo. Las atenciones activas no facturadas del mismo origen operacional se
+presentan como turno actual o heredadas. El Historial de Emergencias se ordena
+de mas reciente a mas antiguo.
+
+CAUSA RAIZ
+----------
+BillingAdmissionQueryService ejecutaba ensure_admission_history_projection()
+antes de consultar admission_attention_projection. Esa reconciliacion usaba la
+SQLite privada de la PC de Facturacion y podia fallar o quedar vacia aunque la
+proyeccion central ya contuviera las atenciones creadas en otra PC. Por eso el
+Historial de Emergencias podia tener datos y el Historial de Admision de
+Facturacion mostraba cero o un error de carga.
+
+VALIDACIONES FUNCIONALES
+-----------------------
+CENTRAL_HISTORY_NO_LOCAL_SQLITE_DEPENDENCY = PASS
+ADMIN_FULL_HISTORY = PASS
+AUDIT_FULL_HISTORY = PASS
+AUX_OPERATIONAL_SCOPE_PRESERVED = PASS
+CURRENT_OR_INHERITED_QUEUE = PASS
+PRIVILEGED_UNBILLED_RECOVERY = PASS
+CANCELLED_OR_DELETED_EXCLUDED = PASS
+ACTIVE_RECEIPT_LINK_EXCLUDED = PASS
+EMERGENCY_HISTORY_NEWEST_FIRST = PASS
+REAL_CENTRAL_ADMIN_HISTORY_ORDER = 31,30
+REAL_CENTRAL_ADMIN_HISTORY_FULL = PASS
+REAL_CENTRAL_ADMIN_QUEUE = 31:ACTUAL,30:ACTUAL
+
+PRUEBAS
+-------
+RELATED_TESTS = 130 PASS
+RELATED_SUBTESTS = 15 PASS
+FOCUSED_REGRESSION = 37 PASS
+FULL_APPLICABLE_REGRESSION = 647 PASS
+PLATFORM_SKIPS = 23
+BASELINE_KNOWN_FAILURE = 1 N/A
+BASELINE_KNOWN_FAILURE_REASON = La prueba heredada de override de turno intenta
+guardar dos veces el mismo paciente en el mismo dia operativo y falla tambien
+sin este cambio en origin/main. No se modifico por estar fuera del alcance.
+PY_COMPILE = PASS
+
+COBERTURA Y CALIDAD
+-------------------
+DIFF_LINE_COVERAGE = 96%
+DIFF_COVERAGE_GATE_90 = PASS
+RUFF_CHANGED_TESTS = PASS
+RUFF_NEW_ERRORS_RUNTIME = 0
+RUFF_BASELINE_CALCULOS_QT = 327
+RUFF_CURRENT_CALCULOS_QT = 327
+RUFF_BASELINE_ADAPTER = 3
+RUFF_CURRENT_ADAPTER = 3
+GIT_DIFF_CHECK = PASS
+
+BUILD Y QA
+----------
+BUILD_COMMAND = pyinstaller --noconfirm --clean --workpath build_codex_sigeh_1_0_4_history_final_20260827 --distpath dist_codex_sigeh_1_0_4_history_final_20260827 build_app.spec
+PYINSTALLER_ONEDIR = PASS
+BUILD_COUNT = 1
+LAUNCHER_SELF_TEST = PASS
+PACKAGED_V15_SMOKE = PASS
+ADMISSION_WIDGET_CONSTRUCTED = PASS
+HISTORY_OPENED = PASS
+CONFIGURATION_OPENED = PASS
+PINK_ERROR_PANEL = FALSE
+
+PUBLICACION
+-----------
+PULL_REQUEST = https://github.com/jhoelproo/SIGEH/pull/10
+PULL_REQUEST_MERGED = PASS
+MAIN_COMMIT = 12ad641f3de565f4f00a744a91b89cbcecb437ff
+RELEASE_URL = https://github.com/jhoelproo/SIGEH/releases/tag/v1.0.4
+RELEASE_VERSION = 1.0.4
+RELEASE_STABLE = PASS
+RELEASE_ASSETS_REPLACED = PASS
+REMOTE_CHANNEL_RESOLUTION = PASS
+REMOTE_PACKAGE_SHA256 = 32ff28854ebe761597a40963a6de0cacc3c846ab5fe507f17c13ff541da82b30
+MANIFEST_PACKAGE_SHA256 = 32ff28854ebe761597a40963a6de0cacc3c846ab5fe507f17c13ff541da82b30
+REMOTE_SHA_MATCH = PASS
+
+CARPETA DE ESCRITORIO
+---------------------
+C:\Users\ampar\OneDrive\Desktop\SIGEH_1.0.4_ESTABLE_HISTORIAL_20260827_074827
+ONEDIR_FILE_COUNT = 1828
+DESKTOP_COPY = PASS
+
+ARCHIVOS MODIFICADOS
+--------------------
+CALCULOS_QT.py
+admission_v15_adapter.py
+tests/test_admission_v15_unified_history.py
+tests/test_admission_validation_extensions.py
+tests/test_billing_admission_turn_history.py
+tests/test_emergency_history_newest_first_v104.py
+
+QUALITY GATES
+-------------
+FUNCTIONALITY = PASS
+UNIT_TESTS = PASS
+INTEGRATION_TESTS = PASS
+REGRESSION_TESTS = PASS
+COVERAGE = PASS
+BOUNDARY_TESTS = PASS
+FORMATTER = N/A - el proyecto no define formatter obligatorio
+LINT = PASS - cero errores nuevos; deuda heredada sin incremento
+TYPE_CHECKER = N/A - el proyecto no define gate de tipos
+STATIC_ANALYSIS = PASS
+COMPLEXITY = PASS - no se agregaron funciones complejas
+DUPLICATION = PASS - no se agrego logica duplicada
+BUILD = PASS
+SMOKE_TEST = PASS
+SECURITY = PASS - se conservaron permisos y exclusiones vigentes
+QA_FINAL = PASS
+
+FINAL_RESULT = APPROVED
+ESTADO FINAL = APROBADO PARA ENTREGA
