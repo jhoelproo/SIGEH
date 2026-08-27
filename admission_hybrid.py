@@ -1516,6 +1516,9 @@ def install_central_hybrid_schema(connection: Any) -> None:
     ensure_admission_import_progress_schema(connection)
 
 
+ADMISSION_HISTORY_RESET_VERSION = "SIGEH_ADMISSION_HISTORY_RESET_20260826_V1"
+
+
 class OfflineAdmissionStore:
     """Extensi\u00f3n transaccional de una SQLite local de Admisi\u00f3n."""
 
@@ -1714,6 +1717,61 @@ class OfflineAdmissionStore:
                     "VALUES('admission.patient_directory_schema_version','1')"
                 )
         self._initialized = True
+
+    @staticmethod
+    def apply_authorized_history_reset(con: sqlite3.Connection) -> int:
+        """Aplica una sola vez el corte autorizado de historia previo a 1.0.4."""
+        row = con.execute(
+            "SELECT valor FROM app_metadata WHERE clave=?",
+            ("sigeh.admission_history_reset_version",),
+        ).fetchone()
+        if row and str(row[0] or "") == ADMISSION_HISTORY_RESET_VERSION:
+            return 0
+
+        for trigger_name in (
+            "trg_admission_sync_attention_create",
+            "trg_admission_sync_attention_update",
+        ):
+            con.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+        cursor = con.execute(
+            """UPDATE atenciones
+                  SET estado='ANULADA',is_deleted=1,
+                      deleted_at=COALESCE(deleted_at,datetime('now')),
+                      deleted_by_user_id=COALESCE(
+                          NULLIF(deleted_by_user_id,''),'SIGEH_1_0_4_RESET'
+                      ),
+                      delete_reason=COALESCE(
+                          NULLIF(delete_reason,''),
+                          'Reinicio autorizado del historial de Admisión'
+                      ),
+                      anulada_at=COALESCE(anulada_at,datetime('now')),
+                      anulada_por=COALESCE(
+                          NULLIF(anulada_por,''),'SIGEH_1_0_4_RESET'
+                      ),
+                      anulada_motivo=COALESCE(
+                          NULLIF(anulada_motivo,''),
+                          'Reinicio autorizado del historial de Admisión'
+                      ),
+                      sync_state='SYNCED'
+                WHERE COALESCE(is_deleted,0)=0"""
+        )
+        reset_count = max(0, int(cursor.rowcount or 0))
+        con.execute(
+            """UPDATE sync_outbox
+                  SET sync_status='SUPERSEDED',
+                      last_error='SIGEH_1_0_4_HISTORY_RESET'
+                WHERE entity_type='attention'
+                  AND sync_status IN ('PENDING','RETRY','CONFLICT')"""
+        )
+        con.execute(
+            """INSERT INTO app_metadata(clave,valor) VALUES(?,?)
+               ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor""",
+            (
+                "sigeh.admission_history_reset_version",
+                ADMISSION_HISTORY_RESET_VERSION,
+            ),
+        )
+        return reset_count
 
     @staticmethod
     def _install_attention_outbox_triggers(con: sqlite3.Connection) -> None:

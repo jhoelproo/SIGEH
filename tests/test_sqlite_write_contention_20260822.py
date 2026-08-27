@@ -257,16 +257,23 @@ def test_pdf_render_starts_after_its_sqlite_metadata_write_is_released(
 
 
 def test_remote_events_are_applied_in_bounded_local_batches(monkeypatch):
-    store = OfflineAdmissionStore(":memory:")
-    calls: list[tuple[int, bool]] = []
-    monkeypatch.setattr(store, "initialize", lambda: None)
+    connection = sqlite3.connect(":memory:")
+    try:
+        store = OfflineAdmissionStore(connection)
+        calls: list[tuple[int, bool]] = []
+        monkeypatch.setattr(store, "initialize", lambda: None)
+        monkeypatch.setattr(store, "last_cloud_cursor", lambda: 121)
 
-    def apply_batch(events, *, advance_cursor):
-        calls.append((len(list(events)), advance_cursor))
-        return len(calls)
+        def apply_batch(events, *, advance_cursor):
+            calls.append((len(list(events)), advance_cursor))
+            return len(calls)
 
-    monkeypatch.setattr(store, "_apply_remote_events_batch", apply_batch)
-    result = store.apply_remote_events([{"event_uuid": str(index)} for index in range(121)])
+        monkeypatch.setattr(store, "_apply_remote_events_batch", apply_batch)
+        result = store.apply_remote_events(
+            [{"event_uuid": str(index)} for index in range(121)]
+        )
 
-    assert calls == [(50, True), (50, True), (21, True)]
-    assert result == 6
+        assert calls == [(50, True), (50, True), (21, True)]
+        assert result == 6
+    finally:
+        connection.close()

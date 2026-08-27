@@ -75,7 +75,6 @@ from emergency_core.session_context import (
     normalize_role,
 )
 from emergency_core.single_instance import SingleInstanceGuard
-from emergency_core.updater import APP_VERSION, UpdateError, get_latest_release, is_newer
 
 # PDF / Excel
 from reportlab.pdfgen import canvas
@@ -6265,11 +6264,6 @@ class App:
         if self._puede(CAP_EDIT_RECORDS):
             self.actions_menu.add_command(label="Editar paciente", command=self._abrir_edicion_paciente)
         self.actions_menu.add_command(label="Impresiones y documentos pendientes", command=self.abrir_trabajos_salida_pendientes)
-        self.actions_menu.add_command(
-            label="Buscar actualizaciones",
-            command=self.buscar_actualizaciones,
-            state="disabled" if OFFLINE_MODE else "normal",
-        )
         if self._puede(CAP_INTERNAL_CONFIG):
             self.actions_menu.add_command(label="Configuración", command=self._abrir_configuracion_interna)
         self.actions_menu.aboutToShow.connect(self._refresh_actions_menu_state)
@@ -6586,11 +6580,6 @@ class App:
             self._date_after_id = self.root.after(1000, self._actualizar_fecha_actual)
             self.root.after(2200, self._avisar_trabajos_salida_pendientes)
             self.root.after(2600, self._retry_excel_export_jobs)
-            if not OFFLINE_MODE:
-                self.root.after(
-                    5000,
-                    lambda: self.buscar_actualizaciones(manual=False),
-                )
         except Exception:
             pass
 
@@ -8735,102 +8724,6 @@ class App:
         self._admin_authorized_until = datetime.now() + timedelta(minutes=5)
         self._admin_authorized_actor = actor
         return actor
-
-    def buscar_actualizaciones(self, manual=True):
-        """Consulta GitHub sin bloquear la interfaz y ofrece una instalacion verificada."""
-        if OFFLINE_MODE:
-            self.set_status("Modo local: actualizaciones por Internet desactivadas", "ok")
-            if manual:
-                messagebox.showinfo(
-                    "Modo local",
-                    "Esta instalación trabaja sin Internet. Las actualizaciones "
-                    "se aplican únicamente desde el paquete central autorizado.",
-                    parent=self.root,
-                )
-            return
-
-        def consultar():
-            return get_latest_release()
-
-        def completado(release):
-            self.set_status("Actualizaciones comprobadas", "ok")
-            if not is_newer(release.version, APP_VERSION):
-                if manual:
-                    messagebox.showinfo(
-                        "Actualizaciones",
-                        f"Ya tiene la version mas reciente ({APP_VERSION}).",
-                        parent=self.root,
-                    )
-                return
-            notas = release.notes[:900].strip()
-            detalle = f"\n\n{notas}" if notas else ""
-            aceptar = messagebox.askyesno(
-                "Actualizacion disponible",
-                f"Esta disponible la version {release.version}.\n\n"
-                "La aplicacion se cerrara, verificara el paquete y volvera a abrirse. "
-                "La base de datos y los documentos no se reemplazaran."
-                f"{detalle}\n\n¿Desea actualizar ahora?",
-                parent=self.root,
-            )
-            if aceptar:
-                self._iniciar_actualizador_externo()
-
-        def fallo(exc):
-            APP_LOG.warning("No se pudo consultar la actualizacion: %s", exc)
-            self.set_status("No se pudo comprobar actualizaciones", "warning")
-            if manual:
-                messagebox.showwarning(
-                    "Actualizaciones",
-                    f"No se pudo comprobar si hay una version nueva:\n\n{exc}",
-                    parent=self.root,
-                )
-
-        self._ejecutar_en_segundo_plano(
-            "Comprobando actualizaciones...",
-            consultar,
-            al_terminar=completado,
-            al_error=fallo,
-        )
-
-    def _iniciar_actualizador_externo(self):
-        if not getattr(sys, "frozen", False):
-            messagebox.showinfo(
-                "Actualizaciones",
-                "La actualizacion automatica se prueba desde la version empaquetada.",
-                parent=self.root,
-            )
-            return
-        install_dir = os.path.dirname(os.path.abspath(sys.executable))
-        updater = os.path.join(install_dir, "SIGEH_Updater.exe")
-        launcher = os.path.join(install_dir, "SIGEH.exe")
-        if not os.path.isfile(updater):
-            messagebox.showerror(
-                "Actualizaciones",
-                "No se encontró SIGEH_Updater.exe junto a SIGEH.",
-                parent=self.root,
-            )
-            return
-        if not os.path.isfile(launcher):
-            messagebox.showerror(
-                "Actualizaciones",
-                "No se encontró SIGEH.exe junto a la aplicación.",
-                parent=self.root,
-            )
-            return
-        try:
-            subprocess.Popen(
-                [launcher, "--check-updates"],
-                cwd=install_dir,
-                close_fds=True,
-            )
-            self.on_close()
-        except OSError as exc:
-            APP_LOG.exception("No se pudo iniciar el actualizador")
-            messagebox.showerror(
-                "Actualizaciones",
-                f"No se pudo iniciar el actualizador:\n\n{exc}",
-                parent=self.root,
-            )
 
     def set_status(self, mensaje, tipo="info"):
         colores = {

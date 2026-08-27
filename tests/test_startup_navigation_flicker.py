@@ -43,8 +43,7 @@ def test_period_selector_never_shows_parentless_controls():
         qt_app.removeEventFilter(trace)
 
 
-def test_launcher_normal_path_is_immediate_and_update_is_opt_in(monkeypatch):
-    monkeypatch.delenv("HOSPITAL_CHECK_UPDATES", raising=False)
+def test_launcher_validates_updates_before_opening_the_application(monkeypatch):
     calls = []
     monkeypatch.setattr(
         lanzador,
@@ -57,43 +56,70 @@ def test_launcher_normal_path_is_immediate_and_update_is_opt_in(monkeypatch):
         lambda: calls.append("update") or 23,
     )
 
-    assert lanzador.main([]) == 17
-    assert calls == ["local"]
+    assert lanzador.main([]) == 23
+    assert calls == ["update"]
 
     calls.clear()
     assert lanzador.main(["--check-updates"]) == 23
     assert calls == ["update"]
 
 
-def test_launcher_fast_path_precedes_requests_and_qt_imports():
+def test_launcher_self_test_fast_path_precedes_requests_and_qt_imports():
     source = inspect.getsource(lanzador)
-    early_exit = source.index("_fast_launch_main_before_gui_imports())")
+    early_exit = source.index('if __name__ == "__main__" and _EARLY_ARGS == ["--self-test"]')
     requests_import = source.index("import requests")
     qt_import = source.index("from PySide6.QtCore")
     assert early_exit < requests_import
     assert early_exit < qt_import
 
 
-def test_three_cold_and_three_warm_launcher_dispatches_create_no_qt_window(monkeypatch):
-    qt_app = _application()
-    trace = _TopLevelShowTrace()
-    qt_app.installEventFilter(trace)
+def test_three_cold_and_three_warm_launcher_dispatches_use_update_gate(monkeypatch):
     calls = []
-    monkeypatch.delenv("HOSPITAL_CHECK_UPDATES", raising=False)
     monkeypatch.setattr(
         lanzador,
-        "launch_main_app_immediately",
-        lambda: calls.append("main") or 0,
+        "run_update_check_ui",
+        lambda: calls.append("update") or 0,
     )
-    try:
-        for _cycle in range(3):
-            assert lanzador.main([]) == 0
-        for _cycle in range(3):
-            assert lanzador.main([]) == 0
-        assert calls == ["main"] * 6
-        assert trace.shown == []
-    finally:
-        qt_app.removeEventFilter(trace)
+    for _cycle in range(3):
+        assert lanzador.main([]) == 0
+    for _cycle in range(3):
+        assert lanzador.main([]) == 0
+    assert calls == ["update"] * 6
+
+
+def test_launcher_uses_portable_bootstrap_after_update_gate(monkeypatch):
+    monkeypatch.setattr(
+        lanzador,
+        "_fast_launch_main_before_gui_imports",
+        lambda: 31,
+    )
+    assert lanzador.launch_main_app_immediately() == 31
+
+
+def test_launcher_self_test_does_not_open_update_gate(monkeypatch):
+    monkeypatch.setattr(
+        lanzador,
+        "run_update_check_ui",
+        lambda: (_ for _ in ()).throw(AssertionError("update gate opened")),
+    )
+    assert lanzador.main(["--self-test"]) == 0
+
+
+def test_launcher_dialog_dispatches_main_and_reports_bootstrap_failure(monkeypatch):
+    qt_app = _application()
+    errors = []
+    monkeypatch.setattr(lanzador, "launch_main_app_immediately", lambda: 0)
+    monkeypatch.setattr(qt_app, "quit", lambda: None)
+    lanzador.LauncherDialog.launch_main_app(None)
+
+    monkeypatch.setattr(lanzador, "launch_main_app_immediately", lambda: 5)
+    monkeypatch.setattr(
+        lanzador.QMessageBox,
+        "critical",
+        lambda *args: errors.append(args),
+    )
+    lanzador.LauncherDialog.launch_main_app(None)
+    assert len(errors) == 1
 
 
 def test_reports_period_controls_open_five_times_without_ghost_top_levels():
