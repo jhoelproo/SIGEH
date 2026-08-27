@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import urllib.error
 from pathlib import Path
 
@@ -20,8 +21,13 @@ from sigeh_update import (
     verify_archive,
     version_tuple,
 )
-from updater import apply_update, merge_preserved
-
+from updater import (
+    UPDATE_PRESERVE_PATHS,
+    apply_update,
+    merge_preserved,
+    snapshot_preserved_local_state,
+    verify_preserved_local_state,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -255,3 +261,94 @@ def test_onedir_update_replaces_program_and_preserves_local_state(
     assert (install / "_internal" / "data" / "pacientes.db").read_bytes() == b"history"
     assert (install / "_internal" / "database_url.bundle").read_bytes() == b"private"
     assert not (install / "old.txt").exists()
+
+
+def test_preserved_local_state_snapshot_detects_any_history_change(tmp_path):
+    install = tmp_path / "SIGEH"
+    data = install / "_internal" / "data"
+    data.mkdir(parents=True)
+    database = data / "pacientes.db"
+    database.write_bytes(b"hospital-history")
+    (data / "turnos_config.json").write_text("{}", encoding="utf-8")
+
+    before = snapshot_preserved_local_state(install)
+
+    assert Path("_internal/data") in UPDATE_PRESERVE_PATHS
+    verify_preserved_local_state(before, install)
+    database.write_bytes(b"changed-history")
+    with pytest.raises(RuntimeError, match="estado local"):
+        verify_preserved_local_state(before, install)
+
+
+def test_v105_update_preserves_history_counts_and_distributed_ids(
+    tmp_path, monkeypatch
+):
+    install = tmp_path / "SIGEH"
+    payload = tmp_path / "payload"
+    data = install / "_internal" / "data"
+    data.mkdir(parents=True)
+    database = data / "pacientes.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """CREATE TABLE pacientes(
+                   id INTEGER PRIMARY KEY,
+                   global_patient_id TEXT NOT NULL
+               );
+               CREATE TABLE atenciones(
+                   id INTEGER PRIMARY KEY,
+                   global_attention_id TEXT NOT NULL,
+                   global_patient_id TEXT NOT NULL,
+                   source_instance_id TEXT NOT NULL
+               );
+               INSERT INTO pacientes VALUES(1, 'patient-global-1');
+               INSERT INTO atenciones VALUES(
+                   1, 'attention-global-1', 'patient-global-1', 'hospital-source-1'
+            );"""
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    (data / "device_id.json").write_text(
+        '{"device_id":"hospital-device-1"}', encoding="utf-8"
+    )
+    before_hash = hashlib.sha256(database.read_bytes()).hexdigest()
+
+    (payload / "_internal").mkdir(parents=True)
+    for executable in ("CALCULOS_QT.exe", "SIGEH.exe", "SIGEH_Updater.exe"):
+        (payload / executable).write_bytes(b"new")
+    manifest = tmp_path / "update.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "product": PRODUCT_ID,
+                "version": APP_VERSION,
+                "install_dir": str(install),
+                "payload_dir": str(payload),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("updater.wait_for_process", lambda *_args: None)
+    monkeypatch.setattr("updater.time.sleep", lambda *_args: None)
+    monkeypatch.setattr("updater.health_check_install", lambda *_args: True)
+    monkeypatch.setattr("updater.update_storage_root", lambda: tmp_path / "local")
+    monkeypatch.setattr("updater.start_launcher", lambda *_args: None)
+
+    assert apply_update(manifest, 0) == 0
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before_hash
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert connection.execute("SELECT COUNT(*) FROM pacientes").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM atenciones").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT global_attention_id, global_patient_id, source_instance_id "
+            "FROM atenciones"
+        ).fetchone() == (
+            "attention-global-1",
+            "patient-global-1",
+            "hospital-source-1",
+        )
+    assert json.loads((data / "device_id.json").read_text(encoding="utf-8")) == {
+        "device_id": "hospital-device-1"
+    }

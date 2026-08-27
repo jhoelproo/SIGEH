@@ -179,6 +179,16 @@ def test_updater_replaces_onedir_preserves_state_and_keeps_local_backup(
     assert (storage / "backup" / "1.0.2" / "old.dll").is_file()
 
 
+def test_release_rejects_packaged_operational_database(tmp_path):
+    dist = tmp_path / "SIGEH"
+    data = dist / "_internal" / "data"
+    data.mkdir(parents=True)
+    (data / "pacientes.db").write_bytes(b"must-not-ship")
+
+    with pytest.raises(ValueError, match="base operacional"):
+        release_packaging.validate_no_operational_database(dist)
+
+
 def test_failed_health_check_rolls_back_complete_install(tmp_path, monkeypatch):
     install = tmp_path / "SIGEH"
     payload = tmp_path / "payload"

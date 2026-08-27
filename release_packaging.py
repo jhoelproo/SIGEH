@@ -12,7 +12,6 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from sigeh_product import APP_VERSION, PRODUCT_ID
 
-
 REQUIRED_DIST_ENTRIES = (
     Path("SIGEH.exe"),
     Path("SIGEH_Updater.exe"),
@@ -27,6 +26,26 @@ VERSION_METADATA_PATHS = (
     Path("version_config.json"),
     Path("_internal/version_config.json"),
 )
+OPERATIONAL_DATABASE_SUFFIXES = (
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".db-wal",
+    ".db-shm",
+)
+
+
+def validate_no_operational_database(dist_dir: Path) -> None:
+    packaged_databases = tuple(
+        path.relative_to(dist_dir)
+        for path in Path(dist_dir).rglob("*")
+        if path.is_file() and path.name.lower().endswith(OPERATIONAL_DATABASE_SUFFIXES)
+    )
+    if packaged_databases:
+        raise ValueError(
+            "La distribución contiene una base operacional y podría sobrescribir "
+            "el historial: " + ", ".join(map(str, packaged_databases))
+        )
 
 
 def validate_dist(dist_dir: Path) -> tuple[Path, ...]:
@@ -40,6 +59,7 @@ def validate_dist(dist_dir: Path) -> tuple[Path, ...]:
         raise FileNotFoundError(
             "Distribución SIGEH incompleta: " + ", ".join(map(str, missing))
         )
+    validate_no_operational_database(dist_dir)
     return tuple(dist_dir / relative for relative in REQUIRED_DIST_ENTRIES)
 
 
