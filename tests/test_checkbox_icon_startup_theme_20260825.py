@@ -272,6 +272,7 @@ def test_checked_choice_controls_keep_stable_width_and_text_guard():
 
 
 def test_svg_icons_are_theme_role_and_dpi_aware_with_visible_pixels():
+    _application()
     for is_dark in (False, True):
         tokens = shell.visual_theme_tokens(is_dark)
         foreground = tokens["button_danger_text"]

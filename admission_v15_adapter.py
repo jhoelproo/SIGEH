@@ -919,6 +919,7 @@ class _HybridAdmissionRuntime:
             self._bound_database = database
             self.store = OfflineAdmissionStore(database.db_name)
             self.store.initialize()
+            self._apply_central_history_reset_if_authorized()
             # V15 uses the same local writer/outbox as the sync worker.  The
             # reference is local-only and does not make SQLite authoritative.
             database.hybrid_store = self.store
@@ -985,6 +986,35 @@ class _HybridAdmissionRuntime:
                 self.host.connection_factory,
                 is_online=lambda: not self.offline,
             )
+
+    def _apply_central_history_reset_if_authorized(self) -> int:
+        """Replica localmente el corte central 1.0.4, una sola vez por PC."""
+        if self.store is None:
+            return 0
+        try:
+            with self.host.connection_factory() as connection:
+                row = connection.execute(
+                    """SELECT 1 FROM sigeh_maintenance_events
+                        WHERE event_key=%s LIMIT 1""",
+                    ("SIGEH_ADMISSION_HISTORY_RESET_20260826_V1",),
+                ).fetchone()
+        except Exception as exc:
+            self.logger.debug(
+                "Marcador central de reinicio de historial no disponible: %s",
+                type(exc).__name__,
+            )
+            return 0
+        if not row:
+            return 0
+        with self.store.connection() as connection:
+            reset_count = self.store.apply_authorized_history_reset(connection)
+            self.store._install_attention_outbox_triggers(connection)
+        if reset_count:
+            self.logger.warning(
+                "ADMISSION_HISTORY_LOCAL_RESET count=%s version=1.0.4",
+                reset_count,
+            )
+        return reset_count
 
     def search_patient_directory(self, *, cedula: str = "", nss: str = "") -> dict[str, Any] | None:
         """Exact local-first lookup; cloud hydration runs in the V15 worker."""

@@ -2710,6 +2710,183 @@ def _apply_admission_hybrid_migration(con):
     install_central_hybrid_schema(con)
 
 
+def _apply_admission_cancellation_receipt_trash_migration(con):
+    """Mantiene Facturación coherente con tombstones centrales de Admisión."""
+    con.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        ("admission-cancellation-receipt-trash-v1",),
+    )
+    con.executescript(
+        r"""
+        CREATE OR REPLACE FUNCTION trash_receipt_for_cancelled_admission()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SET search_path = public, pg_temp
+        AS $$
+        DECLARE
+            trashed_count INTEGER := 0;
+            actor_name TEXT;
+        BEGIN
+            IF NOT (
+                COALESCE(NEW.is_deleted,FALSE)
+                OR UPPER(BTRIM(COALESCE(NEW.source_status,'')))='ANULADA'
+            ) THEN
+                RETURN NEW;
+            END IF;
+            IF TG_OP='UPDATE'
+               AND (
+                    COALESCE(OLD.is_deleted,FALSE)
+                    OR UPPER(BTRIM(COALESCE(OLD.source_status,'')))='ANULADA'
+               ) THEN
+                RETURN NEW;
+            END IF;
+
+            actor_name := COALESCE(
+                NULLIF(BTRIM(NEW.deleted_by_user_id),''),
+                NULLIF(BTRIM(NEW.admission_username),''),
+                'ADMISION'
+            );
+
+            DELETE FROM admission_billing_claims
+             WHERE source_instance_id=NEW.source_instance_id
+               AND attention_id=NEW.attention_id;
+
+            UPDATE recibos
+               SET is_deleted=1,
+                   deleted_at=COALESCE(
+                       NULLIF(NEW.deleted_at::TEXT,''),NOW()::TEXT
+                   ),
+                   deleted_by=actor_name,
+                   deleted_reason=COALESCE(
+                       NULLIF(BTRIM(NEW.delete_reason),''),
+                       'Atención anulada en Admisión'
+                   )
+             WHERE is_deleted=0
+               AND admission_atencion_id=NEW.attention_id
+               AND COALESCE(admission_source_instance_id,'LEGACY')=
+                   COALESCE(NULLIF(NEW.source_instance_id,''),'LEGACY');
+            GET DIAGNOSTICS trashed_count = ROW_COUNT;
+
+            IF trashed_count > 0 THEN
+                INSERT INTO action_history(
+                    username,action,details,module,entity_type,entity_id,created_at
+                ) VALUES(
+                    actor_name,
+                    'RECEIPT_TRASHED_BY_ADMISSION_CANCELLATION',
+                    'Recibos enviados a papelera: ' || trashed_count::TEXT,
+                    'Facturación','admission_attention',
+                    COALESCE(NEW.global_attention_id::TEXT,
+                             NEW.source_instance_id || ':' || NEW.attention_id::TEXT),
+                    NOW()::TEXT
+                );
+            END IF;
+            RETURN NEW;
+        END
+        $$;
+
+        DROP TRIGGER IF EXISTS trg_admission_cancellation_receipt_trash
+            ON admission_attention_projection;
+        CREATE TRIGGER trg_admission_cancellation_receipt_trash
+        AFTER INSERT OR UPDATE
+        ON admission_attention_projection
+        FOR EACH ROW
+        EXECUTE FUNCTION trash_receipt_for_cancelled_admission();
+
+        UPDATE recibos r
+           SET is_deleted=1,
+               deleted_at=COALESCE(NULLIF(p.deleted_at::TEXT,''),NOW()::TEXT),
+               deleted_by=COALESCE(
+                   NULLIF(BTRIM(p.deleted_by_user_id),''),
+                   NULLIF(BTRIM(p.admission_username),''),
+                   'ADMISION'
+               ),
+               deleted_reason=COALESCE(
+                   NULLIF(BTRIM(p.delete_reason),''),
+                   'Atención anulada en Admisión'
+               )
+          FROM admission_attention_projection p
+         WHERE r.is_deleted=0
+           AND r.admission_atencion_id=p.attention_id
+           AND COALESCE(r.admission_source_instance_id,'LEGACY')=
+               COALESCE(NULLIF(p.source_instance_id,''),'LEGACY')
+           AND (
+               COALESCE(p.is_deleted,FALSE)
+               OR UPPER(BTRIM(COALESCE(p.source_status,'')))='ANULADA'
+           );
+        """
+    )
+
+
+def _apply_authorized_admission_history_reset_104(con):
+    """Ejecuta una sola vez el reinicio lógico central autorizado para 1.0.4."""
+    con.executescript(
+        r"""
+        CREATE TABLE IF NOT EXISTS sigeh_maintenance_events(
+            event_key TEXT PRIMARY KEY,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            applied_by TEXT NOT NULL,
+            details_json JSONB NOT NULL DEFAULT '{}'::JSONB
+        );
+
+        DO $$
+        DECLARE
+            reset_count BIGINT := 0;
+        BEGIN
+            PERFORM pg_advisory_xact_lock(
+                hashtext('SIGEH_ADMISSION_HISTORY_RESET_20260826_V1')
+            );
+            IF EXISTS (
+                SELECT 1 FROM sigeh_maintenance_events
+                 WHERE event_key='SIGEH_ADMISSION_HISTORY_RESET_20260826_V1'
+            ) THEN
+                RETURN;
+            END IF;
+
+            UPDATE admission_attention_projection
+               SET is_deleted=TRUE,
+                   source_status='ANULADA',
+                   deleted_at=COALESCE(deleted_at,NOW()),
+                   deleted_by_user_id=COALESCE(
+                       NULLIF(BTRIM(deleted_by_user_id),''),'SIGEH_1_0_4_RESET'
+                   ),
+                   delete_reason=COALESCE(
+                       NULLIF(BTRIM(delete_reason),''),
+                       'Reinicio autorizado del historial de Admisión'
+                   ),
+                   server_revision=GREATEST(COALESCE(server_revision,0),1)+1
+             WHERE COALESCE(is_deleted,FALSE)=FALSE
+                OR UPPER(BTRIM(COALESCE(source_status,'')))<>'ANULADA';
+            GET DIAGNOSTICS reset_count = ROW_COUNT;
+
+            DELETE FROM admission_billing_claims;
+
+            INSERT INTO action_history(
+                username,action,details,module,entity_type,entity_id,created_at
+            ) VALUES(
+                'SIGEH_1_0_4_RESET','ADMISSION_HISTORY_RESET',
+                'Atenciones reiniciadas lógicamente: ' || reset_count::TEXT,
+                'Admisión','maintenance',
+                'SIGEH_ADMISSION_HISTORY_RESET_20260826_V1',NOW()::TEXT
+            );
+            INSERT INTO sigeh_maintenance_events(
+                event_key,applied_by,details_json
+            ) VALUES(
+                'SIGEH_ADMISSION_HISTORY_RESET_20260826_V1',
+                'SIGEH_1_0_4_RESET',
+                jsonb_build_object('reset_attentions',reset_count)
+            );
+        END
+        $$;
+        """
+    )
+
+
+def _apply_admission_data_lifecycle_migrations(con):
+    """Instala anulación→papelera antes de ejecutar el corte autorizado."""
+    _apply_admission_cancellation_receipt_trash_migration(con)
+    _apply_authorized_admission_history_reset_104(con)
+
+
 def db_init():
     os.makedirs(REPORTS_DIR, exist_ok=True)
     os.makedirs(PDFS_DIR, exist_ok=True)
@@ -2900,6 +3077,7 @@ def db_init():
                     f"ALTER TABLE admission_attention_projection ADD COLUMN {column_name} {definition}"
                 )
         con.execute("UPDATE admission_attention_projection SET service_type='EMERGENCIA' WHERE service_type IS NULL OR TRIM(service_type)=''")
+        _apply_admission_data_lifecycle_migrations(con)
         batch_receipt_columns = {
             row[0]
             for row in con.execute(
@@ -4761,9 +4939,12 @@ def evaluate_attention_billing_eligibility(
                    FROM admission_operational_sessions
                    WHERE status='ACTIVE' ORDER BY updated_at DESC LIMIT 1
                ) active ON TRUE
-               WHERE (%s<>'' AND p.global_attention_id::TEXT=%s)
-                  OR (%s='' AND p.attention_id=%s
-                      AND (%s='' OR p.source_instance_id=%s))
+               WHERE (
+                       (%s<>'' AND p.global_attention_id::TEXT=%s)
+                    OR (%s='' AND p.attention_id=%s
+                        AND (%s='' OR p.source_instance_id=%s))
+               )
+                 AND COALESCE(p.is_deleted,FALSE)=FALSE
                ORDER BY p.synced_at DESC LIMIT 1""",
             (
                 str(session_id or ""), bool(allow_claim_override),
@@ -5286,6 +5467,7 @@ class BillingAdmissionQueryService:
                      AND {ars_exclusion}
                      AND (%s OR p.coverage_status<>%s)
                      AND UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
+                     AND COALESCE(p.is_deleted,FALSE)=FALSE
                      AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
                          IN ('ACTIVA','PENDIENTE')
                      AND NOT EXISTS (
@@ -5464,6 +5646,7 @@ class BillingAdmissionQueryService:
                        LIMIT 1
                    ) r ON TRUE
                    WHERE (%s OR {ars_exclusion})
+                     AND COALESCE(p.is_deleted,FALSE)=FALSE
                      AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
                          IN ('ACTIVA','PENDIENTE')
                      AND (%s
@@ -5860,6 +6043,7 @@ def get_projected_billable_attention(
                  AND (%s OR p.coverage_status<>%s)
                  AND (%s OR p.turn_id=cs.turn_id
                       OR inheritance.attention_id IS NOT NULL)
+                 AND COALESCE(p.is_deleted,FALSE)=FALSE
                  AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')
                LIMIT 1""",
             (
@@ -6913,6 +7097,7 @@ def claim_projected_billable_attention(
                      AND (%s OR p.turn_id=cs.turn_id
                           OR inheritance.attention_id IS NOT NULL)
                      AND UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
+                     AND COALESCE(p.is_deleted,FALSE)=FALSE
                      AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')
                       AND NOT EXISTS (
                             SELECT 1 FROM recibos r
@@ -7016,6 +7201,7 @@ def load_current_shift_billing_summary(repository=None) -> dict:
         projected_cursor = con.execute(
             """SELECT p.* FROM admission_attention_projection p
                WHERE p.operational_source_id=%s AND p.turn_id=%s
+                 AND COALESCE(p.is_deleted,FALSE)=FALSE
                  AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
                      IN ('ACTIVA','PENDIENTE')
                ORDER BY COALESCE(
@@ -9710,6 +9896,7 @@ def _lock_and_validate_admission_processing(
                    OR inheritance.attention_id IS NOT NULL
              )
              AND UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
+             AND COALESCE(p.is_deleted,FALSE)=FALSE
              AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
                  IN ('ACTIVA','PENDIENTE')
            LIMIT 1""",

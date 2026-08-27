@@ -3,25 +3,16 @@ import os
 
 
 def _fast_launch_main_before_gui_imports() -> int:
-    """Camino normal: abre la app antes de importar red, Qt o el actualizador."""
+    """Abre la app con el bootstrap mínimo y su conexión central preparada."""
     from portable_launcher import main as launch_portable_main
 
     return launch_portable_main()
 
 
 _EARLY_ARGS = list(sys.argv[1:])
-_EARLY_UPDATE_OPT_IN = (
-    "--check-updates" in _EARLY_ARGS
-    or os.environ.get("HOSPITAL_CHECK_UPDATES", "").strip() == "1"
-)
 if __name__ == "__main__" and _EARLY_ARGS == ["--self-test-fast-launch"]:
     raise SystemExit(0)
 if __name__ == "__main__" and _EARLY_ARGS == ["--self-test"]:
-    raise SystemExit(_fast_launch_main_before_gui_imports())
-if (
-    __name__ == "__main__"
-    and not _EARLY_UPDATE_OPT_IN
-):
     raise SystemExit(_fast_launch_main_before_gui_imports())
 
 import json
@@ -239,30 +230,12 @@ def _show_launch_error(message: str):
 
 
 def launch_main_app_immediately() -> int:
-    """Abre la aplicación local sin ventana ni verificación de red previa."""
-    current_dir = get_real_dir()
-    main_app_path = os.path.join(current_dir, MAIN_APP_NAME)
-    if not os.path.isfile(main_app_path):
-        message = f"No se encontró {MAIN_APP_NAME} junto al lanzador."
-        write_launcher_log(message)
-        _show_launch_error(message)
-        return 2
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(main_app_path)
-        else:
-            subprocess.Popen([main_app_path], cwd=current_dir)
-        return 0
-    except Exception as exc:
-        write_launcher_log(
-            f"No se pudo iniciar la aplicación local: {type(exc).__name__}"
-        )
-        _show_launch_error("No fue posible iniciar el sistema hospitalario.")
-        return 1
+    """Abre la aplicación mediante el bootstrap portátil canónico."""
+    return _fast_launch_main_before_gui_imports()
 
 
 def run_update_check_ui() -> int:
-    """Verificación manual/opt-in; nunca se ejecuta en el arranque normal."""
+    """Valida y aplica actualizaciones antes de abrir la aplicación principal."""
     app = QApplication.instance() or QApplication(sys.argv)
     launcher = LauncherDialog()
     launcher.show()
@@ -594,37 +567,22 @@ class LauncherDialog(QDialog):
             self.launch_main_app()
 
     def launch_main_app(self):
-        current_dir = get_real_dir()
-        main_app_path = os.path.join(current_dir, MAIN_APP_NAME)
-
-        if os.path.exists(main_app_path):
-            try:
-                if sys.platform.startswith("win"):
-                    os.startfile(main_app_path)
-                else:
-                    subprocess.Popen([main_app_path], cwd=current_dir)
-            except Exception as e:
-                QMessageBox.critical(self, "Error Fatal", f"No se pudo iniciar el programa:\n{e}")
-        else:
+        result = launch_main_app_immediately()
+        if result != 0:
             QMessageBox.critical(
                 self,
-                "Archivo no encontrado",
-                f"No se encontró el sistema principal.\n\nAsegúrate de tener '{MAIN_APP_NAME}' en la carpeta."
+                "No fue posible iniciar SIGEH",
+                "La instalación no pudo preparar la aplicación principal. "
+                "Revise lanzador_log.txt para conocer el detalle.",
             )
-        sys.exit(0)
+        QApplication.instance().quit()
 
 
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["--self-test"]:
         return 0
-    update_opt_in = (
-        "--check-updates" in args
-        or os.environ.get("HOSPITAL_CHECK_UPDATES", "").strip() == "1"
-    )
-    if update_opt_in:
-        return run_update_check_ui()
-    return launch_main_app_immediately()
+    return run_update_check_ui()
 
 
 if __name__ == "__main__":

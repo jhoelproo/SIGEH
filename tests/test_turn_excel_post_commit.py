@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ctypes
 import importlib
-import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -341,17 +340,22 @@ def test_turn_dialog_commits_before_excel_and_does_not_use_excel_com():
     assert "os.startfile(ruta)" in source
 
 
-def test_empty_excel_dataset_is_recorded_only_once(tmp_path, monkeypatch, caplog):
+def test_empty_excel_dataset_is_recorded_only_once(tmp_path, monkeypatch):
     v15 = _v15_module()
     state_path = tmp_path / "excel_export_state.json"
     monkeypatch.setattr(v15, "EXCEL_EXPORT_STATE_PATH", str(state_path))
     database = _TurnDatabase(rows=[])
+    messages = []
+    monkeypatch.setattr(
+        v15.APP_LOG,
+        "info",
+        lambda message, *args: messages.append(message % args if args else message),
+    )
 
-    with caplog.at_level(logging.INFO, logger=v15.APP_LOG.name):
-        assert v15.reconstruir_excel_turno(database, _turn_config()) == 0
-        assert v15.reconstruir_excel_turno(database, _turn_config()) == 0
+    assert v15.reconstruir_excel_turno(database, _turn_config()) == 0
+    assert v15.reconstruir_excel_turno(database, _turn_config()) == 0
 
-    assert caplog.text.count("ADMISSION_EXCEL_SKIPPED_EMPTY") == 1
+    assert sum("ADMISSION_EXCEL_SKIPPED_EMPTY" in value for value in messages) == 1
     assert v15._read_excel_export_state()["excel_status"] == "SKIPPED_EMPTY"
 
 

@@ -1,4 +1,5 @@
 import json
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -133,7 +134,9 @@ def test_canonical_updater_names_and_onefile_spec():
         encoding="utf-8"
     )
     assert "ACTUALIZADOR.exe" not in v15
-    assert '"SIGEH_Updater.exe"' in v15
+    assert '"SIGEH_Updater.exe"' not in v15
+    assert "buscar_actualizaciones" not in v15
+    assert "return run_update_check_ui()" in inspect.getsource(lanzador.main)
     launcher = Path("lanzador.py").read_text(encoding="utf-8")
     assert '_EARLY_ARGS == ["--self-test"]' in launcher
     assert "_fast_launch_main_before_gui_imports()" in launcher

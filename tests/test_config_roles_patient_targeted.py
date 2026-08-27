@@ -81,11 +81,30 @@ def test_config_roles_primary_transfer_and_pin(tmp_path: Path):
 
     database = _load_operational_fake()
     service = OperationalSessionService(lambda: database)
+    service.attach_device(
+        login_username="admin",
+        login_user_id=7,
+        login_role="administrador",
+        device_id="PC-1",
+        login_session_id="ADMIN-P1",
+        turn_id=500,
+    )
+    # The current policy requires an Administrator to create the very first
+    # operational context.  This fake then represents the separately audited
+    # representative correction that is outside this transfer-focused test.
+    database.session.update(
+        {
+            "active_username": "auxiliar_a",
+            "active_user_id": "22",
+            "active_user_display_name": "Auxiliar A",
+            "turn_id": 500,
+        }
+    )
     primary = service.attach_device(
+        device_id="PC-1",
         login_username="auxiliar_a",
         login_user_id=22,
         login_role="auxiliar",
-        device_id="PC-1",
         login_session_id="AUX-P1",
         turn_id=500,
     )
