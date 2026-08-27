@@ -97,7 +97,9 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         self.central_context.stop()
         self.projection_reconcile_patch.stop()
 
-    def test_operational_query_uses_one_central_shift_query_and_explicit_inheritance(self):
+    def test_operational_query_uses_one_central_shift_query_and_explicit_inheritance(
+        self,
+    ):
         connection = _Connection()
         service = app.BillingAdmissionQueryService(_Repository())
         with patch.object(app, "db_connect", return_value=connection):
@@ -105,6 +107,8 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         sql, params = connection.calls[-1]
         self.assertEqual(params[0:3], ("TODOS", "TODOS", "TODOS"))
         self.assertIn("FROM admission_operational_sessions", sql)
+        self.assertIn("JOIN sigeh_product_state product", sql)
+        self.assertIn("product.production_epoch_id=session.production_epoch_id", sql)
         self.assertIn("p.operational_source_id::TEXT=cs.operational_source_id", sql)
         self.assertNotIn("SELECT p.*", sql)
         self.assertNotIn("local_shift", sql)
@@ -113,7 +117,9 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         self.assertNotIn("turn_rank", sql)
         self.assertNotIn("MAX(p2.turn_id)", sql)
 
-    def test_selector_uses_central_projection_when_local_reconcile_fails(self):
+    def test_selector_repairs_projection_then_uses_central_when_local_reconcile_fails(
+        self,
+    ):
         connection = _Connection()
         repository = _Repository()
         service = app.BillingAdmissionQueryService(repository)
@@ -122,8 +128,34 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         )
         with patch.object(app, "db_connect", return_value=connection):
             service.get_operational_candidates()
-        self.projection_reconcile.assert_not_called()
+        self.projection_reconcile.assert_called_once_with(repository)
         self.assertTrue(connection.calls)
+
+    def test_selector_returns_attention_materialized_by_prequery_repair(self):
+        connection = _Connection()
+        repository = _Repository()
+        row = _history_row(17)
+        row.update(
+            {
+                "readiness": app.READINESS_READY,
+                "coverage_status": "ASEGURADO",
+                "source_status": "ACTIVA",
+                "global_attention_id": "11111111-1111-4111-8111-111111111111",
+                "operational_source_id": "OPERATIONAL-SOURCE",
+            }
+        )
+
+        def materialize(_repository):
+            connection.rows = [row]
+            return {"synced": 1, "already_current": False}
+
+        self.projection_reconcile.side_effect = materialize
+        service = app.BillingAdmissionQueryService(repository)
+        with patch.object(app, "db_connect", return_value=connection):
+            result = service.get_operational_candidates()
+
+        self.assertEqual([attention.attention_id for attention in result], [17])
+        self.projection_reconcile.assert_called_once_with(repository)
 
     def test_history_fetches_only_fifty_and_returns_keyset_cursor(self):
         rows = [_history_row(value) for value in range(100, 49, -1)]
@@ -142,7 +174,9 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         self.assertIn("NULLIF(p.synced_at,'')::TIMESTAMPTZ", sql)
         self.assertEqual(params[-1], 51)
 
-    def test_history_uses_central_projection_when_local_reconcile_fails(self):
+    def test_history_repairs_projection_then_uses_central_when_local_reconcile_fails(
+        self,
+    ):
         connection = _Connection()
         repository = _Repository()
         service = app.BillingAdmissionQueryService(repository)
@@ -153,7 +187,7 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
             result = service.load_admission_history_batch(
                 current_user={"role": app.ROLE_ADMIN}, limit=50
             )
-        self.projection_reconcile.assert_not_called()
+        self.projection_reconcile.assert_called_once_with(repository)
         self.assertEqual(result["rows"], [])
         self.assertTrue(connection.calls)
 
@@ -171,13 +205,15 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
 
     def test_typed_validation_search_reuses_the_short_lived_queue_snapshot(self):
         row = _history_row(17)
-        row.update({
-            "readiness": app.READINESS_READY,
-            "coverage_status": "ASEGURADO",
-            "source_status": "ACTIVA",
-            "global_attention_id": "11111111-1111-4111-8111-111111111111",
-            "operational_source_id": "OPERATIONAL-SOURCE",
-        })
+        row.update(
+            {
+                "readiness": app.READINESS_READY,
+                "coverage_status": "ASEGURADO",
+                "source_status": "ACTIVA",
+                "global_attention_id": "11111111-1111-4111-8111-111111111111",
+                "operational_source_id": "OPERATIONAL-SOURCE",
+            }
+        )
         connection = _Connection([row])
         with patch.object(app, "db_connect", return_value=connection):
             first = app.load_admission_validation_attentions(
@@ -205,15 +241,16 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
             )
 
         service = app.BillingAdmissionQueryService(_Repository())
-        with patch.object(app, "db_connect") as connect, self.assertRaises(PermissionError):
+        with (
+            patch.object(app, "db_connect") as connect,
+            self.assertRaises(PermissionError),
+        ):
             service.load_admission_history_batch(current_user={"role": "invitado"})
         connect.assert_not_called()
 
     def test_history_columns_and_billing_status_badges(self):
         with patch.object(app.QTimer, "singleShot", return_value=None):
-            dialog = app.AdmissionHistoryDialog(
-                current_user={"role": app.ROLE_ADMIN}
-            )
+            dialog = app.AdmissionHistoryDialog(current_user={"role": app.ROLE_ADMIN})
         try:
             headers = [
                 dialog.table.horizontalHeaderItem(i).text()
@@ -232,16 +269,16 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
 
     def test_old_generation_cannot_contaminate_new_search(self):
         with patch.object(app.QTimer, "singleShot", return_value=None):
-            dialog = app.AdmissionHistoryDialog(
-                current_user={"role": app.ROLE_ADMIN}
-            )
+            dialog = app.AdmissionHistoryDialog(current_user={"role": app.ROLE_ADMIN})
         try:
             dialog._generation = 3
-            dialog._apply_result({
-                "generation": 2,
-                "rows": [_history_row(1)],
-                "has_more": False,
-            })
+            dialog._apply_result(
+                {
+                    "generation": 2,
+                    "rows": [_history_row(1)],
+                    "has_more": False,
+                }
+            )
             self.assertEqual(dialog.table.rowCount(), 0)
         finally:
             dialog.close()

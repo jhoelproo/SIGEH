@@ -5306,6 +5306,28 @@ def ensure_admission_history_projection(repository=None, *, page_size=500):
         return {"synced": synced, "source": state, "already_current": False}
 
 
+def repair_admission_projection_before_billing(repository=None) -> dict:
+    """Repair the central read projection without making Billing local-only.
+
+    PostgreSQL remains the dataset consumed by Billing. This best-effort step
+    closes the interval between V15's local commit and its regular outbox
+    cycle. If this station has no usable replica, Billing still reads the
+    central rows materialized by the other stations.
+    """
+    try:
+        return dict(ensure_admission_history_projection(repository) or {})
+    except AdmissionBridgeError as exc:
+        logging.getLogger("hospital.billing.admission").warning(
+            "ADMISSION_PROJECTION_REPAIR_SKIPPED reason=%s",
+            type(exc).__name__,
+        )
+        return {
+            "synced": 0,
+            "already_current": False,
+            "local_source_available": False,
+        }
+
+
 def _attention_from_projection(row) -> AdmissionAttention:
     data = dict(row)
     try:
@@ -5409,6 +5431,7 @@ class BillingAdmissionQueryService:
         limit: int = 500,
         offset: int = 0,
     ):
+        repair_admission_projection_before_billing(self.repository)
         search_text = str(identifier or "").strip()
         digits = re.sub(r"\D", "", search_text)
         numeric_search = bool(digits) and not bool(
@@ -5426,9 +5449,12 @@ class BillingAdmissionQueryService:
                 f"""WITH current_shift AS (
                        SELECT operational_source_id::TEXT AS operational_source_id,
                               turn_id
-                       FROM admission_operational_sessions
-                       WHERE status='ACTIVE'
-                       ORDER BY updated_at DESC
+                       FROM admission_operational_sessions session
+                       JOIN sigeh_product_state product
+                         ON product.singleton=1
+                        AND product.production_epoch_id=session.production_epoch_id
+                       WHERE session.status='ACTIVE'
+                       ORDER BY session.updated_at DESC
                        LIMIT 1
                    )
                    SELECT p.source_instance_id,p.attention_id,p.patient_id,
@@ -5560,6 +5586,7 @@ class BillingAdmissionQueryService:
             raise PermissionError(
                 "Tu rol no puede consultar el Historial de Admisión para Facturación."
             )
+        repair_admission_projection_before_billing(self.repository)
         full_history = _is_privileged_billing_role(user)
         shift = self.current_shift()
         turn_filter = str(turn_filter or "TODOS").strip().upper()
