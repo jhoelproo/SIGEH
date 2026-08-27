@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import urllib.error
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,9 @@ from sigeh_update import (
     version_tuple,
 )
 from updater import apply_update, merge_preserved
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _release(repository=GITHUB_REPOSITORY, version="1.0.6"):
@@ -44,6 +48,12 @@ def test_product_and_channel_are_sigeh_only():
     assert APP_VERSION == "1.0.5"
     assert LATEST_RELEASE_API.endswith(f"/{GITHUB_REPOSITORY}/releases/latest")
     assert "Hospital-Contreras-Facturacion1" not in LATEST_RELEASE_API
+
+
+def test_tracked_version_metadata_matches_compiled_version():
+    metadata = json.loads((ROOT / "version_config.json").read_text(encoding="utf-8"))
+
+    assert metadata == {"product": PRODUCT_ID, "version": APP_VERSION}
 
 
 def test_release_parser_accepts_complete_sigeh_release():

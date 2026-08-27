@@ -19,6 +19,13 @@ REQUIRED_DIST_ENTRIES = (
     Path("CALCULOS_QT.exe"),
     Path("_internal"),
     Path("_internal/database_url.bundle"),
+    Path("version_config.json"),
+    Path("_internal/version_config.json"),
+)
+
+VERSION_METADATA_PATHS = (
+    Path("version_config.json"),
+    Path("_internal/version_config.json"),
 )
 
 
@@ -44,6 +51,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def write_dist_version_metadata(dist_dir: Path, version: str) -> None:
+    """Make launcher metadata agree with the release being packaged."""
+    metadata = json.dumps(
+        {"product": PRODUCT_ID, "version": version},
+        ensure_ascii=False,
+    )
+    for relative_path in VERSION_METADATA_PATHS:
+        destination = Path(dist_dir) / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(metadata + "\n", encoding="utf-8")
+
+
 def prepare_release(
     dist_dir: Path,
     updater_exe: Path,
@@ -57,6 +76,7 @@ def prepare_release(
     if not updater_exe.is_file():
         raise FileNotFoundError(f"No existe updater ONEFILE: {updater_exe}")
     shutil.copy2(updater_exe, dist_dir / "SIGEH_Updater.exe")
+    write_dist_version_metadata(dist_dir, version)
     validate_dist(dist_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     asset_name = f"SIGEH-{version}-windows-x64.zip"
