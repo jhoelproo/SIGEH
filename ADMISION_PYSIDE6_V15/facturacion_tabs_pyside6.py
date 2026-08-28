@@ -85,7 +85,7 @@ import openpyxl
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font as XLFont, Alignment as XLAlignment, Border as XLBorder, Side as XLSide
 
-from admission_statistical_reports import (
+from admission_statistical_reports import (  # noqa: E402 - PROJECT_ROOT bootstrap requerido
     ARS_ALL,
     ARS_EXCLUDE,
     ARS_INCLUDE,
