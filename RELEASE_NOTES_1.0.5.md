@@ -25,6 +25,15 @@ offline; no se comparte entre equipos y no reemplaza el historial central.
   auditoría permanecen en solo lectura para Admisión.
 - Una atención anulada desaparece del historial activo. Su recibo vinculado se
   mueve a la papelera; restaurar el recibo no restaura la atención original.
+- La inicialización de una base PostgreSQL limpia y la actualización desde el
+  esquema heredado crean las columnas híbridas antes de sus índices
+  operacionales.
+- La actualización de lotes ARS amplía su restricción de estados antes de
+  convertir registros `BORRADOR` a `PENDIENTE`.
+- El análisis de capacidad sigue operativo sin `pgcrypto` y, en ese caso, no
+  declara copias PDF como verificadas sin poder comprobar su SHA-256.
+- La vinculación de un recibo nuevo conserva en sus columnas correctas el UUID
+  global de la atención, la huella del snapshot, la cobertura y el readiness.
 - Se eliminó el reinicio automático del historial introducido en 1.0.4.
 
 ## Despliegue obligatorio del baseline inicial

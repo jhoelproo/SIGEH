@@ -294,6 +294,37 @@ def test_absent_optional_relations_have_zero_safe_cleanup():
     assert analyzer.analyze_pdf_storage()["relation_bytes"] == 0
 
 
+@pytest.mark.parametrize(
+    ("digest_available", "expected_rows"),
+    [(False, 0), (True, 2)],
+)
+def test_pdf_analysis_conservatively_handles_missing_pgcrypto(
+    monkeypatch, digest_available, expected_rows
+):
+    digest_queries = []
+    analyzer = DatabaseCapacityAnalyzer(lambda: object())
+    monkeypatch.setattr(analyzer, "_relation_exists", lambda *_args: True)
+    monkeypatch.setattr(analyzer, "_relation_size", lambda *_args: 512)
+
+    def fake_one(_con, sql, _params=()):
+        if "to_regprocedure" in sql:
+            return {"available": digest_available}
+        if "DIGEST" in sql:
+            digest_queries.append(sql)
+            return {"rows": 2, "logical_bytes": 256}
+        if "LEFT JOIN recibos" in sql:
+            return {"receipt_rows": 2, "receipt_bytes": 256}
+        return {"rows": 3, "logical_bytes": 384, "unknown_rows": 1}
+
+    monkeypatch.setattr(analyzer, "_one", fake_one)
+
+    result = analyzer.analyze_pdf_storage(object())
+
+    assert result["verified_external_rows"] == expected_rows
+    assert result["verified_external_bytes"] == (256 if digest_available else 0)
+    assert len(digest_queries) == int(digest_available)
+
+
 class _SchemaConnection(_MaintenanceConnection):
     def __init__(self, recent=None):
         super().__init__()

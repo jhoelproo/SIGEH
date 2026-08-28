@@ -68,6 +68,7 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
             "ars": "SENASA CONTRIBUTIVO",
             "source_updated_at": "2026-07-17 10:00:00",
             "source_instance_id": "source-e2e",
+            "global_attention_id": "11111111-1111-4111-8111-111111111111",
             "snapshot_hash": "a" * 64,
             "coverage_status": "ASEGURADO_VALIDADO",
             "canonical_ars": "SENASA CONTRIBUTIVO",
@@ -131,6 +132,17 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
         self.assertIn(901, receipt_insert[1])
         self.assertIn("source-e2e", receipt_insert[1])
         self.assertIn("123456789", receipt_insert[1])
+        source_position = receipt_insert[1].index("source-e2e")
+        self.assertEqual(
+            receipt_insert[1][source_position:source_position + 5],
+            (
+                "source-e2e",
+                "a" * 64,
+                "11111111-1111-4111-8111-111111111111",
+                "ASEGURADO_VALIDADO",
+                "LISTA",
+            ),
+        )
 
     def test_schema_has_unique_attention_link_and_monthly_snapshots(self):
         migration = (

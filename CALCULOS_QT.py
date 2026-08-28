@@ -1549,8 +1549,6 @@ ON billing_shift_closure_details(
 );
 CREATE INDEX IF NOT EXISTS idx_admission_projection_queue
 ON admission_attention_projection(readiness, service_date);
-CREATE INDEX IF NOT EXISTS idx_admission_projection_operational_turn
-ON admission_attention_projection(operational_source_id, turn_id, source_status);
 CREATE TABLE IF NOT EXISTS admission_ars_crosswalk(
   source_value_key TEXT PRIMARY KEY,
   source_value TEXT NOT NULL,
@@ -3149,6 +3147,13 @@ def db_init():
             "ALTER TABLE billing_batches ALTER COLUMN status SET DEFAULT 'PENDIENTE'"
         )
         con.execute(
+            "ALTER TABLE billing_batches DROP CONSTRAINT IF EXISTS billing_batches_status_check"
+        )
+        con.execute(
+            "ALTER TABLE billing_batches ADD CONSTRAINT billing_batches_status_check "
+            "CHECK(status IN ('PENDIENTE','ENVIADO','BORRADOR','CERRADO','CANCELADO'))"
+        )
+        con.execute(
             "UPDATE billing_batches SET status='PENDIENTE' WHERE status='BORRADOR'"
         )
         con.execute(
@@ -3156,13 +3161,6 @@ def db_init():
                SET sent_at=COALESCE(sent_at,last_exported_at,updated_at),
                    sent_by=COALESCE(sent_by,updated_by)
                WHERE status IN ('ENVIADO','CERRADO')"""
-        )
-        con.execute(
-            "ALTER TABLE billing_batches DROP CONSTRAINT IF EXISTS billing_batches_status_check"
-        )
-        con.execute(
-            "ALTER TABLE billing_batches ADD CONSTRAINT billing_batches_status_check "
-            "CHECK(status IN ('PENDIENTE','ENVIADO','BORRADOR','CERRADO','CANCELADO'))"
         )
         duplicate_receipts = con.execute(
             """SELECT recibo_id,COUNT(DISTINCT batch_id) AS batches
@@ -10356,7 +10354,8 @@ def save_receipt_with_items(
                     authorization_actor,
                     document_state,
                     new_receipt_storage_mode(),
-                    *admission_values[:12], admission_values[15],
+                    *admission_values[:10], admission_values[15],
+                    admission_values[10], admission_values[11],
                     (
                         admission_processing.get("turno_origen_id")
                         if admission_processing else None

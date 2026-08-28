@@ -365,17 +365,25 @@ class DatabaseCapacityAnalyzer:
                FROM pdf_storage p
                LEFT JOIN recibos r ON r.pdf_filename=p.filename""",
         )
-        verified = self._one(
-            con,
-            """SELECT COUNT(*) AS rows,
-                      COALESCE(SUM(OCTET_LENGTH(p.file_data)),0) AS logical_bytes
-                 FROM pdf_storage p
-                 JOIN document_external_files e
-                   ON e.filename=p.filename
-                  AND e.status='AVAILABLE' AND e.verified_at IS NOT NULL
-                  AND e.size_bytes=OCTET_LENGTH(p.file_data)
-                  AND e.sha256=ENCODE(DIGEST(p.file_data,'sha256'),'hex')""",
+        digest_available = bool(
+            self._one(
+                con,
+                "SELECT to_regprocedure('digest(bytea,text)') IS NOT NULL AS available",
+            ).get("available")
         )
+        verified = {}
+        if digest_available:
+            verified = self._one(
+                con,
+                """SELECT COUNT(*) AS rows,
+                          COALESCE(SUM(OCTET_LENGTH(p.file_data)),0) AS logical_bytes
+                     FROM pdf_storage p
+                     JOIN document_external_files e
+                       ON e.filename=p.filename
+                      AND e.status='AVAILABLE' AND e.verified_at IS NOT NULL
+                      AND e.size_bytes=OCTET_LENGTH(p.file_data)
+                      AND e.sha256=ENCODE(DIGEST(p.file_data,'sha256'),'hex')""",
+            )
         return {
             **totals,
             **classification,

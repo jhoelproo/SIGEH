@@ -5,10 +5,13 @@ from datetime import date, datetime
 from types import ModuleType
 from types import SimpleNamespace
 
+import pytest
+
 from admission_v15_adapter import (
     _HybridAdmissionRuntime,
     _HybridDatabaseProxy,
     _V15BackgroundRefreshCoordinator,
+    _bind_hybrid_shutdown,
 )
 
 
@@ -722,3 +725,133 @@ def test_turn_summary_uses_canonical_dataset_and_excludes_urgency_and_consultati
     assert summary["URGENCIAS"] == 1
     assert summary["CONSULTAS"] == 1
     assert summary["sin_seguro"] == 2
+
+
+def test_central_turn_filters_cover_legacy_identity_and_explicit_turn_paths():
+    proxy = _HybridDatabaseProxy(
+        _LocalDatabase(),
+        SimpleNamespace(
+            operational_session=SimpleNamespace(
+                operational_source_id="",
+                operational_session_id="session-legacy",
+                generation=4,
+                turn_id=316,
+            )
+        ),
+    )
+    where = []
+    params = []
+    proxy._append_central_turn_filters({}, "Turno actual", where, params)
+    assert where == ["p.operational_session_id=%s", "p.generation=%s"]
+    assert params == ["session-legacy", 4]
+
+    proxy._runtime.operational_session = None
+    where = []
+    params = []
+    proxy._append_central_turn_filters({}, "Este turno", where, params)
+    assert where == []
+    assert params == []
+
+    proxy._runtime.operational_session = SimpleNamespace(
+        operational_source_id="",
+        operational_session_id="",
+        generation=0,
+        turn_id=None,
+    )
+    where = []
+    params = []
+    proxy._append_central_turn_filters(
+        {"turno_id": 88, "operational_source_id": "requested-source"},
+        "Este turno",
+        where,
+        params,
+    )
+    assert where == ["p.operational_source_id::TEXT=%s", "p.turn_id=%s"]
+    assert params == ["requested-source", 88]
+
+    where = []
+    params = []
+    proxy._append_central_turn_filters(
+        {"turno_id": 89}, "Por turno", where, params
+    )
+    assert where == ["p.turn_id=%s"]
+    assert params == [89]
+
+
+def test_online_history_keeps_central_rows_when_hydration_fails_without_logger():
+    class BrokenStore:
+        @staticmethod
+        def hydrate_remote_events(_events):
+            raise sqlite3.OperationalError("replica unavailable")
+
+    runtime = SimpleNamespace(
+        offline=False,
+        host=SimpleNamespace(connection_factory=lambda: _CloudConnection()),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id="44444444-4444-4444-8444-444444444444",
+        ),
+        store=BrokenStore(),
+    )
+    rows = _HybridDatabaseProxy(_LocalDatabase(), runtime).listar_atenciones()
+    assert {row["nombre"] for row in rows} == {"CENTRAL", "LOCAL PENDING"}
+
+
+def test_online_history_ignores_local_pending_failure_without_logger():
+    class BrokenLocalDatabase(_LocalDatabase):
+        def listar_atenciones(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("replica unavailable")
+
+    runtime = SimpleNamespace(
+        offline=False,
+        host=SimpleNamespace(connection_factory=lambda: _CloudConnection()),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id="44444444-4444-4444-8444-444444444444",
+        ),
+    )
+    rows = _HybridDatabaseProxy(BrokenLocalDatabase(), runtime).listar_atenciones()
+    assert [row["nombre"] for row in rows] == ["CENTRAL"]
+
+
+def test_non_temporary_central_history_error_is_not_hidden():
+    def fail_connection():
+        raise RuntimeError("invalid central query")
+
+    runtime = SimpleNamespace(
+        offline=False,
+        host=SimpleNamespace(connection_factory=fail_connection),
+        operational_session=SimpleNamespace(turn_id=316),
+        _temporary=lambda _error: False,
+    )
+    with pytest.raises(RuntimeError, match="invalid central query"):
+        _HybridDatabaseProxy(_LocalDatabase(), runtime).listar_atenciones()
+
+
+def test_temporary_central_failure_falls_back_without_optional_services():
+    def fail_connection():
+        raise ConnectionError("central unavailable")
+
+    runtime = SimpleNamespace(
+        offline=False,
+        host=SimpleNamespace(connection_factory=fail_connection),
+        operational_session=SimpleNamespace(turn_id=316),
+        _temporary=lambda _error: True,
+        status_message="",
+    )
+    rows = _HybridDatabaseProxy(_LocalDatabase(), runtime).listar_atenciones()
+    assert runtime.offline is True
+    assert {row["nombre"] for row in rows} == {"LOCAL PENDING", "OLD LOCAL"}
+
+
+def test_hybrid_shutdown_without_optional_refreshers_is_idempotent():
+    events = []
+    widget = SimpleNamespace(shutdown=lambda: events.append("widget"))
+    hybrid = SimpleNamespace(shutdown=lambda: events.append("hybrid"))
+    coordinator = SimpleNamespace(stop=lambda: events.append("coordinator"))
+
+    _bind_hybrid_shutdown(widget, hybrid, coordinator, None, None)
+    widget.shutdown()
+    widget.shutdown()
+
+    assert events == ["coordinator", "hybrid", "widget"]
