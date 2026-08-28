@@ -56,6 +56,9 @@ V15_IMAGE_FILES = ()
 ADMISSION_VALIDATION_MIGRATION = (
     ROOT / "migrations" / "20260801_admission_validation_history.sql"
 )
+BILLING_ADMISSION_BRIDGE_MIGRATION = (
+    ROOT / "migrations" / "20260828_billing_admission_bridge_identity.sql"
+)
 ARS_HONORARIUM_MIGRATION = (
     ROOT / "migrations" / "20260820_ars_honorarium_prompt.sql"
 )
@@ -270,6 +273,7 @@ main_datas = [
     (str(REPORT_ENGINE / "report_styles.css"), "report_engine"),
     (str(ROOT / "version_config.json"), "."),
     (str(ADMISSION_VALIDATION_MIGRATION), "migrations"),
+    (str(BILLING_ADMISSION_BRIDGE_MIGRATION), "migrations"),
     (str(ARS_HONORARIUM_MIGRATION), "migrations"),
     (str(PRIMARY_LEASE_MIGRATION), "migrations"),
     (str(ADMISSION_CORE), "admission_source/emergency_core"),

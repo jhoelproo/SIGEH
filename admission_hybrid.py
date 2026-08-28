@@ -8222,10 +8222,37 @@ class AdmissionSeedService:
         return {"central_seed_id": seed_id, "imported": total, "already_completed": False}
 
 
+def _apply_existing_billing_receipt(
+    result: dict[str, Any],
+    receipt: Mapping[str, Any] | None,
+) -> bool:
+    receipt_data = dict(receipt or {})
+    if not receipt_data:
+        return False
+    billing_status = str(
+        receipt_data.get("estado_facturacion")
+        or receipt_data.get("billing_status")
+        or "PENDIENTE"
+    ).upper()
+    result.update(
+        receipt_id=receipt_data.get("id") or receipt_data.get("receipt_id"),
+        billing_status=billing_status,
+    )
+    completed = billing_status in {"COMPLETO", "FACTURADO", "FINAL"} or (
+        str(receipt_data.get("estado_documento") or "").upper() == "FINAL"
+    )
+    if completed:
+        result.update(
+            reason_code="ALREADY_BILLED",
+            reason="Esta atención ya fue facturada completamente.",
+        )
+    return completed
+
+
 def evaluate_attention_billing_eligibility(
     attention: Mapping[str, Any] | None, user_context: Mapping[str, Any] | None = None,
     *, ars_billing_enabled: bool | None = None, receipt: Mapping[str, Any] | None = None,
-    in_operational_scope: bool = True,
+    in_operational_scope: bool = True, allow_uninsured: bool = False,
 ) -> dict[str, Any]:
     """La \u00fanica regla de elegibilidad. La c\u00e9dula nunca es una condici\u00f3n."""
     data = dict(attention or {})
@@ -8251,7 +8278,9 @@ def evaluate_attention_billing_eligibility(
         return result
     ars = str(data.get("canonical_ars") or data.get("ars") or "").strip()
     normalized_ars = "".join(ch for ch in ars.upper() if ch.isalnum())
-    if not ars or normalized_ars in {"SINSEGURO", "NINGUNO"}:
+    if not ars or (
+        normalized_ars in {"SINSEGURO", "NINGUNO"} and not allow_uninsured
+    ):
         result.update(reason_code="ARS_NOT_BILLABLE",reason="La atenci\u00f3n no tiene una cobertura facturable.")
         return result
     if normalized_ars.startswith("SENASASUBSIDIADO"):
@@ -8260,13 +8289,8 @@ def evaluate_attention_billing_eligibility(
     if ars_billing_enabled is False or data.get("billing_enabled") is False:
         result.update(reason_code="ARS_NOT_BILLABLE",reason="La ARS no est\u00e1 habilitada para facturaci\u00f3n.")
         return result
-    receipt_data = dict(receipt or {})
-    if receipt_data:
-        billing_status = str(receipt_data.get("estado_facturacion") or receipt_data.get("billing_status") or "PENDIENTE").upper()
-        result.update(receipt_id=receipt_data.get("id") or receipt_data.get("receipt_id"),billing_status=billing_status)
-        if billing_status in {"COMPLETO", "FACTURADO", "FINAL"} or str(receipt_data.get("estado_documento") or "").upper() == "FINAL":
-            result.update(reason_code="ALREADY_BILLED",reason="Esta atenci\u00f3n ya fue facturada completamente.")
-            return result
+    if _apply_existing_billing_receipt(result, receipt):
+        return result
     role = str((user_context or {}).get("role") or "").casefold()
     if role in {"", "auxiliar"} and bool(data.get("role_restricted")):
         result.update(reason_code="NOT_ALLOWED_FOR_ROLE",reason="Tu rol no puede facturar esta atenci\u00f3n.")

@@ -476,30 +476,23 @@ class AdmissionReadOnlyRepository:
         service_date = normalize_service_date(row["fecha"])
         attention_type = normalize_service_type(row["tipo_atencion"])
         keys = set(row.keys())
+
+        def optional_text(column: str) -> str:
+            value = row[column] if column in keys else None
+            return "" if value is None else str(value).strip()
+
         specialty = normalize_specialty(row["hoja"] if "hoja" in keys else "")
         has_detail_sheet = bool(str(row["hoja"] if "hoja" in keys else "").strip())
-        admission_username = str(row["admission_username"] if "admission_username" in keys else "").strip()
-        authorization_number = str(
-            row["numero_autorizacion"] if "numero_autorizacion" in keys else ""
-        ).strip()
+        admission_username = optional_text("admission_username")
+        authorization_number = optional_text("numero_autorizacion")
         source_status = str(
             row["estado"] if "estado" in keys else "ACTIVA"
         ).strip().upper()
-        global_attention_id = str(
-            row["global_attention_id"] if "global_attention_id" in keys else ""
-        ).strip()
-        global_patient_id = str(
-            row["global_patient_id"] if "global_patient_id" in keys else ""
-        ).strip()
-        operational_source_id = str(
-            row["operational_source_id"] if "operational_source_id" in keys else ""
-        ).strip()
-        operational_session_id = str(
-            row["operational_session_id"] if "operational_session_id" in keys else ""
-        ).strip()
-        origin_device_id = str(
-            row["origin_device_id"] if "origin_device_id" in keys else ""
-        ).strip()
+        global_attention_id = optional_text("global_attention_id")
+        global_patient_id = optional_text("global_patient_id")
+        operational_source_id = optional_text("operational_source_id")
+        operational_session_id = optional_text("operational_session_id")
+        origin_device_id = optional_text("origin_device_id")
         try:
             generation = int(row["generation"] or 0) if "generation" in keys else 0
         except (TypeError, ValueError):

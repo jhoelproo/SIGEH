@@ -4,6 +4,24 @@ Esta entrega consolida PostgreSQL como fuente autoritativa del historial de
 Admisión. El SQLite de cada estación queda limitado a réplica local y trabajo
 offline; no se comparte entre equipos y no reemplaza el historial central.
 
+## Corrección del puente Admisión central → Facturación
+
+- El Historial de Admisión de Facturación y el selector **Verificar paciente**
+  leen directamente la misma proyección central de PostgreSQL; una estación de
+  Facturación ya no intenta reconciliar su SQLite local antes de consultar.
+- El Historial conserva visibles las atenciones centrales permitidas aunque no
+  estén listas para facturarse. El selector aplica por separado readiness, ARS,
+  cobertura, turno actual o herencia explícita, recibos, claims y descartes.
+- La identidad global de la atención es prioritaria para vincular recibos, con
+  compatibilidad legacy cuando un recibo anterior aún no contiene el UUID.
+- Los errores de conexión, esquema, consulta, datos y permisos quedan
+  clasificados en logs técnicos sin exponer datos clínicos; la interfaz mantiene
+  mensajes amigables.
+- Se incluye una migración PostgreSQL idempotente y no destructiva para la
+  identidad global de recibos y los índices de lectura de Facturación.
+- No se reimporta ni modifica el baseline, el Historial de Emergencias, los
+  roles PRIMARY/SECONDARY, el turno central ni la lógica offline.
+
 ## Cambios principales
 
 - Historial, resumen del turno, Excel y reportes consultan la misma proyección
