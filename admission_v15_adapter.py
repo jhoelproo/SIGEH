@@ -2481,6 +2481,144 @@ class _HybridDatabaseProxy:
             )
         return result
 
+    def list_statistical_report_records(
+        self,
+        *,
+        operational_source_id: str,
+        turn_id: int | None,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[dict[str, Any]]:
+        """Read active central attentions for reports without creating a second history.
+
+        Exact-turn reports are scoped by the durable operational identity.  Date
+        reports use a deliberately broad ``service_date`` prefilter and leave the
+        authoritative half-open 08:00 window to the pure report dataset builder.
+        """
+        source_id = str(operational_source_id or "").strip()
+        if not source_id:
+            raise ValueError("El reporte requiere operational_source_id.")
+        started = perf_counter()
+        logger = getattr(self._runtime, "logger", None)
+        if bool(getattr(self._runtime, "offline", False)):
+            rows = list(
+                self._database.obtener_atenciones_para_rango_real(
+                    start_at,
+                    end_at,
+                    operational_turn_id=int(turn_id) if turn_id is not None else None,
+                    operational_source_id=source_id,
+                )
+                or []
+            )
+            if logger is not None:
+                logger.info(
+                    "ADMISSION_STATISTICAL_REPORT_READ source=offline_replica "
+                    "turn_id=%s rows=%s elapsed_ms=%.1f",
+                    turn_id,
+                    len(rows),
+                    (perf_counter() - started) * 1000.0,
+                )
+            return rows
+
+        where = [
+            "COALESCE(p.is_deleted,FALSE)=FALSE",
+            "UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')",
+            "p.operational_source_id::TEXT=%s",
+        ]
+        params: list[Any] = [source_id]
+        if turn_id is not None:
+            where.append("p.turn_id=%s")
+            params.append(int(turn_id))
+        else:
+            # service_date is the compatible prefilter for baseline and newer
+            # projection rows.  One extra day on each side preserves overnight
+            # records; the dataset builder applies the exact effective timestamp.
+            where.append("p.service_date BETWEEN %s AND %s")
+            params.extend(
+                (
+                    (start_at.date() - timedelta(days=1)).isoformat(),
+                    end_at.date().isoformat(),
+                )
+            )
+        sql = f"""SELECT p.*,
+                          p.attention_id AS id,
+                          p.patient_name AS nombre,
+                          p.service_date AS fecha,
+                          p.service_time AS hora,
+                          p.specialty AS hoja,
+                          p.canonical_ars AS ars,
+                          p.nss_snapshot AS nss,
+                          p.cedula_snapshot AS cedula,
+                          p.service_type AS tipo_atencion
+                     FROM admission_attention_projection p
+                    WHERE {' AND '.join(where)}
+                    ORDER BY COALESCE(p.created_at_effective_utc,
+                                      NULLIF(p.synced_at,'')::TIMESTAMPTZ),
+                             COALESCE(p.origin_device_id,''),
+                             COALESCE(p.device_local_sequence,0),
+                             COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT)"""
+        with self._runtime.host.connection_factory() as connection:
+            rows = [
+                dict(row)
+                for row in connection.execute(sql, tuple(params)).fetchall()
+            ]
+        if logger is not None:
+            logger.info(
+                "ADMISSION_STATISTICAL_REPORT_READ source=postgresql turn_id=%s "
+                "rows=%s elapsed_ms=%.1f",
+                turn_id,
+                len(rows),
+                (perf_counter() - started) * 1000.0,
+            )
+        return rows
+
+    def list_statistical_report_turns(
+        self,
+        *,
+        operational_source_id: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List persisted operational turns for the current production source."""
+        source_id = str(operational_source_id or "").strip()
+        if not source_id:
+            return []
+        session = self._runtime.operational_session
+        if bool(getattr(self._runtime, "offline", False)):
+            if session is None:
+                return []
+            return [
+                {
+                    "turn_id": int(session.turn_id),
+                    "operational_source_id": source_id,
+                    "started_at": getattr(session, "turn_started_at", None),
+                    "ends_at": getattr(session, "turn_ends_at", None),
+                    "status": "CURRENT_OFFLINE",
+                }
+            ]
+        sql = """SELECT i.turn_id,s.operational_source_id::TEXT,
+                        i.started_at,
+                        COALESCE(i.ended_at,i.nominal_ends_at,s.turn_ends_at) AS ends_at,
+                        CASE
+                          WHEN s.turn_id=i.turn_id AND s.status='ACTIVE' THEN 'CURRENT'
+                          WHEN i.ended_at IS NULL THEN 'OPEN'
+                          ELSE 'CLOSED'
+                        END AS status,
+                        i.active_username
+                   FROM admission_operational_turn_intervals i
+                   JOIN admission_operational_sessions s
+                     ON s.operational_session_id=i.operational_session_id
+                  WHERE s.operational_source_id::TEXT=%s
+                    AND i.turn_id IS NOT NULL
+                  ORDER BY i.started_at DESC,i.generation DESC
+                  LIMIT %s"""
+        with self._runtime.host.connection_factory() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    sql, (source_id, max(1, min(int(limit or 100), 500)))
+                ).fetchall()
+            ]
+
     def build_current_admission_list_dataset(
         self,
         turn_id: int | None = None,

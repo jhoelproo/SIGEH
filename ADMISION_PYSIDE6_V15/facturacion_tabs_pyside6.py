@@ -85,6 +85,21 @@ import openpyxl
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font as XLFont, Alignment as XLAlignment, Border as XLBorder, Side as XLSide
 
+from admission_statistical_reports import (
+    ARS_ALL,
+    ARS_EXCLUDE,
+    ARS_INCLUDE,
+    COVERAGE_ALL,
+    COVERAGE_INSURED,
+    COVERAGE_UNINSURED,
+    SPECIALTY_ALL,
+    AdmissionReportFilters,
+    build_admission_report_dataset,
+    build_operational_period,
+    build_turn_operational_period,
+    search_ars_catalog,
+)
+
 
 # UI - MIGRADA A PySide6
 # La lógica funcional permanece en este archivo; qt_compat sustituye únicamente
@@ -4273,6 +4288,48 @@ def _dataset_turno_central(db, *, turn_id=None, operational_source_id=None):
     return rows, effective_turn_id, effective_source_id
 
 
+def construir_hoja_listado_pacientes(
+    ws,
+    filas,
+    *,
+    encabezado_linea_3="",
+    encabezado_linea_4="",
+    revision=None,
+):
+    """Build the single official operational patient-listing format."""
+    filas = list(filas or [])
+    for rng in ('A1:D1', 'A2:D2', 'A3:D3', 'A4:D4'):
+        try:
+            ws.unmerge_cells(rng)
+        except (KeyError, ValueError):
+            pass
+        ws.merge_cells(rng)
+    ws['A1'] = "ASISTENCIA DE PACIENTES A EMERGENCIA"
+    ws['A2'] = "ASEGURADOS Y NO ASEGURADOS"
+    ws['A3'] = str(encabezado_linea_3 or "")
+    ws['A4'] = str(encabezado_linea_4 or "")
+    ws['A5'] = "NO."
+    ws['B5'] = "NOMBRE"
+    ws['C5'] = "ESPECIALIDAD"
+    ws['D5'] = "ARS"
+    ws['E5'] = "GLOBAL_ATTENTION_ID"
+    ws['F1'] = str(revision if revision is not None else _admission_dataset_revision(filas))
+    ws.column_dimensions['E'].hidden = True
+    ws.column_dimensions['F'].hidden = True
+    if ws.max_row >= 6:
+        ws.delete_rows(6, ws.max_row - 5)
+    for numero, fila in enumerate(filas, start=1):
+        ws.append([
+            numero,
+            str(fila.get("nombre") or fila.get("patient_name") or "SIN NOMBRE").upper(),
+            fila.get("hoja_normalizada", fila.get("specialty", fila.get("hoja", ""))),
+            fila.get("ars_display", fila.get("canonical_ars", fila.get("ars", "SIN SEGURO"))),
+            str(fila.get("global_attention_id") or ""),
+        ])
+    aplicar_formato_excel(ws)
+    return len(filas)
+
+
 def _construir_workbook_turno(db: DatabaseManager, turno_cfg: dict):
     if not turno_cfg:
         raise TurnoNoVigenteError("No hay turno vigente para reconstruir el listado.")
@@ -4296,44 +4353,16 @@ def _construir_workbook_turno(db: DatabaseManager, turno_cfg: dict):
     wb = Workbook()
     wb.active.title = "Pacientes"
     ws = wb.active
-
-    for rng in ('A1:D1', 'A2:D2', 'A3:D3', 'A4:D4'):
-        try:
-            ws.unmerge_cells(rng)
-        except (KeyError, ValueError):
-            pass
-        ws.merge_cells(rng)
-    ws['A1'] = "ASISTENCIA DE PACIENTES A EMERGENCIA"
-    ws['A2'] = "ASEGURADOS Y NO ASEGURADOS"
-    ws['A3'] = (
-        f"{limpiar_nombre_representante(turno_cfg.get('representante', ''))} "
-        f"{datos_turno['fecha_label']}"
-    ).strip()
-    ws['A4'] = datos_turno["turno_label"]
-    ws['A5'] = "NO."
-    ws['B5'] = "NOMBRE"
-    ws['C5'] = "ESPECIALIDAD"
-    ws['D5'] = "ARS"
-    ws['E5'] = "GLOBAL_ATTENTION_ID"
-    ws['F1'] = _admission_dataset_revision(filas)
-    ws.column_dimensions['E'].hidden = True
-    ws.column_dimensions['F'].hidden = True
-    if ws.max_row >= 6:
-        ws.delete_rows(6, ws.max_row - 5)
-
-    numero = 1
-    for fila in filas:
-        ws.append([
-            numero,
-            (fila.get("nombre", "") or "").upper(),
-            fila.get("hoja_normalizada", fila.get("specialty", fila.get("hoja", ""))),
-            fila.get("ars_display", fila.get("canonical_ars", "SIN SEGURO")),
-            str(fila.get("global_attention_id") or ""),
-        ])
-        numero += 1
-
-    aplicar_formato_excel(ws)
-    return wb, numero - 1
+    total = construir_hoja_listado_pacientes(
+        ws,
+        filas,
+        encabezado_linea_3=(
+            f"{limpiar_nombre_representante(turno_cfg.get('representante', ''))} "
+            f"{datos_turno['fecha_label']}"
+        ).strip(),
+        encabezado_linea_4=datos_turno["turno_label"],
+    )
+    return wb, total
 
 
 def reconstruir_excel_turno(db: DatabaseManager, turno_cfg: dict):
@@ -5665,6 +5694,8 @@ class EmptyAdmissionReportError(ValueError):
 
 def reportable_patient_count(resumen):
     data = dict(resumen or {})
+    if "total_patients" in data:
+        return max(0, int(data.get("total_patients") or 0))
     return max(
         0,
         int(data.get("total_general") or 0)
@@ -5839,11 +5870,17 @@ def crear_pdf_reporte(resumen, destino=None):
         box_h = 48
         gap = 8
         box_w = (usable_w - gap * 3) / 4
+        total_pacientes = int(
+            resumen.get("total_patients", reportable_patient_count(resumen)) or 0
+        )
+        sin_seguro = int(
+            resumen.get("uninsured_patients", resumen.get("cantidad_sin_seguro", 0)) or 0
+        )
         items = [
-            ("EMERGENCIAS", resumen.get("total_general", 0)),
-            ("URGENCIAS", resumen.get("cantidad_urgencias", 0)),
-            ("CONSULTAS", resumen.get("cantidad_consultas", 0)),
-            ("SIN SEGURO", resumen.get("cantidad_sin_seguro", 0)),
+            ("TOTAL PACIENTES", total_pacientes),
+            ("ASEGURADOS", resumen.get("insured_patients", total_pacientes - sin_seguro)),
+            ("SIN SEGURO", sin_seguro),
+            ("MEDICINA GENERAL", resumen.get("general_patients", 0)),
         ]
         x = margen_x
         for title, value in items:
@@ -5878,6 +5915,22 @@ def crear_pdf_reporte(resumen, destino=None):
         y -= 13
         if resumen.get("turno_resumen"):
             c.drawString(margen_x, y, f"Turno: {resumen.get('turno_resumen')}")
+            y -= 13
+        c.drawString(
+            margen_x,
+            y,
+            "Filtros: "
+            f"ARS {resumen.get('ars_mode', ARS_ALL)} · "
+            f"Cobertura {resumen.get('coverage_filter', COVERAGE_ALL)} · "
+            f"Especialidad {resumen.get('specialty_filter', SPECIALTY_ALL)}",
+        )
+        y -= 13
+        if resumen.get("selected_ars_label") and resumen.get("ars_mode") != ARS_ALL:
+            c.drawString(
+                margen_x,
+                y,
+                f"ARS seleccionadas: {resumen.get('selected_ars_label')}",
+            )
             y -= 13
         if representante_mayus:
             c.drawString(margen_x, y, f"Auxiliar de facturación: {representante_mayus}")
@@ -5937,7 +5990,11 @@ def crear_pdf_reporte(resumen, destino=None):
         c.showPage(); page_no += 1; y = dibujar_encabezado(page_no)
     y -= 20
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(margen_x, y, f"Emergencias del período: {resumen.get('total_general', 0)}")
+    c.drawString(
+        margen_x,
+        y,
+        f"Total de pacientes del período: {reportable_patient_count(resumen)}",
+    )
     if representante_mayus:
         c.drawRightString(width - margen_x, y, f"AUXILIAR: {representante_mayus}")
 
@@ -5951,68 +6008,121 @@ def crear_excel_reporte_estadistico(resumen, destino=None):
             "No hay pacientes que coincidan con los criterios seleccionados."
         )
     os.makedirs(REPORTES_DIR, exist_ok=True)
-    if destino: xlsx_path = destino
+    if destino:
+        xlsx_path = destino
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         xlsx_path = output_report_path(f"Reporte_Estadistico_{ts}.xlsx")
+    registros = list(resumen.get("records") or resumen.get("registros") or [])
+    if len(registros) != reportable_patient_count(resumen):
+        raise RuntimeError(
+            "El total del resumen no coincide con el dataset del listado."
+        )
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Resumen por ARS"
-    def style_sheet(ws):
-        thin = XLSide(style="thin", color="D9D9D9")
-        border = XLBorder(left=thin, right=thin, top=thin, bottom=thin)
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.border = border
-                cell.alignment = XLAlignment(vertical="center", wrap_text=True)
-                cell.font = XLFont(name="Calibri", size=11)
-        for cell in ws[1]: cell.font = XLFont(name="Calibri", size=12, bold=True)
-        for col in ws.columns:
-            letter = col[0].column_letter
-            ws.column_dimensions[letter].width = max(14, min(45, max(len(str(c.value or "")) for c in col) + 3))
-    ws.append(["ARS / Seguro", "Cantidad"])
-    for seguro, cantidad in resumen.get("por_seguro", []): ws.append([seguro, cantidad])
-    style_sheet(ws)
-    ws2 = wb.create_sheet("Resumen por especialidad")
-    ws2.append(["Especialidad", "Cantidad"])
-    for esp, cantidad in resumen.get("por_especialidad", []): ws2.append([esp, cantidad])
-    style_sheet(ws2)
-    ws3 = wb.create_sheet("Lista de pacientes")
-    patient_headers = ["Fecha", "Hora", "Nombre", "Tipo de atención", "Especialidad", "ARS", "NSS", "Cédula"]
-    ws3.append(patient_headers)
-    sin_seguro_rows = []
-    rows_by_type = {"EMERGENCIA": [], "URGENCIA": [], "CONSULTA": []}
-    for r in resumen.get("registros", []) or []:
-        tipo = (r.get("tipo_atencion") or "EMERGENCIA").strip().upper()
-        if tipo not in rows_by_type:
-            tipo = "EMERGENCIA"
-        row = [r.get("fecha",""), r.get("hora",""), r.get("nombre",""), tipo, r.get("hoja_normalizada", r.get("hoja","")), r.get("ars_display", ""), r.get("nss",""), r.get("cedula","")]
-        ws3.append(row)
-        rows_by_type[tipo].append(row)
-        if str(r.get("ars_display", "")).upper() == "SIN SEGURO": sin_seguro_rows.append(row)
-    style_sheet(ws3)
-    ws4 = wb.create_sheet("Sin seguro")
-    ws4.append(patient_headers)
-    for row in sin_seguro_rows: ws4.append(row)
-    style_sheet(ws4)
-    ws5 = wb.create_sheet("Resumen general", 0)
-    ws5.append(["Campo", "Valor"])
-    ws5.append(["Período", resumen.get("periodo_texto", "")])
-    ws5.append(["Turno", resumen.get("turno_resumen", "")])
-    ws5.append(["Representante", resumen.get("representante", "")])
-    ws5.append(["Emergencias", resumen.get("total_general", 0)])
-    ws5.append(["Urgencias", resumen.get("cantidad_urgencias", 0)])
-    ws5.append(["Consultas", resumen.get("cantidad_consultas", 0)])
-    ws5.append(["Pacientes sin seguro", resumen.get("cantidad_sin_seguro", 0)])
-    style_sheet(ws5)
-    for title, attention_type in (("Solo emergencias", "EMERGENCIA"), ("Solo urgencias", "URGENCIA"), ("Solo consultas", "CONSULTA")):
-        type_sheet = wb.create_sheet(title)
-        type_sheet.append(patient_headers)
-        for row in rows_by_type[attention_type]:
-            type_sheet.append(row)
-        style_sheet(type_sheet)
-    guardar_excel_seguro(wb, xlsx_path, "exportar el reporte estadístico a Excel")
+    listado = wb.active
+    listado.title = "LISTADO DE PACIENTES"
+    construir_hoja_listado_pacientes(
+        listado,
+        registros,
+        encabezado_linea_3=resumen.get("period_label") or resumen.get("periodo_texto") or "",
+        encabezado_linea_4=resumen.get("turn_label") or resumen.get("turno_resumen") or "",
+    )
+
+    resumen_ws = wb.create_sheet("RESUMEN ESTADÍSTICO")
+    total = int(resumen.get("total_patients", reportable_patient_count(resumen)) or 0)
+    sin_seguro = int(
+        resumen.get("uninsured_patients", resumen.get("cantidad_sin_seguro", 0)) or 0
+    )
+    asegurados = int(resumen.get("insured_patients", total - sin_seguro) or 0)
+    porcentaje_asegurados = float(
+        resumen.get("insured_percentage", (asegurados * 100 / total) if total else 0)
+        or 0
+    )
+    porcentaje_sin_seguro = float(
+        resumen.get("uninsured_percentage", (sin_seguro * 100 / total) if total else 0)
+        or 0
+    )
+    generated_at = resumen.get("generated_at") or datetime.now()
+    if isinstance(generated_at, datetime):
+        generated_label = generated_at.strftime("%d/%m/%Y %I:%M %p")
+    else:
+        generated_label = str(generated_at)
+    summary_rows = [
+        ("REPORTE ESTADÍSTICO", ""),
+        ("Total de pacientes", total),
+        ("Total asegurados", asegurados),
+        ("Total sin seguro", sin_seguro),
+        ("Porcentaje asegurados", porcentaje_asegurados / 100),
+        ("Porcentaje sin seguro", porcentaje_sin_seguro / 100),
+        ("Medicina General", int(resumen.get("general_patients", 0) or 0)),
+        ("Pediatría", int(resumen.get("pediatric_patients", 0) or 0)),
+        ("Ginecología", int(resumen.get("gynecology_patients", 0) or 0)),
+        ("Turno seleccionado", resumen.get("turn_label") or resumen.get("turno_resumen") or "Todos los turnos"),
+        ("Período utilizado", resumen.get("period_label") or resumen.get("periodo_texto") or ""),
+        ("Fecha desde", _report_excel_datetime(resumen.get("start_at"))),
+        ("Fecha hasta", _report_excel_datetime(resumen.get("end_at"))),
+        ("Modo ARS", resumen.get("ars_mode") or ARS_ALL),
+        ("ARS seleccionadas", resumen.get("selected_ars_label") or "Ninguna"),
+        ("Cobertura seleccionada", resumen.get("coverage_filter") or COVERAGE_ALL),
+        ("Especialidad seleccionada", resumen.get("specialty_filter") or SPECIALTY_ALL),
+        ("Fecha/hora de generación", generated_label),
+    ]
+    for label, value in summary_rows:
+        resumen_ws.append([label, value])
+    resumen_ws.append([])
+    resumen_ws.append(["CONTEO POR ESPECIALIDAD", "Cantidad"])
+    for especialidad, cantidad in (
+        resumen.get("by_specialty") or resumen.get("por_especialidad") or []
+    ):
+        resumen_ws.append([especialidad, int(cantidad)])
+    resumen_ws.append([])
+    resumen_ws.append(["CONTEO POR ARS", "Cantidad"])
+    for ars, cantidad in resumen.get("by_ars") or resumen.get("por_seguro") or []:
+        resumen_ws.append([ars, int(cantidad)])
+    _aplicar_formato_resumen_estadistico(resumen_ws)
+    if resumen_ws["B2"].value != len(registros):
+        wb.close()
+        raise RuntimeError(
+            "El resumen estadístico y el listado no contienen el mismo universo."
+        )
+    if not guardar_excel_seguro(
+        wb, xlsx_path, "exportar el reporte estadístico a Excel"
+    ):
+        raise RuntimeError("No se pudo guardar el reporte estadístico en Excel.")
     return xlsx_path
+
+
+def _report_excel_datetime(value):
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y %I:%M %p")
+    return str(value or "")
+
+
+def _aplicar_formato_resumen_estadistico(ws):
+    thin = XLSide(style="thin", color="D9E2EC")
+    border = XLBorder(left=thin, right=thin, top=thin, bottom=thin)
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 42
+    ws.freeze_panes = "A2"
+    for row in ws.iter_rows():
+        for cell in row[:2]:
+            cell.font = XLFont(name="Calibri", size=11)
+            cell.alignment = XLAlignment(vertical="center", wrap_text=True)
+            if any(value is not None for value in (row[0].value, row[1].value)):
+                cell.border = border
+    section_labels = {
+        "REPORTE ESTADÍSTICO",
+        "CONTEO POR ESPECIALIDAD",
+        "CONTEO POR ARS",
+    }
+    for row_number in range(1, ws.max_row + 1):
+        if ws.cell(row_number, 1).value not in section_labels:
+            continue
+        for cell in ws[row_number][:2]:
+            cell.font = XLFont(name="Calibri", size=12, bold=True, color="FFFFFF")
+            cell.fill = openpyxl.styles.PatternFill("solid", fgColor="1F4E78")
+    for row in range(2, min(7, ws.max_row) + 1):
+        ws.cell(row, 2).number_format = "0.00%" if row in (5, 6) else "0"
 
 
 # -------------------------------
@@ -9262,229 +9372,373 @@ class App:
     def abrir_ventana_reporte(self):
         if not self._exigir_permiso(CAP_VIEW_REPORTS, "consultar reportes administrativos"):
             return
-        win = self._crear_toplevel_estable("Reporte estadístico", "960x720", "reporte_win")
+        win = self._crear_toplevel_estable("Reporte estadístico", "1240x850", "reporte_win")
         if win is None:
             return
-
         self._bind_esc_cerrar(win)
-
         cont = tb.Frame(win, padding=14, style="Root.TFrame")
         cont.pack(fill="both", expand=True)
-
         self._crear_header_ventana(
             cont,
             "Reporte estadístico",
-            "Genera el reporte de pacientes por período, ARS, especialidad y conteo general.",
+            "Genera reportes por turno, período, ARS, especialidad y cobertura.",
             "📊"
         )
-
         try:
-            win.minsize(940, 690)
+            win.minsize(1120, 760)
             win.resizable(True, True)
         except Exception:
             pass
-
         barra = tb.Frame(cont, padding=(8, 8), style="Card.TFrame")
         barra.pack(side="bottom", fill="x", pady=(8, 0))
-
         panel = tb.Frame(cont, padding=12, style="Card.TFrame")
-        panel.pack(fill="x", pady=(0, 10))
-        panel.columnconfigure(1, weight=1)
-        panel.columnconfigure(3, weight=1)
+        panel.pack(fill="x", pady=(0, 8))
+        panel.columnconfigure(0, weight=3)
+        panel.columnconfigure(1, weight=2)
 
-        periodo_var = tk.StringVar(value="Diario")
-        fecha_inicio = crear_selector_fecha(panel, width=14)
-        fecha_fin = crear_selector_fecha(panel, width=14)
-
-        hoy = datetime.now().date()
-        establecer_fecha_selector(fecha_inicio, hoy)
-        establecer_fecha_selector(fecha_fin, hoy)
-
-        tb.Label(panel, text="Período:", background="#0E1B2B", font=("Arial", 10, "bold")).grid(
-            row=0, column=0, sticky="w", padx=6, pady=6
+        filtros = tb.Frame(panel, style="Card.TFrame")
+        filtros.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        filtros.columnconfigure(1, weight=1)
+        filtros.columnconfigure(3, weight=1)
+        tb.Label(filtros, text="⚲  Filtros", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 8)
         )
+        periodo_var = tk.StringVar(value="Diario")
+        turno_var = tk.StringVar(value="Turno actual")
+        especialidad_var = tk.StringVar(value=SPECIALTY_ALL)
+        cobertura_var = tk.StringVar(value=COVERAGE_ALL)
+        fecha_inicio = crear_selector_fecha(filtros, width=14)
+        fecha_fin = crear_selector_fecha(filtros, width=14)
+        fecha_base = fecha_base_operativa_actual()
+        establecer_fecha_selector(fecha_inicio, fecha_base)
+        establecer_fecha_selector(fecha_fin, fecha_base)
+
+        tb.Label(filtros, text="Tipo de período").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         combo_periodo = tb.Combobox(
-            panel,
+            filtros,
             textvariable=periodo_var,
             state="readonly",
-            values=["Diario", "Semanal", "Mensual", "Anual", "Personalizado"],
-            width=18
+            values=["Diario", "Semanal", "Mensual", "Anual", "Rango"],
+            width=22,
         )
-        combo_periodo.grid(row=0, column=1, sticky="w", padx=6, pady=6)
-
-        tb.Label(panel, text="Desde:", background="#0E1B2B", font=("Arial", 10, "bold")).grid(
-            row=1, column=0, sticky="w", padx=6, pady=6
+        combo_periodo.grid(row=1, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        tb.Label(filtros, text="Turno").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        combo_turno = tb.Combobox(
+            filtros,
+            textvariable=turno_var,
+            state="readonly",
+            values=["Turno actual", "Turno anterior", "Todos los turnos"],
+            width=22,
         )
-        fecha_inicio.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+        combo_turno.grid(row=2, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        tb.Label(filtros, text="Desde").grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        fecha_inicio.grid(row=3, column=1, sticky="ew", padx=4, pady=4)
+        tb.Label(filtros, text="Hasta").grid(row=3, column=2, sticky="w", padx=4, pady=4)
+        fecha_fin.grid(row=3, column=3, sticky="ew", padx=4, pady=4)
+        tb.Label(filtros, text="Especialidad").grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        tb.Combobox(
+            filtros,
+            textvariable=especialidad_var,
+            state="readonly",
+            values=[SPECIALTY_ALL, "GENERAL", "PEDIATRIA", "GINECOLOGIA", "OTRAS"],
+            width=22,
+        ).grid(row=4, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        tb.Label(filtros, text="Cobertura").grid(row=5, column=0, sticky="w", padx=4, pady=4)
+        tb.Combobox(
+            filtros,
+            textvariable=cobertura_var,
+            state="readonly",
+            values=[COVERAGE_ALL, COVERAGE_INSURED, COVERAGE_UNINSURED],
+            width=22,
+        ).grid(row=5, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
 
-        tb.Label(panel, text="Hasta:", background="#0E1B2B", font=("Arial", 10, "bold")).grid(
-            row=1, column=2, sticky="w", padx=6, pady=6
+        ars_panel = tb.Frame(panel, style="Card.TFrame")
+        ars_panel.grid(row=0, column=1, sticky="nsew")
+        ars_panel.columnconfigure(0, weight=1)
+        tb.Label(ars_panel, text="ARS", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, sticky="w", padx=4, pady=(0, 8)
         )
-        fecha_fin.grid(row=1, column=3, sticky="w", padx=6, pady=6)
-
-        estado_var = tk.StringVar(value="Seleccione el período y presione Generar reporte.")
-        tb.Label(panel, textvariable=estado_var, style="Muted.TLabel", background="#0E1B2B").grid(
-            row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0)
+        ars_mode_var = tk.StringVar(value=ARS_ALL)
+        ars_search_var = tk.StringVar(value="")
+        tb.Label(ars_panel, text="Modo ARS").grid(row=1, column=0, sticky="w", padx=4)
+        ars_mode_combo = tb.Combobox(
+            ars_panel,
+            textvariable=ars_mode_var,
+            state="readonly",
+            values=[ARS_ALL, ARS_INCLUDE, ARS_EXCLUDE],
+            width=20,
         )
+        ars_mode_combo.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 6))
+        ars_search = tb.Entry(ars_panel, textvariable=ars_search_var)
+        ars_search.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 6))
+        try:
+            ars_search.insert(0, "")
+            ars_search.setPlaceholderText("Buscar ARS…")
+        except Exception:
+            pass
+        ars_canvas = tk.Canvas(ars_panel, height=110)
+        try:
+            ars_canvas.setMinimumHeight(120)
+            ars_canvas.setMaximumHeight(120)
+            ars_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        except Exception:
+            pass
+        ars_canvas.grid(row=4, column=0, sticky="nsew", padx=4)
+        ars_checks_frame = tb.Frame(ars_canvas, style="Card.TFrame")
+        ars_canvas.create_window((0, 0), window=ars_checks_frame, anchor="nw")
+        ars_catalog = sorted(set(self._obtener_catalogo_ars()) | {"SIN SEGURO"})
+        ars_vars = {}
+        ars_checks = {}
+        for row_index, ars_name in enumerate(ars_catalog):
+            variable = tk.BooleanVar(value=False)
+            checkbox = tb.Checkbutton(
+                ars_checks_frame,
+                text=ars_name,
+                variable=variable,
+                bootstyle=INFO,
+            )
+            checkbox.grid(row=row_index, column=0, sticky="w", padx=3, pady=1)
+            ars_vars[ars_name] = variable
+            ars_checks[ars_name] = checkbox
 
+        tb.Label(
+            panel,
+            text="ⓘ Los turnos usan identidad operacional persistida y una ventana de 8:00 AM a 8:00 AM.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(10, 0))
+
+        cards = tb.Frame(cont, style="Root.TFrame")
+        cards.pack(fill="x", pady=(0, 8))
+        card_specs = (
+            ("total", "Total pacientes"),
+            ("insured", "Asegurados"),
+            ("uninsured", "Sin seguro"),
+            ("general", "General"),
+            ("pediatric", "Pediatría"),
+            ("gynecology", "Ginecología"),
+        )
+        card_vars = {}
+        for column, (key, title) in enumerate(card_specs):
+            cards.columnconfigure(column, weight=1)
+            card = tb.Frame(cards, padding=10, style="Card.TFrame")
+            card.grid(row=0, column=column, sticky="nsew", padx=3)
+            value_var = tk.StringVar(value="0")
+            detail_var = tk.StringVar(value="0% del total")
+            tb.Label(card, text=title, anchor="center").pack(fill="x")
+            tb.Label(card, textvariable=value_var, font=("Arial", 18, "bold"), anchor="center").pack(fill="x")
+            tb.Label(card, textvariable=detail_var, style="Muted.TLabel", anchor="center").pack(fill="x")
+            card_vars[key] = (value_var, detail_var)
+
+        preview_card = tb.Frame(cont, padding=6, style="Card.TFrame")
+        preview_card.pack(fill="both", expand=True)
+        tb.Label(preview_card, text="◉  Vista previa del reporte", font=("Arial", 11, "bold")).pack(
+            anchor="w", padx=4, pady=(0, 5)
+        )
         vista = ttk.Treeview(
-            cont,
-            columns=("seccion", "concepto", "cantidad"),
+            preview_card,
+            columns=("seccion", "concepto", "cantidad", "ars", "turno", "observacion"),
             show="headings",
-            height=10,
-            style="Modern.Treeview"
+            height=7,
+            style="Modern.Treeview",
         )
-        vista.pack(fill="both", expand=True, pady=(0, 6))
+        vista.pack(fill="both", expand=True)
         vista.heading("seccion", text="Sección")
         vista.heading("concepto", text="Concepto")
         vista.heading("cantidad", text="Cantidad")
-        vista.column("seccion", width=170, anchor="w")
-        vista.column("concepto", width=420, anchor="w")
-        vista.column("cantidad", width=110, anchor="center")
+        vista.heading("ars", text="ARS")
+        vista.heading("turno", text="Turno")
+        vista.heading("observacion", text="Observación")
+        for column, width in (
+            ("seccion", 145), ("concepto", 245), ("cantidad", 90),
+            ("ars", 120), ("turno", 160), ("observacion", 260),
+        ):
+            vista.column(column, width=width, anchor="center" if column in {"cantidad", "ars"} else "w")
 
-        ultimo_resumen = {"data": None, "ruta": ""}
+        estado_var = tk.StringVar(value="Seleccione filtros y presione Generar reporte.")
+        ultimo = {"dataset": None, "pdf": "", "excel": ""}
 
-        def _rango_periodo():
-            base_txt = obtener_fecha_selector(fecha_inicio)
-            base = parse_fecha_ddmmyyyy(base_txt) or datetime.now().date()
-            modo = periodo_var.get()
+        def _selected_ars():
+            return tuple(name for name, variable in ars_vars.items() if variable.get())
 
-            if modo == "Diario":
-                inicio, fin = obtener_rango_operativo_desde_fecha(base)
-                etiqueta = f"Día operativo {base.strftime('%d/%m/%Y')}"
-                return inicio, fin, etiqueta
+        def _period_from_controls():
+            first = parse_fecha_ddmmyyyy(obtener_fecha_selector(fecha_inicio)) or fecha_base_operativa_actual()
+            last = parse_fecha_ddmmyyyy(obtener_fecha_selector(fecha_fin)) or first
+            return build_operational_period(periodo_var.get(), first, last)
 
-            if modo == "Semanal":
-                inicio_date = base - timedelta(days=base.weekday())
-                fin_date = inicio_date + timedelta(days=7)
-                inicio = datetime.combine(inicio_date, time(8, 0))
-                fin = datetime.combine(fin_date, time(8, 0))
-                etiqueta = f"Semana {inicio_date.strftime('%d/%m/%Y')} a {(fin_date - timedelta(days=1)).strftime('%d/%m/%Y')}"
-                return inicio, fin, etiqueta
-
-            if modo == "Mensual":
-                inicio_date = base.replace(day=1)
-                if inicio_date.month == 12:
-                    siguiente = date(inicio_date.year + 1, 1, 1)
+        def _refresh_ars_search(*_):
+            visible = set(search_ars_catalog(ars_catalog, ars_search_var.get()))
+            for name, checkbox in ars_checks.items():
+                if name in visible:
+                    checkbox.grid()
                 else:
-                    siguiente = date(inicio_date.year, inicio_date.month + 1, 1)
-                inicio = datetime.combine(inicio_date, time(8, 0))
-                fin = datetime.combine(siguiente, time(8, 0))
-                etiqueta = f"Mes {inicio_date.strftime('%m/%Y')}"
-                return inicio, fin, etiqueta
+                    checkbox.grid_remove()
 
-            if modo == "Anual":
-                inicio_date = date(base.year, 1, 1)
-                siguiente = date(base.year + 1, 1, 1)
-                inicio = datetime.combine(inicio_date, time(8, 0))
-                fin = datetime.combine(siguiente, time(8, 0))
-                etiqueta = f"Año {base.year}"
-                return inicio, fin, etiqueta
-
-            ini = parse_fecha_ddmmyyyy(obtener_fecha_selector(fecha_inicio)) or base
-            fin_d = parse_fecha_ddmmyyyy(obtener_fecha_selector(fecha_fin)) or ini
-            if fin_d < ini:
-                ini, fin_d = fin_d, ini
-            inicio = datetime.combine(ini, time(0, 0))
-            fin = datetime.combine(fin_d + timedelta(days=1), time(0, 0))
-            etiqueta = f"Personalizado {ini.strftime('%d/%m/%Y')} a {fin_d.strftime('%d/%m/%Y')}"
-            return inicio, fin, etiqueta
-
-        def _cargar_vista_resumen(resumen):
+        def _load_dataset_into_ui(dataset):
             vista.delete(*vista.get_children())
-            vista.insert("", "end", values=("Resumen general", "Emergencias", resumen.get("total_general", 0)))
-            vista.insert("", "end", values=("Resumen general", "Sin seguro", resumen.get("cantidad_sin_seguro", 0)))
-            if resumen.get("cantidad_urgencias", 0):
-                vista.insert("", "end", values=("Resumen general", "Urgencias", resumen.get("cantidad_urgencias", 0)))
-            if resumen.get("cantidad_consultas", 0):
-                vista.insert("", "end", values=("Resumen general", "Consultas", resumen.get("cantidad_consultas", 0)))
+            for preview_row in dataset.preview_rows:
+                vista.insert("", "end", values=preview_row)
+            summary = dataset.summary
+            total = int(summary["total_patients"])
+            values = {
+                "total": (total, 100.0 if total else 0.0),
+                "insured": (summary["insured_patients"], summary["insured_percentage"]),
+                "uninsured": (summary["uninsured_patients"], summary["uninsured_percentage"]),
+                "general": (summary["general_patients"], (summary["general_patients"] * 100 / total) if total else 0),
+                "pediatric": (summary["pediatric_patients"], (summary["pediatric_patients"] * 100 / total) if total else 0),
+                "gynecology": (summary["gynecology_patients"], (summary["gynecology_patients"] * 100 / total) if total else 0),
+            }
+            for key, (count, percentage) in values.items():
+                card_vars[key][0].set(f"{int(count):,}")
+                card_vars[key][1].set(f"{float(percentage):.2f}% del total")
 
-            for seguro, cantidad in resumen.get("por_seguro", []):
-                vista.insert("", "end", values=("Por ARS", seguro, cantidad))
-
-            for especialidad, cantidad in resumen.get("por_especialidad", []):
-                vista.insert("", "end", values=("Por especialidad", especialidad, cantidad))
+        def _resolve_turn(scope, snapshot, period):
+            source_id = str(snapshot.get("operational_source_id") or "").strip()
+            if not source_id:
+                raise RuntimeError("No existe una identidad operacional central activa.")
+            if scope == "Todos los turnos":
+                return source_id, None, period.start_at, period.end_at, scope
+            turns = self.db.list_statistical_report_turns(
+                operational_source_id=source_id,
+                limit=100,
+            )
+            current_turn = int(snapshot.get("turn_id") or 0)
+            if scope == "Turno actual":
+                target = next((row for row in turns if int(row.get("turn_id") or 0) == current_turn), None)
+                target = target or {
+                    "turn_id": current_turn,
+                    "started_at": snapshot.get("turn_started_at"),
+                    "ends_at": snapshot.get("turn_ends_at"),
+                }
+            else:
+                target = next((row for row in turns if int(row.get("turn_id") or 0) != current_turn), None)
+                if target is None:
+                    raise RuntimeError("No existe un turno anterior central disponible.")
+            target_turn = int(target.get("turn_id") or 0)
+            if target_turn <= 0:
+                raise RuntimeError("El turno seleccionado no posee turn_id central.")
+            turn_period = build_turn_operational_period(
+                target.get("started_at"),
+                fallback_date=period.start_at.date(),
+            )
+            start_at, end_at = turn_period.start_at, turn_period.end_at
+            label = f"{scope} · ID {target_turn}"
+            return source_id, target_turn, start_at, end_at, label
 
         def generar():
             try:
-                inicio, fin, etiqueta = _rango_periodo()
+                period = _period_from_controls()
+                scope = turno_var.get()
+                ars_mode = ars_mode_var.get()
+                selected_ars = _selected_ars()
+                specialty = especialidad_var.get()
+                coverage = cobertura_var.get()
+                snapshot = dict(self.db.get_operational_station_snapshot() or {})
                 estado_var.set("Cargando datos del reporte…")
                 self.set_status("Generando reporte en segundo plano…", "process")
                 win.update_idletasks()
-
                 def _trabajo():
-                    registros = self.db.obtener_atenciones_para_reporte(inicio, fin)
-                    turno_resumen, representante = self.db.obtener_metadatos_reporte(
-                        registros
+                    source_id, turn_id, start_at, end_at, turn_label = _resolve_turn(
+                        scope, snapshot, period
                     )
-
-                    resumen = construir_resumen_desde_registros(
-                        registros,
-                        f"{inicio.strftime('%d/%m/%Y %I:%M %p')} a {fin.strftime('%d/%m/%Y %I:%M %p')}",
-                        turno_resumen=turno_resumen,
-                        representante=representante
+                    records = self.db.list_statistical_report_records(
+                        operational_source_id=source_id,
+                        turn_id=turn_id,
+                        start_at=start_at,
+                        end_at=end_at,
                     )
-                    return etiqueta, resumen
+                    filters = AdmissionReportFilters(
+                        start_at=start_at,
+                        end_at=end_at,
+                        period_label=(
+                            turn_label if turn_id is not None else period.label
+                        ),
+                        turn_label=turn_label,
+                        operational_source_id=source_id,
+                        turn_id=turn_id,
+                        specialty=specialty,
+                        coverage=coverage,
+                        ars_mode=ars_mode,
+                        selected_ars=selected_ars,
+                    )
+                    dataset = build_admission_report_dataset(records, filters)
+                    APP_LOG.info(
+                        "ADMISSION_STATISTICAL_REPORT_DATASET turn_id=%s rows=%s diagnostics=%s",
+                        turn_id,
+                        len(dataset.records),
+                        dict(dataset.diagnostics),
+                    )
+                    return dataset
 
-                def _ok(resultado):
-                    etiqueta_ok, resumen = resultado
-                    if reportable_patient_count(resumen) == 0:
-                        ultimo_resumen["data"] = None
-                        ultimo_resumen["ruta"] = ""
-                        vista.delete(*vista.get_children())
-                        estado_var.set(
-                            "No hay pacientes que coincidan con los criterios seleccionados."
-                        )
-                        self.set_status("Reporte omitido: no hay pacientes.", "warning")
-                        messagebox.showinfo(
-                            "Reporte",
-                            "No hay pacientes que coincidan con los criterios seleccionados.",
-                            parent=win,
-                        )
-                        return
-                    ultimo_resumen["data"] = resumen
-                    ultimo_resumen["ruta"] = ""
-                    _cargar_vista_resumen(resumen)
-                    estado_var.set(f"{etiqueta_ok} · Reporte listo. Total emergencia: {resumen.get('total_general', 0)}")
+                def _ok(dataset):
+                    ultimo.update({"dataset": dataset, "pdf": "", "excel": ""})
+                    _load_dataset_into_ui(dataset)
+                    total = int(dataset.summary["total_patients"])
+                    estado_var.set(f"Reporte listo · {total:,} paciente(s) del dataset canónico.")
                     self.set_status("Reporte cargado", "ok")
-
                 def _error(e):
                     estado_var.set("Error al generar reporte.")
-                    messagebox.showerror("Reporte", f"No se pudo generar el reporte:\n{str(e)}")
-
+                    messagebox.showerror("Reporte", f"No se pudo generar el reporte:\n{str(e)}", parent=win)
                 self._ejecutar_en_segundo_plano("Generando reporte…", _trabajo, _ok, _error)
-
             except Exception as e:
                 estado_var.set("Error al generar reporte.")
-                messagebox.showerror("Reporte", f"No se pudo generar el reporte:\n{str(e)}")
+                messagebox.showerror("Reporte", f"No se pudo generar el reporte:\n{str(e)}", parent=win)
 
         def guardar_pdf():
-            resumen = ultimo_resumen.get("data")
-            if not resumen:
+            dataset = ultimo.get("dataset")
+            if dataset is None or not dataset.records:
                 messagebox.showinfo("Reporte", "Primero presione \"Generar reporte\" y espere a que termine la carga.")
                 return
-            if reportable_patient_count(resumen) == 0:
-                messagebox.showinfo(
-                    "Reporte",
-                    "No hay pacientes que coincidan con los criterios seleccionados.",
-                    parent=win,
-                )
-                return
-
-            try:
-                ruta = crear_pdf_reporte(resumen)
-                ultimo_resumen["ruta"] = ruta
+            def _trabajo():
+                return crear_pdf_reporte(dataset.summary)
+            def _ok(ruta):
+                ultimo["pdf"] = ruta
                 abrir_pdf(ruta)
+                estado_var.set(f"PDF creado: {os.path.basename(ruta)}")
+                self.set_status("PDF del reporte generado", "ok")
+            def _error(error):
+                messagebox.showerror("Reporte", f"No se pudo crear el PDF:\n{error}", parent=win)
+            self._ejecutar_en_segundo_plano("Creando PDF…", _trabajo, _ok, _error)
 
-                if self.app_settings.get("auto_print", True) and bool(self.app_settings.get("print_auto_reporte_turno", True)):
-                    copias = max(1, int(self.app_settings.get("print_copies_reporte", 2) or 2))
-                    imprimir_pdf(ruta, copias=copias, mostrar_error=True)
-                    self.set_status(f"Reporte generado e impreso ({copias} copia/s)", "ok")
-                else:
-                    self.set_status("Reporte generado", "ok")
+        def guardar_excel_reporte():
+            dataset = ultimo.get("dataset")
+            if dataset is None or not dataset.records:
+                messagebox.showinfo("Reporte", "Primero genere un reporte con pacientes.", parent=win)
+                return
+            destination = filedialog.asksaveasfilename(
+                parent=win,
+                title="Exportar reporte estadístico",
+                defaultextension=".xlsx",
+                filetypes=[("Excel", "*.xlsx")],
+            )
+            if not destination:
+                return
+            def _trabajo():
+                return crear_excel_reporte_estadistico(dataset.summary, destino=destination)
+            def _ok(ruta):
+                ultimo["excel"] = ruta
+                estado_var.set(f"Excel creado: {os.path.basename(ruta)}")
+                self.set_status("Excel del reporte exportado", "ok")
+            def _error(error):
+                messagebox.showerror("Reporte", f"No se pudo exportar el Excel:\n{error}", parent=win)
+            self._ejecutar_en_segundo_plano("Exportando Excel…", _trabajo, _ok, _error)
 
-            except Exception as e:
-                messagebox.showerror("Reporte", f"No se pudo crear el PDF del reporte:\n{str(e)}")
+        def limpiar_filtros():
+            periodo_var.set("Diario")
+            turno_var.set("Turno actual")
+            especialidad_var.set(SPECIALTY_ALL)
+            cobertura_var.set(COVERAGE_ALL)
+            ars_mode_var.set(ARS_ALL)
+            ars_search_var.set("")
+            establecer_fecha_selector(fecha_inicio, fecha_base_operativa_actual())
+            establecer_fecha_selector(fecha_fin, fecha_base_operativa_actual())
+            for variable in ars_vars.values():
+                variable.set(False)
+            ultimo.update({"dataset": None, "pdf": "", "excel": ""})
+            vista.delete(*vista.get_children())
+            for value_var, detail_var in card_vars.values():
+                value_var.set("0")
+                detail_var.set("0% del total")
+            estado_var.set("Filtros restablecidos.")
 
         def _actualizar_fechas_por_periodo(*_):
             modo = periodo_var.get()
@@ -9514,48 +9768,111 @@ class App:
                 establecer_fecha_selector(fecha_inicio, inicio_date)
                 establecer_fecha_selector(fecha_fin, fin_date)
             else:
-                _marcar_personalizado()
+                periodo_var.set("Rango")
 
-        def _marcar_personalizado(*_):
-            periodo_var.set("Personalizado")
+        def _marcar_rango(*_):
+            periodo_var.set("Rango")
 
         combo_periodo.bind("<<ComboboxSelected>>", _actualizar_fechas_por_periodo)
-        fecha_inicio.bind("<<DateEntrySelected>>", _marcar_personalizado)
-        fecha_inicio.bind("<KeyRelease>", _marcar_personalizado)
-        fecha_fin.bind("<<DateEntrySelected>>", _marcar_personalizado)
-        fecha_fin.bind("<KeyRelease>", _marcar_personalizado)
-
-        tb.Button(barra, text="📊  Generar reporte", bootstyle=PRIMARY, command=generar, width=20).pack(side="left", padx=5, ipady=5)
-        tb.Button(barra, text="📄  Crear / abrir PDF", bootstyle=SUCCESS, command=guardar_pdf, width=20).pack(side="left", padx=5, ipady=5)
-        tb.Button(barra, text="Cerrar", bootstyle=SECONDARY, command=win.destroy, width=12).pack(side="right", padx=5, ipady=5)
-
-        try:
-            estado_var.set("Seleccione el período y presione Generar reporte.")
-        except Exception:
-            pass
+        fecha_inicio.bind("<<DateEntrySelected>>", _marcar_rango)
+        fecha_inicio.bind("<KeyRelease>", _marcar_rango)
+        fecha_fin.bind("<<DateEntrySelected>>", _marcar_rango)
+        fecha_fin.bind("<KeyRelease>", _marcar_rango)
+        ars_search_var.changed.connect(lambda _value: _refresh_ars_search())
+        button_row = tb.Frame(barra, style="Card.TFrame")
+        button_row.pack(fill="x")
+        tb.Button(button_row, text="📊  Generar reporte", bootstyle=PRIMARY, command=generar, width=20).pack(side="left", padx=5, ipady=5)
+        tb.Button(button_row, text="📄  Crear / abrir PDF", bootstyle=SUCCESS, command=guardar_pdf, width=20).pack(side="left", padx=5, ipady=5)
+        tb.Button(button_row, text="📗  Exportar Excel", bootstyle=INFO, command=guardar_excel_reporte, width=18).pack(side="left", padx=5, ipady=5)
+        tb.Button(button_row, text="Limpiar filtros", bootstyle=SECONDARY, command=limpiar_filtros, width=16).pack(side="left", padx=5, ipady=5)
+        tb.Button(button_row, text="Cerrar", bootstyle=SECONDARY, command=win.destroy, width=12).pack(side="right", padx=5, ipady=5)
+        tb.Label(barra, textvariable=estado_var, style="Muted.TLabel").pack(
+            fill="x", padx=5, pady=(6, 0)
+        )
+        win.report_controls = {
+            "period": combo_periodo,
+            "turn": combo_turno,
+            "specialty_var": especialidad_var,
+            "coverage_var": cobertura_var,
+            "ars_mode": ars_mode_combo,
+            "ars_search": ars_search,
+            "ars_vars": ars_vars,
+            "cards": card_vars,
+            "preview": vista,
+            "filters_frame": filtros,
+            "filter_panel": panel,
+            "ars_panel": ars_panel,
+            "ars_canvas": ars_canvas,
+            "cards_frame": cards,
+            "preview_card": preview_card,
+            "generate": generar,
+            "clear": limpiar_filtros,
+            "state": ultimo,
+        }
 
 
     def _generar_reporte_del_dia_rapido(self):
         try:
-            fecha_base = fecha_base_operativa_actual()
-            inicio, fin = obtener_rango_operativo_desde_fecha(fecha_base)
-            registros = self.db.obtener_atenciones_para_reporte(inicio, fin)
-            turno_resumen, representante = self.db.obtener_metadatos_reporte(registros)
-
-            resumen = construir_resumen_desde_registros(
-                registros,
-                f"{inicio.strftime('%d/%m/%Y %I:%M %p')} a {fin.strftime('%d/%m/%Y %I:%M %p')}",
-                turno_resumen=turno_resumen,
-                representante=representante
+            snapshot = dict(self.db.get_operational_station_snapshot() or {})
+            source_id = str(snapshot.get("operational_source_id") or "").strip()
+            turn_id = int(snapshot.get("turn_id") or 0)
+            if not source_id or turn_id <= 0:
+                messagebox.showwarning(
+                    "Reporte",
+                    "No hay una identidad de turno central disponible.",
+                    parent=self.root,
+                )
+                return
+            period = build_turn_operational_period(
+                snapshot.get("turn_started_at"),
+                fallback_date=fecha_base_operativa_actual(),
             )
 
-            if resumen["total_general"] == 0:
-                messagebox.showinfo("Sin registros", "No hay registros para el día operativo actual.")
-                return
+            def _trabajo():
+                records = self.db.list_statistical_report_records(
+                    operational_source_id=source_id,
+                    turn_id=turn_id,
+                    start_at=period.start_at,
+                    end_at=period.end_at,
+                )
+                filters = AdmissionReportFilters(
+                    start_at=period.start_at,
+                    end_at=period.end_at,
+                    period_label=period.label,
+                    turn_label=f"Turno actual · ID {turn_id}",
+                    operational_source_id=source_id,
+                    turn_id=turn_id,
+                )
+                dataset = build_admission_report_dataset(records, filters)
+                if not dataset.records:
+                    return "", dataset
+                return crear_pdf_reporte(dataset.summary), dataset
 
-            ruta = crear_pdf_reporte(resumen)
-            abrir_pdf(ruta)
-            self.set_status("Reporte generado correctamente", "ok")
+            def _ok(result):
+                ruta, dataset = result
+                if not ruta:
+                    messagebox.showinfo(
+                        "Sin registros",
+                        "No hay registros para el turno operacional actual.",
+                        parent=self.root,
+                    )
+                    self.set_status("Reporte omitido: turno sin pacientes", "warning")
+                    return
+                abrir_pdf(ruta)
+                self.set_status(
+                    f"Reporte generado · {len(dataset.records)} paciente(s)", "ok"
+                )
+
+            def _error(error):
+                messagebox.showerror(
+                    "Error",
+                    f"No se pudo generar el reporte del turno:\n{error}",
+                    parent=self.root,
+                )
+
+            self._ejecutar_en_segundo_plano(
+                "Generando reporte del turno…", _trabajo, _ok, _error
+            )
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo generar el reporte del día:\n{str(e)}")
 

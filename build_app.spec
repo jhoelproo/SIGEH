@@ -111,6 +111,7 @@ REQUIRED_FILES = [
     ROOT / "admission_contract.py",
     ROOT / "admission_bridge.py",
     ROOT / "admission_v15_adapter.py",
+    ROOT / "admission_statistical_reports.py",
     ROOT / "admission_hybrid.py",
     ROOT / "admission_refresh_coordinator.py",
     ROOT / "patient_directory.py",
