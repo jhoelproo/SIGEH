@@ -247,31 +247,45 @@ class AdmissionReportDataset:
     diagnostics: Mapping[str, int]
 
 
+def _first_truthy(row: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value:
+            return value
+    return default
+
+
+def _coerce_int(value: Any, *, default: int | None) -> int | None:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_record(row: Mapping[str, Any]) -> dict[str, Any] | None:
     occurred_at = _record_datetime(row)
     if occurred_at is None:
         return None
-    ars = _normalize_ars(
-        row.get("ars_display") or row.get("canonical_ars") or row.get("ars")
-    )
+    ars = _normalize_ars(_first_truthy(row, "ars_display", "canonical_ars", "ars"))
     coverage_status = _fold(row.get("coverage_status"))
     uninsured = coverage_status in UNINSURED_STATUSES or ars == "SIN SEGURO"
     if uninsured:
         ars = "SIN SEGURO"
     specialty = _normalize_specialty(
-        row.get("hoja_normalizada") or row.get("specialty") or row.get("hoja")
+        _first_truthy(row, "hoja_normalizada", "specialty", "hoja")
     )
-    attention_id = row.get("attention_id") or row.get("id") or 0
-    try:
-        attention_id = int(attention_id)
-    except (TypeError, ValueError):
-        attention_id = 0
-    turn_id = row.get("turn_id") or row.get("operational_turn_id")
-    try:
-        turn_id = int(turn_id) if turn_id is not None else None
-    except (TypeError, ValueError):
-        turn_id = None
-    name = _plain_text(row.get("patient_name") or row.get("nombre")) or "SIN NOMBRE"
+    attention_id = _coerce_int(
+        _first_truthy(row, "attention_id", "id", default=0), default=0
+    )
+    turn_id = _coerce_int(
+        _first_truthy(row, "turn_id", "operational_turn_id"), default=None
+    )
+    name = _plain_text(_first_truthy(row, "patient_name", "nombre")) or "SIN NOMBRE"
+    service_type = _normalize_attention_type(
+        _first_truthy(row, "service_type", "tipo_atencion")
+    )
     result = dict(row)
     result.update(
         {
@@ -293,16 +307,12 @@ def _normalize_record(row: Mapping[str, Any]) -> dict[str, Any] | None:
             "specialty": specialty,
             "hoja_normalizada": specialty,
             "hoja": specialty,
-            "service_type": _normalize_attention_type(
-                row.get("service_type") or row.get("tipo_atencion")
-            ),
-            "tipo_atencion": _normalize_attention_type(
-                row.get("service_type") or row.get("tipo_atencion")
-            ),
+            "service_type": service_type,
+            "tipo_atencion": service_type,
             "operational_source_id": _plain_text(row.get("operational_source_id")),
             "turn_id": turn_id,
             "source_status": _fold(
-                row.get("source_status") or row.get("estado") or "ACTIVA"
+                _first_truthy(row, "source_status", "estado", default="ACTIVA")
             ),
             "is_deleted": _truthy(row.get("is_deleted")),
         }
@@ -310,19 +320,27 @@ def _normalize_record(row: Mapping[str, Any]) -> dict[str, Any] | None:
     return result
 
 
-def _matches_filters(record: Mapping[str, Any], filters: AdmissionReportFilters) -> str:
+def _scope_exclusion_reason(
+    record: Mapping[str, Any], filters: AdmissionReportFilters
+) -> str:
     if record["is_deleted"] or record["source_status"] not in ACTIVE_STATUSES:
         return "CANCELLED"
-    if filters.operational_source_id and (
-        record["operational_source_id"] != filters.operational_source_id
+    if (
+        filters.operational_source_id
+        and record["operational_source_id"] != filters.operational_source_id
     ):
         return "WRONG_OPERATIONAL_SOURCE"
-    if filters.turn_id is not None and record["turn_id"] != filters.turn_id:
-        return "WRONG_TURN"
-    if filters.turn_id is None:
-        occurred_at = record["occurred_at"]
-        if occurred_at < filters.start_at or occurred_at >= filters.end_at:
-            return "OUTSIDE_PERIOD"
+    if filters.turn_id is not None:
+        return "WRONG_TURN" if record["turn_id"] != filters.turn_id else ""
+    occurred_at = record["occurred_at"]
+    if occurred_at < filters.start_at or occurred_at >= filters.end_at:
+        return "OUTSIDE_PERIOD"
+    return ""
+
+
+def _specialty_exclusion_reason(
+    record: Mapping[str, Any], filters: AdmissionReportFilters
+) -> str:
     if filters.specialty == "OTRAS":
         if record["specialty"] in {"GENERAL", "PEDIATRIA", "GINECOLOGIA"}:
             return "WRONG_SPECIALTY"
@@ -330,15 +348,40 @@ def _matches_filters(record: Mapping[str, Any], filters: AdmissionReportFilters)
         filters.specialty != SPECIALTY_ALL and record["specialty"] != filters.specialty
     ):
         return "WRONG_SPECIALTY"
+    return ""
+
+
+def _coverage_exclusion_reason(
+    record: Mapping[str, Any], filters: AdmissionReportFilters
+) -> str:
     if filters.coverage == COVERAGE_INSURED and not record["is_insured"]:
         return "WRONG_COVERAGE"
     if filters.coverage == COVERAGE_UNINSURED and record["is_insured"]:
         return "WRONG_COVERAGE"
+    return ""
+
+
+def _ars_exclusion_reason(
+    record: Mapping[str, Any], filters: AdmissionReportFilters
+) -> str:
     selected = set(filters.selected_ars)
     if filters.ars_mode == ARS_INCLUDE and record["canonical_ars"] not in selected:
         return "ARS_NOT_INCLUDED"
     if filters.ars_mode == ARS_EXCLUDE and record["canonical_ars"] in selected:
         return "ARS_EXCLUDED"
+    return ""
+
+
+def _matches_filters(record: Mapping[str, Any], filters: AdmissionReportFilters) -> str:
+    for exclusion in (
+        _scope_exclusion_reason,
+        _specialty_exclusion_reason,
+        _coverage_exclusion_reason,
+        _ars_exclusion_reason,
+    ):
+        reason = exclusion(record, filters)
+        if reason:
+            return reason
     return "INCLUDED"
 
 
