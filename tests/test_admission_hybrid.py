@@ -83,6 +83,53 @@ class HybridAdmissionTests(unittest.TestCase):
         self.assertTrue(result["eligible"])
         self.assertEqual(result["reason_code"], "ELIGIBLE_PENDING")
 
+    def test_uninsured_requires_explicit_billing_permission(self):
+        attention = {
+            "attention_id": 10,
+            "source_status": "ACTIVA",
+            "service_type": "EMERGENCIA",
+            "canonical_ars": "SIN SEGURO",
+            "coverage_status": "SIN_SEGURO_DECLARADO",
+        }
+
+        denied = evaluate_attention_billing_eligibility(attention)
+        allowed = evaluate_attention_billing_eligibility(
+            attention,
+            {"role": "administrador"},
+            allow_uninsured=True,
+        )
+
+        self.assertFalse(denied["eligible"])
+        self.assertEqual(denied["reason_code"], "ARS_NOT_BILLABLE")
+        self.assertTrue(allowed["eligible"])
+        self.assertEqual(allowed["reason_code"], "ELIGIBLE_PENDING")
+
+    def test_billing_eligibility_preserves_existing_receipt_states(self):
+        attention = {
+            "global_attention_id": "global-1",
+            "source_status": "ACTIVA",
+            "service_type": "EMERGENCIA",
+            "canonical_ars": "FUTURO",
+        }
+        pending = evaluate_attention_billing_eligibility(
+            attention,
+            receipt={"id": 9, "estado_facturacion": "PENDIENTE"},
+        )
+        completed = evaluate_attention_billing_eligibility(
+            attention,
+            receipt={
+                "id": 10,
+                "estado_facturacion": "PENDIENTE",
+                "estado_documento": "FINAL",
+            },
+        )
+
+        self.assertTrue(pending["eligible"])
+        self.assertEqual(pending["receipt_id"], 9)
+        self.assertEqual(pending["billing_status"], "PENDIENTE")
+        self.assertFalse(completed["eligible"])
+        self.assertEqual(completed["reason_code"], "ALREADY_BILLED")
+
     def test_guard_blocks_secondary_with_another_user(self):
         decision = AdmissionWriteGuard().can_write_admission(
             login_user="ADMIN",

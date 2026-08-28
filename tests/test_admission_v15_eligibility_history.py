@@ -135,6 +135,7 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
             (app.ROLE_ADMIN, True),
         ):
             connection = _Connection()
+            app.invalidate_admission_validation_cache()
             with patch.object(app, "db_connect", return_value=connection):
                 app.load_admission_validation_attentions(
                     current_user={"role": role},

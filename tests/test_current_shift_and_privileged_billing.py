@@ -163,7 +163,7 @@ class _SelectionConnection:
         return _Result(row=None)
 
 
-def test_privileged_roles_bypass_only_turn_age_filter_for_history_selection():
+def test_privileged_roles_cannot_select_uninherited_historical_attention():
     connection = _SelectionConnection()
     with (
         patch.object(
@@ -181,8 +181,8 @@ def test_privileged_roles_bypass_only_turn_age_filter_for_history_selection():
 
     assert result is None
     assert "ELSE 'HISTÓRICO' END AS turn_scope" in connection.sql
-    assert "(%s OR p.turn_id=cs.turn_id" in connection.sql
-    assert connection.params[-1] is True
+    assert "AND (p.turn_id=cs.turn_id" in connection.sql
+    assert "(%s OR p.turn_id=cs.turn_id" not in connection.sql
 
 
 def test_regular_roles_keep_current_or_inherited_turn_restriction():
@@ -200,7 +200,8 @@ def test_regular_roles_keep_current_or_inherited_turn_restriction():
             "V15-REAL",
             current_user={"role": app.ROLE_AUX},
         )
-    assert connection.params[-1] is False
+    assert "AND (p.turn_id=cs.turn_id" in connection.sql
+    assert "(%s OR p.turn_id=cs.turn_id" not in connection.sql
 
 
 def test_yellow_theme_icons_remain_visible_for_moon_and_sun():

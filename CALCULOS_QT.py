@@ -18,7 +18,7 @@ import tempfile
 import logging
 import unicodedata
 from dataclasses import dataclass, field
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from types import SimpleNamespace
 try:
     import requests  # type: ignore
@@ -2700,6 +2700,26 @@ def _apply_admission_validation_history_migration(con):
     con.executescript(migration_path.read_text(encoding="utf-8"))
 
 
+def _apply_billing_admission_bridge_identity_migration(con):
+    """Install the global receipt identity even on an already-marked schema."""
+    con.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        ("billing-admission-bridge-identity-v1",),
+    )
+    migration_path = (
+        Path(APP_DIR)
+        / "migrations"
+        / "20260828_billing_admission_bridge_identity.sql"
+    )
+    if getattr(sys, "frozen", False):
+        migration_path = Path(BUNDLE_DIR) / "migrations" / migration_path.name
+    if not migration_path.exists():
+        raise RuntimeError(
+            "No se encontró la migración de identidad Admisión-Facturación."
+        )
+    con.executescript(migration_path.read_text(encoding="utf-8"))
+
+
 def _apply_admission_hybrid_migration(con):
     """Añade coordinación central y eventos sin alterar atenciones legacy."""
     con.execute(
@@ -2863,6 +2883,7 @@ def db_init():
         _apply_active_sessions_migration(con)
         _apply_billing_shift_closure_snapshot_migration(con)
         _apply_admission_validation_history_migration(con)
+        _apply_billing_admission_bridge_identity_migration(con)
         _apply_admission_hybrid_migration(con)
 
         projection_columns = {
@@ -3392,7 +3413,17 @@ def db_init():
 
 _BOOTSTRAP_REQUIRED_SCHEMA = {
     "users": {"id", "username", "role", "is_active"},
-    "recibos": {"id", "numero", "estado_facturacion", "is_deleted"},
+    "recibos": {
+        "id",
+        "numero",
+        "estado_facturacion",
+        "estado_documento",
+        "is_deleted",
+        "created_at",
+        "admission_atencion_id",
+        "admission_source_instance_id",
+        "admission_global_attention_id",
+    },
     "ars": {
         "id", "nombre", "is_active", "suppress_honorarium_prompt",
         "honorarium_prompt_enabled",
@@ -3434,12 +3465,44 @@ _BOOTSTRAP_REQUIRED_SCHEMA = {
     },
     "admission_attention_projection": {
         "global_attention_id",
+        "global_patient_id",
+        "source_instance_id",
         "attention_id",
+        "patient_id",
         "operational_source_id",
         "turn_id",
+        "patient_name",
+        "service_date",
+        "service_time",
+        "service_type",
+        "source_status",
+        "readiness",
+        "coverage_status",
+        "canonical_ars",
+        "authorization_snapshot",
+        "created_at_effective_utc",
+        "origin_device_id",
+        "device_local_sequence",
         "is_deleted",
         "server_revision",
         "delete_event_uuid",
+    },
+    "admission_shift_inheritances": {
+        "source_instance_id",
+        "attention_id",
+        "turno_origen_id",
+        "estado",
+    },
+    "admission_billing_claims": {
+        "source_instance_id",
+        "attention_id",
+        "session_id",
+        "expires_at",
+    },
+    "admission_quick_list_dismissals": {
+        "source_instance_id",
+        "attention_id",
+        "is_active",
     },
     "admission_sync_events": {
         "sequence",
@@ -4824,20 +4887,92 @@ def _admission_values(attention) -> tuple:
 def get_receipt_for_admission_attention(
     attention_id: int,
     source_instance_id: str = "",
+    global_attention_id: str = "",
 ):
     with db_connect() as con:
         row = con.execute(
             """SELECT id, numero, estado_facturacion, estado_documento, tipo_cobertura
                FROM recibos
-               WHERE admission_atencion_id=%s AND is_deleted=0
+               WHERE is_deleted=0
                  AND (
-                       admission_source_instance_id=%s
-                       OR admission_source_instance_id IS NULL
+                       (%s<>'' AND admission_global_attention_id::TEXT=%s)
+                       OR (
+                           (%s='' OR admission_global_attention_id IS NULL)
+                           AND admission_atencion_id=%s
+                           AND (
+                               admission_source_instance_id=%s
+                               OR admission_source_instance_id IS NULL
+                           )
+                       )
                  )
                LIMIT 1""",
-            (int(attention_id), str(source_instance_id or "LEGACY")),
+            (
+                str(global_attention_id or ""),
+                str(global_attention_id or ""),
+                str(global_attention_id or ""),
+                int(attention_id),
+                str(source_instance_id or "LEGACY"),
+            ),
         ).fetchone()
         return dict(row) if row else None
+
+
+def _billing_projection_denial(row: dict, user: dict, access: dict):
+    if access["reason_code"] == "HISTORICAL_ROLE_DENIED":
+        return (
+            "HISTORICAL_ROLE_DENIED",
+            "Tu rol no puede facturar atenciones históricas no heredadas.",
+        )
+    if str(row.get("readiness") or "") != READINESS_READY:
+        return "NOT_READY", "La atención todavía no está lista para facturación."
+    if not admission_ars_is_visible(row.get("canonical_ars")):
+        ars_key = medication_ars_key(row.get("canonical_ars"))
+        code = (
+            "SUBSIDIZED_EXCLUDED"
+            if ars_key.startswith("SENASASUB")
+            else "ARS_EXCLUDED"
+        )
+        return code, "La ARS está excluida de la cola de facturación."
+    if (
+        str(row.get("coverage_status") or "") == COVERAGE_UNINSURED_DECLARED
+        and not can_view_uninsured_patients(user)
+    ):
+        return (
+            "UNINSURED_NOT_ALLOWED",
+            "Tu rol no puede facturar atenciones declaradas sin seguro.",
+        )
+    if access["reason_code"] == "ALREADY_BILLED":
+        return "ALREADY_BILLED", "Esta atención ya fue facturada completamente."
+    return None
+
+
+def _apply_billing_projection_outcome(
+    result: dict,
+    row: dict,
+    user: dict,
+    access: dict,
+) -> None:
+    denial = _billing_projection_denial(row, user, access)
+    if denial:
+        result.update(eligible=False, reason_code=denial[0], reason=denial[1])
+    elif result.get("eligible") and access["can_continue_receipt"]:
+        result.update(
+            eligible=False,
+            reason_code="RECEIPT_PENDING",
+            reason="Esta atención ya tiene una facturación pendiente para continuar.",
+        )
+    if row.get("claimed_elsewhere") and result.get("eligible"):
+        result.update(
+            eligible=False,
+            reason_code="CLAIMED_OTHER_SESSION",
+            reason="La atención está siendo procesada por otra estación.",
+        )
+    if row.get("dismissed_from_quick_list") and result.get("eligible"):
+        result.update(
+            eligible=False,
+            reason_code="DISMISSED",
+            reason="La atención fue descartada de la cola rápida.",
+        )
 
 
 def evaluate_attention_billing_eligibility(
@@ -4862,8 +4997,8 @@ def evaluate_attention_billing_eligibility(
     allow_claim_override = can_override_admission_billing_claim(
         dict(user_context or {})
     )
-    with db_connect() as con:
-        projection = con.execute(
+    receipt_identity = admission_receipt_identity_sql("receipt", "p")
+    eligibility_sql = "".join((
             """SELECT p.*,
                       receipt.id AS linked_receipt_id,
                       receipt.estado_facturacion AS linked_billing_status,
@@ -4886,14 +5021,21 @@ def evaluate_attention_billing_eligibility(
                              AND claim.session_id<>%s
                              AND NOT %s
                        ) AS claimed_elsewhere
+                      ,EXISTS(
+                          SELECT 1 FROM admission_quick_list_dismissals dismissal
+                          WHERE dismissal.source_instance_id=p.source_instance_id
+                            AND dismissal.attention_id=p.attention_id
+                            AND dismissal.is_active=TRUE
+                       ) AS dismissed_from_quick_list
                FROM admission_attention_projection p
                LEFT JOIN LATERAL (
                    SELECT id,estado_facturacion,estado_documento
-                   FROM recibos
-                   WHERE admission_atencion_id=p.attention_id
-                     AND COALESCE(admission_source_instance_id,'LEGACY')=p.source_instance_id
-                     AND is_deleted=0
-                   ORDER BY id DESC LIMIT 1
+                   FROM recibos receipt
+                   WHERE """,
+            receipt_identity,
+            """
+                     AND receipt.is_deleted=0
+                   ORDER BY receipt.id DESC LIMIT 1
                ) receipt ON TRUE
                LEFT JOIN LATERAL (
                    SELECT billing_enabled FROM ars
@@ -4912,23 +5054,30 @@ def evaluate_attention_billing_eligibility(
                )
                  AND COALESCE(p.is_deleted,FALSE)=FALSE
                ORDER BY p.synced_at DESC LIMIT 1""",
+    ))
+    rows, _timings = CentralAdmissionReader().fetch_all(
+            eligibility_sql,
             (
                 str(session_id or ""), bool(allow_claim_override),
                 global_id, global_id, global_id,
                 identity, source, source,
             ),
-        ).fetchone()
-        if not projection:
-            return _evaluate_hybrid_eligibility(None, dict(user_context or {}))
-        row = dict(projection)
-        access = evaluate_admission_billing_access(
-            row,
-            dict(user_context or {}),
-            {
-                "turn_id": row.get("active_turn_id"),
-                "operational_source_id": row.get("active_operational_source_id"),
-            },
-        )
+            operation="evaluate_attention_billing_eligibility",
+            sql_stage="ELIGIBILITY_REVALIDATION_QUERY",
+            current_user=user_context,
+            statement_timeout_ms=10000,
+    )
+    if not rows:
+        return _evaluate_hybrid_eligibility(None, dict(user_context or {}))
+    row = dict(rows[0])
+    access = evaluate_admission_billing_access(
+        row,
+        dict(user_context or {}),
+        {
+            "turn_id": row.get("active_turn_id"),
+            "operational_source_id": row.get("active_operational_source_id"),
+        },
+    )
     enabled_value = row.get("ars_billing_enabled")
     enabled = None if enabled_value is None else bool(enabled_value)
     receipt = None
@@ -4946,6 +5095,7 @@ def evaluate_attention_billing_eligibility(
         # El alcance se aplica debajo de forma explícita por rol; no usar el
         # guard histórico genérico del adaptador híbrido.
         in_operational_scope=True,
+        allow_uninsured=can_view_uninsured_patients(dict(user_context or {})),
     )
     result.update({
         key: access[key] for key in (
@@ -4953,26 +5103,12 @@ def evaluate_attention_billing_eligibility(
             "can_open_receipt", "can_reopen_completed",
         )
     })
-    if access["reason_code"] == "HISTORICAL_ROLE_DENIED":
-        result.update(
-            eligible=False,
-            reason_code="HISTORICAL_ROLE_DENIED",
-            reason="Tu rol no puede facturar atenciones históricas no heredadas.",
-        )
-    elif access["reason_code"] == "ALREADY_BILLED":
-        result.update(eligible=False, reason_code="ALREADY_BILLED")
-    elif result.get("eligible") and access["can_continue_receipt"]:
-        result.update(
-            eligible=False,
-            reason_code="RECEIPT_PENDING",
-            reason="Esta atención ya tiene una facturación pendiente para continuar.",
-        )
-    if row.get("claimed_elsewhere") and result.get("eligible"):
-        result.update(
-            eligible=False,
-            reason_code="CLAIMED_OTHER_SESSION",
-            reason="La atención está siendo procesada por otra estación.",
-        )
+    _apply_billing_projection_outcome(
+        result,
+        row,
+        dict(user_context or {}),
+        access,
+    )
     result["_projection"] = row
     return result
 
@@ -5294,6 +5430,42 @@ def repair_admission_projection_before_billing(repository=None) -> dict:
         }
 
 
+def _projection_int(value, default=0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
+def admission_receipt_identity_sql(
+    receipt_alias: str = "r",
+    projection_alias: str = "p",
+) -> str:
+    """Prefer global attention UUID while preserving legacy receipt links."""
+    for alias in (receipt_alias, projection_alias):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(alias or "")):
+            raise ValueError("Invalid SQL alias for Admission receipt identity.")
+    receipt = str(receipt_alias)
+    projection = str(projection_alias)
+    return f"""(
+        (
+            {projection}.global_attention_id IS NOT NULL
+            AND {receipt}.admission_global_attention_id=
+                {projection}.global_attention_id
+        )
+        OR (
+            (
+                {projection}.global_attention_id IS NULL
+                OR {receipt}.admission_global_attention_id IS NULL
+            )
+            AND {receipt}.admission_atencion_id={projection}.attention_id
+            AND COALESCE(
+                  {receipt}.admission_source_instance_id,'LEGACY'
+                )={projection}.source_instance_id
+        )
+    )"""
+
+
 def _attention_from_projection(row) -> AdmissionAttention:
     data = dict(row)
     try:
@@ -5303,9 +5475,9 @@ def _attention_from_projection(row) -> AdmissionAttention:
     coverage_status = str(data.get("coverage_status") or "")
     canonical_ars = str(data.get("canonical_ars") or "")
     return AdmissionAttention(
-        attention_id=int(data["attention_id"]),
-        patient_id=int(data["patient_id"]),
-        turn_id=int(data.get("turn_id") or 0),
+        attention_id=_projection_int(data.get("attention_id")),
+        patient_id=_projection_int(data.get("patient_id")),
+        turn_id=_projection_int(data.get("turn_id")),
         name=str(data.get("patient_name") or ""),
         service_date=str(data.get("service_date") or ""),
         service_time=str(data.get("service_time") or ""),
@@ -5318,7 +5490,7 @@ def _attention_from_projection(row) -> AdmissionAttention:
         source_updated_at=str(data.get("source_updated_at") or ""),
         uninsured=coverage_status == COVERAGE_UNINSURED_DECLARED,
         source_instance_id=str(data.get("source_instance_id") or "LEGACY"),
-        source_schema_version=int(data.get("contract_version") or 0),
+        source_schema_version=_projection_int(data.get("contract_version")),
         coverage_status=coverage_status,
         canonical_ars=canonical_ars,
         billing_readiness=str(data.get("readiness") or ""),
@@ -5329,15 +5501,17 @@ def _attention_from_projection(row) -> AdmissionAttention:
         authorization_number=str(data.get("authorization_snapshot") or ""),
         source_status=str(data.get("source_status") or "ACTIVA"),
         turn_scope=str(data.get("turn_scope") or ""),
-        processing_turn_id=int(data.get("processing_turn_id") or data.get("turn_id") or 0),
+        processing_turn_id=_projection_int(
+            data.get("processing_turn_id") or data.get("turn_id")
+        ),
         has_detail_sheet=bool(data.get("has_detail_sheet")),
         global_attention_id=str(data.get("global_attention_id") or ""),
         global_patient_id=str(data.get("global_patient_id") or ""),
         operational_source_id=str(data.get("operational_source_id") or ""),
         operational_session_id=str(data.get("operational_session_id") or ""),
-        generation=int(data.get("generation") or 0),
+        generation=_projection_int(data.get("generation")),
         origin_device_id=str(data.get("origin_device_id") or ""),
-        version=int(data.get("version") or 1),
+        version=max(1, _projection_int(data.get("version"), 1)),
     )
 
 
@@ -5371,19 +5545,144 @@ def get_central_operational_context(connection_factory=None) -> dict:
     return data
 
 
+_BILLING_ADMISSION_ERROR_MESSAGES = {
+    "CONNECTION_ERROR": "central_database_unavailable",
+    "SCHEMA_ERROR": "central_schema_incompatible",
+    "DATA_ERROR": "invalid_projected_metadata",
+    "PERMISSION_ERROR": "central_query_not_authorized",
+    "QUERY_ERROR": "central_query_failed",
+}
+
+
+def _classify_billing_admission_error(exc: BaseException) -> str:
+    sqlstate = str(getattr(exc, "pgcode", "") or "")
+    if sqlstate.startswith("08"):
+        return "CONNECTION_ERROR"
+    if sqlstate in {"42P01", "42703", "42804", "42883", "3F000"}:
+        return "SCHEMA_ERROR"
+    if sqlstate.startswith("22"):
+        return "DATA_ERROR"
+    if sqlstate == "42501" or isinstance(exc, PermissionError):
+        return "PERMISSION_ERROR"
+    return "QUERY_ERROR"
+
+
+def _billing_admission_log_token(value, default="-") -> str:
+    token = re.sub(r"[^A-Za-z0-9_.:@+-]", "_", str(value or "").strip())
+    return token[:120] or default
+
+
+def log_billing_admission_query_failure(
+    exc: BaseException,
+    *,
+    operation: str,
+    sql_stage: str,
+    current_user=None,
+    context=None,
+    elapsed_ms: float = 0.0,
+) -> str:
+    """Log a technical failure without SQL parameters or clinical data."""
+    category = _classify_billing_admission_error(exc)
+    operational = dict(context or {})
+    role = normalize_role(dict(current_user or {}).get("role")) or "UNKNOWN"
+    details = " ".join(
+        (
+            f"operation={_billing_admission_log_token(operation)}",
+            f"exception_type={_billing_admission_log_token(type(exc).__name__)}",
+            f"error_category={category}",
+            "safe_error_message=" + _BILLING_ADMISSION_ERROR_MESSAGES[category],
+            f"sql_stage={_billing_admission_log_token(sql_stage)}",
+            "current_turn_id="
+            + _billing_admission_log_token(operational.get("turn_id")),
+            "operational_source_id="
+            + _billing_admission_log_token(
+                operational.get("operational_source_id")
+            ),
+            f"role={_billing_admission_log_token(role)}",
+        )
+    )
+    write_main_app_log(
+        "BILLING_ADMISSION_QUERY_FAILED",
+        stage="BILLING_ADMISSION_QUERY",
+        elapsed_ms=float(elapsed_ms or 0.0),
+        success=False,
+        details=details,
+    )
+    with suppress(Exception):
+        setattr(exc, "_billing_admission_failure_logged", True)
+    return category
+
+
+class CentralAdmissionReader:
+    """Canonical PostgreSQL reader for the existence of Admission records."""
+
+    def current_operational_context(self) -> dict:
+        started = perf_counter()
+        try:
+            context = get_central_operational_context()
+            if not context.get("operational_source_id") or not context.get("turn_id"):
+                raise AdmissionBridgeError(
+                    "No se pudo resolver el turno abierto vigente de Admisión."
+                )
+            return context
+        except Exception as exc:
+            log_billing_admission_query_failure(
+                exc,
+                operation="get_central_operational_context",
+                sql_stage="OPERATIONAL_CONTEXT",
+                elapsed_ms=(perf_counter() - started) * 1000.0,
+            )
+            raise
+
+    def fetch_all(
+        self,
+        sql: str,
+        params=(),
+        *,
+        operation: str,
+        sql_stage: str,
+        current_user=None,
+        context=None,
+        statement_timeout_ms: int | None = None,
+    ) -> tuple[list, dict]:
+        started = perf_counter()
+        connection_ready_ms = 0.0
+        try:
+            with db_connect() as con:
+                connection_ready_ms = (perf_counter() - started) * 1000.0
+                if statement_timeout_ms is not None:
+                    timeout = max(1000, min(int(statement_timeout_ms), 60000))
+                    con.execute(f"SET LOCAL statement_timeout = '{timeout}ms'")
+                rows = con.execute(sql, tuple(params or ())).fetchall()
+        except Exception as exc:
+            log_billing_admission_query_failure(
+                exc,
+                operation=operation,
+                sql_stage=sql_stage,
+                current_user=current_user,
+                context=context,
+                elapsed_ms=(perf_counter() - started) * 1000.0,
+            )
+            raise
+        query_finished_ms = (perf_counter() - started) * 1000.0
+        return list(rows), {
+            "connection_ms": connection_ready_ms,
+            "query_ms": max(0.0, query_finished_ms - connection_ready_ms),
+            "elapsed_ms": query_finished_ms,
+        }
+
+
 class BillingAdmissionQueryService:
     """Canonical read service shared by the selector and Admission history."""
 
-    def __init__(self, repository=None):
-        self.repository = repository or AdmissionReadOnlyRepository()
+    def __init__(self, repository=None, central_reader=None):
+        # Retained only for call compatibility. Central Billing reads must not
+        # depend on a station's local SQLite replica.
+        self.repository = repository
+        self.central_reader = central_reader or CentralAdmissionReader()
 
     def current_shift(self) -> dict:
-        context = get_central_operational_context()
-        if not context.get("operational_source_id") or not context.get("turn_id"):
-            raise AdmissionBridgeError(
-                "No se pudo resolver el turno abierto vigente de Admisión."
-            )
-        return context
+        return self.central_reader.current_operational_context()
 
     def get_operational_candidates(
         self,
@@ -5396,8 +5695,12 @@ class BillingAdmissionQueryService:
         allow_all_unbilled: bool = False,
         limit: int = 500,
         offset: int = 0,
+        current_user=None,
     ):
-        repair_admission_projection_before_billing(self.repository)
+        # Former callers may still pass this flag. Privilege never turns all
+        # previous shifts into inherited work.
+        del allow_all_unbilled
+        shift = self.current_shift()
         search_text = str(identifier or "").strip()
         digits = re.sub(r"\D", "", search_text)
         numeric_search = bool(digits) and not bool(
@@ -5408,12 +5711,11 @@ class BillingAdmissionQueryService:
         if turn_filter not in {"ACTUAL", "HEREDADO", "TODOS"}:
             turn_filter = "ACTUAL"
         ars_exclusion = admission_ars_sql_exclusion("p.canonical_ars")
+        receipt_identity = admission_receipt_identity_sql("r", "p")
         started = perf_counter()
-        with db_connect() as con:
-            connection_ready_ms = (perf_counter() - started) * 1000.0
-            rows = con.execute(
+        rows, timings = self.central_reader.fetch_all(
                 f"""WITH current_shift AS (
-                       SELECT operational_source_id::TEXT AS operational_source_id,
+                       SELECT operational_source_id,
                               turn_id
                        FROM admission_operational_sessions session
                        JOIN sigeh_product_state product
@@ -5439,22 +5741,24 @@ class BillingAdmissionQueryService:
                           cs.turn_id AS processing_turn_id
                    FROM admission_attention_projection p
                    JOIN current_shift cs
-                     ON p.operational_source_id::TEXT=cs.operational_source_id
+                     ON p.operational_source_id=cs.operational_source_id
                    LEFT JOIN admission_shift_inheritances inheritance
                      ON inheritance.source_instance_id=p.source_instance_id
                     AND inheritance.attention_id=p.attention_id
                     AND inheritance.turno_origen_id=p.turn_id
                     AND inheritance.estado='PENDIENTE'
                    WHERE (
-                           %s='TODOS'
+                           (%s='TODOS' AND (
+                               p.turn_id=cs.turn_id
+                               OR inheritance.attention_id IS NOT NULL
+                           ))
                         OR (%s='ACTUAL' AND p.turn_id=cs.turn_id)
                         OR (%s='HEREDADO' AND p.turn_id<>cs.turn_id
-                            AND (inheritance.attention_id IS NOT NULL OR %s))
+                            AND inheritance.attention_id IS NOT NULL)
                      )
                      AND (
                           p.turn_id=cs.turn_id
                           OR inheritance.attention_id IS NOT NULL
-                          OR (%s AND p.turn_id<>cs.turn_id)
                      )
                      AND p.readiness=%s
                      AND {ars_exclusion}
@@ -5465,8 +5769,7 @@ class BillingAdmissionQueryService:
                          IN ('ACTIVA','PENDIENTE')
                      AND NOT EXISTS (
                            SELECT 1 FROM recibos r
-                           WHERE r.admission_atencion_id=p.attention_id
-                             AND COALESCE(r.admission_source_instance_id,'LEGACY')=p.source_instance_id
+                           WHERE {receipt_identity}
                              AND r.is_deleted=0
                      )
                      AND (
@@ -5495,17 +5798,13 @@ class BillingAdmissionQueryService:
                         ))
                      )
                    ORDER BY CASE WHEN p.turn_id=cs.turn_id THEN 0 ELSE 1 END,
-                            COALESCE(
-                                p.created_at_effective_utc,
-                                NULLIF(p.synced_at,'')::TIMESTAMPTZ
-                            ) DESC,
+                            COALESCE(p.created_at_effective_utc,TO_TIMESTAMP(0)) DESC,
                             COALESCE(p.origin_device_id,'') DESC,
                             COALESCE(p.device_local_sequence,0) DESC,
                             COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) DESC
                    LIMIT %s OFFSET %s""",
                 (
                     turn_filter, turn_filter, turn_filter,
-                    bool(allow_all_unbilled), bool(allow_all_unbilled),
                     READINESS_READY,
                     bool(allow_uninsured), COVERAGE_UNINSURED_DECLARED,
                     bool(allow_claim_override),
@@ -5516,15 +5815,30 @@ class BillingAdmissionQueryService:
                     max(1, min(int(limit), 5000)),
                     max(0, int(offset)),
                 ),
-            ).fetchall()
+                operation="get_operational_candidates",
+                sql_stage="ELIGIBILITY_QUERY",
+                current_user=current_user,
+                context=shift,
+        )
         query_elapsed_ms = (perf_counter() - started) * 1000.0
-        attentions = [_attention_from_projection(row) for row in rows]
+        try:
+            attentions = [_attention_from_projection(row) for row in rows]
+        except Exception as exc:
+            log_billing_admission_query_failure(
+                exc,
+                operation="get_operational_candidates",
+                sql_stage="PROJECTION_MAPPING",
+                current_user=current_user,
+                context=shift,
+                elapsed_ms=(perf_counter() - started) * 1000.0,
+            )
+            raise
         total_elapsed_ms = (perf_counter() - started) * 1000.0
         if total_elapsed_ms > 200.0:
             write_runtime_log(
                 "PATIENT_VALIDATION_TIME "
-                f"operation=operational_candidates connection_ms={connection_ready_ms:.1f} "
-                f"query_ms={query_elapsed_ms - connection_ready_ms:.1f} "
+                f"operation=operational_candidates connection_ms={timings['connection_ms']:.1f} "
+                f"query_ms={timings['query_ms']:.1f} "
                 f"mapping_ms={total_elapsed_ms - query_elapsed_ms:.1f} "
                 f"total_ms={total_elapsed_ms:.1f} rows={len(attentions)}"
             )
@@ -5552,7 +5866,6 @@ class BillingAdmissionQueryService:
             raise PermissionError(
                 "Tu rol no puede consultar el Historial de Admisión para Facturación."
             )
-        repair_admission_projection_before_billing(self.repository)
         full_history = _is_privileged_billing_role(user)
         shift = self.current_shift()
         turn_filter = str(turn_filter or "TODOS").strip().upper()
@@ -5579,22 +5892,19 @@ class BillingAdmissionQueryService:
         ars_exclusion = admission_ars_sql_exclusion(
             "p.canonical_ars", history=True
         )
+        receipt_identity = admission_receipt_identity_sql("receipt", "p")
         batch_size = max(1, min(int(limit), 100))
         cursor_data = dict(cursor or {})
-        cursor_date = str(cursor_data.get("service_date") or "")
-        cursor_time = str(cursor_data.get("service_time") or "")
-        cursor_attention = int(cursor_data.get("attention_id") or 0)
+        cursor_attention = _projection_int(cursor_data.get("attention_id"))
         cursor_effective = str(
             cursor_data.get("created_at_effective_utc") or ""
         )
         cursor_device = str(cursor_data.get("origin_device_id") or "")
-        cursor_sequence = int(cursor_data.get("device_local_sequence") or 0)
+        cursor_sequence = _projection_int(cursor_data.get("device_local_sequence"))
         cursor_global = str(cursor_data.get("global_attention_id") or "")
         has_cursor = bool(cursor_data and (cursor_global or cursor_attention))
 
-        with db_connect() as con:
-            con.execute("SET LOCAL statement_timeout = '10000ms'")
-            rows = con.execute(
+        rows, _timings = self.central_reader.fetch_all(
                 f"""WITH local_shift AS (
                        SELECT %s::TEXT AS source_instance_id,%s::BIGINT AS turn_id
                    ), current_shift AS (
@@ -5613,8 +5923,13 @@ class BillingAdmissionQueryService:
                           p.patient_name,p.cedula_snapshot,p.nss_snapshot,
                           p.service_date,p.service_time,p.turn_id,
                           cs.turn_id AS processing_turn_id,
-                          CASE WHEN p.turn_id=cs.turn_id THEN 'TURNO ACTUAL'
-                               WHEN inheritance.attention_id IS NOT NULL
+                          CASE WHEN p.operational_source_id::TEXT=
+                                         cs.operational_source_id
+                                    AND p.turn_id=cs.turn_id
+                               THEN 'TURNO ACTUAL'
+                               WHEN p.operational_source_id::TEXT=
+                                         cs.operational_source_id
+                                    AND inheritance.attention_id IS NOT NULL
                                THEN 'HEREDADA'
                                ELSE 'HISTÓRICO' END AS turn_scope,
                           p.service_type,p.canonical_ars,
@@ -5632,29 +5947,30 @@ class BillingAdmissionQueryService:
                     AND inheritance.estado='PENDIENTE'
                    LEFT JOIN LATERAL (
                        SELECT id,numero,estado_facturacion,estado_documento
-                       FROM recibos
-                       WHERE admission_atencion_id=p.attention_id
-                         AND COALESCE(admission_source_instance_id,'LEGACY')=p.source_instance_id
-                         AND is_deleted=0
-                       ORDER BY created_at DESC,id DESC
+                       FROM recibos receipt
+                       WHERE {receipt_identity}
+                         AND receipt.is_deleted=0
+                       ORDER BY receipt.created_at DESC,receipt.id DESC
                        LIMIT 1
                    ) r ON TRUE
                    WHERE (%s OR {ars_exclusion})
                      AND COALESCE(p.is_deleted,FALSE)=FALSE
                      AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
                          IN ('ACTIVA','PENDIENTE')
-                     AND (%s
-                          OR p.operational_source_id::TEXT=cs.operational_source_id
-                          OR p.source_instance_id=cs.source_instance_id)
                      AND (
                            (%s AND %s='TODOS')
-                        OR (%s='ACTUAL' AND p.turn_id=cs.turn_id)
-                        OR (%s='HEREDADO' AND p.turn_id<>cs.turn_id
-                            AND inheritance.attention_id IS NOT NULL)
-                        OR (%s='TODOS' AND (
-                               p.turn_id=cs.turn_id
-                               OR inheritance.attention_id IS NOT NULL
-                        ))
+                        OR (
+                            p.operational_source_id::TEXT=cs.operational_source_id
+                            AND (
+                                 (%s='ACTUAL' AND p.turn_id=cs.turn_id)
+                              OR (%s='HEREDADO' AND p.turn_id<>cs.turn_id
+                                  AND inheritance.attention_id IS NOT NULL)
+                              OR (%s='TODOS' AND (
+                                     p.turn_id=cs.turn_id
+                                     OR inheritance.attention_id IS NOT NULL
+                              ))
+                            )
+                        )
                      )
                      AND (%s='' OR p.service_date>=%s)
                      AND (%s='' OR p.service_date<=%s)
@@ -5687,23 +6003,13 @@ class BillingAdmissionQueryService:
                      AND (
                            NOT %s
                         OR (
-                           COALESCE(
-                             p.created_at_effective_utc,
-                             (COALESCE(p.service_date,'1970-01-01') || ' ' ||
-                              COALESCE(NULLIF(p.service_time,''),'00:00:00'))::TIMESTAMPTZ,
-                             NULLIF(p.synced_at,'')::TIMESTAMPTZ
-                           ),
+                           COALESCE(p.created_at_effective_utc,TO_TIMESTAMP(0)),
                            COALESCE(p.origin_device_id,''),
                            COALESCE(p.device_local_sequence,0),
                            COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT)
                         ) < (%s::TIMESTAMPTZ,%s,%s,%s)
                      )
-                   ORDER BY COALESCE(
-                              p.created_at_effective_utc,
-                              (COALESCE(p.service_date,'1970-01-01') || ' ' ||
-                               COALESCE(NULLIF(p.service_time,''),'00:00:00'))::TIMESTAMPTZ,
-                              NULLIF(p.synced_at,'')::TIMESTAMPTZ
-                            ) DESC,
+                   ORDER BY COALESCE(p.created_at_effective_utc,TO_TIMESTAMP(0)) DESC,
                             COALESCE(p.origin_device_id,'') DESC,
                             COALESCE(p.device_local_sequence,0) DESC,
                             COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) DESC
@@ -5713,8 +6019,7 @@ class BillingAdmissionQueryService:
                     int(shift["turn_id"]),
                     bool(full_history),
                     bool(full_history),
-                    bool(full_history), turn_filter,
-                    turn_filter, turn_filter, turn_filter,
+                    turn_filter, turn_filter, turn_filter, turn_filter,
                     str(date_from or ""), str(date_from or ""),
                     str(date_to or ""), str(date_to or ""),
                     ars_text, ars_key,
@@ -5728,13 +6033,18 @@ class BillingAdmissionQueryService:
                     bool(numeric_search), digits, digits, digits, digits,
                     bool(text_search), search_like,
                     bool(has_cursor),
-                    cursor_effective or f"{cursor_date or '1970-01-01'} {cursor_time or '00:00:00'}",
+                    cursor_effective or "1970-01-01 00:00:00+00",
                     cursor_device,
                     cursor_sequence,
                     cursor_global or str(cursor_attention),
                     batch_size + 1,
                 ),
-            ).fetchall()
+                operation="load_admission_history_batch",
+                sql_stage="CENTRAL_HISTORY_QUERY",
+                current_user=user,
+                context=shift,
+                statement_timeout_ms=10000,
+        )
 
         mapped = [dict(row) for row in rows]
         has_more = len(mapped) > batch_size
@@ -5745,13 +6055,13 @@ class BillingAdmissionQueryService:
             next_cursor = {
                 "service_date": str(last.get("service_date") or ""),
                 "service_time": str(last.get("service_time") or ""),
-                "attention_id": int(last.get("attention_id") or 0),
+                "attention_id": _projection_int(last.get("attention_id")),
                 "created_at_effective_utc": str(
                     last.get("created_at_effective_utc") or ""
                 ),
                 "origin_device_id": str(last.get("origin_device_id") or ""),
-                "device_local_sequence": int(
-                    last.get("device_local_sequence") or 0
+                "device_local_sequence": _projection_int(
+                    last.get("device_local_sequence")
                 ),
                 "global_attention_id": str(last.get("global_attention_id") or ""),
             }
@@ -5781,6 +6091,7 @@ def list_projected_current_and_previous_billable_attentions(
     limit: int = 500,
     offset: int = 0,
     repository=None,
+    current_user=None,
 ):
     """Compatibility wrapper for the canonical operational queue."""
     return BillingAdmissionQueryService(repository).get_operational_candidates(
@@ -5792,7 +6103,213 @@ def list_projected_current_and_previous_billable_attentions(
         allow_all_unbilled=allow_all_unbilled,
         limit=limit,
         offset=offset,
+        current_user=current_user,
     )
+
+
+def diagnose_billing_admission_queue(
+    *,
+    current_user=None,
+    session_id: str = "",
+    central_reader=None,
+) -> dict:
+    """Count the central queue after every eligibility stage.
+
+    The result and its log contain only aggregate counters and operational
+    identifiers. No patient identity or clinical value is emitted.
+    """
+    user = dict(current_user or {})
+    reader = central_reader or CentralAdmissionReader()
+    context = reader.current_operational_context()
+    allow_uninsured = can_view_uninsured_patients(user)
+    allow_claim_override = can_override_admission_billing_claim(user)
+    ars_visible = admission_ars_sql_exclusion("p.canonical_ars")
+    receipt_identity = admission_receipt_identity_sql("receipt", "p")
+    diagnostic_sql = "".join((
+        """WITH current_shift AS (
+               SELECT operational_source_id,
+                      turn_id
+               FROM admission_operational_sessions session
+               JOIN sigeh_product_state product
+                 ON product.singleton=1
+                AND product.production_epoch_id=session.production_epoch_id
+               WHERE session.status='ACTIVE'
+               ORDER BY session.updated_at DESC
+               LIMIT 1
+           ), base AS (
+               SELECT
+                   COALESCE(p.is_deleted,FALSE)=FALSE AS central_record,
+                   UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
+                     IN ('ACTIVA','PENDIENTE') AS active,
+                   p.operational_source_id=shift.operational_source_id
+                     AS same_source,
+                   (
+                       p.turn_id=shift.turn_id
+                       OR EXISTS (
+                           SELECT 1
+                           FROM admission_shift_inheritances inheritance
+                           WHERE inheritance.source_instance_id=p.source_instance_id
+                             AND inheritance.attention_id=p.attention_id
+                             AND inheritance.turno_origen_id=p.turn_id
+                             AND inheritance.estado='PENDIENTE'
+                       )
+                   ) AS turn_scoped,
+                   p.readiness=%s AS ready,
+                   (""",
+        ars_visible,
+        """) AS ars_visible,
+                   (%s OR p.coverage_status<>%s) AS coverage_allowed,
+                   UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
+                     AS emergency,
+                   NOT EXISTS (
+                       SELECT 1 FROM recibos receipt
+                       WHERE """,
+        receipt_identity,
+        """
+                         AND receipt.is_deleted=0
+                   ) AS without_receipt,
+                   (
+                       %s OR NOT EXISTS (
+                           SELECT 1 FROM admission_billing_claims claim
+                           WHERE claim.source_instance_id=p.source_instance_id
+                             AND claim.attention_id=p.attention_id
+                             AND claim.expires_at>NOW()
+                             AND claim.session_id<>%s
+                       )
+                   ) AS claim_allowed,
+                   NOT EXISTS (
+                       SELECT 1 FROM admission_quick_list_dismissals dismissal
+                       WHERE dismissal.source_instance_id=p.source_instance_id
+                         AND dismissal.attention_id=p.attention_id
+                         AND dismissal.is_active=TRUE
+                   ) AS not_dismissed
+               FROM admission_attention_projection p
+               CROSS JOIN current_shift shift
+           )
+           SELECT
+               COUNT(*) FILTER (WHERE central_record) AS stage_0_central,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active
+               ) AS stage_1_active,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source
+               ) AS stage_2_same_source,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source AND turn_scoped
+               ) AS stage_3_turn_scope,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source AND turn_scoped
+                     AND ready
+               ) AS stage_4_ready,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source AND turn_scoped
+                     AND ready AND ars_visible
+               ) AS stage_5_ars_visible,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source AND turn_scoped
+                     AND ready AND ars_visible AND coverage_allowed
+               ) AS stage_6_coverage,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source AND turn_scoped
+                     AND ready AND ars_visible AND coverage_allowed AND emergency
+               ) AS stage_7_emergency,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source AND turn_scoped
+                     AND ready AND ars_visible AND coverage_allowed AND emergency
+                     AND without_receipt
+               ) AS stage_8_without_receipt,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source AND turn_scoped
+                     AND ready AND ars_visible AND coverage_allowed AND emergency
+                     AND without_receipt AND claim_allowed
+               ) AS stage_9_without_foreign_claim,
+               COUNT(*) FILTER (
+                   WHERE central_record AND active AND same_source AND turn_scoped
+                     AND ready AND ars_visible AND coverage_allowed AND emergency
+                     AND without_receipt AND claim_allowed AND not_dismissed
+               ) AS stage_10_eligible
+           FROM base""",
+    ))
+    rows, timings = reader.fetch_all(
+        diagnostic_sql,
+        (
+            READINESS_READY,
+            bool(allow_uninsured),
+            COVERAGE_UNINSURED_DECLARED,
+            bool(allow_claim_override),
+            str(session_id or ""),
+        ),
+        operation="diagnose_billing_admission_queue",
+        sql_stage="ELIGIBILITY_STAGE_COUNTS",
+        current_user=user,
+        context=context,
+        statement_timeout_ms=10000,
+    )
+    raw_counts = dict(rows[0]) if rows else {}
+    stages = {
+        name: _projection_int(raw_counts.get(name))
+        for name in (
+            "stage_0_central",
+            "stage_1_active",
+            "stage_2_same_source",
+            "stage_3_turn_scope",
+            "stage_4_ready",
+            "stage_5_ars_visible",
+            "stage_6_coverage",
+            "stage_7_emergency",
+            "stage_8_without_receipt",
+            "stage_9_without_foreign_claim",
+            "stage_10_eligible",
+        )
+    }
+    stage_values = list(stages.values())
+    reason_names = (
+        "INACTIVE_OR_DELETED",
+        "WRONG_OPERATIONAL_SOURCE",
+        "WRONG_TURN",
+        "NOT_READY",
+        "ARS_EXCLUDED",
+        "COVERAGE_NOT_ALLOWED",
+        "NON_EMERGENCY",
+        "ALREADY_BILLED",
+        "CLAIMED",
+        "DISMISSED",
+    )
+    exclusions = {
+        reason: max(0, stage_values[index] - stage_values[index + 1])
+        for index, reason in enumerate(reason_names)
+    }
+    details = " ".join(
+        [f"{name}={value}" for name, value in stages.items()]
+        + [
+            "current_turn_id=" + _billing_admission_log_token(context.get("turn_id")),
+            "operational_source_id="
+            + _billing_admission_log_token(context.get("operational_source_id")),
+            "role="
+            + _billing_admission_log_token(normalize_role(user.get("role"))),
+        ]
+    )
+    write_main_app_log(
+        "BILLING_ADMISSION_QUEUE_STAGES",
+        stage="ELIGIBILITY_STAGE_COUNTS",
+        elapsed_ms=timings["elapsed_ms"],
+        success=True,
+        details=details,
+    )
+    return {
+        "context": {
+            "operational_source_id": str(context.get("operational_source_id") or ""),
+            "turn_id": _projection_int(context.get("turn_id")),
+        },
+        "stages": stages,
+        "exclusions": exclusions,
+        "existing": stages["stage_1_active"],
+        "eligible": stages["stage_10_eligible"],
+        "not_eligible": max(
+            0,
+            stages["stage_1_active"] - stages["stage_10_eligible"],
+        ),
+    }
 
 
 _ADMISSION_VALIDATION_CACHE_LOCK = threading.Lock()
@@ -5865,7 +6382,8 @@ def load_admission_validation_attentions(
     user = dict(current_user or {})
     allow_uninsured = can_view_uninsured_patients(user)
     allow_claim_override = can_override_admission_billing_claim(user)
-    allow_all_unbilled = _is_privileged_billing_role(user)
+    # Previous turns are visible only through an explicit pending inheritance.
+    allow_all_unbilled = False
     cache_key = _validation_cache_key(
         session_id=session_id,
         turn_filter=turn_filter,
@@ -5897,6 +6415,7 @@ def load_admission_validation_attentions(
         limit=limit,
         offset=offset,
         repository=repository,
+        current_user=user,
     )
 
     unique = {}
@@ -6011,7 +6530,6 @@ def get_projected_billable_attention(
     current_user=None,
     global_attention_id: str = "",
 ):
-    full_history = _is_privileged_billing_role(dict(current_user or {}))
     ars_exclusion = admission_ars_sql_exclusion("p.canonical_ars")
     allow_uninsured = can_view_uninsured_patients(dict(current_user or {}))
     with db_connect() as con:
@@ -6042,7 +6560,7 @@ def get_projected_billable_attention(
                  AND p.readiness=%s
                  AND {ars_exclusion}
                  AND (%s OR p.coverage_status<>%s)
-                 AND (%s OR p.turn_id=cs.turn_id
+                 AND (p.turn_id=cs.turn_id
                       OR inheritance.attention_id IS NOT NULL)
                  AND COALESCE(p.is_deleted,FALSE)=FALSE
                  AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')
@@ -6056,7 +6574,6 @@ def get_projected_billable_attention(
                 READINESS_READY,
                 bool(allow_uninsured),
                 COVERAGE_UNINSURED_DECLARED,
-                bool(full_history),
             ),
         ).fetchone()
     return _attention_from_projection(row) if row else None
@@ -7058,12 +7575,12 @@ def claim_projected_billable_attention(
     operational_context=None,
 ):
     """Reserva central transitoria para impedir selección simultánea."""
-    full_history = _is_privileged_billing_role(dict(current_user or {}))
     allow_claim_override = can_override_admission_billing_claim(
         dict(current_user or {})
     )
     station_id = str(os.environ.get("COMPUTERNAME", "") or "ESTACION")
     ars_exclusion = admission_ars_sql_exclusion("p.canonical_ars")
+    receipt_identity = admission_receipt_identity_sql("r", "p")
     allow_uninsured = can_view_uninsured_patients(dict(current_user or {}))
     global_id = str(global_attention_id or "").strip()
     if global_id:
@@ -7099,15 +7616,14 @@ def claim_projected_billable_attention(
                       AND p.readiness=%s
                       AND {ars_exclusion}
                       AND (%s OR p.coverage_status<>%s)
-                     AND (%s OR p.turn_id=cs.turn_id
+                     AND (p.turn_id=cs.turn_id
                           OR inheritance.attention_id IS NOT NULL)
                      AND UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
                      AND COALESCE(p.is_deleted,FALSE)=FALSE
                      AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')
                       AND NOT EXISTS (
                             SELECT 1 FROM recibos r
-                            WHERE r.admission_atencion_id=p.attention_id
-                              AND COALESCE(r.admission_source_instance_id,'LEGACY')=p.source_instance_id
+                            WHERE {receipt_identity}
                               AND r.is_deleted=0
                       )
                       AND NOT EXISTS (
@@ -7163,7 +7679,6 @@ def claim_projected_billable_attention(
                 READINESS_READY,
                 bool(allow_uninsured),
                 COVERAGE_UNINSURED_DECLARED,
-                bool(full_history),
                 str(username or ""),
                 str(session_id or ""),
                 station_id,
@@ -8237,6 +8752,7 @@ def create_uninsured_admission_receipt(
     existing = get_receipt_for_admission_attention(
         attention.attention_id,
         attention.source_instance_id,
+        attention.global_attention_id,
     )
     if existing:
         return existing, False
@@ -13781,15 +14297,26 @@ def evaluate_admission_billing_access(
     state = dict(current_operational_state or {})
     role = normalize_role((current_user or {}).get("role"))
     current_turn = state.get("turn_id")
+    current_source = str(state.get("operational_source_id") or "").strip()
+    attention_source = str(data.get("operational_source_id") or "").strip()
+    same_source = not current_source or not attention_source or (
+        attention_source == current_source
+    )
     try:
-        is_current = current_turn is not None and int(data.get("turn_id") or 0) == int(current_turn)
+        is_current = (
+            same_source
+            and current_turn is not None
+            and int(data.get("turn_id") or 0) == int(current_turn)
+        )
     except (TypeError, ValueError):
         is_current = False
     if current_turn is None:
         is_current = str(data.get("turn_scope") or "").upper() in {"CURRENT", "TURNO ACTUAL"}
-    inherited = bool(data.get("explicitly_inherited")) or str(
-        data.get("turn_scope") or ""
-    ).upper() in {"INHERITED", "HEREDADA", "HEREDADA DEL TURNO ANTERIOR"}
+    inherited = same_source and (
+        bool(data.get("explicitly_inherited"))
+        or str(data.get("turn_scope") or "").upper()
+        in {"INHERITED", "HEREDADA", "HEREDADA DEL TURNO ANTERIOR"}
+    )
     scope = "CURRENT" if is_current else "INHERITED" if inherited else "HISTORICAL"
     receipt_id = data.get("linked_receipt_id") or data.get("receipt_id")
     billing_status = str(
@@ -13800,7 +14327,7 @@ def evaluate_admission_billing_access(
             data.get("linked_document_status") or data.get("estado_documento") or ""
         ).upper() == "FINAL"
     )
-    scope_allowed = scope in {"CURRENT", "INHERITED"} or role in {ROLE_AUDIT, ROLE_ADMIN}
+    scope_allowed = scope in {"CURRENT", "INHERITED"}
     reason_code = (
         f"{scope}_PENDING_ALLOWED" if scope_allowed and not completed
         else "ALREADY_BILLED" if completed
@@ -29161,7 +29688,16 @@ class AdmissionValidationLoadWorker(QThread):
             self.loaded.emit(attentions)
         except Exception as exc:
             self.elapsed_ms = (perf_counter() - started) * 1000.0
-            self.failed.emit(str(exc))
+            category = _classify_billing_admission_error(exc)
+            if not getattr(exc, "_billing_admission_failure_logged", False):
+                category = log_billing_admission_query_failure(
+                    exc,
+                    operation="AdmissionValidationLoadWorker",
+                    sql_stage="WORKER",
+                    current_user=self.current_user,
+                    elapsed_ms=self.elapsed_ms,
+                )
+            self.failed.emit(category)
 
 
 class AdmissionValidationClaimWorker(QThread):
@@ -29206,9 +29742,18 @@ class AdmissionValidationClaimWorker(QThread):
                 (perf_counter() - started) * 1000.0,
             )
         except Exception as exc:
+            elapsed_ms = (perf_counter() - started) * 1000.0
+            category = log_billing_admission_query_failure(
+                exc,
+                operation="AdmissionValidationClaimWorker",
+                sql_stage="CLAIM_TRANSACTION",
+                current_user=self.current_user,
+                context=self.operational_context,
+                elapsed_ms=elapsed_ms,
+            )
             self.failed.emit(
-                str(exc),
-                (perf_counter() - started) * 1000.0,
+                category,
+                elapsed_ms,
             )
 
 
@@ -29720,10 +30265,20 @@ class AdmissionHistoryLoadWorker(QThread):
             result["elapsed_ms"] = (perf_counter() - started) * 1000.0
             self.loaded.emit(result)
         except Exception as exc:
+            elapsed_ms = (perf_counter() - started) * 1000.0
+            category = _classify_billing_admission_error(exc)
+            if not getattr(exc, "_billing_admission_failure_logged", False):
+                category = log_billing_admission_query_failure(
+                    exc,
+                    operation="AdmissionHistoryLoadWorker",
+                    sql_stage="WORKER",
+                    current_user=self.current_user,
+                    elapsed_ms=elapsed_ms,
+                )
             self.failed.emit({
                 "generation": self.generation,
-                "message": str(exc),
-                "elapsed_ms": (perf_counter() - started) * 1000.0,
+                "message": category,
+                "elapsed_ms": elapsed_ms,
             })
 
 
@@ -29753,7 +30308,23 @@ class AdmissionHistoryEligibilityWorker(QThread):
             )
             self.resolved.emit(result, (perf_counter() - started) * 1000.0)
         except Exception as exc:
-            self.failed.emit(str(exc), (perf_counter() - started) * 1000.0)
+            elapsed_ms = (perf_counter() - started) * 1000.0
+            category = _classify_billing_admission_error(exc)
+            if not getattr(exc, "_billing_admission_failure_logged", False):
+                category = log_billing_admission_query_failure(
+                    exc,
+                    operation="AdmissionHistoryEligibilityWorker",
+                    sql_stage="ELIGIBILITY_REVALIDATION",
+                    current_user=self.current_user,
+                    context={
+                        "turn_id": self.row_data.get("processing_turn_id"),
+                        "operational_source_id": self.row_data.get(
+                            "operational_source_id"
+                        ),
+                    },
+                    elapsed_ms=elapsed_ms,
+                )
+            self.failed.emit(category, elapsed_ms)
 
 
 class AdmissionHistoryDialog(QDialog):
