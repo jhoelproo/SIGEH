@@ -613,6 +613,20 @@ def test_report_window_and_themed_icons_follow_the_host_theme_in_place(
         app.abrir_ventana_reporte()
         QTest.qWait(80)
         assert app.reporte_win is not None and app.reporte_win.isVisible()
+        controls = app.reporte_win.report_controls
+        assert set(controls["cards"]) == {
+            "total", "insured", "uninsured", "general", "pediatric", "gynecology"
+        }
+        assert {controls["turn"].itemText(i) for i in range(controls["turn"].count())} == {
+            "Turno actual", "Turno anterior", "Todos los turnos"
+        }
+        assert {
+            controls["ars_mode"].itemText(i)
+            for i in range(controls["ars_mode"].count())
+        } == {
+            "TODAS", "INCLUIR", "EXCLUIR"
+        }
+        assert controls["preview"].columnCount() == 6
         assert "#EEF2F6" in app.reporte_win.styleSheet()
         assert "#FFFFFF" in app.combo_unidad.styleSheet()
 
@@ -637,6 +651,120 @@ def test_report_window_and_themed_icons_follow_the_host_theme_in_place(
         QTest.qWait(40)
         assert "#0A1420" in app.reporte_win.styleSheet()
         assert "#0F1B2A" in app.combo_unidad.styleSheet()
+    finally:
+        widget.shutdown()
+        shell.close()
+        shell.deleteLater()
+        application.processEvents()
+
+
+def test_report_window_generates_cards_and_preview_from_one_filtered_dataset(
+    tmp_path, monkeypatch
+):
+    application, shell, stack, _billing, widget = _build_admission_widget(
+        tmp_path, monkeypatch, host_theme_is_dark=True
+    )
+    proxy_type = type(widget.admission.db)
+    source_id = "44444444-4444-4444-8444-444444444444"
+    rows = [
+        {
+            "attention_id": 1,
+            "global_attention_id": "00000000-0000-4000-8000-000000000001",
+            "patient_name": "PACIENTE GENERAL",
+            "created_at_effective_utc": "2026-08-27T10:00:00-04:00",
+            "canonical_ars": "HUMANO",
+            "coverage_status": "INSURED",
+            "specialty": "GENERAL",
+            "service_type": "EMERGENCIA",
+            "operational_source_id": source_id,
+            "turn_id": 316,
+            "source_status": "ACTIVA",
+            "is_deleted": False,
+        },
+        {
+            "attention_id": 2,
+            "global_attention_id": "00000000-0000-4000-8000-000000000002",
+            "patient_name": "PACIENTE PEDIATRIA",
+            "created_at_effective_utc": "2026-08-28T04:30:00-04:00",
+            "canonical_ars": "HUMANO",
+            "coverage_status": "INSURED",
+            "specialty": "PEDIATRIA",
+            "service_type": "EMERGENCIA",
+            "operational_source_id": source_id,
+            "turn_id": 316,
+            "source_status": "ACTIVA",
+            "is_deleted": False,
+        },
+        {
+            "attention_id": 3,
+            "global_attention_id": "00000000-0000-4000-8000-000000000003",
+            "patient_name": "PACIENTE SIN SEGURO",
+            "created_at_effective_utc": "2026-08-28T07:59:00-04:00",
+            "canonical_ars": "SIN SEGURO",
+            "coverage_status": "UNINSURED_DECLARED",
+            "specialty": "GINECOLOGIA",
+            "service_type": "EMERGENCIA",
+            "operational_source_id": source_id,
+            "turn_id": 316,
+            "source_status": "ACTIVA",
+            "is_deleted": False,
+        },
+    ]
+    monkeypatch.setattr(
+        proxy_type,
+        "get_operational_station_snapshot",
+        lambda _self: {
+            "operational_source_id": source_id,
+            "turn_id": 316,
+            "turn_started_at": "2026-08-27T08:00:00-04:00",
+            "turn_ends_at": "2026-08-28T08:00:00-04:00",
+        },
+    )
+    monkeypatch.setattr(
+        proxy_type,
+        "list_statistical_report_turns",
+        lambda _self, **_kwargs: [
+            {
+                "operational_source_id": source_id,
+                "turn_id": 316,
+                "started_at": "2026-08-27T08:00:00-04:00",
+                "ends_at": "2026-08-28T08:00:00-04:00",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        proxy_type,
+        "list_statistical_report_records",
+        lambda _self, **_kwargs: list(rows),
+    )
+    try:
+        shell.resize(1600, 900)
+        stack.setCurrentWidget(widget)
+        shell.show()
+        QTest.qWait(80)
+        app = widget.admission
+        app.abrir_ventana_reporte()
+        controls = app.reporte_win.report_controls
+        controls["ars_mode"].set("INCLUIR")
+        controls["ars_vars"]["HUMANO"].set(True)
+        controls["generate"]()
+        for _ in range(30):
+            QTest.qWait(30)
+            if controls["state"]["dataset"] is not None:
+                break
+
+        dataset = controls["state"]["dataset"]
+        assert dataset is not None
+        assert len(dataset.records) == 2
+        assert controls["cards"]["total"][0].get() == "2"
+        assert controls["cards"]["insured"][0].get() == "2"
+        assert controls["cards"]["uninsured"][0].get() == "0"
+        assert controls["preview"].rowCount() >= 5
+
+        controls["clear"]()
+        assert controls["state"]["dataset"] is None
+        assert controls["cards"]["total"][0].get() == "0"
+        assert controls["preview"].rowCount() == 0
     finally:
         widget.shutdown()
         shell.close()
