@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import replace
 import sqlite3
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from admission_hybrid import (
     OfflineAdmissionStore,
     OperationalSession,
     StationRole,
+    SyncConflict,
     SyncEvent,
     evaluate_attention_billing_eligibility,
 )
@@ -287,7 +289,14 @@ class HybridAdmissionTests(unittest.TestCase):
             store.apply_remote_event(remote)
             with closing(sqlite3.connect(database)) as con:
                 con.execute(
-                    "UPDATE atenciones SET telefono='8095550000' WHERE global_attention_id=?",
+                    """UPDATE atenciones
+                          SET telefono='8095550000',
+                              correction_reason='Corrección de teléfono',
+                              correction_actor='auxiliar.prueba',
+                              correction_before_json='{"telefono":""}',
+                              correction_after_json='{"telefono":"8095550000"}',
+                              correction_changed_fields_json='["telefono"]'
+                        WHERE global_attention_id=?""",
                     (entity_uuid,),
                 )
                 con.commit()
@@ -295,6 +304,15 @@ class HybridAdmissionTests(unittest.TestCase):
             self.assertEqual(event.operation, "UPDATE")
             self.assertEqual(event.base_version, 1)
             self.assertEqual(int(event.payload["version"]), 2)
+            self.assertEqual(event.payload["event_type"], "ATTENTION_RECTIFIED")
+            self.assertEqual(
+                event.payload["correction_reason"], "Corrección de teléfono"
+            )
+            self.assertEqual(event.payload["previous_values"], {"telefono": ""})
+            self.assertEqual(
+                event.payload["new_values"], {"telefono": "8095550000"}
+            )
+            self.assertEqual(event.payload["changed_fields"], ["telefono"])
 
     def test_cloud_push_validates_session_and_materializes_projection(self):
         class CursorResult:
@@ -307,6 +325,7 @@ class HybridAdmissionTests(unittest.TestCase):
         class FakeConnection:
             def __init__(self):
                 self.queries = []
+                self.latest_event = None
 
             def __enter__(self):
                 return self
@@ -326,6 +345,8 @@ class HybridAdmissionTests(unittest.TestCase):
                     return CursorResult(None)
                 if "SELECT COALESCE(MAX(resulting_version),0)" in compact:
                     return CursorResult((0,))
+                if "SELECT resulting_version,operation,payload_json" in compact:
+                    return CursorResult(self.latest_event)
                 if "INSERT INTO admission_sync_events" in compact:
                     return CursorResult((41,))
                 if "UPDATE admission_attention_projection" in compact:
@@ -376,6 +397,33 @@ class HybridAdmissionTests(unittest.TestCase):
             if value is not None
         }
         self.assertIn("LISTA", flattened_params)
+
+        delete_event = replace(
+            event,
+            event_uuid="66666666-6666-4666-8666-666666666666",
+            operation="DELETE",
+            payload={**event.payload, "event_type": "ATTENTION_DELETED"},
+        )
+        self.assertEqual(repository.push_event(delete_event), 41)
+
+        rectified_event = replace(
+            event,
+            event_uuid="77777777-7777-4777-8777-777777777777",
+            operation="UPDATE",
+            payload={**event.payload, "event_type": "ATTENTION_RECTIFIED"},
+        )
+        self.assertEqual(repository.push_event(rectified_event), 41)
+
+        connection.latest_event = (1, "DELETE", {})
+        with self.assertRaisesRegex(
+            SyncConflict, "STALE_RECORD_SUPPRESSED_BY_TOMBSTONE"
+        ):
+            repository.push_event(
+                replace(
+                    rectified_event,
+                    event_uuid="88888888-8888-4888-8888-888888888888",
+                )
+            )
 
     def test_two_independent_stations_converge_without_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 from admission_source.emergency_core import db_migrations, paths
+from admission_source.emergency_core.backup import BackupManager
 
 
 def test_new_distribution_data_root_is_internal_and_not_a_legacy_global_path(
@@ -57,3 +58,44 @@ def test_latest_local_schema_skips_ddl_and_integrity_scan_on_normal_startup(
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pacientes'"
         ).fetchone() is None
+
+
+def test_v18_migration_adds_rectification_audit_columns_after_verified_backup(
+    tmp_path: Path,
+):
+    database = tmp_path / "admission.db"
+    backup_manager = BackupManager(database, tmp_path / "backups")
+    db_migrations.migrate_database(database, backup_manager)
+    correction_columns = (
+        "correction_reason",
+        "correction_actor",
+        "correction_at",
+        "correction_before_json",
+        "correction_after_json",
+        "correction_changed_fields_json",
+    )
+    with sqlite3.connect(database) as connection:
+        for column in correction_columns:
+            connection.execute(f"ALTER TABLE atenciones DROP COLUMN {column}")
+        connection.execute("UPDATE schema_version SET version=18 WHERE id=1")
+
+    result = db_migrations.migrate_database(database, backup_manager)
+
+    assert result["migrated"] is True
+    assert result["from_version"] == 18
+    assert result["to_version"] == db_migrations.LATEST_SCHEMA_VERSION
+    backup_folder = Path(result["backup"])
+    assert backup_folder.is_dir()
+    assert backup_manager.verify(backup_folder)["database"] == database.name
+    with sqlite3.connect(database) as connection:
+        migrated_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(atenciones)")
+        }
+        migration = connection.execute(
+            "SELECT name,details_json FROM schema_migrations WHERE version=19"
+        ).fetchone()
+    assert set(correction_columns) <= migrated_columns
+    assert migration == (
+        "attention_rectification_audit_metadata",
+        '{"from_version": 18}',
+    )

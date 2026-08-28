@@ -16,7 +16,7 @@ from typing import Any
 
 from .backup import BackupManager
 
-LATEST_SCHEMA_VERSION = 18
+LATEST_SCHEMA_VERSION = 19
 
 
 def _digits(value: Any) -> str:
@@ -61,6 +61,17 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     if not _table_exists(conn, table):
         return set()
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_missing_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    definitions: tuple[tuple[str, str], ...],
+) -> None:
+    existing = _columns(conn, table)
+    for column, definition in definitions:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _rows(conn: sqlite3.Connection, table: str) -> list[dict]:
@@ -204,6 +215,12 @@ def create_latest_schema(conn: sqlite3.Connection) -> None:
             nss_clean TEXT,
             cedula_clean TEXT,
             telefono_clean TEXT,
+            correction_reason TEXT,
+            correction_actor TEXT,
+            correction_at TEXT,
+            correction_before_json TEXT,
+            correction_after_json TEXT,
+            correction_changed_fields_json TEXT,
             FOREIGN KEY (paciente_id) REFERENCES pacientes(id) ON DELETE RESTRICT,
             FOREIGN KEY (dia_operativo_id) REFERENCES dias_operativos(id) ON DELETE RESTRICT,
             FOREIGN KEY (turno_id) REFERENCES turnos(id) ON DELETE RESTRICT,
@@ -748,7 +765,7 @@ def migrate_database(db_path: str | os.PathLike[str], backup_manager: BackupMana
             "version": version,
             "startup_checked": True,
         }
-    if version in (11, 12, 13, 14, 15, 16, 17):
+    if version in (11, 12, 13, 14, 15, 16, 17, 18):
         backup_folder = backup_manager.create(
             f"antes_migracion_v{version}_a_v{LATEST_SCHEMA_VERSION}"
         )
@@ -756,28 +773,38 @@ def migrate_database(db_path: str | os.PathLike[str], backup_manager: BackupMana
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("BEGIN IMMEDIATE")
             create_latest_schema(conn)
-            patient_columns = _columns(conn, "pacientes")
-            for column, definition in (
-                ("global_patient_id", "TEXT"),
-                ("server_revision", "INTEGER NOT NULL DEFAULT 0"),
-                ("sync_state", "TEXT NOT NULL DEFAULT 'SYNCED'"),
-                ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
-            ):
-                if column not in patient_columns:
-                    conn.execute(
-                        f"ALTER TABLE pacientes ADD COLUMN {column} {definition}"
-                    )
-            existentes = _columns(conn, "identidad_conflictos")
-            for columna, definicion in (
-                ("resolucion", "TEXT"),
-                ("motivo_resolucion", "TEXT"),
-                ("resuelto_por", "TEXT"),
-                ("resuelto_at", "TEXT"),
-            ):
-                if columna not in existentes:
-                    conn.execute(
-                        f"ALTER TABLE identidad_conflictos ADD COLUMN {columna} {definicion}"
-                    )
+            _add_missing_columns(
+                conn,
+                "pacientes",
+                (
+                    ("global_patient_id", "TEXT"),
+                    ("server_revision", "INTEGER NOT NULL DEFAULT 0"),
+                    ("sync_state", "TEXT NOT NULL DEFAULT 'SYNCED'"),
+                    ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+                ),
+            )
+            _add_missing_columns(
+                conn,
+                "atenciones",
+                (
+                    ("correction_reason", "TEXT"),
+                    ("correction_actor", "TEXT"),
+                    ("correction_at", "TEXT"),
+                    ("correction_before_json", "TEXT"),
+                    ("correction_after_json", "TEXT"),
+                    ("correction_changed_fields_json", "TEXT"),
+                ),
+            )
+            _add_missing_columns(
+                conn,
+                "identidad_conflictos",
+                (
+                    ("resolucion", "TEXT"),
+                    ("motivo_resolucion", "TEXT"),
+                    ("resuelto_por", "TEXT"),
+                    ("resuelto_at", "TEXT"),
+                ),
+            )
             _retire_identity_conflicts(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_version(id,version) VALUES (1,?)",
@@ -790,7 +817,7 @@ def migrate_database(db_path: str | os.PathLike[str], backup_manager: BackupMana
                 """,
                 (
                     LATEST_SCHEMA_VERSION,
-                    "patient_document_replica_fast_lookup",
+                    "attention_rectification_audit_metadata",
                     datetime.now().isoformat(timespec="seconds"),
                     json.dumps({"from_version": version}, sort_keys=True),
                 ),

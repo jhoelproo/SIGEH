@@ -122,7 +122,7 @@ def test_current_dataset_uses_only_central_source_and_turn_id():
     proxy, connection = _proxy([])
 
     assert proxy.build_current_admission_list_dataset() == []
-    assert connection.params == ()
+    assert connection.params == (SOURCE, CURRENT_TURN, 500, 0)
 
 
 def test_new_empty_turn_excludes_historical_rows_without_date_fallback():
@@ -154,7 +154,7 @@ def test_previous_turn_identity_cannot_enter_current_dataset():
     assert proxy.build_turn_dataset(
         turn_id=PREVIOUS_TURN, operational_source_id=SOURCE
     ) == []
-    assert connection.params == ()
+    assert connection.params == (SOURCE, PREVIOUS_TURN, 500, 0)
 
 
 def test_excel_and_turn_report_use_the_same_explicit_central_dataset():

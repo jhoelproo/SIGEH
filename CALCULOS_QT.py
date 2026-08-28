@@ -1240,6 +1240,7 @@ CREATE TABLE IF NOT EXISTS recibos(
   admission_linked_by TEXT,
   admission_source_updated_at TEXT,
   admission_source_instance_id TEXT,
+  admission_global_attention_id UUID,
   admission_snapshot_hash TEXT,
   admission_coverage_status TEXT,
   admission_readiness TEXT,
@@ -2718,6 +2719,20 @@ def _apply_admission_cancellation_receipt_trash_migration(con):
     )
     con.executescript(
         r"""
+        ALTER TABLE recibos
+          ADD COLUMN IF NOT EXISTS admission_global_attention_id UUID;
+        CREATE INDEX IF NOT EXISTS idx_recibos_admission_global_attention
+          ON recibos(admission_global_attention_id)
+          WHERE admission_global_attention_id IS NOT NULL;
+
+        UPDATE recibos r
+           SET admission_global_attention_id=p.global_attention_id
+          FROM admission_attention_projection p
+         WHERE r.admission_global_attention_id IS NULL
+           AND r.admission_atencion_id=p.attention_id
+           AND COALESCE(r.admission_source_instance_id,'LEGACY')=
+               COALESCE(NULLIF(p.source_instance_id,''),'LEGACY');
+
         CREATE OR REPLACE FUNCTION trash_receipt_for_cancelled_admission()
         RETURNS trigger
         LANGUAGE plpgsql
@@ -2762,9 +2777,17 @@ def _apply_admission_cancellation_receipt_trash_migration(con):
                        'Atención anulada en Admisión'
                    )
              WHERE is_deleted=0
-               AND admission_atencion_id=NEW.attention_id
-               AND COALESCE(admission_source_instance_id,'LEGACY')=
-                   COALESCE(NULLIF(NEW.source_instance_id,''),'LEGACY');
+               AND (
+                    (
+                        NEW.global_attention_id IS NOT NULL
+                        AND admission_global_attention_id=NEW.global_attention_id
+                    )
+                    OR (
+                        admission_atencion_id=NEW.attention_id
+                        AND COALESCE(admission_source_instance_id,'LEGACY')=
+                            COALESCE(NULLIF(NEW.source_instance_id,''),'LEGACY')
+                    )
+               );
             GET DIAGNOSTICS trashed_count = ROW_COUNT;
 
             IF trashed_count > 0 THEN
@@ -2806,9 +2829,17 @@ def _apply_admission_cancellation_receipt_trash_migration(con):
                )
           FROM admission_attention_projection p
          WHERE r.is_deleted=0
-           AND r.admission_atencion_id=p.attention_id
-           AND COALESCE(r.admission_source_instance_id,'LEGACY')=
-               COALESCE(NULLIF(p.source_instance_id,''),'LEGACY')
+           AND (
+                (
+                    p.global_attention_id IS NOT NULL
+                    AND r.admission_global_attention_id=p.global_attention_id
+                )
+                OR (
+                    r.admission_atencion_id=p.attention_id
+                    AND COALESCE(r.admission_source_instance_id,'LEGACY')=
+                        COALESCE(NULLIF(p.source_instance_id,''),'LEGACY')
+                )
+           )
            AND (
                COALESCE(p.is_deleted,FALSE)
                OR UPPER(BTRIM(COALESCE(p.source_status,'')))='ANULADA'
@@ -2817,74 +2848,9 @@ def _apply_admission_cancellation_receipt_trash_migration(con):
     )
 
 
-def _apply_authorized_admission_history_reset_104(con):
-    """Ejecuta una sola vez el reinicio lógico central autorizado para 1.0.4."""
-    con.executescript(
-        r"""
-        CREATE TABLE IF NOT EXISTS sigeh_maintenance_events(
-            event_key TEXT PRIMARY KEY,
-            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            applied_by TEXT NOT NULL,
-            details_json JSONB NOT NULL DEFAULT '{}'::JSONB
-        );
-
-        DO $$
-        DECLARE
-            reset_count BIGINT := 0;
-        BEGIN
-            PERFORM pg_advisory_xact_lock(
-                hashtext('SIGEH_ADMISSION_HISTORY_RESET_20260826_V1')
-            );
-            IF EXISTS (
-                SELECT 1 FROM sigeh_maintenance_events
-                 WHERE event_key='SIGEH_ADMISSION_HISTORY_RESET_20260826_V1'
-            ) THEN
-                RETURN;
-            END IF;
-
-            UPDATE admission_attention_projection
-               SET is_deleted=TRUE,
-                   source_status='ANULADA',
-                   deleted_at=COALESCE(deleted_at,NOW()),
-                   deleted_by_user_id=COALESCE(
-                       NULLIF(BTRIM(deleted_by_user_id),''),'SIGEH_1_0_4_RESET'
-                   ),
-                   delete_reason=COALESCE(
-                       NULLIF(BTRIM(delete_reason),''),
-                       'Reinicio autorizado del historial de Admisión'
-                   ),
-                   server_revision=GREATEST(COALESCE(server_revision,0),1)+1
-             WHERE COALESCE(is_deleted,FALSE)=FALSE
-                OR UPPER(BTRIM(COALESCE(source_status,'')))<>'ANULADA';
-            GET DIAGNOSTICS reset_count = ROW_COUNT;
-
-            DELETE FROM admission_billing_claims;
-
-            INSERT INTO action_history(
-                username,action,details,module,entity_type,entity_id,created_at
-            ) VALUES(
-                'SIGEH_1_0_4_RESET','ADMISSION_HISTORY_RESET',
-                'Atenciones reiniciadas lógicamente: ' || reset_count::TEXT,
-                'Admisión','maintenance',
-                'SIGEH_ADMISSION_HISTORY_RESET_20260826_V1',NOW()::TEXT
-            );
-            INSERT INTO sigeh_maintenance_events(
-                event_key,applied_by,details_json
-            ) VALUES(
-                'SIGEH_ADMISSION_HISTORY_RESET_20260826_V1',
-                'SIGEH_1_0_4_RESET',
-                jsonb_build_object('reset_attentions',reset_count)
-            );
-        END
-        $$;
-        """
-    )
-
-
 def _apply_admission_data_lifecycle_migrations(con):
-    """Instala anulación→papelera antes de ejecutar el corte autorizado."""
+    """Instala la cascada anulación→papelera sin alterar datos existentes."""
     _apply_admission_cancellation_receipt_trash_migration(con)
-    _apply_authorized_admission_history_reset_104(con)
 
 
 def db_init():
@@ -2983,6 +2949,7 @@ def db_init():
             "admission_linked_by": "TEXT",
             "admission_source_updated_at": "TEXT",
             "admission_source_instance_id": "TEXT",
+            "admission_global_attention_id": "UUID",
             "admission_snapshot_hash": "TEXT",
             "admission_coverage_status": "TEXT",
             "admission_readiness": "TEXT",
@@ -4827,7 +4794,7 @@ def get_next_recibo_number() -> int:
 def _admission_values(attention) -> tuple:
     if not attention:
         return (
-            None, None, "", "", "", None, None, "", "", "", "", "", "EMERGENCIA", "", "",
+            None, None, "", "", "", None, None, "", "", "", "", "", "EMERGENCIA", "", "", "",
         )
     if isinstance(attention, AdmissionAttention):
         data = attention.snapshot()
@@ -4852,6 +4819,7 @@ def _admission_values(attention) -> tuple:
         str(data.get("attention_type") or data.get("service_type") or "EMERGENCIA"),
         str(data.get("specialty") or ""),
         str(data.get("admission_username") or ""),
+        str(data.get("global_attention_id") or ""),
     )
 
 
@@ -6440,7 +6408,11 @@ class AdmissionDatabaseImportTaskManager(QObject):
             self._remote_poll.stop()
 
     def is_running(self):
-        return self._worker is not None and self._worker.isRunning()
+        # The finished signal is queued on the GUI thread.  Treat the worker
+        # as owned until that slot clears it; otherwise a caller can overwrite
+        # the stopped QThread before Qt delivers ``finished`` and abort the
+        # process with "QThread: Destroyed while thread is still running".
+        return self._worker is not None
 
     def _ensure_slot_is_available(self):
         self.recover_durable_task()
@@ -8289,6 +8261,7 @@ def create_uninsured_admission_receipt(
                        admission_ars_snapshot, admission_linked_at,
                        admission_linked_by, admission_source_updated_at,
                        admission_source_instance_id, admission_snapshot_hash,
+                       admission_global_attention_id,
                        admission_coverage_status, admission_readiness,
                        turno_origen_id, turno_procesamiento_id,
                        herencia_estado, herencia_procesada_at,
@@ -8297,7 +8270,7 @@ def create_uninsured_admission_receipt(
                    ) VALUES(
                        %s,%s,%s,'','', 'NO_ASEGURADO',0,0,'',%s,%s,0,0,
                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
                    )
                    RETURNING id""",
                 (
@@ -8320,6 +8293,7 @@ def create_uninsured_admission_receipt(
                     attention.source_updated_at,
                     attention.source_instance_id or "LEGACY",
                     attention.snapshot_hash or stable_snapshot_hash(attention),
+                    attention.global_attention_id or None,
                     attention.coverage_status,
                     attention.billing_readiness,
                     processing["turno_origen_id"],
@@ -10280,6 +10254,8 @@ def save_receipt_with_items(
                            THEN admission_source_updated_at ELSE %s END,
                        admission_source_instance_id=COALESCE(
                            NULLIF(%s,''), admission_source_instance_id),
+                       admission_global_attention_id=COALESCE(
+                           NULLIF(%s,'')::UUID, admission_global_attention_id),
                        admission_snapshot_hash=COALESCE(
                            NULLIF(%s,''), admission_snapshot_hash),
                        admission_coverage_status=COALESCE(
@@ -10307,7 +10283,7 @@ def save_receipt_with_items(
                     admission_values[0], admission_values[4],
                     admission_values[5], admission_values[6],
                     admission_values[0], admission_values[7],
-                    admission_values[8], admission_values[9],
+                    admission_values[8], admission_values[15], admission_values[9],
                     admission_values[10], admission_values[11],
                     (
                         admission_processing.get("turno_origen_id")
@@ -10358,6 +10334,7 @@ def save_receipt_with_items(
                        admission_ars_snapshot, admission_linked_at,
                        admission_linked_by, admission_source_updated_at,
                        admission_source_instance_id, admission_snapshot_hash,
+                       admission_global_attention_id,
                        admission_coverage_status, admission_readiness,
                        turno_origen_id, turno_procesamiento_id,
                        herencia_estado, herencia_procesada_at,
@@ -10366,7 +10343,7 @@ def save_receipt_with_items(
                    ) VALUES(
                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,
                        %s,
-                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                        %s,%s,%s,%s,%s,%s,%s,%s
                    )
                    RETURNING id""",
@@ -10379,7 +10356,7 @@ def save_receipt_with_items(
                     authorization_actor,
                     document_state,
                     new_receipt_storage_mode(),
-                    *admission_values[:12],
+                    *admission_values[:12], admission_values[15],
                     (
                         admission_processing.get("turno_origen_id")
                         if admission_processing else None
@@ -10901,7 +10878,8 @@ def restore_recibo(recibo_id: int, restored_by=None):
         row = con.execute(
             """SELECT id, numero, nombre, fecha, estado_facturacion,
                       admission_atencion_id, admission_nss_snapshot,
-                      admission_cedula_snapshot, admission_source_instance_id
+                      admission_cedula_snapshot, admission_source_instance_id,
+                      admission_global_attention_id
                FROM recibos WHERE id=%s AND is_deleted=1 FOR UPDATE""",
             (int(recibo_id),),
         ).fetchone()
@@ -10916,6 +10894,33 @@ def restore_recibo(recibo_id: int, restored_by=None):
             exclude_id=recibo_id,
         )
         previous_status = str(row["estado_facturacion"] or BILLING_UNCLASSIFIED)
+        linked_attention = con.execute(
+            """SELECT is_deleted,source_status
+                 FROM admission_attention_projection
+                WHERE (
+                    (%s::UUID IS NOT NULL AND global_attention_id=%s::UUID)
+                    OR (
+                        %s::UUID IS NULL AND attention_id=%s
+                        AND source_instance_id=COALESCE(%s,'LEGACY')
+                    )
+                )
+                ORDER BY server_revision DESC LIMIT 1""",
+            (
+                row["admission_global_attention_id"],
+                row["admission_global_attention_id"],
+                row["admission_global_attention_id"],
+                row["admission_atencion_id"],
+                row["admission_source_instance_id"],
+            ),
+        ).fetchone()
+        original_attention_deleted = bool(
+            linked_attention
+            and (
+                bool(linked_attention["is_deleted"])
+                or str(linked_attention["source_status"] or "").upper()
+                == "ANULADA"
+            )
+        )
         restored_status = BILLING_PENDING if previous_status == BILLING_INVOICED else previous_status
         restored_at = now_str()
         con.execute(
@@ -10939,9 +10944,17 @@ def restore_recibo(recibo_id: int, restored_by=None):
             )
         con.execute(
             "INSERT INTO action_history(username, action, details, created_at) VALUES(%s,%s,%s,%s)",
-            (username, "Restaurar recibo", f"Recibo Nº {row['numero']} · ID {recibo_id}", restored_at),
+            (
+                username,
+                "Restaurar recibo",
+                f"Recibo Nº {row['numero']} · ID {recibo_id}; "
+                f"atención_original_anulada={original_attention_deleted}",
+                restored_at,
+            ),
         )
-        return dict(row)
+        result = dict(row)
+        result["original_attention_deleted"] = original_attention_deleted
+        return result
 
 def list_deleted_receipts(limit: int = 50, offset: int = 0):
     with db_connect() as con:

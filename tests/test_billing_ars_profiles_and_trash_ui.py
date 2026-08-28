@@ -80,8 +80,11 @@ def test_ars_manager_loads_editable_profile_fields():
     }
     with (
         patch.object(app, "ars_list", return_value=["ARS DEMO"]),
-        patch.object(app, "get_emergency_price", return_value=0),
-        patch.object(app, "get_consultation_price", return_value=0),
+        patch.object(
+            app,
+            "load_ars_runtime_data",
+            return_value={"sala_emergencia": 0, "consulta_price": 0},
+        ),
         patch.object(app, "get_ars_billing_profile", return_value=profile),
     ):
         dialog = app.ARSManagerDialog(parent.current_user, parent)

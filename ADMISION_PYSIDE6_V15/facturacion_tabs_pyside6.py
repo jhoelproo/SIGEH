@@ -3579,6 +3579,9 @@ class DatabaseManager:
         usuario="",
         motivo="Corrección de atención específica",
     ):
+        correction_reason = str(motivo or "").strip()
+        if len(correction_reason) < 5:
+            raise ValueError("Debe indicar un motivo de rectificación de al menos 5 caracteres.")
         nombre = (nuevos.get("Nombre") or "").strip()
         fecha = (nuevos.get("Fecha") or "").strip()
         hora = (nuevos.get("Hora") or "").strip()
@@ -3598,6 +3601,12 @@ class DatabaseManager:
         tipo_atencion = (nuevos.get("TipoAtencion") or "EMERGENCIA").strip().upper()
         if tipo_atencion not in ("EMERGENCIA", "URGENCIA", "CONSULTA"):
             tipo_atencion = "EMERGENCIA"
+        actor = limpiar_nombre_representante(
+            usuario
+            or (cargar_turno_config(permitir_vencido=True) or {}).get(
+                "representante", ""
+            )
+        )
 
         with closing(self._connect()) as conn:
             conn.row_factory = sqlite3.Row
@@ -3610,6 +3619,28 @@ class DatabaseManager:
             if str(snapshot["estado"] or "ACTIVA").upper() != "ACTIVA":
                 conn.rollback()
                 raise ValueError("No se puede editar una atención anulada.")
+
+            correction_after = {
+                "nombre": nombre,
+                "sexo": sexo,
+                "fecha": fecha,
+                "hora": hora,
+                "hoja": hoja,
+                "ars": ars,
+                "nss": nss,
+                "cedula": cedula,
+                "telefono": telefono,
+                "direccion": direccion,
+                "nacionalidad": nacionalidad,
+                "edad_num": edad_num,
+                "unidad": unidad,
+                "tipo_atencion": tipo_atencion,
+            }
+            changed_fields = sorted(
+                key
+                for key, value in correction_after.items()
+                if str(snapshot[key] or "") != str(value or "")
+            )
 
             nss_clean = re.sub(r"\D", "", nss)
             cedula_clean = re.sub(r"\D", "", cedula)
@@ -3640,12 +3671,18 @@ class DatabaseManager:
                 SET nombre=?, sexo=?, fecha=?, hora=?, hoja=?, ars=?, nss=?, cedula=?, telefono=?, direccion=?, nacionalidad=?,
                     edad_num=?, unidad=?, tipo_atencion=?, nss_clean=?, cedula_clean=?, telefono_clean=?,
                     identidad_estado=?, requiere_revision=?,
+                    correction_reason=?,correction_actor=?,correction_at=datetime('now'),
+                    correction_before_json=?,correction_after_json=?,
+                    correction_changed_fields_json=?,
                     updated_at=datetime('now','localtime')
                 WHERE id=?
             """, (nombre, sexo, fecha, hora, hoja, ars, nss, cedula, telefono, direccion, nacionalidad,
                   edad_num, unidad, tipo_atencion, nss_clean_atencion,
                   cedula_clean or None, telefono_clean or None, identidad_estado,
-                  int(bool(revision_nss)), int(atencion_id)))
+                  int(bool(revision_nss)), correction_reason, actor,
+                  json.dumps(dict(snapshot), ensure_ascii=False, sort_keys=True),
+                  json.dumps(correction_after, ensure_ascii=False, sort_keys=True),
+                  json.dumps(changed_fields, ensure_ascii=False), int(atencion_id)))
             rowcount = cur.rowcount
 
             # Una edición tampoco debe detener el flujo. Si queda un NSS sin
@@ -3738,14 +3775,11 @@ class DatabaseManager:
                     )
 
             after = dict(cur.execute("SELECT * FROM atenciones WHERE id=?", (int(atencion_id),)).fetchone())
-            actor = limpiar_nombre_representante(
-                usuario or (cargar_turno_config(permitir_vencido=True) or {}).get("representante", "")
-            )
             self._registrar_auditoria_conn(
                 conn,
                 int(atencion_id),
                 "MODIFICACION",
-                (motivo or "Corrección de atención específica").strip(),
+                correction_reason,
                 actor,
                 dict(snapshot),
                 after,
@@ -12834,13 +12868,29 @@ class App:
                 "Nacionalidad": _get("Nacionalidad"),
             }
 
+            motivo_rectificacion = simpledialog.askstring(
+                "Motivo de rectificación",
+                "Indique el motivo de esta corrección (mínimo 5 caracteres):",
+                parent=win,
+            )
+            if motivo_rectificacion is None:
+                return
+            motivo_rectificacion = motivo_rectificacion.strip()
+            if len(motivo_rectificacion) < 5:
+                messagebox.showerror(
+                    "Motivo requerido",
+                    "Debe indicar un motivo de al menos 5 caracteres.",
+                    parent=win,
+                )
+                return
+
             try:
                 snapshot_antes = dict(at)
                 self.db.actualizar_atencion_especifica(
                     atencion_id,
                     nuevos,
                     usuario=self.session_context.audit_actor,
-                    motivo="Edición desde historial de atenciones",
+                    motivo=motivo_rectificacion,
                 )
                 revision_nss_id = self.db.obtener_revision_nss_atencion(atencion_id)
                 self._invalidar_cache_ars()

@@ -243,7 +243,14 @@ def test_embedded_admission_applies_checkmarks_to_both_sex_options(
         assert app.lbl_sexo_f.isChecked() is True
         assert app.lbl_sexo_m.isChecked() is False
     finally:
+        coordinator = widget._hybrid_coordinator
+        refresh_controller = widget._hybrid_refresh_controller
+        excel_refresh = widget._hybrid_excel_refresh
         widget.shutdown()
+        assert coordinator._stopped is True
+        assert coordinator._timer.isActive() is False
+        assert refresh_controller._summary_debounce.isActive() is False
+        assert excel_refresh._debounce.isActive() is False
         host.close()
         host.deleteLater()
         application.processEvents()

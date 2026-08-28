@@ -40,12 +40,13 @@ _OPERATIONAL_CAPABILITIES = frozenset(
     }
 )
 
-# Admisión es un puesto operativo compartido: todos los usuarios autenticados
-# pueden corregir pacientes, consultar documentos y abrir sus herramientas.
-# La configuración continúa protegida por el PIN administrativo dentro de la
-# propia aplicación, independientemente del rol recibido desde Facturación.
 _ROLE_CAPABILITIES = {
-    role: _OPERATIONAL_CAPABILITIES for role in _KNOWN_ROLES
+    ROLE_ADMIN: _OPERATIONAL_CAPABILITIES,
+    ROLE_AUXILIARY: frozenset(
+        {CAP_VIEW_REPORTS, CAP_OPEN_EXCEL, CAP_EDIT_RECORDS, CAP_VOID_RECORDS}
+    ),
+    ROLE_BILLING_AUDIT: frozenset({CAP_VIEW_REPORTS, CAP_OPEN_EXCEL}),
+    ROLE_MEDICAL_AUDIT: frozenset({CAP_VIEW_REPORTS, CAP_OPEN_EXCEL}),
 }
 
 

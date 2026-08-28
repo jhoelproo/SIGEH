@@ -86,6 +86,24 @@ _V15_CAPABILITIES = frozenset(
         "configuration.manage",
     }
 )
+_V15_READ_CAPABILITIES = frozenset({"reports.view", "excel.open"})
+_V15_OPERATIONAL_CAPABILITIES = frozenset({"records.edit", "records.void"})
+
+
+def v15_capabilities_for_role(user: Any) -> frozenset[str]:
+    """Expose controls according to the authenticated main-system role."""
+    from admission_hybrid import (
+        ADMISSION_ROLE_ADMINISTRATOR,
+        ADMISSION_ROLE_AUXILIARY,
+        canonical_role,
+    )
+
+    role = canonical_role(user)
+    if role == ADMISSION_ROLE_ADMINISTRATOR:
+        return _V15_CAPABILITIES
+    if role == ADMISSION_ROLE_AUXILIARY:
+        return _V15_READ_CAPABILITIES | _V15_OPERATIONAL_CAPABILITIES
+    return _V15_READ_CAPABILITIES
 
 
 class AdmissionV15EventBus(QObject):
@@ -201,7 +219,6 @@ class _HybridAdmissionRuntime:
             return
         from admission_hybrid import (
             ConnectivityState,
-            DeviceAttachment,
             OperationalSession,
             OperationalState,
             StationRole,
@@ -919,7 +936,6 @@ class _HybridAdmissionRuntime:
             self._bound_database = database
             self.store = OfflineAdmissionStore(database.db_name)
             self.store.initialize()
-            self._apply_central_history_reset_if_authorized()
             # V15 uses the same local writer/outbox as the sync worker.  The
             # reference is local-only and does not make SQLite authoritative.
             database.hybrid_store = self.store
@@ -986,35 +1002,6 @@ class _HybridAdmissionRuntime:
                 self.host.connection_factory,
                 is_online=lambda: not self.offline,
             )
-
-    def _apply_central_history_reset_if_authorized(self) -> int:
-        """Replica localmente el corte central 1.0.4, una sola vez por PC."""
-        if self.store is None:
-            return 0
-        try:
-            with self.host.connection_factory() as connection:
-                row = connection.execute(
-                    """SELECT 1 FROM sigeh_maintenance_events
-                        WHERE event_key=%s LIMIT 1""",
-                    ("SIGEH_ADMISSION_HISTORY_RESET_20260826_V1",),
-                ).fetchone()
-        except Exception as exc:
-            self.logger.debug(
-                "Marcador central de reinicio de historial no disponible: %s",
-                type(exc).__name__,
-            )
-            return 0
-        if not row:
-            return 0
-        with self.store.connection() as connection:
-            reset_count = self.store.apply_authorized_history_reset(connection)
-            self.store._install_attention_outbox_triggers(connection)
-        if reset_count:
-            self.logger.warning(
-                "ADMISSION_HISTORY_LOCAL_RESET count=%s version=1.0.4",
-                reset_count,
-            )
-        return reset_count
 
     def search_patient_directory(self, *, cedula: str = "", nss: str = "") -> dict[str, Any] | None:
         """Exact local-first lookup; cloud hydration runs in the V15 worker."""
@@ -2017,9 +2004,17 @@ class _HybridDatabaseProxy:
             raise ValueError(f"Método de historial local no permitido: {method_name}")
         mode = str(values.get("modo") or "Todos")
         session = self._runtime.operational_session
-        if mode in {"Este turno", "Turno actual"} and session is not None:
-            turn_id = getattr(session, "turn_id", None)
-            source_id = str(getattr(session, "operational_source_id", "") or "")
+        if mode in {"Este turno", "Turno actual", "Por turno"}:
+            turn_id = (
+                values.get("turno_id")
+                if mode == "Por turno"
+                else getattr(session, "turn_id", None)
+            )
+            source_id = str(
+                values.get("operational_source_id")
+                or getattr(session, "operational_source_id", "")
+                or ""
+            )
             if turn_id is None or not source_id:
                 return []
             rows = self._local_list_rows(
@@ -2097,6 +2092,71 @@ class _HybridDatabaseProxy:
             result.append(row)
         return result
 
+    def _append_central_turn_filters(
+        self,
+        values: Mapping[str, Any],
+        mode: str,
+        where: list[str],
+        params: list[Any],
+    ) -> None:
+        turn_id = values.get("turno_id")
+        if mode in {"Este turno", "Turno actual"}:
+            session = self._runtime.operational_session
+            operational_source_id = str(
+                getattr(session, "operational_source_id", "") or ""
+            )
+            central_turn_id = getattr(session, "turn_id", None)
+            operational_session_id = str(
+                getattr(session, "operational_session_id", "") or ""
+            )
+            generation = int(getattr(session, "generation", 0) or 0)
+            if operational_source_id and central_turn_id is not None:
+                where.extend(("p.operational_source_id::TEXT=%s", "p.turn_id=%s"))
+                params.extend((operational_source_id, int(central_turn_id)))
+                turn_id = None
+            elif operational_session_id and generation:
+                where.extend(("p.operational_session_id=%s", "p.generation=%s"))
+                params.extend((operational_session_id, generation))
+                turn_id = None
+            elif not turn_id:
+                turn_id = session.turn_id if session else None
+        if not turn_id:
+            return
+        requested_source = str(values.get("operational_source_id") or "").strip()
+        if requested_source:
+            where.append("p.operational_source_id::TEXT=%s")
+            params.append(requested_source)
+        where.append("p.turn_id=%s")
+        params.append(int(turn_id))
+
+    def _pending_history_rows(
+        self,
+        method_name: str,
+        names: Iterable[str],
+        values: Mapping[str, Any],
+        limit: int,
+        offset: int,
+        logger: Any,
+    ) -> list[dict[str, Any]]:
+        local_values = dict(values)
+        local_values["limite"] = limit + offset
+        local_values["offset"] = 0
+        accepted = set(names) | {"operational_source_id"}
+        local_values = {
+            key: value for key, value in local_values.items() if key in accepted
+        }
+        local_method = getattr(self._database, method_name, None)
+        try:
+            if not callable(local_method):
+                return []
+            return self._local_pending_history(
+                self.list_history_cache_local(method_name, **local_values)
+            )
+        except Exception:
+            if logger is not None:
+                logger.exception("HISTORY_LOCAL_PENDING_READ_FAILED")
+            return []
+
     def _legacy_projection_readthrough(
         self, method_name: str, args, kwargs
     ) -> list[dict[str, Any]]:
@@ -2104,8 +2164,8 @@ class _HybridDatabaseProxy:
         logger = getattr(self._runtime, "logger", None)
         if logger is not None:
             logger.info("HISTORY_SYNC_START method=%s", method_name)
-        local_method = getattr(self._database, method_name)
         if self._runtime.offline:
+            local_method = getattr(self._database, method_name)
             return sorted(
                 local_method(*args, **kwargs) or [],
                 key=self._history_sort_key,
@@ -2127,7 +2187,8 @@ class _HybridDatabaseProxy:
         limit = max(1, min(int(values.get("limite") or 200), 500))
         offset = max(0, int(values.get("offset") or 0))
         where = [
-            "UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')"
+            "COALESCE(p.is_deleted,FALSE)=FALSE",
+            "UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')",
         ]
         params: list[Any] = []
         query = str(values.get("filtro_texto") or "").strip()
@@ -2159,39 +2220,7 @@ class _HybridDatabaseProxy:
         if mode == "Por ARS" and ars and ars.casefold() != "(todas)":
             where.append("p.canonical_ars ILIKE %s")
             params.append(f"%{ars}%")
-        turn_id = values.get("turno_id")
-        if mode in {"Este turno", "Turno actual"}:
-            session = self._runtime.operational_session
-            operational_source_id = str(
-                getattr(session, "operational_source_id", "") or ""
-            )
-            central_turn_id = getattr(session, "turn_id", None)
-            operational_session_id = str(
-                getattr(session, "operational_session_id", "") or ""
-            )
-            generation = int(getattr(session, "generation", 0) or 0)
-            if operational_source_id and central_turn_id is not None:
-                # The operational source plus central turn id is stable across
-                # stations. ``generation`` advances for a later turn or
-                # correction, while historical rows from this active turn may
-                # validly retain the generation in which they were created.
-                where.append("p.operational_source_id::TEXT=%s")
-                params.append(operational_source_id)
-                where.append("p.turn_id=%s")
-                params.append(int(central_turn_id))
-                turn_id = None
-            elif operational_session_id and generation:
-                # Compatibility only for pre-source snapshots.
-                where.append("p.operational_session_id=%s")
-                params.append(operational_session_id)
-                where.append("p.generation=%s")
-                params.append(generation)
-                turn_id = None
-            elif not turn_id:
-                turn_id = session.turn_id if session else None
-        if turn_id:
-            where.append("p.turn_id=%s")
-            params.append(int(turn_id))
+        self._append_central_turn_filters(values, mode, where, params)
 
         sql = f"""SELECT p.*,p.attention_id AS origin_attention_id,
                           p.attention_id AS id,p.service_date AS fecha,
@@ -2259,25 +2288,16 @@ class _HybridDatabaseProxy:
                 # secondary whose local turn mirror is still being created)
                 # must not hide the central history.  The mirror coordinator
                 # retries independently; the visible cloud rows remain valid.
-                self._runtime.logger.exception(
-                    "HISTORY_READTHROUGH_HYDRATION_FAILED rows=%s",
-                    len(cloud_rows),
-                )
+                if logger is not None:
+                    logger.exception(
+                        "HISTORY_CACHE_HYDRATION_FAILED rows=%s",
+                        len(cloud_rows),
+                    )
 
-        # Native V15 query is local and is only used to keep unacknowledged rows visible.
-        local_values = dict(values)
-        local_values["limite"] = limit + offset
-        local_values["offset"] = 0
-        accepted = set(names)
-        local_values = {key: value for key, value in local_values.items() if key in accepted}
-        try:
-            pending_rows = self._local_pending_history(local_method(**local_values))
-        except Exception:
-            # Local pending rows are supplemental.  A temporary SQLite issue
-            # must not make the central history disappear or leave the UI in a
-            # permanent loading state.
-            self._runtime.logger.exception("HISTORY_LOCAL_PENDING_READ_FAILED")
-            pending_rows = []
+        # Native V15 data is supplemental and only keeps unacknowledged rows visible.
+        pending_rows = self._pending_history_rows(
+            method_name, names, values, limit, offset, logger
+        )
         by_uuid = {
             str(row.get("global_attention_id") or "").replace("-", "").lower(): row
             for row in cloud_rows
@@ -2300,7 +2320,7 @@ class _HybridDatabaseProxy:
         return result
 
     def _cloud_history(self, method_name: str, args, kwargs) -> list[dict[str, Any]]:
-        """Serve history from the synchronized local replica, never a second UI source."""
+        """Read PostgreSQL online and use SQLite only as the offline replica."""
         started = perf_counter()
         logger = getattr(self._runtime, "logger", None)
         values = dict(kwargs or {})
@@ -2315,6 +2335,33 @@ class _HybridDatabaseProxy:
         )
         for name, value in zip(names, positional):
             values.setdefault(name, value)
+        if not bool(getattr(self._runtime, "offline", False)):
+            if logger is not None:
+                logger.info("HISTORY_CENTRAL_QUERY method=%s", method_name)
+            try:
+                return self._legacy_projection_readthrough(
+                    method_name, args, kwargs
+                )
+            except Exception as exc:
+                temporary = getattr(self._runtime, "_temporary", lambda _exc: False)
+                if not temporary(exc):
+                    raise
+                supervisor = getattr(
+                    self._runtime, "connection_supervisor", None
+                )
+                if supervisor is not None:
+                    supervisor.mark_offline(exc)
+                self._runtime.offline = True
+                self._runtime.status_message = (
+                    "Sin conexión · trabajando con la réplica local"
+                )
+                if logger is not None:
+                    logger.warning(
+                        "HISTORY_OFFLINE_FALLBACK method=%s error=%s",
+                        method_name,
+                        type(exc).__name__,
+                    )
+
         rows = sorted(
             self.list_history_cache_local(method_name, **values),
             key=self._history_sort_key,
@@ -2322,7 +2369,8 @@ class _HybridDatabaseProxy:
         )
         if logger is not None:
             logger.info(
-                "HISTORY_REFRESH method=%s rows=%s source=local_replica elapsed_ms=%.1f",
+                "HISTORY_REFRESH method=%s rows=%s source=offline_replica "
+                "elapsed_ms=%.1f",
                 method_name,
                 len(rows),
                 (perf_counter() - started) * 1000.0,
@@ -2409,16 +2457,23 @@ class _HybridDatabaseProxy:
                     operational_source or "-",
                 )
             return []
-        # The UI reads a single durable universe: this station's synchronized
-        # SQLite replica plus locally pending records.  The runtime reconciles
-        # the current central turn before refreshes; querying PostgreSQL here
-        # created a second, inconsistent History/Summary dataset.
-        result = sorted(
-            self._local_list_rows(
+        if bool(getattr(self._runtime, "offline", False)):
+            rows = self._local_list_rows(
                 effective_turn, operational_source, pending_only=False
-            ),
-            key=self._history_sort_key,
-        )
+            )
+        else:
+            rows = self._cloud_history(
+                "listar_atenciones_filtradas",
+                (),
+                {
+                    "modo": "Por turno",
+                    "turno_id": effective_turn,
+                    "operational_source_id": operational_source,
+                    "limite": 500,
+                    "offset": 0,
+                },
+            )
+        result = sorted(rows, key=self._history_sort_key)
         if logger is not None:
             logger.info(
                 "CURRENT_TURN_DATASET turn_id=%s source=%s count=%s",
@@ -2594,6 +2649,7 @@ class _HybridCoordinator(QObject):
         self._last_state_fingerprint = None
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(2)
+        self._pool.setExpiryTimeout(0)
         self._timer = QTimer(self)
         self._timer.setInterval(int(SYNC_TICK_SECONDS * 1000))
         self._timer.timeout.connect(self._schedule)
@@ -2609,8 +2665,12 @@ class _HybridCoordinator(QObject):
         )
 
     def stop(self) -> None:
+        if self._stopped:
+            return
         self._stopped = True
         self._timer.stop()
+        self._pending = False
+        self._pool.clear()
 
     def submit_background(
         self,
@@ -2622,8 +2682,17 @@ class _HybridCoordinator(QObject):
         if self._stopped:
             return
         signals = _BackgroundTaskSignals(self)
-        signals.succeeded.connect(on_success)
-        signals.failed.connect(on_failure or self.failed.emit)
+
+        def deliver_success(result: Any) -> None:
+            if not self._stopped:
+                on_success(result)
+
+        def deliver_failure(code: str) -> None:
+            if not self._stopped:
+                (on_failure or self.failed.emit)(code)
+
+        signals.succeeded.connect(deliver_success)
+        signals.failed.connect(deliver_failure)
         self._pool.start(_BackgroundTask(operation, signals))
 
     @Slot()
@@ -2754,6 +2823,11 @@ class _V15BackgroundRefreshCoordinator(QObject):
         self._summary_debounce.timeout.connect(self._start_summary)
         self.lookup_completed.connect(self._consume_lookup)
 
+    def stop(self) -> None:
+        self._summary_debounce.stop()
+        self._summary_pending = False
+        self._lookup_generation += 1
+
     def request_summary(self, reason: str = "attention_event") -> None:
         runtime = getattr(getattr(self.admission, "db", None), "_runtime", None)
         logger = getattr(runtime, "logger", None)
@@ -2845,14 +2919,18 @@ class _V15BackgroundRefreshCoordinator(QObject):
         generation = self._lookup_generation
         if field == "cedula":
             value = str(self.admission.entry_cedula.get() or "").replace("-", "").strip()
-            operation = lambda: dict(
-                self.admission.db.search_patient_directory(cedula=value) or {}
-            )
+
+            def operation():
+                return dict(
+                    self.admission.db.search_patient_directory(cedula=value) or {}
+                )
         else:
             value = str(self.admission.entry_nss.get() or "").upper().strip()
-            operation = lambda: dict(
-                self.admission.db.search_patient_directory(nss=value) or {}
-            )
+
+            def operation():
+                return dict(
+                    self.admission.db.search_patient_directory(nss=value) or {}
+                )
         if not value:
             return
 
@@ -2928,6 +3006,10 @@ class _HybridExcelRefreshCoordinator(QObject):
         self._debounce.setInterval(220)
         self._debounce.timeout.connect(self._start)
 
+    def stop(self) -> None:
+        self._debounce.stop()
+        self._pending = False
+
     def request(self) -> None:
         if self._busy:
             self._pending = True
@@ -2964,6 +3046,31 @@ class _HybridExcelRefreshCoordinator(QObject):
         if self._pending:
             self._pending = False
             self._debounce.start()
+
+
+def _bind_hybrid_shutdown(
+    widget: Any,
+    hybrid: Any,
+    coordinator: _HybridCoordinator,
+    refresh_controller: _V15BackgroundRefreshCoordinator | None,
+    excel_refresh: _HybridExcelRefreshCoordinator | None,
+) -> None:
+    original_shutdown = widget.shutdown
+    shutdown_state = {"complete": False}
+
+    def shutdown_with_hybrid_cleanup(_widget_self) -> None:
+        if shutdown_state["complete"]:
+            return
+        shutdown_state["complete"] = True
+        if refresh_controller is not None:
+            refresh_controller.stop()
+        if excel_refresh is not None:
+            excel_refresh.stop()
+        coordinator.stop()
+        hybrid.shutdown()
+        original_shutdown()
+
+    widget.shutdown = MethodType(shutdown_with_hybrid_cleanup, widget)
 
 
 def _clean(value: Any, maximum: int) -> str:
@@ -3733,7 +3840,7 @@ class AdmissionV15Factory:
             # operativo es transitorio y se valida en el proxy antes de toda
             # mutación; no se omiten controles durante la construcción porque
             # eso dejaba el modo solo lectura pegado tras una transición.
-            return capability in _V15_CAPABILITIES
+            return capability in v15_capabilities_for_role(host.user)
 
         configuration = dict(getattr(host, "configuration", {}) or {})
         configuration["admission_hybrid"] = hybrid.state()
@@ -4110,6 +4217,9 @@ class AdmissionV15Factory:
             widget._hybrid_coordinator = coordinator
             widget._hybrid_refresh_controller = refresh_controller
             widget._hybrid_excel_refresh = excel_refresh
+            _bind_hybrid_shutdown(
+                widget, hybrid, coordinator, refresh_controller, excel_refresh
+            )
             apply_state(hybrid.state())
             coordinator.start()
             return widget
