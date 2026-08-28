@@ -73,37 +73,25 @@ def test_schema_initialization_installs_cancellation_trigger_after_columns():
     assert billing_columns < projection_columns < trigger_migration
 
 
-def test_central_history_reset_is_logical_audited_and_idempotent():
-    connection = _MigrationConnection()
-
-    app._apply_authorized_admission_history_reset_104(connection)
-
-    sql = connection.scripts[0]
-    assert "CREATE TABLE IF NOT EXISTS sigeh_maintenance_events" in sql
-    assert "IF EXISTS" in sql
-    assert "SIGEH_ADMISSION_HISTORY_RESET_20260826_V1" in sql
-    assert "UPDATE admission_attention_projection" in sql
-    assert "is_deleted=TRUE" in sql
-    assert "source_status='ANULADA'" in sql
-    assert "DELETE FROM admission_attention_projection" not in sql
-    assert "DELETE FROM admission_sync_events" not in sql
-    assert "ADMISSION_HISTORY_RESET" in sql
-
-
-def test_data_lifecycle_installs_trigger_before_authorized_reset(monkeypatch):
+def test_data_lifecycle_installs_trigger_without_automatic_history_reset(monkeypatch):
     calls = []
     monkeypatch.setattr(
         app,
         "_apply_admission_cancellation_receipt_trash_migration",
         lambda connection: calls.append(("trigger", connection)),
     )
-    monkeypatch.setattr(
-        app,
-        "_apply_authorized_admission_history_reset_104",
-        lambda connection: calls.append(("reset", connection)),
-    )
     connection = object()
 
     app._apply_admission_data_lifecycle_migrations(connection)
 
-    assert calls == [("trigger", connection), ("reset", connection)]
+    assert calls == [("trigger", connection)]
+
+
+def test_cancellation_trigger_links_receipts_by_global_attention_id():
+    connection = _MigrationConnection()
+
+    app._apply_admission_cancellation_receipt_trash_migration(connection)
+
+    sql = connection.scripts[0]
+    assert "admission_global_attention_id" in sql
+    assert "NEW.global_attention_id" in sql

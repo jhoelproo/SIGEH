@@ -151,7 +151,7 @@ class _ApplyLockConnection(_TaskStateConnection):
     def execute(self, sql, params=()):
         compact = " ".join(sql.split())
         self.statements.append((compact, params))
-        if compact.startswith("SELECT status FROM admission_import_batches"):
+        if compact.startswith("SELECT status,mode,source_sha256"):
             return _RowResult(("ANALYZED",))
         if "AND (%s::TEXT='' OR import_batch_id::TEXT<>" in compact:
             return _RowResult(("other-active-batch",))

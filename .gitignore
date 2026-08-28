@@ -47,6 +47,7 @@ LOGS/
 outputs/
 test_artifacts/
 visual_evidence/
+/_internal/
 database_url.bundle
 database_url.protected
 *.protected

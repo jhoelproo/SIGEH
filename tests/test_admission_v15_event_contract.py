@@ -303,6 +303,7 @@ def test_embedded_v15_receives_the_host_event_bus_without_second_session(
     finally:
         if hasattr(widget, "shutdown"):
             widget.shutdown()
+            widget.shutdown()
         else:
             widget.close()
         widget.deleteLater()

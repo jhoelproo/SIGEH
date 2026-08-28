@@ -18,7 +18,9 @@ PDF_ENGINE = ROOT / "pdf_engine"
 REPORT_ENGINE = ROOT / "report_engine"
 ADMISSION_SOURCE = ROOT / "admission_source"
 ADMISSION_CORE = ADMISSION_SOURCE / "emergency_core"
-SUMATRA_PDF = ADMISSION_SOURCE / "SumatraPDF.exe"
+SUMATRA_PDF = Path(
+    os.environ.get("SIGEH_SUMATRA_PDF", ADMISSION_SOURCE / "SumatraPDF.exe")
+).resolve()
 V15_PACKAGE = "ADMISION_PYSIDE6_V15"
 V15_SOURCE = (ROOT / V15_PACKAGE).resolve()
 V15_ASSETS = V15_SOURCE / "assets"
@@ -118,7 +120,6 @@ REQUIRED_FILES = [
     ROOT / "private_insurance_exporter.py",
     ROOT / "lanzador.py",
     ROOT / "updater.py",
-    ROOT / "config_local.py",
     ROOT / "database_config.py",
     ROOT / "sigeh_product.py",
     ROOT / "sigeh_update.py",

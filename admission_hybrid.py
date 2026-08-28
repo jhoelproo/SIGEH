@@ -124,6 +124,7 @@ class ConnectionSupervisor:
 ADMISSION_ROLE_AUXILIARY = "auxiliar"
 ADMISSION_ROLE_ADMINISTRATOR = "administrador"
 ADMISSION_ROLE_AUDIT = "facturador de auditoria"
+ADMISSION_ROLE_MEDICAL_AUDIT = "auditoria medica y cuentas"
 ADMISSION_TURN_HOURS = 12
 
 
@@ -163,6 +164,14 @@ def user_can_operate_admission(user: Any) -> bool:
 
 def user_can_be_assigned_admission_operator(user: Any) -> bool:
     """Roles asignables mediante una transición operacional explícita."""
+    return canonical_role(user) in {
+        ADMISSION_ROLE_AUXILIARY,
+        ADMISSION_ROLE_ADMINISTRATOR,
+    }
+
+
+def user_can_void_attention(user: Any) -> bool:
+    """Only active Admission roles may create an irreversible tombstone."""
     return canonical_role(user) in {
         ADMISSION_ROLE_AUXILIARY,
         ADMISSION_ROLE_ADMINISTRATOR,
@@ -1113,9 +1122,27 @@ CREATE TABLE IF NOT EXISTS admission_central_seeds(
   started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   seed_completed_at TIMESTAMPTZ,
   origin_device_id TEXT,
+  seed_kind TEXT NOT NULL DEFAULT 'LEGACY_SEED',
+  operational_source_id UUID,
+  operational_session_id UUID,
+  turn_id BIGINT,
+  applied_by_user_id TEXT,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   UNIQUE(legacy_source_instance_id,seed_source_fingerprint,schema_version),
   CHECK(status IN ('RUNNING','COMPLETED','FAILED'))
 );
+ALTER TABLE admission_central_seeds
+  ADD COLUMN IF NOT EXISTS seed_kind TEXT NOT NULL DEFAULT 'LEGACY_SEED';
+ALTER TABLE admission_central_seeds
+  ADD COLUMN IF NOT EXISTS operational_source_id UUID;
+ALTER TABLE admission_central_seeds
+  ADD COLUMN IF NOT EXISTS operational_session_id UUID;
+ALTER TABLE admission_central_seeds ADD COLUMN IF NOT EXISTS turn_id BIGINT;
+ALTER TABLE admission_central_seeds ADD COLUMN IF NOT EXISTS applied_by_user_id TEXT;
+ALTER TABLE admission_central_seeds
+  ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_admission_initial_baseline
+  ON admission_central_seeds(seed_kind) WHERE seed_kind='INITIAL_BASELINE';
 CREATE TABLE IF NOT EXISTS admission_import_batches(
   import_batch_id UUID PRIMARY KEY,
   source_filename TEXT NOT NULL,
@@ -1138,6 +1165,9 @@ CREATE TABLE IF NOT EXISTS admission_import_batches(
   completed_at TIMESTAMPTZ,
   error_code TEXT,
   error_message TEXT,
+  backup_path TEXT,
+  backup_sha256 TEXT,
+  baseline_context_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   CHECK(mode IN ('SEED','MERGE')),
   CHECK(status IN ('ANALYZING','ANALYZED','APPLYING','COMPLETED','FAILED')),
   CHECK(progress_percent BETWEEN 0 AND 100)
@@ -1166,6 +1196,10 @@ ALTER TABLE admission_import_batches
   ADD COLUMN IF NOT EXISTS error_code TEXT;
 ALTER TABLE admission_import_batches
   ADD COLUMN IF NOT EXISTS error_message TEXT;
+ALTER TABLE admission_import_batches ADD COLUMN IF NOT EXISTS backup_path TEXT;
+ALTER TABLE admission_import_batches ADD COLUMN IF NOT EXISTS backup_sha256 TEXT;
+ALTER TABLE admission_import_batches
+  ADD COLUMN IF NOT EXISTS baseline_context_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS idx_admission_import_batches_active
   ON admission_import_batches(status,last_heartbeat_at DESC)
   WHERE status IN ('ANALYZING','APPLYING');
@@ -1327,7 +1361,7 @@ ADMISSION_IMPORT_BATCH_COLUMNS = frozenset({
     "totals_json", "applied_at", "current_phase", "progress_percent",
     "processed_records", "total_records", "status_message", "started_at",
     "progress_updated_at", "last_heartbeat_at", "completed_at", "error_code",
-    "error_message",
+    "error_message", "backup_path", "backup_sha256", "baseline_context_json",
 })
 ADMISSION_IMPORT_STAGING_COLUMNS = frozenset({
     "import_batch_id", "row_number", "global_attention_id",
@@ -1340,6 +1374,32 @@ ADMISSION_IMPORT_STAGING_COLUMNS = frozenset({
 def ensure_admission_import_progress_schema(connection: Any) -> None:
     """Migrate legacy import tables to durable progress without deleting rows."""
     statements = (
+        """CREATE TABLE IF NOT EXISTS admission_central_seeds(
+               central_seed_id UUID PRIMARY KEY,
+               legacy_source_instance_id TEXT NOT NULL,
+               seed_source_fingerprint TEXT NOT NULL,
+               schema_version INTEGER NOT NULL,
+               status TEXT NOT NULL,
+               imported_records BIGINT NOT NULL DEFAULT 0,
+               started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+               seed_completed_at TIMESTAMPTZ,
+               origin_device_id TEXT,
+               seed_kind TEXT NOT NULL DEFAULT 'LEGACY_SEED',
+               operational_source_id UUID,
+               operational_session_id UUID,
+               turn_id BIGINT,
+               applied_by_user_id TEXT,
+               metadata_json JSONB NOT NULL DEFAULT '{}'::JSONB,
+               UNIQUE(legacy_source_instance_id,seed_source_fingerprint,schema_version),
+               CHECK(status IN ('RUNNING','COMPLETED','FAILED'))
+           )""",
+        "ALTER TABLE admission_central_seeds ADD COLUMN IF NOT EXISTS seed_kind TEXT NOT NULL DEFAULT 'LEGACY_SEED'",
+        "ALTER TABLE admission_central_seeds ADD COLUMN IF NOT EXISTS operational_source_id UUID",
+        "ALTER TABLE admission_central_seeds ADD COLUMN IF NOT EXISTS operational_session_id UUID",
+        "ALTER TABLE admission_central_seeds ADD COLUMN IF NOT EXISTS turn_id BIGINT",
+        "ALTER TABLE admission_central_seeds ADD COLUMN IF NOT EXISTS applied_by_user_id TEXT",
+        "ALTER TABLE admission_central_seeds ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::JSONB",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_admission_initial_baseline ON admission_central_seeds(seed_kind) WHERE seed_kind='INITIAL_BASELINE'",
         """CREATE TABLE IF NOT EXISTS admission_import_batches(
                import_batch_id UUID PRIMARY KEY,
                source_filename TEXT NOT NULL, source_sha256 TEXT NOT NULL,
@@ -1353,6 +1413,8 @@ def ensure_admission_import_progress_schema(connection: Any) -> None:
                status_message TEXT NOT NULL DEFAULT '', started_at TIMESTAMPTZ,
                progress_updated_at TIMESTAMPTZ, last_heartbeat_at TIMESTAMPTZ,
                completed_at TIMESTAMPTZ, error_code TEXT, error_message TEXT,
+               backup_path TEXT, backup_sha256 TEXT,
+               baseline_context_json JSONB NOT NULL DEFAULT '{}'::JSONB,
                CHECK(mode IN ('SEED','MERGE')),
                CHECK(status IN ('ANALYZING','ANALYZED','APPLYING','COMPLETED','FAILED')),
                CHECK(progress_percent BETWEEN 0 AND 100)
@@ -1381,6 +1443,9 @@ def ensure_admission_import_progress_schema(connection: Any) -> None:
         "ALTER TABLE admission_import_batches ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ",
         "ALTER TABLE admission_import_batches ADD COLUMN IF NOT EXISTS error_code TEXT",
         "ALTER TABLE admission_import_batches ADD COLUMN IF NOT EXISTS error_message TEXT",
+        "ALTER TABLE admission_import_batches ADD COLUMN IF NOT EXISTS backup_path TEXT",
+        "ALTER TABLE admission_import_batches ADD COLUMN IF NOT EXISTS backup_sha256 TEXT",
+        "ALTER TABLE admission_import_batches ADD COLUMN IF NOT EXISTS baseline_context_json JSONB NOT NULL DEFAULT '{}'::JSONB",
         """CREATE TABLE IF NOT EXISTS admission_import_staging(
                import_batch_id UUID NOT NULL REFERENCES admission_import_batches(import_batch_id) ON DELETE CASCADE,
                row_number BIGINT NOT NULL, global_attention_id UUID NOT NULL,
@@ -1516,9 +1581,6 @@ def install_central_hybrid_schema(connection: Any) -> None:
     ensure_admission_import_progress_schema(connection)
 
 
-ADMISSION_HISTORY_RESET_VERSION = "SIGEH_ADMISSION_HISTORY_RESET_20260826_V1"
-
-
 class OfflineAdmissionStore:
     """Extensi\u00f3n transaccional de una SQLite local de Admisi\u00f3n."""
 
@@ -1629,6 +1691,14 @@ class OfflineAdmissionStore:
             self._add_column(con, "atenciones", "anulada_at", "TEXT")
             self._add_column(con, "atenciones", "anulada_por", "TEXT")
             self._add_column(con, "atenciones", "anulada_motivo", "TEXT")
+            self._add_column(con, "atenciones", "correction_reason", "TEXT")
+            self._add_column(con, "atenciones", "correction_actor", "TEXT")
+            self._add_column(con, "atenciones", "correction_at", "TEXT")
+            self._add_column(con, "atenciones", "correction_before_json", "TEXT")
+            self._add_column(con, "atenciones", "correction_after_json", "TEXT")
+            self._add_column(
+                con, "atenciones", "correction_changed_fields_json", "TEXT"
+            )
             self._add_column(con, "pacientes", "is_deleted", "INTEGER NOT NULL DEFAULT 0")
             self._add_column(con, "pacientes", "sync_state", "TEXT NOT NULL DEFAULT 'SYNCED'")
             self._add_column(con, "pacientes", "server_revision", "INTEGER NOT NULL DEFAULT 0")
@@ -1717,61 +1787,6 @@ class OfflineAdmissionStore:
                     "VALUES('admission.patient_directory_schema_version','1')"
                 )
         self._initialized = True
-
-    @staticmethod
-    def apply_authorized_history_reset(con: sqlite3.Connection) -> int:
-        """Aplica una sola vez el corte autorizado de historia previo a 1.0.4."""
-        row = con.execute(
-            "SELECT valor FROM app_metadata WHERE clave=?",
-            ("sigeh.admission_history_reset_version",),
-        ).fetchone()
-        if row and str(row[0] or "") == ADMISSION_HISTORY_RESET_VERSION:
-            return 0
-
-        for trigger_name in (
-            "trg_admission_sync_attention_create",
-            "trg_admission_sync_attention_update",
-        ):
-            con.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
-        cursor = con.execute(
-            """UPDATE atenciones
-                  SET estado='ANULADA',is_deleted=1,
-                      deleted_at=COALESCE(deleted_at,datetime('now')),
-                      deleted_by_user_id=COALESCE(
-                          NULLIF(deleted_by_user_id,''),'SIGEH_1_0_4_RESET'
-                      ),
-                      delete_reason=COALESCE(
-                          NULLIF(delete_reason,''),
-                          'Reinicio autorizado del historial de Admisión'
-                      ),
-                      anulada_at=COALESCE(anulada_at,datetime('now')),
-                      anulada_por=COALESCE(
-                          NULLIF(anulada_por,''),'SIGEH_1_0_4_RESET'
-                      ),
-                      anulada_motivo=COALESCE(
-                          NULLIF(anulada_motivo,''),
-                          'Reinicio autorizado del historial de Admisión'
-                      ),
-                      sync_state='SYNCED'
-                WHERE COALESCE(is_deleted,0)=0"""
-        )
-        reset_count = max(0, int(cursor.rowcount or 0))
-        con.execute(
-            """UPDATE sync_outbox
-                  SET sync_status='SUPERSEDED',
-                      last_error='SIGEH_1_0_4_HISTORY_RESET'
-                WHERE entity_type='attention'
-                  AND sync_status IN ('PENDING','RETRY','CONFLICT')"""
-        )
-        con.execute(
-            """INSERT INTO app_metadata(clave,valor) VALUES(?,?)
-               ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor""",
-            (
-                "sigeh.admission_history_reset_version",
-                ADMISSION_HISTORY_RESET_VERSION,
-            ),
-        )
-        return reset_count
 
     @staticmethod
     def _install_attention_outbox_triggers(con: sqlite3.Connection) -> None:
@@ -1924,6 +1939,10 @@ class OfflineAdmissionStore:
                     ELSE 'UPDATE'
                   END,
                   json_object('attention_id',a.id,'global_attention_id',a.global_attention_id,
+                              'event_type',CASE
+                                  WHEN UPPER(COALESCE(a.estado,''))='ANULADA'
+                                      THEN 'ATTENTION_VOIDED'
+                                  ELSE 'ATTENTION_RECTIFIED' END,
                               'patient_id',a.paciente_id,'global_patient_id',a.global_patient_id,
                               'turn_id',COALESCE(c.operational_turn_id,a.turno_id),
                               'local_turn_id',a.turno_id,'name',a.nombre,'sex',a.sexo,
@@ -1954,6 +1973,15 @@ class OfflineAdmissionStore:
                               'deleted_by_user_id',a.deleted_by_user_id,
                               'delete_event_uuid',a.delete_event_uuid,
                               'delete_reason',COALESCE(a.delete_reason,a.anulada_motivo,''),
+                              'correction_reason',COALESCE(a.correction_reason,''),
+                              'correction_actor',COALESCE(a.correction_actor,''),
+                              'correction_at',COALESCE(a.correction_at,''),
+                              'previous_values',json(COALESCE(
+                                  NULLIF(a.correction_before_json,''),'{}')),
+                              'new_values',json(COALESCE(
+                                  NULLIF(a.correction_after_json,''),'{}')),
+                              'changed_fields',json(COALESCE(
+                                  NULLIF(a.correction_changed_fields_json,''),'[]')),
                               'base_server_revision',a.base_server_revision,
                               'legacy_source_instance_id',a.legacy_source_instance_id,
                               'legacy_attention_id',COALESCE(a.legacy_attention_id,a.id),
@@ -3564,6 +3592,10 @@ class OfflineAdmissionStore:
         reason: str,
     ) -> dict[str, Any] | None:
         """Creates a local tombstone and DELETE outbox in one SQLite transaction."""
+        if not user_can_void_attention(current_user):
+            raise PermissionError(
+                "El rol autenticado no puede anular atenciones de Admisión."
+            )
         reason_text = str(reason or "").strip()
         if len(reason_text) < 5:
             raise ValueError("La anulación requiere un motivo de al menos 5 caracteres.")
@@ -3605,6 +3637,11 @@ class OfflineAdmissionStore:
             current = con.execute(
                 "SELECT * FROM atenciones WHERE id=?", (int(row[0]),)
             ).fetchone()
+        OPERATIONAL_LOG.info(
+            "ATTENTION_VOIDED global_attention_id=%s actor=%s",
+            normalized,
+            username,
+        )
         return dict(current) if current else None
 
 
@@ -6409,6 +6446,10 @@ class AdmissionCloudRepository:
         device_id: str,
     ) -> dict[str, Any] | None:
         """Creates an idempotent central tombstone; DELETE wins normal updates."""
+        if not user_can_void_attention(current_user):
+            raise PermissionError(
+                "El rol autenticado no puede anular atenciones de Admisión."
+            )
         reason_text = str(reason or "").strip()
         if len(reason_text) < 5:
             raise ValueError("La anulacion requiere un motivo de al menos 5 caracteres.")
@@ -6467,6 +6508,12 @@ class AdmissionCloudRepository:
             created_at_effective_utc=now,
         )
         self.push_event(event)
+        OPERATIONAL_LOG.info(
+            "ATTENTION_VOIDED global_attention_id=%s actor=%s event_uuid=%s",
+            global_attention_id,
+            actor_username,
+            event_uuid,
+        )
         return self.get_attention_by_global_id(global_attention_id, include_deleted=True)
 
     def backfill_projection_events(self, *, limit: int = 500) -> int:
@@ -7082,6 +7129,10 @@ class AdmissionCloudRepository:
             if latest_operation in {"DELETE", "CANCEL", "ATTENTION_DELETED"} and operation not in {
                 "DELETE", "RESTORE_ATTENTION"
             }:
+                OPERATIONAL_LOG.warning(
+                    "ATTENTION_STALE_UPDATE_REJECTED global_attention_id=%s",
+                    event_to_store.entity_uuid,
+                )
                 raise SyncConflict(
                     json.dumps(
                         {"reason_code": "STALE_RECORD_SUPPRESSED_BY_TOMBSTONE"},
@@ -7138,7 +7189,25 @@ class AdmissionCloudRepository:
             ).fetchone()
             if event_to_store.entity_type.casefold() == "attention":
                 self._materialize_attention(con, event_to_store, current_version + 1)
+                self._log_materialized_attention(event_to_store, current_version + 1)
             return int(row[0])
+
+    @staticmethod
+    def _log_materialized_attention(event: SyncEvent, server_revision: int) -> None:
+        operation = event.operation.upper()
+        if operation == "DELETE":
+            OPERATIONAL_LOG.info(
+                "ATTENTION_TOMBSTONE_APPLIED global_attention_id=%s "
+                "server_revision=%s",
+                event.entity_uuid,
+                server_revision,
+            )
+        elif str(event.payload.get("event_type") or "").upper() == "ATTENTION_RECTIFIED":
+            OPERATIONAL_LOG.info(
+                "ATTENTION_RECTIFIED global_attention_id=%s server_revision=%s",
+                event.entity_uuid,
+                server_revision,
+            )
 
     @staticmethod
     def _bulk_projection_row(event: SyncEvent) -> tuple[Any, ...]:
@@ -8205,6 +8274,7 @@ __all__ = [
     "ADMISSION_ROLE_ADMINISTRATOR",
     "ADMISSION_ROLE_AUDIT",
     "ADMISSION_ROLE_AUXILIARY",
+    "ADMISSION_ROLE_MEDICAL_AUDIT",
     "MAX_ACTIVE_SESSION_DEVICES",
     "SYNC_TICK_SECONDS",
     "AdmissionAccessDecision",
@@ -8239,4 +8309,5 @@ __all__ = [
     "select_effective_turn_interval",
     "user_can_be_assigned_admission_operator",
     "user_can_operate_admission",
+    "user_can_void_attention",
 ]

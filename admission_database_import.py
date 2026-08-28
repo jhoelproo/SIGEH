@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import uuid
 from collections import Counter
@@ -29,6 +30,7 @@ STAGING_BATCH_SIZE = 250
 APPLY_BATCH_SIZE = 100
 ACTIVE_IMPORT_STATUSES = frozenset({"ANALYZING", "APPLYING"})
 IMPORT_STALE_SECONDS = 180
+IMPORT_LOG = logging.getLogger("hospital.admission.import")
 
 IMPORT_PHASE_LABELS = {
     "VALIDATE_SOURCE": "Validando integridad SQLite",
@@ -145,6 +147,55 @@ def _stream_sha256(
     return digest.hexdigest()
 
 
+def _verified_sqlite_backup(path: Path, source_sha256: str) -> tuple[str, str]:
+    """Create and verify a recoverable SQLite backup before central mutation."""
+    backup_directory = path.parent / "BACKUPS"
+    backup_directory.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_path = backup_directory / (
+        f"{path.stem}_pre_import_{timestamp}_{source_sha256[:12]}.sqlite3"
+    )
+    temporary_path = backup_path.with_suffix(".sqlite3.partial")
+    source_uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    source = sqlite3.connect(source_uri, uri=True)
+    target = sqlite3.connect(temporary_path)
+    try:
+        source.backup(target)
+        target.commit()
+        quick_check = target.execute("PRAGMA quick_check").fetchone()
+        if not quick_check or str(quick_check[0]).strip().casefold() != "ok":
+            raise ValueError("La copia de seguridad SQLite no superó PRAGMA quick_check.")
+    except Exception:
+        target.close()
+        source.close()
+        temporary_path.unlink(missing_ok=True)
+        raise
+    target.close()
+    source.close()
+    temporary_path.replace(backup_path)
+    backup_sha256 = _stream_sha256(backup_path, phase="VERIFY_BACKUP")
+    if not backup_sha256:
+        backup_path.unlink(missing_ok=True)
+        raise ValueError("No se pudo verificar la copia de seguridad SQLite.")
+    return str(backup_path), backup_sha256
+
+
+def _require_compatible_initial_baseline(
+    *,
+    existing_fingerprint: str,
+    existing_source_id: str,
+    source_sha256: str,
+    source_id: str,
+) -> None:
+    if (
+        str(existing_fingerprint) != str(source_sha256)
+        or str(existing_source_id) != str(source_id)
+    ):
+        raise ValueError(
+            "El baseline inicial central ya fue aplicado desde otra fuente."
+        )
+
+
 def _emit_progress(
     callback: Callable[[str, int, int], None] | None,
     phase: str,
@@ -155,7 +206,39 @@ def _emit_progress(
         callback(str(phase), max(0, int(current)), max(0, int(total)))
 
 
-def _historical_context(payload: Mapping[str, Any], source_id: str) -> dict[str, Any]:
+def _historical_context(
+    payload: Mapping[str, Any],
+    source_id: str,
+    *,
+    baseline_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if baseline_context is not None:
+        operational_source_id = str(
+            uuid.UUID(str(baseline_context.get("operational_source_id") or ""))
+        )
+        operational_session_id = str(
+            uuid.UUID(str(baseline_context.get("operational_session_id") or ""))
+        )
+        turn_id = int(baseline_context.get("turn_id") or 0)
+        generation = int(baseline_context.get("generation") or 0)
+        active_username = str(
+            baseline_context.get("active_username") or ""
+        ).strip()
+        if turn_id <= 0 or generation <= 0 or not active_username:
+            raise ValueError(
+                "El turno central activo no tiene un contexto operacional válido."
+            )
+        return {
+            "operational_source_id": operational_source_id,
+            "operational_session_id": operational_session_id,
+            "turn_id": turn_id,
+            "generation": generation,
+            "origin_device_id": str(
+                baseline_context.get("primary_device_id") or "CENTRAL_BASELINE"
+            ),
+            "admission_username": active_username,
+            "reconciliation_status": "INITIAL_BASELINE",
+        }
     operational_source_id = _uuid(
         payload.get("operational_source_id"),
         f"hospital-admission-import-source:{source_id}",
@@ -205,6 +288,8 @@ def _classify_import_row(
     payload: dict[str, Any],
     cloud: Mapping[str, Any] | None,
     projection_matches: Callable[[Mapping[str, Any], Mapping[str, Any]], bool],
+    *,
+    allow_updates: bool = True,
 ) -> tuple[str, int, int]:
     local_revision = int(payload.get("version") or 0)
     cloud_revision = int((cloud or {}).get("server_revision") or 0)
@@ -215,7 +300,7 @@ def _classify_import_row(
     if cloud and cloud_revision > local_revision:
         return "SKIPPED_CLOUD_NEWER", local_revision, cloud_revision
     if cloud:
-        return "UPDATE", local_revision, cloud_revision
+        return ("UPDATE" if allow_updates else "CONFLICT"), local_revision, cloud_revision
     if bool(payload.get("is_deleted")):
         return "SKIP_ORPHAN_TOMBSTONE", local_revision, cloud_revision
     return "INSERT", local_revision, cloud_revision
@@ -518,16 +603,62 @@ class AdmissionDatabaseImporter:
                 ),
             )
 
+    @staticmethod
+    def _active_baseline_context(connection: Any) -> dict[str, Any]:
+        rows = connection.execute(
+            """SELECT operational_session_id::TEXT,operational_source_id::TEXT,
+                      turn_id,generation,active_username,primary_device_id
+                 FROM admission_operational_sessions
+                WHERE status='ACTIVE'
+                ORDER BY updated_at DESC NULLS LAST
+                FOR SHARE"""
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError(
+                "SEED requiere exactamente un turno central activo y verificable."
+            )
+        raw = rows[0]
+        if isinstance(raw, Mapping):
+            context = dict(raw)
+        else:
+            keys = (
+                "operational_session_id",
+                "operational_source_id",
+                "turn_id",
+                "generation",
+                "active_username",
+                "primary_device_id",
+            )
+            context = dict(zip(keys, raw, strict=False))
+        _historical_context({}, "CENTRAL_BASELINE", baseline_context=context)
+        return context
+
     def _set_analysis_source(
-        self, batch_id: str, source_sha256: str, source_id: str
+        self,
+        batch_id: str,
+        source_sha256: str,
+        source_id: str,
+        *,
+        backup_path: str,
+        backup_sha256: str,
+        baseline_context: Mapping[str, Any] | None,
     ) -> None:
         with self.connection_factory() as con:
             con.execute(
                 """UPDATE admission_import_batches
                       SET source_sha256=%s,legacy_source_instance_id=%s,
+                          backup_path=%s,backup_sha256=%s,
+                          baseline_context_json=%s::JSONB,
                           last_heartbeat_at=NOW(),progress_updated_at=NOW()
                     WHERE import_batch_id=%s::UUID AND status='ANALYZING'""",
-                (source_sha256, source_id, batch_id),
+                (
+                    source_sha256,
+                    source_id,
+                    backup_path,
+                    backup_sha256,
+                    json.dumps(dict(baseline_context or {}), sort_keys=True),
+                    batch_id,
+                ),
             )
 
     def update_task_progress(
@@ -681,12 +812,51 @@ class AdmissionDatabaseImporter:
             username=username,
             mode=normalized_mode,
         )
+        IMPORT_LOG.info(
+            "%s batch_id=%s source=%s",
+            "BASELINE_ANALYZE_START"
+            if normalized_mode == "SEED"
+            else "MERGE_ANALYZE",
+            batch_id,
+            path.name,
+        )
         try:
             source_sha256, source_id, patient_count, payloads = self._payloads(
                 path,
                 progress=progress,
             )
-            self._set_analysis_source(batch_id, source_sha256, source_id)
+            backup_path, backup_sha256 = _verified_sqlite_backup(
+                path, source_sha256
+            )
+            IMPORT_LOG.info(
+                "BASELINE_SOURCE_VERIFIED batch_id=%s source_sha256=%s "
+                "backup_sha256=%s records=%s patients=%s",
+                batch_id,
+                source_sha256,
+                backup_sha256,
+                len(payloads),
+                patient_count,
+            )
+            baseline_context: dict[str, Any] | None = None
+            if normalized_mode == "SEED":
+                with self.connection_factory() as con:
+                    baseline_context = self._active_baseline_context(con)
+                for payload in payloads:
+                    payload.update(
+                        _historical_context(
+                            payload,
+                            source_id,
+                            baseline_context=baseline_context,
+                        )
+                    )
+            self._set_analysis_source(
+                batch_id,
+                source_sha256,
+                source_id,
+                backup_path=backup_path,
+                backup_sha256=backup_sha256,
+                baseline_context=baseline_context,
+            )
         except Exception:
             self.mark_task_failed(batch_id, "No fue posible analizar la fuente SQLite.")
             raise
@@ -712,8 +882,16 @@ class AdmissionDatabaseImporter:
                 payload,
                 cloud,
                 self._projection_matches,
+                allow_updates=normalized_mode == "MERGE",
             )
             counts[classification] += 1
+            IMPORT_LOG.info(
+                "BASELINE_RECORD_CLASSIFIED batch_id=%s row=%s "
+                "classification=%s",
+                batch_id,
+                row_number,
+                classification,
+            )
             staged.append(
                 {
                     "row_number": row_number,
@@ -732,6 +910,9 @@ class AdmissionDatabaseImporter:
         totals = {
             "records": len(staged),
             "patients": patient_count,
+            "backup_path": backup_path,
+            "backup_sha256": backup_sha256,
+            "baseline_context": dict(baseline_context or {}),
             **dict(counts),
         }
         with self.connection_factory() as con:
@@ -786,8 +967,155 @@ class AdmissionDatabaseImporter:
             "source_sha256": source_sha256,
             "source_instance_id": source_id,
             "source_path": str(path),
+            "backup_path": backup_path,
+            "backup_sha256": backup_sha256,
+            "baseline_context": dict(baseline_context or {}),
             **totals,
         }
+
+    def _prepare_apply(
+        self,
+        con: Any,
+        *,
+        batch_id: str,
+        current_user: Mapping[str, Any] | Any,
+        device_id: str,
+    ) -> tuple[str, str, str, list[Any]]:
+        con.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            ("admission-import-global",),
+        )
+        batch = con.execute(
+            """SELECT status,mode,source_sha256,legacy_source_instance_id,
+                      backup_path,backup_sha256,baseline_context_json
+                 FROM admission_import_batches
+                WHERE import_batch_id=%s::UUID FOR UPDATE""",
+            (batch_id,),
+        ).fetchone()
+        if not batch or str(self._value(batch, "status", 0)).upper() != "ANALYZED":
+            raise ValueError("El lote no esta disponible para aplicar.")
+        active_batch_id = self._active_batch_locked(con, exclude_batch_id=batch_id)
+        if active_batch_id:
+            raise AdmissionImportTaskActiveError(active_batch_id)
+        mode = str(self._value(batch, "mode", 1, "")).upper()
+        IMPORT_LOG.info(
+            "%s batch_id=%s",
+            "BASELINE_APPLY_START" if mode == "SEED" else "MERGE_APPLY",
+            batch_id,
+        )
+        source_sha256 = str(self._value(batch, "source_sha256", 2, ""))
+        source_id = str(self._value(batch, "legacy_source_instance_id", 3, ""))
+        backup_path = str(self._value(batch, "backup_path", 4, ""))
+        backup_sha256 = str(self._value(batch, "backup_sha256", 5, ""))
+        baseline_value = self._value(batch, "baseline_context_json", 6, {}) or {}
+        baseline_context = (
+            json.loads(baseline_value)
+            if isinstance(baseline_value, str)
+            else dict(baseline_value)
+        )
+        if not backup_path or not backup_sha256:
+            raise ValueError(
+                "El lote no tiene una copia de seguridad verificada. Analícelo nuevamente."
+            )
+        backup_file = Path(backup_path)
+        if not backup_file.is_file() or _stream_sha256(
+            backup_file, phase="VERIFY_BACKUP"
+        ) != backup_sha256:
+            raise ValueError(
+                "La copia de seguridad previa no está disponible o cambió."
+            )
+        central_seed_id = ""
+        if mode == "SEED":
+            current_context = self._active_baseline_context(con)
+            expected_context = _historical_context(
+                {}, source_id, baseline_context=baseline_context
+            )
+            live_context = _historical_context(
+                {}, source_id, baseline_context=current_context
+            )
+            if expected_context != live_context:
+                raise ValueError(
+                    "El turno central cambió desde la vista previa; analice nuevamente."
+                )
+            existing_seed = con.execute(
+                """SELECT central_seed_id::TEXT,seed_source_fingerprint,status,
+                          legacy_source_instance_id
+                     FROM admission_central_seeds
+                    WHERE seed_kind='INITIAL_BASELINE' FOR UPDATE"""
+            ).fetchone()
+            if existing_seed:
+                _require_compatible_initial_baseline(
+                    existing_fingerprint=str(
+                        self._value(existing_seed, "seed_source_fingerprint", 1, "")
+                    ),
+                    existing_source_id=str(
+                        self._value(
+                            existing_seed,
+                            "legacy_source_instance_id",
+                            3,
+                            "",
+                        )
+                    ),
+                    source_sha256=source_sha256,
+                    source_id=source_id,
+                )
+            central_seed_id = str(
+                self._value(existing_seed, "central_seed_id", 0, "")
+                or uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"sigeh-initial-baseline:{source_id}:{source_sha256}",
+                )
+            )
+            con.execute(
+                """INSERT INTO admission_central_seeds(
+                       central_seed_id,legacy_source_instance_id,
+                       seed_source_fingerprint,schema_version,status,
+                       origin_device_id,seed_kind,operational_source_id,
+                       operational_session_id,turn_id,applied_by_user_id,
+                       metadata_json
+                   ) VALUES(%s::UUID,%s,%s,1,'RUNNING',%s,'INITIAL_BASELINE',
+                            %s::UUID,%s::UUID,%s,%s,%s::JSONB)
+                   ON CONFLICT(central_seed_id) DO UPDATE SET
+                       status=CASE WHEN admission_central_seeds.status='COMPLETED'
+                           THEN 'COMPLETED' ELSE 'RUNNING' END,
+                       metadata_json=EXCLUDED.metadata_json""",
+                (
+                    central_seed_id,
+                    source_id,
+                    source_sha256,
+                    str(device_id),
+                    baseline_context["operational_source_id"],
+                    baseline_context["operational_session_id"],
+                    int(baseline_context["turn_id"]),
+                    canonical_user_id(current_user),
+                    json.dumps(
+                        {
+                            "backup_path": backup_path,
+                            "backup_sha256": backup_sha256,
+                            "baseline_context": baseline_context,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        con.execute(
+            """UPDATE admission_import_batches
+                  SET status='APPLYING',current_phase='PREPARE_APPLY',
+                      progress_percent=0,processed_records=0,total_records=0,
+                      status_message=%s,started_at=NOW(),progress_updated_at=NOW(),
+                      last_heartbeat_at=NOW(),error_code=NULL,error_message=NULL
+                WHERE import_batch_id=%s::UUID""",
+            (IMPORT_PHASE_LABELS["PREPARE_APPLY"], batch_id),
+        )
+        rows = con.execute(
+            """SELECT * FROM admission_import_staging
+                WHERE import_batch_id=%s::UUID
+                  AND classification IN ('INSERT','UPDATE')
+                  AND result_code IS NULL
+                ORDER BY row_number""",
+            (batch_id,),
+        ).fetchall()
+        return mode, source_id, central_seed_id, list(rows)
 
     def apply(
         self,
@@ -801,6 +1129,7 @@ class AdmissionDatabaseImporter:
     ) -> dict[str, Any]:
         self._require_admin(current_user)
         batch_id = str(uuid.UUID(str(import_batch_id)))
+        IMPORT_LOG.info("IMPORT_APPLY_START batch_id=%s", batch_id)
         if sqlite_path is not None:
             source_path = Path(sqlite_path).expanduser().resolve()
             current_sha256 = _stream_sha256(
@@ -814,38 +1143,12 @@ class AdmissionDatabaseImporter:
         # the local stale-preview guard: an altered file must not open cloud.
         self.ensure_schema()
         with self.connection_factory() as con:
-            con.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                ("admission-import-global",),
+            mode, source_id, central_seed_id, rows = self._prepare_apply(
+                con,
+                batch_id=batch_id,
+                current_user=current_user,
+                device_id=device_id,
             )
-            batch = con.execute(
-                """SELECT status FROM admission_import_batches
-                    WHERE import_batch_id=%s::UUID FOR UPDATE""",
-                (batch_id,),
-            ).fetchone()
-            if not batch or str(self._value(batch, "status", 0)).upper() != "ANALYZED":
-                raise ValueError("El lote no esta disponible para aplicar.")
-            active_batch_id = self._active_batch_locked(con, exclude_batch_id=batch_id)
-            if active_batch_id:
-                raise AdmissionImportTaskActiveError(active_batch_id)
-            source_id = ""
-            con.execute(
-                """UPDATE admission_import_batches
-                      SET status='APPLYING',current_phase='PREPARE_APPLY',
-                          progress_percent=0,processed_records=0,total_records=0,
-                          status_message=%s,started_at=NOW(),progress_updated_at=NOW(),
-                          last_heartbeat_at=NOW(),error_code=NULL,error_message=NULL
-                    WHERE import_batch_id=%s::UUID""",
-                (IMPORT_PHASE_LABELS["PREPARE_APPLY"], batch_id),
-            )
-            rows = con.execute(
-                """SELECT * FROM admission_import_staging
-                    WHERE import_batch_id=%s::UUID
-                      AND classification IN ('INSERT','UPDATE')
-                      AND result_code IS NULL
-                    ORDER BY row_number""",
-                (batch_id,),
-            ).fetchall()
         _emit_progress(progress, "PREPARE_APPLY", 1, 1)
         counts: Counter[str] = Counter()
         total_rows = len(rows)
@@ -890,7 +1193,10 @@ class AdmissionDatabaseImporter:
                         payload.update(context)
                         payload.update(
                             {
-                                "reconciliation_status": "ADMIN_HISTORICAL_IMPORT",
+                                "reconciliation_status": payload.get(
+                                    "reconciliation_status"
+                                )
+                                or "ADMIN_HISTORICAL_IMPORT",
                                 "import_requested_by_user_id": canonical_user_id(
                                     current_user
                                 ),
@@ -932,7 +1238,7 @@ class AdmissionDatabaseImporter:
                                    device_local_sequence,reconciliation_status
                                ) VALUES(%s::UUID,'attention',%s::UUID,'RECONCILE',%s::JSONB,
                                         %s::UUID,%s,%s,%s,%s,%s,NOW(),%s::UUID,%s,%s,%s,
-                                        %s,%s,%s,'ADMIN_HISTORICAL_IMPORT')""",
+                                        %s,%s,%s,%s)""",
                             (
                                 event.event_uuid,
                                 global_id,
@@ -950,6 +1256,7 @@ class AdmissionDatabaseImporter:
                                 event.created_at_device,
                                 event.created_at_effective_utc,
                                 event.device_local_sequence,
+                                str(payload["reconciliation_status"]),
                             ),
                         )
                         AdmissionCloudRepository._materialize_attention(
@@ -991,6 +1298,14 @@ class AdmissionDatabaseImporter:
             )
             counts["PATIENT_CONFLICTS"] = int(patient_result.get("conflicts") or 0)
         with self.connection_factory() as con:
+            if central_seed_id:
+                con.execute(
+                    """UPDATE admission_central_seeds
+                          SET status='COMPLETED',imported_records=%s,
+                              seed_completed_at=NOW()
+                        WHERE central_seed_id=%s::UUID""",
+                    (sum(counts.values()), central_seed_id),
+                )
             con.execute(
                 """UPDATE admission_import_batches
                       SET status='COMPLETED',applied_at=NOW(),totals_json=%s::JSONB,
@@ -1013,6 +1328,13 @@ class AdmissionDatabaseImporter:
         result = {"import_batch_id": batch_id, **dict(counts)}
         _emit_progress(progress, "FINALIZE_APPLY", 1, 1)
         self._audit("ADMIN_DATABASE_IMPORT_APPLIED", result)
+        IMPORT_LOG.info(
+            "%s batch_id=%s applied_insert=%s applied_update=%s",
+            "BASELINE_APPLY_DONE" if mode == "SEED" else "MERGE_APPLY",
+            batch_id,
+            counts.get("APPLIED_INSERT", 0),
+            counts.get("APPLIED_UPDATE", 0),
+        )
         return result
 
 

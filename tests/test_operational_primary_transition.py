@@ -154,6 +154,16 @@ class _OperationalDB:
         if upper.startswith("INSERT INTO ADMISSION_OPERATIONAL_DEVICES"):
             if len(params) == 4:
                 sid, device_id, login_id, device_name = params
+                self.active_sessions.setdefault(str(login_id), True)
+                self.active_session_users.setdefault(
+                    str(login_id),
+                    {
+                        "username": str(self.session.get("active_username") or ""),
+                        "device_id": str(device_id),
+                        "user_id": str(self.session.get("active_user_id") or ""),
+                        "role": "administrador",
+                    },
+                )
                 row = self.devices.setdefault(str(device_id), {})
                 row.update({
                     "operational_session_id": str(sid),
@@ -321,7 +331,7 @@ class _OperationalDB:
         if upper.startswith("UPDATE ADMISSION_OPERATIONAL_SESSIONS SET ACTIVE_USERNAME"):
             (
                 username, user_id, display_name, login_id, turn_id,
-                generation, _changed_by, _reason, _sid,
+                turn_code, generation, _changed_by, _reason, _sid,
             ) = params
             self.session.update({
                 "active_username": str(username),
@@ -329,6 +339,7 @@ class _OperationalDB:
                 "active_user_display_name": str(display_name),
                 "primary_login_session_id": str(login_id),
                 "turn_id": turn_id,
+                "turn_code": str(turn_code),
                 "generation": int(generation),
             })
             return _Result(rowcount=1)
@@ -343,10 +354,15 @@ class _OperationalDB:
             })
             return _Result(rowcount=1)
         if "INVALIDATED_REASON='PRIMARY_USER_CHANGED'" in upper:
-            generation, username, sid, primary = params
+            generation, username, sid, selected_devices = params
+            selected_devices = {str(item) for item in selected_devices}
             count = 0
             for device_id, row in self.devices.items():
-                if row["operational_session_id"] == str(sid) and device_id != str(primary) and row.get("detached_at") is None:
+                if (
+                    row["operational_session_id"] == str(sid)
+                    and device_id in selected_devices
+                    and row.get("detached_at") is None
+                ):
                     row.update({
                         "detached_at": "now", "invalidated_at": "now",
                         "invalidated_reason": "PRIMARY_USER_CHANGED",
@@ -403,6 +419,52 @@ def _service():
     return database, OperationalSessionService(lambda: database)
 
 
+def _configured_primary(
+    database,
+    service,
+    *,
+    username,
+    user_id,
+    device_id,
+    login_session_id,
+    turn_id,
+    login_role="administrador",
+    display_name="",
+):
+    """Model the explicit representative/turn setup that follows Admin bootstrap."""
+    service.attach_device(
+        login_username=username,
+        login_user_id=user_id,
+        login_role="administrador",
+        login_display_name=display_name,
+        device_id=device_id,
+        login_session_id=login_session_id,
+        turn_id=turn_id,
+    )
+    database.session.update(
+        active_username=str(username),
+        active_user_id=str(user_id),
+        active_user_display_name=str(display_name or username),
+        turn_id=int(turn_id),
+    )
+    database.active_sessions[str(login_session_id)] = True
+    database.active_session_users[str(login_session_id)] = {
+        "username": str(username),
+        "device_id": str(device_id),
+        "user_id": str(user_id),
+        "role": str(login_role),
+    }
+    return service.attach_device(
+        login_username=username,
+        login_user_id=user_id,
+        login_role=login_role,
+        login_display_name=display_name,
+        device_id=device_id,
+        login_session_id=login_session_id,
+        turn_id=turn_id,
+    )
+
+
 def test_canonical_identity_never_uses_full_name_for_permission():
     assert same_user(
         {"id": 7, "username": "admin", "full_name": "FERNANDO JHOEL"},
@@ -410,9 +472,9 @@ def test_canonical_identity_never_uses_full_name_for_permission():
     )
 
 
-def test_auxiliary_is_not_an_admission_operational_user():
-    assert user_can_operate_admission({"role": "auxiliar"}) is False
-    assert user_can_operate_admission({"role": "Auxiliar de facturación"}) is False
+def test_auxiliary_and_administrator_are_admission_operational_roles():
+    assert user_can_operate_admission({"role": "auxiliar"}) is True
+    assert user_can_operate_admission({"role": "Auxiliar de facturación"}) is True
     assert user_can_operate_admission({"role": "administrador"}) is True
 
 
@@ -429,9 +491,11 @@ def test_auxiliary_login_never_creates_or_replaces_operational_session():
         )
     assert database.session is None
 
-    current = service.attach_device(
-        login_username="fernando",
-        login_user_id=8,
+    current = _configured_primary(
+        database,
+        service,
+        username="fernando",
+        user_id=8,
         login_role="administrador",
         device_id="PC-1",
         login_session_id="P-1",
@@ -446,38 +510,45 @@ def test_auxiliary_login_never_creates_or_replaces_operational_session():
         login_session_id="AUX-2",
         turn_id=999,
     )
-    assert auxiliary.role == StationRole.NONE
+    assert auxiliary.role == StationRole.PRIMARY
     assert auxiliary.writable is False
     assert database.session["active_username"] == "fernando"
     assert database.session["turn_id"] == 316
     assert database.session["generation"] == generation
 
 
-def test_primary_transition_rejects_auxiliary_role():
-    _database, service = _service()
-    current = service.attach_device(
-        login_username="fernando",
-        login_user_id=8,
+def test_primary_transition_accepts_an_explicitly_assigned_auxiliary():
+    database, service = _service()
+    current = _configured_primary(
+        database,
+        service,
+        username="fernando",
+        user_id=8,
         login_role="administrador",
         device_id="PC-1",
         login_session_id="P-1",
         turn_id=316,
     )
-    with pytest.raises(AdmissionWriteBlocked):
-        service.transition_primary_user(
-            operational_session_id=current.operational_session.operational_session_id,
-            primary_device_id="PC-1",
-            new_login_session_id="AUX-1",
-            new_user={"id": 9, "username": "aux", "role": "auxiliar"},
-            new_turn_id=317,
-            expected_generation=1,
-        )
+    database.active_sessions["AUX-1"] = True
+    changed = service.transition_primary_user(
+        operational_session_id=current.operational_session.operational_session_id,
+        primary_device_id="PC-1",
+        new_login_session_id="AUX-1",
+        new_user={"id": 9, "username": "aux", "role": "auxiliar"},
+        new_turn_id=317,
+        expected_generation=1,
+    )
+    assert changed.operational_session.active_username == "aux"
+    assert changed.operational_session.turn_id == 317
 
 
 def test_auxiliary_write_guard_is_read_only_without_changing_the_session():
-    current = _service()[1].attach_device(
-        login_username="fernando",
-        login_user_id=8,
+    database, service = _service()
+    current = _configured_primary(
+        database,
+        service,
+        username="fernando",
+        user_id=8,
         login_role="administrador",
         device_id="PC-1",
         login_session_id="P-1",
@@ -493,14 +564,17 @@ def test_auxiliary_write_guard_is_read_only_without_changing_the_session():
         role=StationRole.NONE,
     )
     assert decision.allowed is False
-    assert decision.code == "AUX_NOT_ADMISSION_USER"
+    assert decision.code == "SECONDARY_USER_MISMATCH"
     assert "FERNANDO" in decision.message.upper()
 
 
 def test_primary_rebinds_login_by_device_and_guard_uses_user_id():
     database, service = _service()
-    first = service.attach_device(
-        login_username="admin", login_user_id=7, login_display_name="FERNANDO JHOEL",
+    first = _configured_primary(
+        database,
+        service,
+        username="admin", user_id=7, display_name="FERNANDO JHOEL",
+        login_role="administrador",
         device_id="PC-1", login_session_id="LOGIN-1", turn_id=10,
     )
     restarted = service.rebind_login_session_to_operational_state(
@@ -520,7 +594,7 @@ def test_primary_rebinds_login_by_device_and_guard_uses_user_id():
     assert restarted.operational_session.turn_id == 10
     assert restarted.operational_session.generation == 1
     decision = AdmissionWriteGuard().can_write_admission(
-        login_user="ADMIN",login_user_id=7,device_id="PC-1",
+        login_user="ADMIN",login_user_id=7,login_role="administrador",device_id="PC-1",
         session=restarted.operational_session,generation=1,role=StationRole.PRIMARY,
     )
     assert decision.allowed
@@ -530,13 +604,13 @@ def test_primary_rebinds_login_by_device_and_guard_uses_user_id():
 
 def test_secondary_logout_and_wrong_user_never_change_primary():
     database, service = _service()
-    primary = service.attach_device(
-        login_username="admin",login_user_id=7,device_id="PC-1",
-        login_session_id="P-1",turn_id=10,
+    primary = _configured_primary(
+        database, service, username="admin",user_id=7,device_id="PC-1",
+        login_session_id="P-1",turn_id=10,login_role="administrador",
     )
     service.attach_device(
         login_username="admin",login_user_id=7,device_id="PC-2",
-        login_session_id="S-1",turn_id=10,
+        login_session_id="S-1",turn_id=10,login_role="administrador",
     )
     service.detach_device(
         operational_session_id=primary.operational_session.operational_session_id,
@@ -548,18 +622,19 @@ def test_secondary_logout_and_wrong_user_never_change_primary():
     rejected = service.attach_device(
         login_username="otro",login_user_id=8,device_id="PC-2",
         login_session_id="S-OTHER",turn_id=999,
+        login_role="facturador de auditoria",
     )
-    assert rejected.role == StationRole.DETACHED
-    assert database.active_sessions["S-OTHER"] is False
+    assert rejected.role == StationRole.NONE
+    assert database.active_sessions["S-OTHER"] is True
     assert database.session["active_username"] == "admin"
     assert database.session["primary_device_id"] == "PC-1"
 
 
 def test_closed_primary_login_allows_same_user_to_acquire_primary_on_another_device():
     database, service = _service()
-    primary = service.attach_device(
-        login_username="fernando", login_user_id=8, device_id="PC-A",
-        login_session_id="LOGIN-A", turn_id=316,
+    primary = _configured_primary(
+        database, service, username="fernando", user_id=8, device_id="PC-A",
+        login_session_id="LOGIN-A", turn_id=316, login_role="administrador",
     )
     database.active_sessions["LOGIN-A"] = False
 
@@ -572,7 +647,7 @@ def test_closed_primary_login_allows_same_user_to_acquire_primary_on_another_dev
     database.active_sessions["LOGIN-B"] = True
     acquired = service.attach_device(
         login_username="fernando", login_user_id=8, device_id="PC-B",
-        login_session_id="LOGIN-B", turn_id=999,
+        login_session_id="LOGIN-B", turn_id=999, login_role="administrador",
     )
 
     assert acquired.role == StationRole.PRIMARY
@@ -586,16 +661,16 @@ def test_closed_primary_login_allows_same_user_to_acquire_primary_on_another_dev
 
 def test_primary_logout_and_relogin_on_same_device_reuses_turn_and_generation():
     database, service = _service()
-    original = service.attach_device(
-        login_username="admin", login_user_id=7, device_id="PC-A",
-        login_session_id="LOGIN-A1", turn_id=500,
+    original = _configured_primary(
+        database, service, username="admin", user_id=7, device_id="PC-A",
+        login_session_id="LOGIN-A1", turn_id=500, login_role="administrador",
     )
     assert service.release_login_session(
         device_id="PC-A", login_session_id="LOGIN-A1", reason="LOGOUT"
     )
     acquired = service.attach_device(
         login_username="admin", login_user_id=7, device_id="PC-A",
-        login_session_id="LOGIN-A2", turn_id=999,
+        login_session_id="LOGIN-A2", turn_id=999, login_role="administrador",
     )
     assert acquired.role == StationRole.PRIMARY
     assert acquired.operational_session.turn_id == original.operational_session.turn_id
@@ -605,20 +680,20 @@ def test_primary_logout_and_relogin_on_same_device_reuses_turn_and_generation():
 
 def test_available_primary_lease_has_one_winner_and_live_owner_cannot_be_stolen():
     database, service = _service()
-    first = service.attach_device(
-        login_username="admin", login_user_id=7, device_id="PC-A",
-        login_session_id="LOGIN-A", turn_id=500,
+    first = _configured_primary(
+        database, service, username="admin", user_id=7, device_id="PC-A",
+        login_session_id="LOGIN-A", turn_id=500, login_role="administrador",
     )
     service.release_login_session(
         device_id="PC-A", login_session_id="LOGIN-A", reason="LOGOUT"
     )
     winner = service.attach_device(
         login_username="admin", login_user_id=7, device_id="PC-B",
-        login_session_id="LOGIN-B", turn_id=999,
+        login_session_id="LOGIN-B", turn_id=999, login_role="administrador",
     )
     loser = service.attach_device(
         login_username="admin", login_user_id=7, device_id="PC-C",
-        login_session_id="LOGIN-C", turn_id=999,
+        login_session_id="LOGIN-C", turn_id=999, login_role="administrador",
     )
     assert winner.role == StationRole.PRIMARY
     assert loser.role == StationRole.SECONDARY
@@ -633,23 +708,22 @@ def test_available_primary_lease_has_one_winner_and_live_owner_cannot_be_stolen(
 
 def test_primary_transition_invalidates_exact_secondaries_and_is_idempotent():
     database, service = _service()
-    primary = service.attach_device(
-        login_username="admin",login_user_id=7,device_id="PC-1",
-        login_session_id="P-OLD",turn_id=10,
+    primary = _configured_primary(
+        database, service, username="admin",user_id=7,device_id="PC-1",
+        login_session_id="P-OLD",turn_id=10,login_role="administrador",
     )
     service.attach_device(
         login_username="admin",login_user_id=7,device_id="PC-2",
-        login_session_id="S-OLD",turn_id=10,
+        login_session_id="S-OLD",turn_id=10,login_role="administrador",
     )
     database.active_sessions.update({"P-OLD": True, "P-NEW": True, "S-OLD": True})
-    service.attach_device(
-        login_username="usuario_b",login_user_id=8,device_id="PC-1",
-        login_session_id="P-NEW",turn_id=20,
-    )
     changed = service.transition_primary_user(
         operational_session_id=primary.operational_session.operational_session_id,
         primary_device_id="PC-1",new_login_session_id="P-NEW",
-        new_user={"id": 8,"username": "usuario_b","full_name": "USUARIO B"},
+        new_user={
+            "id": 8,"username": "usuario_b","full_name": "USUARIO B",
+            "role": "administrador",
+        },
         new_turn_id=20,expected_generation=1,transition_id="22222222-2222-4222-8222-222222222222",
     )
     assert changed.operational_session.generation == 2
@@ -669,7 +743,7 @@ def test_primary_transition_invalidates_exact_secondaries_and_is_idempotent():
     duplicate = service.transition_primary_user(
         operational_session_id=primary.operational_session.operational_session_id,
         primary_device_id="PC-1",new_login_session_id="P-NEW",
-        new_user={"id": 8,"username": "usuario_b"},new_turn_id=20,
+        new_user={"id": 8,"username": "usuario_b","role": "administrador"},new_turn_id=20,
         expected_generation=2,transition_id="22222222-2222-4222-8222-222222222222",
     )
     assert duplicate.operational_session.generation == 2
@@ -680,20 +754,23 @@ def test_primary_transition_invalidates_exact_secondaries_and_is_idempotent():
 
 def test_same_user_relogin_keeps_turn_generation_and_secondary():
     database, service = _service()
-    primary = service.attach_device(
-        login_username="admin",login_user_id=7,device_id="PC-1",
-        login_session_id="P-1",turn_id=10,
+    primary = _configured_primary(
+        database, service, username="admin",user_id=7,device_id="PC-1",
+        login_session_id="P-1",turn_id=10,login_role="administrador",
     )
     service.attach_device(
         login_username="admin",login_user_id=7,device_id="PC-2",
-        login_session_id="S-1",turn_id=10,
+        login_session_id="S-1",turn_id=10,login_role="administrador",
     )
     database.active_sessions.update({"P-1": True, "S-1": True})
     result = service.transition_primary_user(
         operational_session_id=primary.operational_session.operational_session_id,
         primary_device_id="PC-1",new_login_session_id="P-1",
-        new_user={"id": 7,"username": "admin","full_name": "FERNANDO"},
-        new_turn_id=11,expected_generation=1,
+        new_user={
+            "id": 7,"username": "admin","full_name": "FERNANDO",
+            "role": "administrador",
+        },
+        new_turn_id=10,expected_generation=1,
         transition_id="44444444-4444-4444-8444-444444444444",
         invalidate_secondaries=False,
     )
@@ -702,7 +779,7 @@ def test_same_user_relogin_keeps_turn_generation_and_secondary():
     assert database.devices["PC-2"]["detached_at"] is None
     assert database.active_sessions["S-1"] is True
     stale = service.resolve_operational_state(
-        current_user={"id": 7, "username": "admin"},
+        current_user={"id": 7, "username": "admin", "role": "administrador"},
         current_session_id="S-1",
         current_device_id="PC-2",
         local_generation=1,
@@ -710,7 +787,7 @@ def test_same_user_relogin_keeps_turn_generation_and_secondary():
     assert stale.reason_code == "ALLOWED"
     assert stale.write_allowed is True
     refreshed = service.resolve_operational_state(
-        current_user={"id": 7, "username": "admin"},
+        current_user={"id": 7, "username": "admin", "role": "administrador"},
         current_session_id="S-1",
         current_device_id="PC-2",
         local_generation=None,
@@ -725,9 +802,13 @@ def test_nominal_turn_window_is_twelve_hours_in_central_schema():
 
     assert ADMISSION_TURN_HOURS == 12
     assert "turn_ends_at TIMESTAMPTZ" in POSTGRES_HYBRID_SCHEMA
-    session = _service()[1].attach_device(
-        login_username="admin",
-        login_user_id=7,
+    database, service = _service()
+    session = _configured_primary(
+        database,
+        service,
+        username="admin",
+        user_id=7,
+        login_role="administrador",
         device_id="PC-1",
         login_session_id="P-1",
         turn_id=10,
@@ -739,38 +820,38 @@ def test_nominal_turn_window_is_twelve_hours_in_central_schema():
 
 def test_secondary_old_user_is_rejected_and_new_user_reattaches_to_central_turn():
     database, service = _service()
-    primary = service.attach_device(
-        login_username="admin", login_user_id=7, device_id="PC-1",
-        login_session_id="P-OLD", turn_id=10,
+    primary = _configured_primary(
+        database, service, username="admin", user_id=7, device_id="PC-1",
+        login_session_id="P-OLD", turn_id=10, login_role="administrador",
     )
     service.attach_device(
         login_username="admin", login_user_id=7, device_id="PC-2",
-        login_session_id="S-OLD", turn_id=10,
+        login_session_id="S-OLD", turn_id=10, login_role="administrador",
     )
     database.active_sessions.update({"P-OLD": True, "P-NEW": True, "S-OLD": True})
-    service.attach_device(
-        login_username="fernando", login_user_id=8, device_id="PC-1",
-        login_session_id="P-NEW", turn_id=20,
-    )
     service.transition_primary_user(
         operational_session_id=primary.operational_session.operational_session_id,
         primary_device_id="PC-1", new_login_session_id="P-NEW",
-        new_user={"id": 8, "username": "fernando", "full_name": "FERNANDO"},
+        new_user={
+            "id": 8, "username": "fernando", "full_name": "FERNANDO",
+            "role": "auxiliar",
+        },
         new_turn_id=20, expected_generation=1,
         transition_id="55555555-5555-4555-8555-555555555555",
     )
 
     old_login = service.attach_device(
         login_username="admin", login_user_id=7, device_id="PC-2",
-        login_session_id="S-ADMIN-NEW", turn_id=999,
+        login_session_id="S-ADMIN-NEW", turn_id=999, login_role="auxiliar",
     )
-    assert old_login.role == StationRole.DETACHED
+    assert old_login.role == StationRole.SECONDARY
+    assert old_login.writable is False
     assert old_login.operational_session.active_username == "fernando"
     assert old_login.operational_session.turn_id == 20
 
     new_login = service.attach_device(
         login_username="fernando", login_user_id=8, device_id="PC-2",
-        login_session_id="S-FERNANDO", turn_id=999,
+        login_session_id="S-FERNANDO", turn_id=999, login_role="auxiliar",
     )
     assert new_login.role == StationRole.SECONDARY
     assert new_login.writable is True
@@ -779,10 +860,10 @@ def test_secondary_old_user_is_rejected_and_new_user_reattaches_to_central_turn(
 
 
 def test_five_consecutive_primary_transitions_preserve_invariants():
-    _database, service = _service()
-    attached = service.attach_device(
-        login_username="user_a",login_user_id=1,device_id="PC-1",
-        login_session_id="P-0",turn_id=100,
+    database, service = _service()
+    attached = _configured_primary(
+        database, service, username="user_a",user_id=1,device_id="PC-1",
+        login_session_id="P-0",turn_id=100,login_role="administrador",
     )
     generation = attached.operational_session.generation
     users = [("user_b", 2), ("user_a", 1), ("user_b", 2), ("user_a", 1), ("user_b", 2)]
@@ -790,11 +871,15 @@ def test_five_consecutive_primary_transitions_preserve_invariants():
         service.attach_device(
             login_username=username,login_user_id=user_id,device_id="PC-1",
             login_session_id=f"P-{index}",turn_id=100 + index,
+            login_role="administrador",
         )
         result = service.transition_primary_user(
             operational_session_id=attached.operational_session.operational_session_id,
             primary_device_id="PC-1",new_login_session_id=f"P-{index}",
-            new_user={"id": user_id,"username": username,"full_name": username.upper()},
+            new_user={
+                "id": user_id,"username": username,"full_name": username.upper(),
+                "role": "administrador",
+            },
             new_turn_id=100 + index,expected_generation=generation,
             transition_id=f"33333333-3333-4333-8333-{index:012d}",
         )
@@ -809,8 +894,8 @@ def test_five_consecutive_primary_transitions_preserve_invariants():
 
 def test_admin_force_transfer_changes_only_primary_lease():
     database, service = _service()
-    primary = service.attach_device(
-        login_username="admin", login_user_id=7, login_role="administrador",
+    primary = _configured_primary(
+        database, service, username="admin", user_id=7, login_role="administrador",
         device_id="PC-1", login_session_id="P-1", turn_id=350,
     )
     service.attach_device(
@@ -880,10 +965,12 @@ def test_admin_force_transfer_changes_only_primary_lease():
 
 
 def test_transfer_is_rejected_when_target_is_already_primary():
-    _database, service = _service()
-    session = service.attach_device(
-        login_username="admin",
-        login_user_id=7,
+    database, service = _service()
+    session = _configured_primary(
+        database,
+        service,
+        username="admin",
+        user_id=7,
         login_role="administrador",
         device_id="PC-1",
         login_session_id="P-1",
@@ -902,10 +989,10 @@ def test_transfer_is_rejected_when_target_is_already_primary():
 
 
 def test_non_admin_cannot_force_primary_transfer():
-    _database, service = _service()
-    session = service.attach_device(
-        login_username="audit", login_user_id=9,
-        login_role="facturador de auditoria", device_id="PC-1",
+    database, service = _service()
+    session = _configured_primary(
+        database, service, username="admin", user_id=7,
+        login_role="administrador", device_id="PC-1",
         login_session_id="P-1", turn_id=350,
     ).operational_session
     with pytest.raises(AdmissionWriteBlocked):
@@ -919,10 +1006,12 @@ def test_non_admin_cannot_force_primary_transfer():
 
 def test_vacant_primary_is_acquired_by_admin_without_changing_representative():
     database, service = _service()
-    original = service.attach_device(
-        login_username="aux-test",
-        login_user_id=8,
-        login_role="auxiliar",
+    original = _configured_primary(
+        database,
+        service,
+        username="aux-test",
+        user_id=8,
+        login_role="administrador",
         device_id="PC-A",
         login_session_id="LOGIN-A1",
         turn_id=500,
@@ -949,10 +1038,12 @@ def test_vacant_primary_is_acquired_by_admin_without_changing_representative():
 
 def test_valid_primary_is_not_acquired_by_a_second_admin_device():
     database, service = _service()
-    service.attach_device(
-        login_username="aux-test",
-        login_user_id=8,
-        login_role="auxiliar",
+    _configured_primary(
+        database,
+        service,
+        username="aux-test",
+        user_id=8,
+        login_role="administrador",
         device_id="PC-B",
         login_session_id="LOGIN-B1",
         turn_id=500,

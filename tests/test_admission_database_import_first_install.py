@@ -123,6 +123,182 @@ def test_sqlite_inspection_reports_progress_and_uses_historical_context(tmp_path
     assert context["origin_device_id"].startswith("IMPORT:")
 
 
+def test_initial_baseline_context_forces_one_canonical_central_turn():
+    baseline = {
+        "operational_session_id": "55555555-5555-4555-8555-555555555555",
+        "operational_source_id": "44444444-4444-4444-8444-444444444444",
+        "turn_id": 316,
+        "generation": 42,
+        "active_username": "aux.inicial",
+    }
+    first = database_import._historical_context(
+        {"turn_id": 1}, "PRIMARY-SOURCE", baseline_context=baseline
+    )
+    second = database_import._historical_context(
+        {"turn_id": 99}, "PRIMARY-SOURCE", baseline_context=baseline
+    )
+
+    assert first == second
+    assert first["turn_id"] == 316
+    assert first["operational_source_id"] == baseline["operational_source_id"]
+    assert first["operational_session_id"] == baseline["operational_session_id"]
+    assert first["reconciliation_status"] == "INITIAL_BASELINE"
+
+
+@pytest.mark.parametrize("rows", [[], [{"turn_id": 1}, {"turn_id": 2}]])
+def test_seed_requires_exactly_one_active_central_turn(rows):
+    class Connection:
+        def execute(self, _query):
+            return _Rows(rows)
+
+    with pytest.raises(ValueError, match="exactamente un turno central activo"):
+        database_import.AdmissionDatabaseImporter._active_baseline_context(
+            Connection()
+        )
+
+
+def test_verified_backup_is_recoverable_and_does_not_replace_source(tmp_path):
+    path = tmp_path / "primary.sqlite3"
+    _legacy_database(path)
+    source_sha256 = database_import._stream_sha256(path)
+
+    backup_path, backup_sha256 = database_import._verified_sqlite_backup(
+        path, source_sha256
+    )
+    second_backup_path, second_backup_sha256 = (
+        database_import._verified_sqlite_backup(path, source_sha256)
+    )
+
+    assert Path(backup_path).parent == tmp_path / "BACKUPS"
+    assert Path(backup_path).is_file()
+    assert backup_sha256 == database_import._stream_sha256(Path(backup_path))
+    assert second_backup_path != backup_path
+    assert second_backup_sha256 == database_import._stream_sha256(
+        Path(second_backup_path)
+    )
+    with closing(sqlite3.connect(path)) as source:
+        assert source.execute("SELECT COUNT(*) FROM atenciones").fetchone()[0] == 1
+    with closing(sqlite3.connect(backup_path)) as backup:
+        assert backup.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert backup.execute("SELECT COUNT(*) FROM atenciones").fetchone()[0] == 1
+
+
+def test_verified_backup_removes_partial_file_when_integrity_check_fails(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "invalid.sqlite3"
+    path.touch()
+
+    class Connection:
+        def __init__(self, *, quick_check="ok"):
+            self.quick_check = quick_check
+
+        def backup(self, _target):
+            return None
+
+        def commit(self):
+            return None
+
+        def execute(self, _query):
+            return _Rows([(self.quick_check,)])
+
+        def close(self):
+            return None
+
+    connections = iter((Connection(), Connection(quick_check="corrupt")))
+    monkeypatch.setattr(database_import.sqlite3, "connect", lambda *_a, **_k: next(connections))
+
+    with pytest.raises(ValueError, match="quick_check"):
+        database_import._verified_sqlite_backup(path, "a" * 64)
+
+    assert not list((tmp_path / "BACKUPS").glob("*.partial"))
+
+
+def test_verified_backup_rejects_an_empty_verification_digest(monkeypatch, tmp_path):
+    path = tmp_path / "primary.sqlite3"
+    _legacy_database(path)
+    monkeypatch.setattr(database_import, "_stream_sha256", lambda *_a, **_k: "")
+
+    with pytest.raises(ValueError, match="No se pudo verificar"):
+        database_import._verified_sqlite_backup(path, "a" * 64)
+
+    assert not list((tmp_path / "BACKUPS").glob("*.sqlite3"))
+
+
+def test_initial_baseline_identity_rejects_fingerprint_or_source_changes():
+    database_import._require_compatible_initial_baseline(
+        existing_fingerprint="hash-a",
+        existing_source_id="PRIMARY-A",
+        source_sha256="hash-a",
+        source_id="PRIMARY-A",
+    )
+    with pytest.raises(ValueError, match="otra fuente"):
+        database_import._require_compatible_initial_baseline(
+            existing_fingerprint="hash-a",
+            existing_source_id="PRIMARY-A",
+            source_sha256="hash-b",
+            source_id="PRIMARY-A",
+        )
+    with pytest.raises(ValueError, match="otra fuente"):
+        database_import._require_compatible_initial_baseline(
+            existing_fingerprint="hash-a",
+            existing_source_id="PRIMARY-A",
+            source_sha256="hash-a",
+            source_id="SECONDARY-B",
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_context",
+    [
+        {"turn_id": 0, "generation": 1, "active_username": "aux"},
+        {"turn_id": 1, "generation": 0, "active_username": "aux"},
+        {"turn_id": 1, "generation": 1, "active_username": ""},
+    ],
+)
+def test_initial_baseline_rejects_incomplete_operational_context(invalid_context):
+    invalid_context.update(
+        operational_session_id="55555555-5555-4555-8555-555555555555",
+        operational_source_id="44444444-4444-4444-8444-444444444444",
+    )
+
+    with pytest.raises(ValueError, match="contexto operacional válido"):
+        database_import._historical_context(
+            {}, "CENTRAL_BASELINE", baseline_context=invalid_context
+        )
+
+
+def test_active_baseline_context_accepts_positional_database_rows():
+    row = (
+        "55555555-5555-4555-8555-555555555555",
+        "44444444-4444-4444-8444-444444444444",
+        316,
+        42,
+        "aux.inicial",
+        "PC-PRIMARY",
+    )
+
+    context = database_import.AdmissionDatabaseImporter._active_baseline_context(
+        type("Connection", (), {"execute": lambda _self, _query: _Rows([row])})()
+    )
+
+    assert context["turn_id"] == 316
+    assert context["active_username"] == "aux.inicial"
+
+
+def test_seed_classification_never_overwrites_a_different_central_record():
+    classification, _local_revision, _cloud_revision = (
+        database_import._classify_import_row(
+            {"version": 4, "is_deleted": False},
+            {"server_revision": 4, "is_deleted": False},
+            lambda _payload, _cloud: False,
+            allow_updates=False,
+        )
+    )
+
+    assert classification == "CONFLICT"
+
+
 def test_importer_uses_streaming_hash_and_batched_staging_source_contract():
     source = Path(database_import.__file__).read_text(encoding="utf-8")
     assert ".read_bytes()" not in source

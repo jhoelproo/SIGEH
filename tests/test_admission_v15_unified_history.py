@@ -145,7 +145,7 @@ class _LocalDatabase:
         return []
 
 
-def test_online_v15_history_reads_the_local_synchronized_replica():
+def test_online_v15_history_reads_postgresql_and_keeps_only_local_pending_rows():
     database = _LocalDatabase()
     runtime = SimpleNamespace(
         offline=False,
@@ -159,10 +159,11 @@ def test_online_v15_history_reads_the_local_synchronized_replica():
 
     rows = proxy.listar_atenciones(limite=200, offset=0)
 
-    assert {row["id"] for row in rows} == {99, 100}
+    assert {row["id"] for row in rows} == {100, 200}
+    assert {row["nombre"] for row in rows} == {"CENTRAL", "LOCAL PENDING"}
 
 
-def test_excel_dataset_reads_the_same_local_current_turn_view():
+def test_excel_dataset_reads_the_same_central_current_turn_view():
     database = _LocalDatabase()
     runtime = SimpleNamespace(
         offline=False,
@@ -176,11 +177,14 @@ def test_excel_dataset_reads_the_same_local_current_turn_view():
 
     rows = proxy.build_current_admission_list_dataset(turn_id=999)
 
-    assert [row["id"] for row in rows] == [100]
-    assert {row["global_attention_id"] for row in rows} == {"pending-uuid"}
+    assert [row["id"] for row in rows] == [200, 100]
+    assert {row["global_attention_id"] for row in rows} == {
+        "cloud-uuid",
+        "pending-uuid",
+    }
 
 
-def test_turn_summary_uses_the_same_local_current_turn_dataset_as_history():
+def test_turn_summary_uses_the_same_central_current_turn_dataset_as_history():
     database = _LocalDatabase()
     runtime = SimpleNamespace(
         offline=False,
@@ -194,8 +198,8 @@ def test_turn_summary_uses_the_same_local_current_turn_dataset_as_history():
 
     summary = proxy.refresh_turn_summary()
 
-    assert summary["total"] == 1
-    assert summary["GENERAL"] == 1
+    assert summary["total"] == 2
+    assert summary["GENERAL"] == 2
     assert summary["URGENCIAS"] == 0
     assert summary["CONSULTAS"] == 0
 
@@ -283,7 +287,7 @@ def test_offline_excel_dataset_uses_local_turn_and_deterministic_order():
     assert [row["id"] for row in rows] == [100]
 
 
-def test_history_does_not_query_postgresql_when_the_replica_is_available():
+def test_history_queries_postgresql_even_when_the_replica_is_available():
     database = _LocalDatabase()
     runtime = SimpleNamespace(
         offline=False,
@@ -298,7 +302,7 @@ def test_history_does_not_query_postgresql_when_the_replica_is_available():
 
     rows = proxy.listar_atenciones(limite=200, offset=0)
 
-    assert [row["nombre"] for row in rows] == ["LOCAL PENDING", "OLD LOCAL"]
+    assert [row["nombre"] for row in rows] == ["LOCAL PENDING", "CENTRAL"]
 
 
 def test_this_turn_history_uses_central_source_and_turn_from_local_replica():
@@ -323,7 +327,142 @@ def test_this_turn_history_uses_central_source_and_turn_from_local_replica():
         offset=0,
     )
 
-    assert connection.query == ""
+    assert "admission_attention_projection" in connection.query
+    assert "p.operational_source_id::TEXT=%s" in connection.query
+    assert "p.turn_id=%s" in connection.query
+    assert connection.params[:2] == ("central-source", 316)
+
+
+def test_online_history_survives_local_hydration_failure():
+    class _BrokenStore:
+        def hydrate_remote_events(self, _events):
+            raise sqlite3.OperationalError("disk unavailable")
+
+    database = _LocalDatabase()
+    runtime = SimpleNamespace(
+        offline=False,
+        host=SimpleNamespace(connection_factory=lambda: _CloudConnection()),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id="44444444-4444-4444-8444-444444444444",
+        ),
+        store=_BrokenStore(),
+        logger=logging.getLogger("test.history-hydration-failure"),
+    )
+    proxy = _HybridDatabaseProxy(database, runtime)
+
+    rows = proxy.listar_atenciones(limite=200, offset=0)
+
+    assert {row["nombre"] for row in rows} == {"CENTRAL", "LOCAL PENDING"}
+
+
+def test_online_history_survives_local_pending_read_failure():
+    class _BrokenLocalDatabase(_LocalDatabase):
+        def listar_atenciones(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("local replica unavailable")
+
+    runtime = SimpleNamespace(
+        offline=False,
+        host=SimpleNamespace(connection_factory=lambda: _CloudConnection()),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id="44444444-4444-4444-8444-444444444444",
+        ),
+        logger=logging.getLogger("test.history-local-failure"),
+    )
+    proxy = _HybridDatabaseProxy(_BrokenLocalDatabase(), runtime)
+
+    rows = proxy.listar_atenciones(limite=200, offset=0)
+
+    assert [row["nombre"] for row in rows] == ["CENTRAL"]
+
+
+def test_temporary_central_failure_switches_to_offline_local_history():
+    marked_offline = []
+
+    def unavailable():
+        raise ConnectionError("central unavailable")
+
+    runtime = SimpleNamespace(
+        offline=False,
+        host=SimpleNamespace(connection_factory=unavailable),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id="44444444-4444-4444-8444-444444444444",
+        ),
+        logger=logging.getLogger("test.history-offline-fallback"),
+        _temporary=lambda _error: True,
+        connection_supervisor=SimpleNamespace(
+            mark_offline=lambda error: marked_offline.append(error)
+        ),
+        status_message="",
+    )
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    rows = proxy.listar_atenciones(limite=200, offset=0)
+
+    assert runtime.offline is True
+    assert runtime.status_message.startswith("Sin conexión")
+    assert len(marked_offline) == 1
+    assert {row["nombre"] for row in rows} == {"LOCAL PENDING", "OLD LOCAL"}
+
+
+def test_offline_history_never_opens_the_central_connection():
+    runtime = SimpleNamespace(
+        offline=True,
+        host=SimpleNamespace(
+            connection_factory=lambda: (_ for _ in ()).throw(
+                AssertionError("central must not be opened")
+            )
+        ),
+        operational_session=SimpleNamespace(turn_id=316),
+    )
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    rows = proxy.listar_atenciones(limite=200, offset=0)
+
+    assert [row["id"] for row in rows] == [100, 99]
+
+
+def test_projection_readthrough_has_an_explicit_offline_replica_path():
+    runtime = SimpleNamespace(offline=True)
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    rows = proxy._legacy_projection_readthrough(
+        "listar_atenciones", (), {"limite": 200, "offset": 0}
+    )
+
+    assert [row["id"] for row in rows] == [100, 99]
+
+
+def test_background_lookup_executes_cedula_and_nss_queries():
+    values = []
+
+    class Coordinator:
+        @staticmethod
+        def submit_background(operation, _consume):
+            values.append(operation())
+
+    controller = _V15BackgroundRefreshCoordinator.__new__(
+        _V15BackgroundRefreshCoordinator
+    )
+    controller._lookup_generation = 0
+    controller.coordinator = Coordinator()
+    controller.admission = SimpleNamespace(
+        entry_cedula=SimpleNamespace(get=lambda: "001-002"),
+        entry_nss=SimpleNamespace(get=lambda: " nss-9 "),
+        db=SimpleNamespace(
+            search_patient_directory=lambda **query: {"query": query}
+        ),
+    )
+
+    controller.request_lookup("cedula")
+    controller.request_lookup("nss")
+
+    assert values == [
+        {"query": {"cedula": "001002"}},
+        {"query": {"nss": "NSS-9"}},
+    ]
 
 
 def test_central_state_creates_v15_turn_mirror_without_primary_transition(monkeypatch):

@@ -228,7 +228,26 @@ class _StatefulImportConnection:
         if "SELECT * FROM admission_attention_projection" in compact:
             return _Cursor(list(self.projections.values()))
         if compact.startswith("INSERT INTO admission_import_batches"):
-            self.batches[str(params[0])] = "ANALYZED"
+            self.batches[str(params[0])] = {
+                "status": "ANALYZED",
+                "mode": str(params[5]),
+                "source_sha256": "",
+                "legacy_source_instance_id": "",
+                "backup_path": "",
+                "backup_sha256": "",
+                "baseline_context_json": {},
+            }
+        elif compact.startswith(
+            "UPDATE admission_import_batches SET source_sha256="
+        ):
+            batch = self.batches[str(params[5])]
+            batch.update(
+                source_sha256=str(params[0]),
+                legacy_source_instance_id=str(params[1]),
+                backup_path=str(params[2]),
+                backup_sha256=str(params[3]),
+                baseline_context_json=json.loads(params[4]),
+            )
         elif compact.startswith("INSERT INTO admission_import_staging"):
             batch_id = str(params[0])
             self.staging.setdefault(batch_id, []).append({
@@ -242,11 +261,11 @@ class _StatefulImportConnection:
                 "classification": str(params[7]),
                 "payload_json": json.loads(params[8]),
             })
-        elif "SELECT status FROM admission_import_batches" in compact:
-            status = self.batches.get(str(params[0]))
-            return _Cursor([(status,)] if status else [])
+        elif compact.startswith("SELECT status,mode,source_sha256"):
+            batch = self.batches.get(str(params[0]))
+            return _Cursor([batch] if batch else [])
         elif compact.startswith("UPDATE admission_import_batches SET status='APPLYING'"):
-            self.batches[str(params[0])] = "APPLYING"
+            self.batches[str(params[1])]["status"] = "APPLYING"
         elif "SELECT * FROM admission_import_staging" in compact:
             return _Cursor([
                 row for row in self.staging.get(str(params[0]), [])
@@ -257,14 +276,19 @@ class _StatefulImportConnection:
             return _Cursor(
                 [(row["is_deleted"], row["server_revision"])] if row else []
             )
-        elif "SELECT * FROM admission_operational_sessions" in compact:
+        elif "FROM admission_operational_sessions" in compact:
             return _Cursor([{
                 "operational_session_id": _session().operational_session_id,
                 "operational_source_id": _session().operational_source_id,
+                "turn_id": _session().turn_id,
                 "generation": _session().generation,
+                "active_username": _session().active_username,
+                "primary_device_id": _session().primary_device_id,
             }])
-        elif "SET status='COMPLETED'" in compact:
-            self.batches[str(params[1])] = "COMPLETED"
+        elif compact.startswith(
+            "UPDATE admission_import_batches SET status='COMPLETED'"
+        ):
+            self.batches[str(params[-1])]["status"] = "COMPLETED"
         elif compact.startswith("UPDATE admission_dataset_state"):
             self.dataset_epoch += 1
         return _Cursor()
@@ -377,9 +401,9 @@ def test_admin_import_apply_is_idempotent_and_increments_dataset_epoch(
     second_preview = importer.analyze(path, mode="MERGE", current_user=admin)
 
     assert applied["APPLIED_INSERT"] == 1
-    assert materialized_events[0].payload["admission_username"] == "IMPORTACION HISTORICA"
-    assert materialized_events[0].payload["reconciliation_status"] == "ADMIN_HISTORICAL_IMPORT"
-    assert not any(
+    assert materialized_events[0].payload["admission_username"] == "admin"
+    assert materialized_events[0].payload["reconciliation_status"] == "INITIAL_BASELINE"
+    assert any(
         "admission_operational_sessions" in sql
         for sql, _params in central.statements
     )
