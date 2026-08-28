@@ -4,6 +4,7 @@ import portable_launcher
 def test_launcher_uses_bundled_database_configuration_without_env_file(
     tmp_path, monkeypatch
 ):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     executable = tmp_path / "CALCULOS_QT.exe"
     executable.write_bytes(b"test")
     (tmp_path / "_internal").mkdir()

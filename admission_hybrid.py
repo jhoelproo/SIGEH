@@ -1039,6 +1039,14 @@ INSERT INTO admission_replication_event_floors(
   stream_name,minimum_available_sequence,checkpoint_sequence,retention_days
 ) VALUES('ATTENTION',0,0,7)
 ON CONFLICT(stream_name) DO NOTHING;
+ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS turn_id BIGINT;
+ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS service_time TEXT;
+ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS service_type TEXT NOT NULL DEFAULT 'EMERGENCIA';
+ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS specialty TEXT;
+ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS admission_username TEXT;
+ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS authorization_snapshot TEXT;
+ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS source_status TEXT NOT NULL DEFAULT 'ACTIVA';
+ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS has_detail_sheet BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS global_attention_id UUID;
 ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS global_patient_id UUID;
 ALTER TABLE admission_attention_projection ADD COLUMN IF NOT EXISTS operational_source_id UUID;

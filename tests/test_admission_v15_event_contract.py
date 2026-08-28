@@ -45,6 +45,25 @@ def _attention(*, name="PACIENTE CONTROLADO", status="ACTIVA", sheet=False):
     )
 
 
+@pytest.mark.parametrize(
+    "module_name",
+    (
+        "admission_source.facturacion_tabs",
+        "ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6",
+    ),
+)
+def test_rectification_rejects_an_ambiguous_short_reason(module_name):
+    module = __import__(module_name, fromlist=["DatabaseManager"])
+
+    with pytest.raises(ValueError, match="al menos 5 caracteres"):
+        module.DatabaseManager.actualizar_atencion_especifica(
+            None,
+            1,
+            {},
+            motivo="no",
+        )
+
+
 class _Repository:
     def __init__(self):
         self.current = _attention()
@@ -390,10 +409,10 @@ def test_administrative_turn_override_allows_pdf_attention_persistence(tmp_path,
         )
     )
     stale_shift = {
-        "fecha_base": date.today() - timedelta(days=1),
+        "fecha_base": date.today() - timedelta(days=2),
         "turno_codigo": "8AM_8AM",
         "representante": "AUX TEST",
-        "inicio_real_dt": datetime.now().replace(microsecond=0),
+        "inicio_real_dt": (datetime.now() - timedelta(days=2)).replace(microsecond=0),
         "administrative_override": True,
         "override_reason": "Corrección administrativa de prueba",
     }

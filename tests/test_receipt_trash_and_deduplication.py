@@ -108,7 +108,14 @@ class ReceiptTrashAndDeduplicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "listado pendiente"):
             app.delete_recibo(receipt_id, self.admin)
         with app.db_connect() as con:
-            con.execute("UPDATE billing_batches SET status='ENVIADO' WHERE id=%s", (batch_id,))
+            con.execute(
+                """UPDATE billing_batches
+                   SET status='ENVIADO',sent_receipt_count=1,sent_total=373.75,
+                       sent_invoice_number='',sent_ncf='',sent_ars=ars,
+                       sent_period_year=period_year,sent_period_month=period_month
+                   WHERE id=%s""",
+                (batch_id,),
+            )
         with self.assertRaisesRegex(ValueError, "listado enviado"):
             app.delete_recibo(receipt_id, self.admin)
 

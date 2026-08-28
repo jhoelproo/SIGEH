@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import psycopg2
 from PySide6.QtCore import Signal
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QAbstractItemView, QDialog, QMainWindow, QMessageBox
 
 import CALCULOS_QT as app
@@ -32,6 +33,13 @@ class LogoutHarness(QMainWindow):
     _close_secondary_windows_for_logout = app.MainWindow._close_secondary_windows_for_logout
     _clear_sensitive_session_references = app.MainWindow._clear_sensitive_session_references
     _shutdown_admission_session = app.MainWindow._shutdown_admission_session
+    _cancel_session_work_without_waiting = app.MainWindow._cancel_session_work_without_waiting
+    _complete_remote_logout = staticmethod(app.MainWindow._complete_remote_logout)
+    _request_session_health = app.MainWindow._request_session_health
+    _on_session_health_completed = app.MainWindow._on_session_health_completed
+    _on_session_health_failed = app.MainWindow._on_session_health_failed
+    _session_health_finished = app.MainWindow._session_health_finished
+    _handle_inactive_login_session = app.MainWindow._handle_inactive_login_session
     check_remote_logout = app.MainWindow.check_remote_logout
 
     def __init__(self, user, session_id):
@@ -41,6 +49,10 @@ class LogoutHarness(QMainWindow):
         self.session_started_at = app.now_str()
         self._logout_prompt_active = False
         self._logout_finalizing = False
+        self.offline_login = False
+        self._session_health_worker = None
+        self._session_health_requested_again = False
+        self._operational_context = {}
         self.current_admission_attention = object()
         self.editing_recibo_id = 1
         self.editing_recibo_numero = 1
@@ -78,6 +90,32 @@ class AdvancedOptionsActionHistoryLogoutTests(unittest.TestCase):
             "full_name": "Administrador del sistema",
             "role": app.ROLE_ADMIN,
         }
+
+    def wait_for_history_load(self, dialog):
+        for _ in range(500):
+            self.qt_app.processEvents()
+            if dialog._load_worker is None:
+                return
+            QTest.qWait(10)
+        self.fail("La carga asíncrona del historial no terminó.")
+
+    def wait_for_remote_logout(self, session_id, *, require_audit=False):
+        for _ in range(500):
+            self.qt_app.processEvents()
+            with app.db_connect() as con:
+                active = con.execute(
+                    "SELECT is_active FROM active_sessions WHERE session_id=%s",
+                    (session_id,),
+                ).fetchone()[0]
+                audit = con.execute(
+                    """SELECT module,entity_type,entity_id,details
+                       FROM action_history WHERE action='Cerrar sesión'
+                       ORDER BY id DESC LIMIT 1"""
+                ).fetchone()
+            if int(active) == 0 and (audit is not None or not require_audit):
+                return audit
+            QTest.qWait(10)
+        self.fail("El cierre remoto de la sesión no terminó.")
 
     def tearDown(self):
         for widget in list(QApplication.topLevelWidgets()):
@@ -154,13 +192,16 @@ class AdvancedOptionsActionHistoryLogoutTests(unittest.TestCase):
                 )
         main = MainStub(self.admin)
         dialog = app.HistoryDialog(main)
+        self.wait_for_history_load(dialog)
         self.assertEqual(dialog.table.rowCount(), 200)
         self.assertEqual(dialog.table.editTriggers(), QAbstractItemView.NoEditTriggers)
         dialog.load_rows(reset=False)
+        self.wait_for_history_load(dialog)
         self.assertEqual(dialog.table.rowCount(), 225)
         action_index = dialog.action_filter.findData("Acción paginada")
         dialog.action_filter.setCurrentIndex(action_index)
         dialog.load_rows(reset=True)
+        self.wait_for_history_load(dialog)
         self.assertEqual(dialog.table.rowCount(), 200)
         dialog.btn_logout.click()
         self.assertEqual(main.logout_sources, ["Historial de acciones"])
@@ -207,20 +248,11 @@ class AdvancedOptionsActionHistoryLogoutTests(unittest.TestCase):
             window.request_logout("Gestión de Usuarios")
         self.qt_app.processEvents()
         self.assertEqual(emitted, [True])
-        self.assertTrue(secondary.shutdown_called)
+        self.assertFalse(secondary.shutdown_called)
+        self.assertFalse(secondary.isEnabled())
         self.assertFalse(secondary.isVisible())
         self.assertEqual(window.current_user, {})
-        with app.db_connect() as con:
-            active = con.execute(
-                "SELECT is_active FROM active_sessions WHERE session_id=%s",
-                (session_id,),
-            ).fetchone()[0]
-            audit = con.execute(
-                """SELECT module,entity_type,entity_id,details
-                   FROM action_history WHERE action='Cerrar sesión'
-                   ORDER BY id DESC LIMIT 1"""
-            ).fetchone()
-        self.assertEqual(int(active), 0)
+        audit = self.wait_for_remote_logout(session_id, require_audit=True)
         self.assertEqual(audit["module"], "Seguridad")
         self.assertEqual(audit["entity_type"], "sesion")
         self.assertEqual(audit["entity_id"], session_id)
@@ -236,14 +268,16 @@ class AdvancedOptionsActionHistoryLogoutTests(unittest.TestCase):
         window.logout_requested.connect(lambda: emitted.append(True))
         with patch.object(QMessageBox, "question") as question:
             window.check_remote_logout()
+            for _ in range(500):
+                self.qt_app.processEvents()
+                if emitted:
+                    break
+                QTest.qWait(10)
+            else:
+                self.fail("La verificación remota de sesión no terminó.")
         self.assertEqual(emitted, [True])
         question.assert_not_called()
-        with app.db_connect() as con:
-            active = con.execute(
-                "SELECT is_active FROM active_sessions WHERE session_id=%s",
-                (session_id,),
-            ).fetchone()[0]
-        self.assertEqual(int(active), 0)
+        self.wait_for_remote_logout(session_id)
 
 
 if __name__ == "__main__":

@@ -171,12 +171,45 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
         self.assertEqual(incomplete.billing_readiness, READINESS_INCOMPLETE)
         self.assertIsNone(repository.get_billable_attention(1002))
 
+        actor = {"username": "admin", "role": app.ROLE_ADMIN}
+        operational_source_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                "hospital-operational-source:source-integral-e2e",
+            )
+        )
+        production_epoch_id = str(uuid.uuid4())
+        with app.db_connect() as connection:
+            connection.execute(
+                """INSERT INTO sigeh_product_state(
+                       singleton,product_id,bootstrap_version,
+                       production_epoch_id,bootstrap_status,
+                       bootstrap_completed_at,production_initialized_at
+                   ) VALUES(1,'SIGEH','1.0.5',%s,'PRODUCTION_ACTIVE',NOW(),NOW())""",
+                (production_epoch_id,),
+            )
+            connection.execute(
+                """INSERT INTO admission_operational_sessions(
+                       operational_session_id,active_username,active_user_id,
+                       active_user_display_name,primary_device_id,
+                       primary_login_session_id,turn_id,turn_started_at,
+                       operational_source_id,status,generation,
+                       production_epoch_id
+                   ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'ACTIVE',1,%s)""",
+                (
+                    str(uuid.uuid4()), "admin", "1", "Administrador",
+                    "PC-E2E", "integral-login", 77,
+                    "2026-07-20 08:00:00", operational_source_id,
+                    production_epoch_id,
+                ),
+            )
         billing_session_id = "integral-emergency-session"
         ready = app.claim_projected_billable_attention(
             ready.attention_id,
             ready.source_instance_id,
             username="admin",
             session_id=billing_session_id,
+            current_user=actor,
         )
         self.assertIsNotNone(ready)
         number = app.get_next_recibo_number()
@@ -226,7 +259,6 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
                 (receipt_id,),
             )
 
-        actor = {"username": "admin", "role": app.ROLE_ADMIN}
         with patch.object(
             app,
             "AdmissionReadOnlyRepository",
@@ -242,6 +274,12 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
                 },
             )
         self.assertEqual(result["estado_facturacion"], app.BILLING_INVOICED)
+        app.change_receipt_billing_status(
+            receipt_id,
+            app.BILLING_PENDING,
+            actor,
+            reason="Preparar recibo para listado mensual de integración",
+        )
 
         with app.db_connect() as connection:
             connection.execute(
@@ -286,6 +324,24 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
         self.assertEqual(rows[0]["authorization_snapshot"], "AUT-E2E-001")
         self.assertEqual(rows[0]["service_date_snapshot"], "2026-07-20")
         self.assertIsNone(rows[0]["specialty_snapshot"])
+
+        with app.db_connect() as connection:
+            connection.execute(
+                "UPDATE recibos SET pdf_synced=1 WHERE id=%s",
+                (receipt_id,),
+            )
+        with patch.object(
+            app,
+            "AdmissionReadOnlyRepository",
+            return_value=repository,
+        ):
+            app.change_receipt_billing_status(
+                receipt_id,
+                app.BILLING_INVOICED,
+                actor,
+                reference="PRUEBA-INTEGRAL-LISTADO",
+                checklist={key: True for key in app.AUDIT_CHECKLIST_ITEMS},
+            )
 
         app.update_monthly_batch_configuration(
             batch_id,
@@ -485,7 +541,7 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
                        RETURNING id""",
                     (
                         number, f"PACIENTE {number}", service_date, ars,
-                        f"{service_date} 12:00:00", app.BILLING_INVOICED,
+                        f"{service_date} 12:00:00", app.BILLING_PENDING,
                         f"{service_date} 12:30:00", f"AUT-{number}",
                         str(number), ars,
                     ),
@@ -672,7 +728,7 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
         unlimited = app.obtener_candidatos_listado_ars(batch_id)
         self.assertEqual(
             {int(row["recibo_id"]) for row in unlimited},
-            {rows[0], rows[1], rows[3], rows[4]},
+            {rows[0], rows[1], rows[4]},
         )
         self.assertTrue(
             all(row["candidate_kind"] == "RECEIPT" for row in unlimited)
