@@ -12,6 +12,7 @@ import pytest
 
 from admission_hybrid import (
     AdmissionWriteBlocked,
+    DatabaseTemporarilyOffline,
     DeviceAttachment,
     OfflineAdmissionStore,
     OperationalSession,
@@ -381,6 +382,31 @@ def test_local_mirror_failure_keeps_central_state_online_and_retryable(tmp_path)
     assert retryable["generation"] == 42
     assert retryable["turn_id"] == 316
     assert host.current_shift["owner_username"] == "fernando"
+
+
+def test_temporary_network_failure_retains_last_confirmed_turn_identity(tmp_path):
+    service = _SessionService(_session())
+    runtime, host, _database_path = _runtime(
+        tmp_path,
+        {"id": 8, "username": "fernando", "role": "administrador"},
+        service,
+    )
+    confirmed = runtime.synchronize()
+    assert confirmed["turn_id"] == 316
+    runtime.apply_operational_mirror_to_v15()
+
+    def unavailable(**_kwargs):
+        raise DatabaseTemporarilyOffline("temporary")
+
+    service.get_central_admission_operational_state = unavailable
+    stale = runtime.synchronize()
+
+    assert stale["turn_id"] == 316
+    assert stale["generation"] == 42
+    assert stale["operational_source_id"] == "source-central"
+    assert stale["reason_code"] == "CENTRAL_TEMPORARILY_UNAVAILABLE"
+    assert stale["offline"] is True
+    assert host.current_shift["turn_id"] == 316
 
 
 def test_old_secondary_user_reattaches_during_reconciliation(tmp_path):

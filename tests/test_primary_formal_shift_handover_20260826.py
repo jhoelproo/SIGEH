@@ -6,14 +6,18 @@ from datetime import datetime, timedelta, timezone
 import logging
 from types import SimpleNamespace
 
+import pytest
+
 from admission_hybrid import (
     AdmissionWriteGuard,
+    AdmissionWriteBlocked,
     DeviceAttachment,
     OperationalSession,
     OperationalSessionService,
     OperationalState,
     PrimaryTransitionResult,
     StationRole,
+    SAME_USER_HANDOFF_MESSAGE,
     can_change_admission_turn,
     is_primary_shift_handover,
 )
@@ -203,6 +207,7 @@ class _HandoverDatabase:
                 turn_id,
                 turn_code,
                 generation,
+                _duration_hours,
                 _changed_by,
                 _reason,
                 _session_id,
@@ -279,6 +284,39 @@ def test_formal_handover_changes_turn_and_rep_but_only_logs_out_old_rep_secondar
     assert database.devices["PC-OTHER-SECONDARY"]["detached_at"] is None
     assert database.active_sessions["login-other-secondary"]["is_active"] is True
     assert any(item["event"] == "OPERATIONAL_GENERATION_CHANGED" for item in database.audit)
+    identity_event = next(
+        item for item in database.audit
+        if item["event"] == "OPERATIONAL_IDENTITY_CHANGED"
+    )
+    assert '"trigger": "USER_REQUESTED_HANDOFF"' in identity_event["details"]
+
+
+def test_same_user_handoff_is_absolute_noop_before_allocating_turn_id():
+    database = _HandoverDatabase()
+    service = OperationalSessionService(lambda: database)
+    allocator_calls = []
+    service._allocate_next_central_turn_id = lambda _connection: allocator_calls.append(True) or 501
+    before_session = deepcopy(database.session)
+    before_devices = deepcopy(database.devices)
+    before_audit = deepcopy(database.audit)
+
+    with pytest.raises(AdmissionWriteBlocked) as error:
+        service.transition_primary_user(
+            operational_session_id="op-1",
+            primary_device_id="PC-PRIMARY",
+            new_login_session_id="login-new",
+            new_user=OLD_USER,
+            new_turn_id=None,
+            expected_generation=7,
+            transition_id="6646a4a5-91ec-44db-9a8c-a6af2d06f18f",
+            allocate_central_turn_id=True,
+        )
+
+    assert str(error.value) == SAME_USER_HANDOFF_MESSAGE
+    assert allocator_calls == []
+    assert database.session == before_session
+    assert database.devices == before_devices
+    assert database.audit == before_audit
 
 
 class _RuntimeTransitionService:
@@ -390,7 +428,10 @@ def _runtime_for_handover():
     runtime.logger = logging.getLogger("test.formal-handover-runtime")
     runtime.session_service = _RuntimeTransitionService(changed)
     runtime.require_primary_turn_change = lambda: True
-    runtime.apply_operational_snapshot = lambda *_args, **_kwargs: True
+    runtime.applied_states = []
+    runtime.apply_operational_snapshot = (
+        lambda state, **_kwargs: runtime.applied_states.append(state) or True
+    )
     runtime.refresh_operational_state = lambda **_kwargs: {}
     return runtime
 
@@ -406,6 +447,12 @@ def test_adapter_routes_normal_different_user_turn_to_atomic_handover():
     assert call["allocate_central_turn_id"] is True
     assert call["invalidate_only_previous_user_secondaries"] is True
     assert call["new_user"]["username"] == "aux_nuevo"
+    committed_state = runtime.applied_states[-1]
+    assert committed_state.turn_id == 501
+    assert committed_state.user_matches_operational is True
+    assert committed_state.write_allowed is True
+    assert committed_state.can_change_turn is True
+    assert committed_state.can_generate_attention is True
 
 
 def test_administrative_schedule_override_stays_turn_only_and_keeps_rep_flow_separate():
@@ -423,6 +470,25 @@ def test_administrative_schedule_override_stays_turn_only_and_keeps_rep_flow_sep
     assert runtime.session_service.handover_calls == []
     assert len(runtime.session_service.turn_only_calls) == 1
     assert runtime.session_service.turn_only_calls[0]["administrative_override"] is True
+
+
+def test_adapter_rejects_normal_same_user_turn_before_any_service_call():
+    runtime = _runtime_for_handover()
+    runtime.host.user = OLD_USER
+    runtime._operational_state = replace(
+        runtime._operational_state,
+        user_matches_operational=True,
+        write_allowed=True,
+    )
+
+    with pytest.raises(AdmissionWriteBlocked) as error:
+        runtime.perform_explicit_turn_handoff(
+            shift_metadata={"turno_codigo": "8PM_8AM"}
+        )
+
+    assert str(error.value) == SAME_USER_HANDOFF_MESSAGE
+    assert runtime.session_service.handover_calls == []
+    assert runtime.session_service.turn_only_calls == []
 
 
 def test_invalidated_old_representative_secondary_requests_immediate_logout():

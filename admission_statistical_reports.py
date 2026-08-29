@@ -245,6 +245,85 @@ class AdmissionReportDataset:
     summary: Mapping[str, Any]
     preview_rows: tuple[tuple[str, str, int, str, str, str], ...]
     diagnostics: Mapping[str, int]
+    filters: AdmissionReportFilters
+    turns: tuple[Mapping[str, Any], ...]
+    representatives: tuple[str, ...]
+    generated_at: datetime
+    filter_signature: tuple[Any, ...]
+    export_metadata: Mapping[str, Any]
+
+    def matches_filters(self, filters: AdmissionReportFilters) -> bool:
+        return self.filter_signature == report_filter_signature(filters)
+
+
+class SnapshotStaleError(RuntimeError):
+    """The visible report no longer represents the selected controls."""
+
+
+class ReportSnapshotStore:
+    """Owns the last immutable report and prevents stale exports."""
+
+    def __init__(self) -> None:
+        self._snapshot: AdmissionReportDataset | None = None
+        self._stale = False
+
+    @property
+    def snapshot(self) -> AdmissionReportDataset | None:
+        return self._snapshot
+
+    @property
+    def stale(self) -> bool:
+        return self._stale
+
+    def replace(self, snapshot: AdmissionReportDataset) -> None:
+        self._snapshot = snapshot
+        self._stale = False
+
+    def clear(self) -> None:
+        self._snapshot = None
+        self._stale = False
+
+    def mark_stale(self) -> bool:
+        if self._snapshot is None:
+            return False
+        self._stale = True
+        return True
+
+    def invalidate_if_changed(self, filters: AdmissionReportFilters) -> bool:
+        if self._snapshot is None:
+            return False
+        self._stale = not self._snapshot.matches_filters(filters)
+        return self._stale
+
+    def require_exportable(
+        self, filters: AdmissionReportFilters | None = None
+    ) -> AdmissionReportDataset:
+        snapshot = self._snapshot
+        if snapshot is None:
+            raise SnapshotStaleError("Primero genere el reporte.")
+        if self._stale or (
+            filters is not None and not snapshot.matches_filters(filters)
+        ):
+            raise SnapshotStaleError(
+                "Los filtros cambiaron. Genere nuevamente el reporte antes de exportar."
+            )
+        return snapshot
+
+
+def report_filter_signature(filters: AdmissionReportFilters) -> tuple[Any, ...]:
+    """Stable identity shared by UI invalidation and export validation."""
+    return (
+        filters.start_at,
+        filters.end_at,
+        filters.period_label,
+        filters.turn_label,
+        filters.operational_source_id,
+        filters.turn_id,
+        filters.specialty,
+        filters.coverage,
+        filters.ars_mode,
+        filters.selected_ars,
+    )
 
 
 def _first_truthy(row: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
@@ -389,10 +468,89 @@ def _percentage(value: int, total: int) -> float:
     return round(value * 100.0 / total, 2) if total else 0.0
 
 
+def _representative_name(evidence: Mapping[str, Any]) -> str:
+    return _plain_text(
+        evidence.get("display_name")
+        or evidence.get("full_name")
+        or evidence.get("username")
+    )
+
+
+def _normalize_turn_representatives(
+    turn: Mapping[str, Any],
+) -> tuple[tuple[Mapping[str, Any], ...], tuple[str, ...]]:
+    evidence_items = sorted(
+        (dict(item or {}) for item in turn.get("representatives") or ()),
+        key=lambda item: _plain_text(item.get("event_at")),
+    )
+    names: list[str] = []
+    seen: set[str] = set()
+    immutable_evidence: list[Mapping[str, Any]] = []
+    for evidence in evidence_items:
+        name = _representative_name(evidence)
+        folded_name = _fold(name)
+        if name and folded_name not in seen:
+            seen.add(folded_name)
+            names.append(name)
+        immutable_evidence.append(MappingProxyType(evidence))
+    return tuple(immutable_evidence), tuple(names)
+
+
+def _report_turn_label(
+    turn: Mapping[str, Any], filters: AdmissionReportFilters
+) -> str:
+    turn_id = _coerce_int(turn.get("turn_id"), default=None)
+    if filters.turn_id is not None and turn_id == filters.turn_id:
+        return filters.turn_label
+    started = coerce_hospital_datetime(turn.get("started_at"))
+    return (
+        f"Turno del {started:%d/%m/%Y}"
+        if started is not None
+        else "Turno operacional"
+    )
+
+
+def _immutable_turns(
+    turns: Iterable[Mapping[str, Any]], filters: AdmissionReportFilters
+) -> tuple[
+    tuple[Mapping[str, Any], ...],
+    tuple[str, ...],
+    tuple[tuple[str, tuple[str, ...]], ...],
+]:
+    immutable_turns: list[Mapping[str, Any]] = []
+    all_representatives: list[str] = []
+    representatives_by_turn: list[tuple[str, tuple[str, ...]]] = []
+    seen_globally: set[str] = set()
+    ordered_turns = sorted(
+        (dict(item or {}) for item in turns or ()),
+        key=lambda item: _plain_text(item.get("started_at")),
+    )
+    for raw_turn in ordered_turns:
+        turn = dict(raw_turn or {})
+        immutable_evidence, turn_names = _normalize_turn_representatives(turn)
+        turn["representatives"] = immutable_evidence
+        turn_label = _report_turn_label(turn, filters)
+        for name in turn_names:
+            folded_name = _fold(name)
+            if folded_name not in seen_globally:
+                seen_globally.add(folded_name)
+                all_representatives.append(name)
+        if turn_names:
+            representatives_by_turn.append((turn_label, turn_names))
+        immutable_turns.append(MappingProxyType(turn))
+    return (
+        tuple(immutable_turns),
+        tuple(all_representatives),
+        tuple(representatives_by_turn),
+    )
+
+
 def _build_summary(
     records: tuple[Mapping[str, Any], ...],
     filters: AdmissionReportFilters,
     generated_at: datetime,
+    representatives: tuple[str, ...],
+    representatives_by_turn: tuple[tuple[str, tuple[str, ...]], ...],
 ) -> dict[str, Any]:
     by_ars = Counter(str(row["canonical_ars"]) for row in records)
     by_specialty = Counter(str(row["specialty"]) for row in records)
@@ -431,6 +589,8 @@ def _build_summary(
         "operational_source_id": filters.operational_source_id,
         "turn_id": filters.turn_id,
         "generated_at": generated_at,
+        "representantes": representatives,
+        "representatives_by_turn": representatives_by_turn,
         "records": records,
         # Compatibility keys used by the existing PDF/turn report helpers.
         "registros": records,
@@ -446,7 +606,7 @@ def _build_summary(
         ),
         "periodo_texto": filters.period_label,
         "turno_resumen": filters.turn_label,
-        "representante": "",
+        "representante": ", ".join(representatives),
     }
     return summary
 
@@ -505,6 +665,7 @@ def build_admission_report_dataset(
     filters: AdmissionReportFilters,
     *,
     generated_at: datetime | None = None,
+    turns: Iterable[Mapping[str, Any]] = (),
 ) -> AdmissionReportDataset:
     diagnostics: Counter[str] = Counter()
     selected: list[dict[str, Any]] = []
@@ -525,17 +686,36 @@ def build_admission_report_dataset(
         )
     )
     immutable_records = tuple(MappingProxyType(row) for row in selected)
+    effective_generated_at = generated_at or datetime.now()
+    immutable_turns, representatives, representatives_by_turn = _immutable_turns(
+        turns, filters
+    )
     summary = _build_summary(
         immutable_records,
         filters,
-        generated_at or datetime.now(),
+        effective_generated_at,
+        representatives,
+        representatives_by_turn,
     )
     preview = _build_preview(summary)
+    signature = report_filter_signature(filters)
     return AdmissionReportDataset(
         records=immutable_records,
         summary=MappingProxyType(summary),
         preview_rows=preview,
         diagnostics=MappingProxyType(dict(diagnostics)),
+        filters=filters,
+        turns=immutable_turns,
+        representatives=representatives,
+        generated_at=effective_generated_at,
+        filter_signature=signature,
+        export_metadata=MappingProxyType(
+            {
+                "patient_count": len(immutable_records),
+                "generated_at": effective_generated_at,
+                "filter_signature": signature,
+            }
+        ),
     )
 
 
@@ -557,10 +737,13 @@ __all__ = [
     "SPECIALTY_ALL",
     "AdmissionReportDataset",
     "AdmissionReportFilters",
+    "ReportSnapshotStore",
+    "SnapshotStaleError",
     "OperationalPeriod",
     "build_admission_report_dataset",
     "build_operational_period",
     "build_turn_operational_period",
     "coerce_hospital_datetime",
+    "report_filter_signature",
     "search_ars_catalog",
 ]

@@ -9,6 +9,7 @@ from admission_hybrid import (
     AdmissionWriteBlocked,
     AdmissionWriteGuard,
     OperationalSessionService,
+    SAME_USER_HANDOFF_MESSAGE,
     StationRole,
     same_user,
     user_can_operate_admission,
@@ -331,7 +332,7 @@ class _OperationalDB:
         if upper.startswith("UPDATE ADMISSION_OPERATIONAL_SESSIONS SET ACTIVE_USERNAME"):
             (
                 username, user_id, display_name, login_id, turn_id,
-                turn_code, generation, _changed_by, _reason, _sid,
+                turn_code, generation, _duration_hours, _changed_by, _reason, _sid,
             ) = params
             self.session.update({
                 "active_username": str(username),
@@ -752,7 +753,7 @@ def test_primary_transition_invalidates_exact_secondaries_and_is_idempotent():
     assert duplicate.new_turn_id == 20
 
 
-def test_same_user_relogin_keeps_turn_generation_and_secondary():
+def test_same_user_handoff_is_rejected_and_keeps_turn_generation_and_secondary():
     database, service = _service()
     primary = _configured_primary(
         database, service, username="admin",user_id=7,device_id="PC-1",
@@ -763,19 +764,21 @@ def test_same_user_relogin_keeps_turn_generation_and_secondary():
         login_session_id="S-1",turn_id=10,login_role="administrador",
     )
     database.active_sessions.update({"P-1": True, "S-1": True})
-    result = service.transition_primary_user(
-        operational_session_id=primary.operational_session.operational_session_id,
-        primary_device_id="PC-1",new_login_session_id="P-1",
-        new_user={
-            "id": 7,"username": "admin","full_name": "FERNANDO",
-            "role": "administrador",
-        },
-        new_turn_id=10,expected_generation=1,
-        transition_id="44444444-4444-4444-8444-444444444444",
-        invalidate_secondaries=False,
-    )
-    assert result.operational_session.turn_id == 10
-    assert result.operational_session.generation == 1
+    before = deepcopy(database.session)
+    with pytest.raises(AdmissionWriteBlocked) as error:
+        service.transition_primary_user(
+            operational_session_id=primary.operational_session.operational_session_id,
+            primary_device_id="PC-1",new_login_session_id="P-1",
+            new_user={
+                "id": 7,"username": "admin","full_name": "FERNANDO",
+                "role": "administrador",
+            },
+            new_turn_id=10,expected_generation=1,
+            transition_id="44444444-4444-4444-8444-444444444444",
+            invalidate_secondaries=False,
+        )
+    assert str(error.value) == SAME_USER_HANDOFF_MESSAGE
+    assert database.session == before
     assert database.devices["PC-2"]["detached_at"] is None
     assert database.active_sessions["S-1"] is True
     stale = service.resolve_operational_state(

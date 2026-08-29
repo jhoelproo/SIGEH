@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from ADMISION_PYSIDE6_V15 import qt_compat as compat
+from ADMISION_PYSIDE6_V15 import facturacion_tabs_pyside6 as v15
 from ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6 import App, theme_icon
 from admission_v15_adapter import AdmissionV15EventBus, AdmissionV15Factory
 from CALCULOS_QT import (
@@ -729,13 +730,54 @@ def test_report_window_generates_cards_and_preview_from_one_filtered_dataset(
                 "turn_id": 316,
                 "started_at": "2026-08-27T08:00:00-04:00",
                 "ends_at": "2026-08-28T08:00:00-04:00",
-            }
+                "representatives": (
+                    {
+                        "user_id": "7",
+                        "username": "auxiliar",
+                        "display_name": "Ana Pérez",
+                        "event_at": "2026-08-27T08:00:00-04:00",
+                    },
+                ),
+            },
+            {
+                "operational_source_id": source_id,
+                "turn_id": 317,
+                "started_at": "2026-08-29T08:00:00-04:00",
+                "ends_at": "2026-08-30T08:00:00-04:00",
+                "representatives": (),
+            },
         ],
     )
     monkeypatch.setattr(
         proxy_type,
         "list_statistical_report_records",
         lambda _self, **_kwargs: list(rows),
+    )
+    pdf_path = tmp_path / "reporte.pdf"
+    excel_path = tmp_path / "reporte.xlsx"
+    opened_pdfs = []
+    messages = []
+    monkeypatch.setattr(v15, "crear_pdf_reporte", lambda _summary: str(pdf_path))
+    monkeypatch.setattr(v15, "abrir_pdf", lambda path: opened_pdfs.append(path))
+    monkeypatch.setattr(
+        v15,
+        "crear_excel_reporte_estadistico",
+        lambda _summary, destino=None: str(destino or excel_path),
+    )
+    monkeypatch.setattr(
+        v15.filedialog,
+        "asksaveasfilename",
+        lambda **_kwargs: str(excel_path),
+    )
+    monkeypatch.setattr(
+        v15.messagebox,
+        "showinfo",
+        lambda title, message, **_kwargs: messages.append((title, message)),
+    )
+    monkeypatch.setattr(
+        v15.messagebox,
+        "showerror",
+        lambda title, message, **_kwargs: messages.append((title, message)),
     )
     try:
         shell.resize(1600, 900)
@@ -756,10 +798,47 @@ def test_report_window_generates_cards_and_preview_from_one_filtered_dataset(
         dataset = controls["state"]["dataset"]
         assert dataset is not None
         assert len(dataset.records) == 2
+        assert "ID 316" not in dataset.summary["turn_label"]
+        assert dataset.summary["representante"] == "Ana Pérez"
         assert controls["cards"]["total"][0].get() == "2"
         assert controls["cards"]["insured"][0].get() == "2"
         assert controls["cards"]["uninsured"][0].get() == "0"
         assert controls["preview"].rowCount() >= 5
+        assert controls["pdf_button"].isEnabled()
+        assert controls["excel_button"].isEnabled()
+
+        controls["pdf_button"].invoke()
+        controls["excel_button"].invoke()
+        for _ in range(30):
+            QTest.qWait(20)
+            if controls["state"]["pdf"] and controls["state"]["excel"]:
+                break
+        assert controls["state"]["pdf"] == str(pdf_path)
+        assert controls["state"]["excel"] == str(excel_path)
+        assert opened_pdfs == [str(pdf_path)]
+
+        controls["coverage_var"].set("SIN SEGURO")
+        assert controls["state"]["snapshot_store"].stale
+        assert not controls["pdf_button"].isEnabled()
+        assert not controls["excel_button"].isEnabled()
+        controls["pdf_button"].invoke()
+        controls["excel_button"].invoke()
+        assert len(messages) == 2
+
+        controls["turn"].set("Todos los turnos")
+        controls["generate"]()
+        for _ in range(30):
+            QTest.qWait(30)
+            current = controls["state"]["dataset"]
+            if current is not None and current.filters.turn_id is None:
+                break
+        empty_dataset = controls["state"]["dataset"]
+        assert empty_dataset is not None
+        assert empty_dataset.filters.turn_id is None
+        assert empty_dataset.records == ()
+        controls["pdf_button"].invoke()
+        controls["excel_button"].invoke()
+        assert len(messages) == 4
 
         controls["clear"]()
         assert controls["state"]["dataset"] is None
