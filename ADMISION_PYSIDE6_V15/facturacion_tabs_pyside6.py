@@ -9246,7 +9246,7 @@ class App:
             foreground=pal["muted"], background=pal["card"]
         )
         self.quick_summary_title.pack(anchor="w", fill="x", pady=(0, 7))
-        self.turno_total_var = tk.StringVar(value="Total pacientes: 0")
+        self.turno_total_var = tk.StringVar(value="Total pacientes: —")
         self.quick_total_label = tb.Label(
             self.quick_info_area, textvariable=self.turno_total_var,
             background=pal["card"], justify="left", anchor="w"
