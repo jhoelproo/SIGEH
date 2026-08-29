@@ -139,6 +139,35 @@ class TurnDatasetStateError(RuntimeError):
         super().__init__(self.code)
 
 
+TURN_DATASET_VALID_STATUSES = frozenset({"VALID", "VALID_EMPTY"})
+
+
+@dataclass(frozen=True)
+class TurnDatasetResult:
+    """Rows plus the evidence needed to distinguish an empty turn from a failure."""
+
+    status: str
+    operational_source_id: str
+    turn_id: int | None
+    generation: int
+    operational_revision: int
+    rows: tuple[Mapping[str, Any], ...]
+    source: str
+    error_code: str
+    generated_at: str
+    central_count: int = 0
+    local_count: int = 0
+    pending_count: int = 0
+
+    @property
+    def is_valid(self) -> bool:
+        return self.status in TURN_DATASET_VALID_STATUSES
+
+    @property
+    def display_count(self) -> int:
+        return len(self.rows)
+
+
 @dataclass(frozen=True)
 class TurnSummarySnapshot:
     """Versioned counts derived from one confirmed operational identity."""
@@ -1970,6 +1999,8 @@ class _HybridDatabaseProxy:
         object.__setattr__(self, "_runtime", runtime)
         object.__setattr__(self, "_last_transition_result", None)
         object.__setattr__(self, "_summary_lock", threading.RLock())
+        object.__setattr__(self, "_last_known_good_summary", None)
+        object.__setattr__(self, "_last_good_turn_rows", None)
         object.__setattr__(self, "_turn_summary", {
             "total": 0,
             "sin_seguro": 0,
@@ -1980,6 +2011,7 @@ class _HybridDatabaseProxy:
             "CONSULTAS": 0,
             "_status": "INVALID_REFRESH",
             "_error_code": "SUMMARY_NOT_LOADED",
+            "_fuente": "LAST_KNOWN_GOOD",
         })
 
     @property
@@ -1995,48 +2027,133 @@ class _HybridDatabaseProxy:
         with self._summary_lock:
             return dict(self._turn_summary)
 
-    def refresh_turn_summary(self) -> dict[str, Any]:
-        """Resumen derivado del mismo dataset canónico usado por Historial/Excel."""
+    def refresh_turn_summary(self, reason: str = "background_refresh") -> dict[str, Any]:
+        """Apply counts only when a dataset has positive identity/query evidence."""
         started = perf_counter()
-        session = self._runtime.operational_session
-        identity = _operational_identity_tuple(session)
+        reason = str(reason or "background_refresh")
+        identity = _operational_identity_tuple(self._runtime.operational_session)
+        logger = getattr(self._runtime, "logger", None)
+        with self._summary_lock:
+            last_good = dict(self._last_known_good_summary or {})
+        if logger is not None:
+            logger.info(
+                "TURN_SUMMARY_REFRESH_START turn_id=%s operational_source_id=%s "
+                "generation=%s operational_revision=%s connection_state=%s "
+                "last_valid_total=%s refresh_reason=%s device_id=%s",
+                identity[1] if identity else None,
+                identity[0] if identity else "-",
+                identity[2] if identity else 0,
+                identity[3] if identity else 0,
+                "OFFLINE" if bool(getattr(self._runtime, "offline", False)) else "ONLINE",
+                last_good.get("total", "-"),
+                reason,
+                str(getattr(self._runtime, "device_id", "") or "-"),
+            )
         if identity is None:
             return self._stale_turn_summary(
-                error_code="TURN_ID_NOT_AVAILABLE",
-                started=started,
-            )
-        source_id, turn_id, generation, revision = identity
-        try:
-            rows = self.build_turn_dataset(
-                turn_id=turn_id,
-                operational_source_id=source_id,
-            )
-        except TurnDatasetStateError as exc:
-            return self._stale_turn_summary(
-                error_code=exc.code,
-                started=started,
-                identity=identity,
-            )
-        except Exception as exc:  # noqa: BLE001 - preserves last valid snapshot
-            logger = getattr(self._runtime, "logger", None)
-            if logger is not None:
-                logger.exception(
-                    "TURN_SUMMARY_QUERY_FAILED exception_type=%s",
-                    type(exc).__name__,
-                )
-            return self._stale_turn_summary(
-                error_code="DB_ERROR",
-                started=started,
-                identity=identity,
+                error_code="IDENTITY_UNAVAILABLE", started=started, reason=reason
             )
 
+        result = self.load_turn_dataset_result(identity=identity)
+        if logger is not None:
+            logger.info(
+                "TURN_SUMMARY_DATASET_RESULT status=%s rows=%s dataset_source=%s "
+                "turn_id=%s operational_source_id=%s generation=%s "
+                "operational_revision=%s central_count=%s local_count=%s "
+                "pending_count=%s display_count=%s error_code=%s",
+                result.status,
+                result.display_count,
+                result.source,
+                result.turn_id,
+                result.operational_source_id or "-",
+                result.generation,
+                result.operational_revision,
+                result.central_count,
+                result.local_count,
+                result.pending_count,
+                result.display_count,
+                result.error_code or "-",
+            )
+        if not result.is_valid:
+            return self._stale_turn_summary(
+                error_code=result.error_code or result.status,
+                started=started,
+                identity=identity,
+                reason=reason,
+            )
         if _operational_identity_tuple(self._runtime.operational_session) != identity:
             return self._stale_turn_summary(
                 error_code="STALE_OPERATIONAL_SNAPSHOT",
                 started=started,
                 identity=identity,
+                reason=reason,
             )
 
+        counts = self._calculate_turn_counts(result.rows)
+        old_total = int(last_good.get("total") or 0)
+        same_last_identity = self._summary_matches_identity(last_good, identity)
+        if same_last_identity and old_total > 0 and counts["total"] == 0:
+            zero_confirmed, zero_error = self._confirm_central_zero(identity)
+            if not zero_confirmed:
+                return self._stale_turn_summary(
+                    error_code=zero_error,
+                    started=started,
+                    identity=identity,
+                    reason=reason,
+                )
+
+        summary = TurnSummarySnapshot(
+            operational_source_id=identity[0],
+            turn_id=identity[1],
+            generation=identity[2],
+            operational_revision=identity[3],
+            counts=counts,
+            refreshed_at=result.generated_at,
+            status=result.status,
+        ).to_mapping()
+        summary.update(
+            {
+                "_fuente": result.source,
+                "_central_count": result.central_count,
+                "_local_count": result.local_count,
+                "_pending_count": result.pending_count,
+                "_display_count": result.display_count,
+                "_refresh_reason": reason,
+            }
+        )
+        with self._summary_lock:
+            object.__setattr__(self, "_last_known_good_summary", dict(summary))
+            object.__setattr__(self, "_last_good_turn_rows", (identity, result.rows))
+            object.__setattr__(self, "_turn_summary", dict(summary))
+        if logger is not None:
+            if not same_last_identity or old_total != counts["total"]:
+                logger.info(
+                    "TURN_SUMMARY_TOTAL_CHANGED old_total=%s new_total=%s turn_id=%s "
+                    "operational_source_id=%s generation=%s reason=%s",
+                    old_total if same_last_identity else "NEW_TURN",
+                    counts["total"],
+                    identity[1],
+                    identity[0],
+                    identity[2],
+                    reason,
+                )
+            logger.info(
+                "TURN_SUMMARY_APPLY status=%s count=%s source=%s turn_id=%s "
+                "operational_source_id=%s generation=%s operational_revision=%s "
+                "elapsed_ms=%.1f",
+                result.status,
+                counts["total"],
+                result.source,
+                identity[1],
+                identity[0],
+                identity[2],
+                identity[3],
+                (perf_counter() - started) * 1000.0,
+            )
+        return summary
+
+    @staticmethod
+    def _calculate_turn_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         counts = {
             "total": 0,
             "sin_seguro": 0,
@@ -2047,14 +2164,19 @@ class _HybridDatabaseProxy:
             "CONSULTAS": 0,
         }
         for row in rows:
-            attention_type = str(row.get("tipo_atencion") or "EMERGENCIA").upper()
+            attention_type = str(
+                row.get("tipo_atencion") or row.get("service_type") or "EMERGENCIA"
+            ).upper()
             if attention_type == "URGENCIA":
                 counts["URGENCIAS"] += 1
             elif attention_type == "CONSULTA":
                 counts["CONSULTAS"] += 1
             else:
                 specialty = str(
-                    row.get("hoja_normalizada") or row.get("specialty") or "GENERAL"
+                    row.get("hoja_normalizada")
+                    or row.get("specialty")
+                    or row.get("hoja")
+                    or "GENERAL"
                 ).upper()
                 key = (
                     "PEDIATRIA" if "PED" in specialty
@@ -2063,45 +2185,26 @@ class _HybridDatabaseProxy:
                 )
                 counts[key] += 1
                 counts["total"] += 1
-            if str(row.get("ars_display") or row.get("canonical_ars") or "").upper() in {
-                "", "SIN SEGURO"
-            }:
+            ars = str(
+                row.get("ars_display") or row.get("canonical_ars") or row.get("ars") or ""
+            ).upper()
+            if ars in {"", "SIN SEGURO"}:
                 counts["sin_seguro"] += 1
-        summary = TurnSummarySnapshot(
-            operational_source_id=source_id,
-            turn_id=turn_id,
-            generation=generation,
-            operational_revision=revision,
-            counts=counts,
-            refreshed_at=datetime.now(timezone.utc).isoformat(),
-            status="VALID",
-        ).to_mapping()
-        summary["_fuente"] = "DATASET_HIBRIDO_CANONICO"
-        with self._summary_lock:
-            object.__setattr__(self, "_turn_summary", summary)
-        logger = getattr(self._runtime, "logger", None)
-        if logger is not None:
-            logger.info(
-                "TURN_SUMMARY_REFRESH turn_id=%s operational_source_id=%s "
-                "generation=%s operational_revision=%s status=VALID count=%s "
-                "source=DATASET_HIBRIDO_CANONICO error_code=- elapsed_ms=%.1f",
-                turn_id,
-                source_id,
-                generation,
-                revision,
-                len(rows),
-                (perf_counter() - started) * 1000.0,
-            )
-            logger.info(
-                "TURN_SUMMARY_COUNTS turn_id=%s total=%s sin_seguro=%s general=%s "
-                "pediatria=%s ginecologia=%s urgencias=%s consultas=%s elapsed_ms=%.1f",
-                getattr(self._runtime.operational_session, "turn_id", None),
-                summary["total"], summary["sin_seguro"], summary["GENERAL"],
-                summary["PEDIATRIA"], summary["GINECOLOGIA"],
-                summary["URGENCIAS"], summary["CONSULTAS"],
-                (perf_counter() - started) * 1000.0,
-            )
-        return summary
+        return counts
+
+    @staticmethod
+    def _summary_matches_identity(
+        summary: Mapping[str, Any], identity: tuple[str, int, int, int]
+    ) -> bool:
+        try:
+            return (
+                str(summary.get("_operational_source_id") or ""),
+                int(summary.get("_turn_id") or 0),
+                int(summary.get("_generation") or 0),
+                int(summary.get("_operational_revision") or 0),
+            ) == identity
+        except (TypeError, ValueError):
+            return False
 
     def _stale_turn_summary(
         self,
@@ -2109,11 +2212,12 @@ class _HybridDatabaseProxy:
         error_code: str,
         started: float,
         identity: tuple[str, int, int, int] | None = None,
+        reason: str = "background_refresh",
     ) -> dict[str, Any]:
         """Keep the last valid counts when an identity/query refresh is invalid."""
         with self._summary_lock:
-            previous = dict(self._turn_summary)
-        had_valid = previous.get("_status") in {"VALID", "STALE"}
+            previous = dict(self._last_known_good_summary or self._turn_summary)
+        had_valid = bool(self._last_known_good_summary)
         # Counts and identity are one immutable snapshot.  If the current
         # turn changed while a refresh was failing, retaining the old counts
         # under the new identity would leak the previous turn's total into
@@ -2139,6 +2243,8 @@ class _HybridDatabaseProxy:
                 "_refreshed_at": datetime.now(timezone.utc).isoformat(),
                 "_status": "STALE" if had_valid else "INVALID_REFRESH",
                 "_error_code": str(error_code or "INVALID_DATASET_STATE"),
+                "_fuente": "LAST_KNOWN_GOOD",
+                "_refresh_reason": str(reason or "background_refresh"),
             }
         )
         with self._summary_lock:
@@ -2146,9 +2252,9 @@ class _HybridDatabaseProxy:
         logger = getattr(self._runtime, "logger", None)
         if logger is not None:
             logger.warning(
-                "TURN_SUMMARY_REFRESH turn_id=%s operational_source_id=%s "
+                "TURN_SUMMARY_REJECTED turn_id=%s operational_source_id=%s "
                 "generation=%s operational_revision=%s status=%s count=%s "
-                "source=LAST_VALID_SNAPSHOT error_code=%s elapsed_ms=%.1f",
+                "source=LAST_KNOWN_GOOD error_code=%s refresh_reason=%s elapsed_ms=%.1f",
                 turn_id or None,
                 source_id or "-",
                 generation,
@@ -2156,6 +2262,7 @@ class _HybridDatabaseProxy:
                 previous["_status"],
                 int(previous.get("total") or 0),
                 previous["_error_code"],
+                str(reason or "background_refresh"),
                 (perf_counter() - started) * 1000.0,
             )
         return previous
@@ -2620,13 +2727,218 @@ class _HybridDatabaseProxy:
         global_id = str(row.get("global_attention_id") or "").replace("-", "").lower()
         return global_id or f"legacy:{row.get('source_instance_id') or ''}:{row.get('attention_id') or row.get('id')}"
 
+    @staticmethod
+    def _merge_turn_rows(
+        primary: Iterable[Mapping[str, Any]],
+        supplemental: Iterable[Mapping[str, Any]],
+        deleted_identities: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        deleted = deleted_identities or set()
+        merged: dict[str, dict[str, Any]] = {}
+        for raw in (*tuple(primary), *tuple(supplemental)):
+            row = dict(raw)
+            identity = _HybridDatabaseProxy._list_identity(row)
+            if identity and identity not in deleted:
+                merged[identity] = row
+        return sorted(merged.values(), key=_HybridDatabaseProxy._history_sort_key)
+
+    def _local_pending_delete_identities(
+        self, turn_id: int, operational_source_id: str
+    ) -> set[str]:
+        """Pending tombstones must hide a central row while offline sync catches up."""
+        try:
+            with self._database._connect() as connection:
+                rows = connection.execute(
+                    """SELECT entity_uuid FROM sync_outbox
+                         WHERE entity_type='attention'
+                           AND operation='DELETE'
+                           AND sync_status IN ('PENDING','RETRY')
+                           AND operational_source_id=? AND turn_id=?""",
+                    (str(operational_source_id), int(turn_id)),
+                ).fetchall()
+        except Exception:  # noqa: BLE001 - old replicas may not expose tombstone columns
+            return set()
+        return {
+            str(row[0] if not isinstance(row, Mapping) else row.get("entity_uuid") or "")
+            .replace("-", "")
+            .lower()
+            for row in rows
+            if row
+        }
+
+    def _load_central_turn_rows(
+        self, turn_id: int, operational_source_id: str
+    ) -> list[dict[str, Any]]:
+        sql = """SELECT p.*,p.attention_id AS origin_attention_id,
+                        p.attention_id AS id,p.service_date AS fecha,
+                        p.service_time AS hora,p.patient_name AS nombre,
+                        CASE WHEN p.has_detail_sheet
+                             THEN COALESCE(NULLIF(p.specialty,''),'GENERAL')
+                             ELSE '' END AS hoja,
+                        p.specialty AS hoja_normalizada,
+                        p.canonical_ars AS ars,p.canonical_ars AS ars_display,
+                        p.nss_snapshot AS nss,p.cedula_snapshot AS cedula,
+                        p.service_type AS tipo_atencion,
+                        'SYNCHRONIZED' AS sync_state
+                   FROM admission_attention_projection p
+                  WHERE p.operational_source_id::TEXT=%s
+                    AND p.turn_id=%s
+                    AND COALESCE(p.is_deleted,FALSE)=FALSE
+                    AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
+                        IN ('ACTIVA','PENDIENTE')
+                  ORDER BY COALESCE(
+                               p.created_at_effective_utc,
+                               NULLIF(p.synced_at,'')::TIMESTAMPTZ
+                           ),
+                           COALESCE(p.origin_device_id,''),
+                           COALESCE(p.device_local_sequence,0),
+                           COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT)"""
+        with self._runtime.host.connection_factory() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    sql, (str(operational_source_id), int(turn_id))
+                ).fetchall()
+            ]
+
+    def _dataset_error_status(self, exc: Exception) -> str:
+        temporary = getattr(self._runtime, "_temporary", None)
+        try:
+            if callable(temporary) and temporary(exc):
+                return "DATABASE_UNAVAILABLE"
+        except Exception:  # noqa: BLE001 - classification must never mask the failure
+            pass
+        if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+            return "DATABASE_UNAVAILABLE"
+        return "QUERY_ERROR"
+
+    def _load_local_turn_evidence(
+        self, identity: tuple[str, int, int, int]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str], str]:
+        source_id, turn_id, _generation, _revision = identity
+        try:
+            local_rows = self._local_list_rows(
+                turn_id, source_id, pending_only=False
+            )
+            pending_rows = [row for row in local_rows if row.get("pending_sync")]
+            deleted = self._local_pending_delete_identities(turn_id, source_id)
+            return local_rows, pending_rows, deleted, ""
+        except Exception as exc:  # noqa: BLE001 - returned as data, never as empty proof
+            return [], [], set(), f"LOCAL_{type(exc).__name__.upper()}"
+
+    def load_turn_dataset_result(
+        self, *, identity: tuple[str, int, int, int] | None
+    ) -> TurnDatasetResult:
+        """Read one exact turn without converting connection/replica errors into zero."""
+        generated_at = datetime.now(timezone.utc).isoformat()
+        if identity is None:
+            return TurnDatasetResult(
+                status="IDENTITY_UNAVAILABLE",
+                operational_source_id="",
+                turn_id=None,
+                generation=0,
+                operational_revision=0,
+                rows=(),
+                source="LAST_KNOWN_GOOD",
+                error_code="IDENTITY_UNAVAILABLE",
+                generated_at=generated_at,
+            )
+        source_id, turn_id, generation, revision = identity
+        local_rows, pending_rows, deleted, local_error = self._load_local_turn_evidence(
+            identity
+        )
+        last_rows = self._last_good_turn_rows
+        cached_rows: tuple[Mapping[str, Any], ...] = ()
+        if last_rows and last_rows[0] == identity:
+            cached_rows = last_rows[1]
+
+        if bool(getattr(self._runtime, "offline", False)):
+            if local_error and not cached_rows:
+                return TurnDatasetResult(
+                    "QUERY_ERROR", source_id, turn_id, generation, revision, (),
+                    "LAST_KNOWN_GOOD", local_error, generated_at,
+                )
+            merged = self._merge_turn_rows(cached_rows, local_rows, deleted)
+            if not merged and not cached_rows and not local_rows:
+                return TurnDatasetResult(
+                    "LOCAL_REPLICA_BEHIND", source_id, turn_id, generation, revision,
+                    (), "LAST_KNOWN_GOOD", "LOCAL_REPLICA_BEHIND", generated_at,
+                    local_count=0, pending_count=len(pending_rows),
+                )
+            result = TurnDatasetResult(
+                "VALID", source_id, turn_id, generation, revision, tuple(merged),
+                "OFFLINE_LOCAL", local_error, generated_at,
+                local_count=len(local_rows), pending_count=len(pending_rows),
+            )
+            return result
+
+        try:
+            central_rows = self._load_central_turn_rows(turn_id, source_id)
+        except Exception as exc:  # noqa: BLE001 - preserve exact-turn local evidence
+            error_status = self._dataset_error_status(exc)
+            merged = self._merge_turn_rows(cached_rows, local_rows, deleted)
+            if not merged:
+                return TurnDatasetResult(
+                    error_status, source_id, turn_id, generation, revision, (),
+                    "LAST_KNOWN_GOOD", error_status, generated_at,
+                    local_count=len(local_rows), pending_count=len(pending_rows),
+                )
+            result = TurnDatasetResult(
+                "VALID", source_id, turn_id, generation, revision, tuple(merged),
+                "OFFLINE_LOCAL", error_status, generated_at,
+                local_count=len(local_rows), pending_count=len(pending_rows),
+            )
+            return result
+
+        merged = self._merge_turn_rows(central_rows, pending_rows, deleted)
+        status = "VALID_EMPTY" if not merged else "VALID"
+        source = "CENTRAL_PLUS_PENDING" if pending_rows else "CENTRAL"
+        result = TurnDatasetResult(
+            status, source_id, turn_id, generation, revision, tuple(merged), source,
+            local_error, generated_at, central_count=len(central_rows),
+            local_count=len(local_rows), pending_count=len(pending_rows),
+        )
+        return result
+
+    def _confirm_central_zero(
+        self, identity: tuple[str, int, int, int]
+    ) -> tuple[bool, str]:
+        """One lightweight recheck guards a same-turn N→0 transition."""
+        if bool(getattr(self._runtime, "offline", False)):
+            return False, "ZERO_RECHECK_OFFLINE"
+        source_id, turn_id, _generation, _revision = identity
+        sql = """SELECT COUNT(*) FILTER (
+                            WHERE UPPER(COALESCE(service_type,'EMERGENCIA'))
+                                  NOT IN ('URGENCIA','CONSULTA')
+                        ) AS emergency_count
+                   FROM admission_attention_projection
+                  WHERE operational_source_id::TEXT=%s
+                    AND turn_id=%s
+                    AND COALESCE(is_deleted,FALSE)=FALSE
+                    AND UPPER(TRIM(COALESCE(source_status,'ACTIVA')))
+                        IN ('ACTIVA','PENDIENTE')"""
+        try:
+            with self._runtime.host.connection_factory() as connection:
+                row = connection.execute(sql, (source_id, turn_id)).fetchone()
+            count = int(
+                (row.get("emergency_count") if isinstance(row, Mapping) else row[0])
+                or 0
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed recheck must preserve LKG
+            return False, f"ZERO_RECHECK_{self._dataset_error_status(exc)}"
+        if _operational_identity_tuple(self._runtime.operational_session) != identity:
+            return False, "ZERO_RECHECK_STALE_IDENTITY"
+        if count != 0:
+            return False, "ZERO_RECHECK_NONZERO"
+        return True, ""
+
     def build_turn_dataset(
         self,
         *,
         turn_id: int | None,
         operational_source_id: str | None,
     ) -> list[dict[str, Any]]:
-        """Dataset canónico de un turno central, sin fallback temporal peligroso."""
+        """Compatibility API: invalid reads raise instead of looking like empty turns."""
         effective_turn = int(turn_id or 0)
         operational_source = str(operational_source_id or "").strip()
         logger = getattr(self._runtime, "logger", None)
@@ -2647,27 +2959,23 @@ class _HybridDatabaseProxy:
                     effective_turn,
                 )
             raise TurnDatasetStateError("OPERATIONAL_SOURCE_ID_NOT_AVAILABLE")
-        if bool(getattr(self._runtime, "offline", False)):
-            rows = self._local_list_rows(
-                effective_turn, operational_source, pending_only=False
-            )
-        else:
-            rows = self._cloud_history(
-                "listar_atenciones_filtradas",
-                (),
-                {
-                    "modo": "Por turno",
-                    "turno_id": effective_turn,
-                    "operational_source_id": operational_source,
-                    "limite": 500,
-                    "offset": 0,
-                },
-            )
-        result = sorted(rows, key=self._history_sort_key)
+        runtime_identity = _operational_identity_tuple(self._runtime.operational_session)
+        identity = (
+            runtime_identity
+            if runtime_identity
+            and runtime_identity[:2] == (operational_source, effective_turn)
+            else (operational_source, effective_turn, 0, 0)
+        )
+        dataset = self.load_turn_dataset_result(identity=identity)
+        if not dataset.is_valid:
+            raise TurnDatasetStateError(dataset.error_code or dataset.status)
+        result = [dict(row) for row in dataset.rows]
         if logger is not None:
             logger.info(
-                "CURRENT_TURN_DATASET turn_id=%s source=%s count=%s",
-                effective_turn, operational_source, len(result),
+                "CURRENT_TURN_DATASET turn_id=%s source=%s count=%s "
+                "status=%s dataset_source=%s",
+                effective_turn, operational_source, len(result), dataset.status,
+                dataset.source,
             )
         return result
 
@@ -3514,13 +3822,20 @@ class _V15BackgroundRefreshCoordinator(QObject):
         runtime = getattr(database, "_runtime", None)
         if runtime is not None:
             runtime.logger.info("SUMMARY_REFRESH_START reason=%s", self._summary_reason)
-        self.coordinator.submit_background(refresh, self._summary_ready, self._summary_failed)
+        reason = self._summary_reason
+        self.coordinator.submit_background(
+            lambda: refresh(reason=reason),
+            self._summary_ready,
+            self._summary_failed,
+        )
 
     @Slot(object)
     def _summary_ready(self, _summary: Any) -> None:
         self._summary_busy = False
         runtime = getattr(getattr(self.admission, "db", None), "_runtime", None)
         summary = dict(_summary or {})
+        if self._discard_invalid_summary(summary, runtime):
+            return
         if runtime is not None and not summary_result_matches_runtime_identity(
             summary, runtime
         ):
@@ -3569,6 +3884,22 @@ class _V15BackgroundRefreshCoordinator(QObject):
         if self._summary_pending:
             self._summary_pending = False
             self.request_summary("pending_event")
+
+    def _discard_invalid_summary(
+        self, summary: Mapping[str, Any], runtime: Any
+    ) -> bool:
+        if summary.get("_status") != "INVALID_REFRESH":
+            return False
+        if runtime is not None:
+            runtime.logger.warning(
+                "SUMMARY_REFRESH_DISCARDED reason=%s error=%s status=INVALID_REFRESH",
+                self._summary_reason,
+                summary.get("_error_code") or "INVALID_DATASET_STATE",
+            )
+        if self._summary_pending:
+            self._summary_pending = False
+            self.request_summary("pending_after_invalid_result")
+        return True
 
     @Slot(str)
     def _summary_failed(self, _code: str) -> None:
@@ -4829,10 +5160,15 @@ class AdmissionV15Factory:
                 if signal is not None and hasattr(signal, "connect"):
                     signal.connect(lambda _value=None, c=coordinator: c._schedule())
                     if refresh_controller is not None:
+                        refresh_reason = {
+                            "attention_created": "attention_created",
+                            "attention_cancelled": "attention_voided",
+                            "attention_updated": "attention_updated",
+                            "detail_sheet_generated": "detail_sheet_generated",
+                        }[signal_name]
                         signal.connect(
-                            lambda _value=None, r=refresh_controller: r.request_summary(
-                                "local_attention_event"
-                            )
+                            lambda _value=None, r=refresh_controller, reason=refresh_reason:
+                                r.request_summary(reason)
                         )
                     if (
                         signal_name != "detail_sheet_generated"
@@ -4907,4 +5243,6 @@ __all__ = [
     "AdmissionV15Factory",
     "AdmissionV15IntegrationError",
     "EmbeddedMainAppGateway",
+    "TurnDatasetResult",
+    "TurnSummarySnapshot",
 ]

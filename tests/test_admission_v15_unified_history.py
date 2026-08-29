@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from admission_v15_adapter import (
+    TurnDatasetResult,
     _HybridAdmissionRuntime,
     _HybridDatabaseProxy,
     _V15BackgroundRefreshCoordinator,
@@ -710,8 +711,12 @@ def test_turn_summary_uses_canonical_dataset_and_excludes_urgency_and_consultati
     proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
     object.__setattr__(
         proxy,
-        "build_turn_dataset",
-        lambda **_kwargs: rows,
+        "load_turn_dataset_result",
+        lambda identity: TurnDatasetResult(
+            "VALID", identity[0], identity[1], identity[2], identity[3],
+            tuple(rows), "CENTRAL", "", "2026-08-22T00:00:00+00:00",
+            central_count=len(rows),
+        ),
     )
 
     summary = proxy.refresh_turn_summary()

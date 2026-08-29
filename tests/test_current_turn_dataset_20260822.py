@@ -16,6 +16,7 @@ from admission_hybrid import (
 )
 from admission_v15_adapter import (
     DEFAULT_V15_ROOT,
+    TurnDatasetResult,
     TurnDatasetStateError,
     _HybridAdmissionRuntime,
     _HybridDatabaseProxy,
@@ -138,7 +139,7 @@ def test_current_dataset_uses_only_central_source_and_turn_id():
     proxy, connection = _proxy([])
 
     assert proxy.build_current_admission_list_dataset() == []
-    assert connection.params == (SOURCE, CURRENT_TURN, 500, 0)
+    assert connection.params == (SOURCE, CURRENT_TURN)
 
 
 def test_new_empty_turn_excludes_historical_rows_without_date_fallback():
@@ -149,7 +150,7 @@ def test_new_empty_turn_excludes_historical_rows_without_date_fallback():
     ) == []
     summary = proxy.refresh_turn_summary()
     assert summary["total"] == 0
-    assert summary["_status"] == "VALID"
+    assert summary["_status"] == "VALID_EMPTY"
 
 
 def test_general_urgency_and_consultation_keep_existing_summary_rules():
@@ -173,7 +174,7 @@ def test_previous_turn_identity_cannot_enter_current_dataset():
     assert proxy.build_turn_dataset(
         turn_id=PREVIOUS_TURN, operational_source_id=SOURCE
     ) == []
-    assert connection.params == (SOURCE, PREVIOUS_TURN, 500, 0)
+    assert connection.params == (SOURCE, PREVIOUS_TURN)
 
 
 def test_excel_and_turn_report_use_the_same_explicit_central_dataset():
@@ -225,7 +226,7 @@ def test_invalid_summary_refresh_retains_last_valid_count_instead_of_zero():
 
     assert stale["total"] == 3
     assert stale["_status"] == "STALE"
-    assert stale["_error_code"] == "TURN_ID_NOT_AVAILABLE"
+    assert stale["_error_code"] == "IDENTITY_UNAVAILABLE"
     assert proxy.resumen_turno_actual()["_status"] == "STALE"
 
 
@@ -288,27 +289,34 @@ def test_summary_refresh_classifies_dataset_and_stale_identity_failures():
     proxy, _connection = _proxy([])
     proxy._runtime.logger = logging.getLogger("test.summary-classification")
 
-    def invalid_dataset(**_kwargs):
-        raise TurnDatasetStateError("OPERATIONAL_SOURCE_ID_NOT_AVAILABLE")
+    def invalid_dataset(*, identity):
+        return TurnDatasetResult(
+            "IDENTITY_UNAVAILABLE", identity[0], identity[1], identity[2],
+            identity[3], (), "LAST_KNOWN_GOOD",
+            "OPERATIONAL_SOURCE_ID_NOT_AVAILABLE", "2026-08-22T00:00:00+00:00",
+        )
 
-    object.__setattr__(proxy, "build_turn_dataset", invalid_dataset)
+    object.__setattr__(proxy, "load_turn_dataset_result", invalid_dataset)
     invalid = proxy.refresh_turn_summary()
     assert invalid["_status"] == "INVALID_REFRESH"
     assert invalid["_error_code"] == "OPERATIONAL_SOURCE_ID_NOT_AVAILABLE"
 
     original_identity = proxy._runtime.operational_session
 
-    def changed_during_query(**_kwargs):
+    def changed_during_query(*, identity):
         proxy._runtime.operational_session = SimpleNamespace(
             operational_source_id=SOURCE,
             turn_id=CURRENT_TURN + 1,
             generation=2,
             operational_revision=2,
         )
-        return []
+        return TurnDatasetResult(
+            "VALID_EMPTY", identity[0], identity[1], identity[2], identity[3],
+            (), "CENTRAL", "", "2026-08-22T00:00:00+00:00",
+        )
 
     proxy._runtime.operational_session = original_identity
-    object.__setattr__(proxy, "build_turn_dataset", changed_during_query)
+    object.__setattr__(proxy, "load_turn_dataset_result", changed_during_query)
     stale = proxy.refresh_turn_summary()
     assert stale["_error_code"] == "STALE_OPERATIONAL_SNAPSHOT"
 
@@ -411,10 +419,14 @@ def test_failed_first_refresh_of_new_turn_does_not_relabel_previous_counts():
         operational_revision=1,
     )
 
-    def fail_query(**_kwargs):
-        raise RuntimeError("temporary database failure")
+    def fail_query(*, identity):
+        return TurnDatasetResult(
+            "DATABASE_UNAVAILABLE", identity[0], identity[1], identity[2],
+            identity[3], (), "LAST_KNOWN_GOOD", "DATABASE_UNAVAILABLE",
+            "2026-08-22T00:00:00+00:00",
+        )
 
-    object.__setattr__(proxy, "build_turn_dataset", fail_query)
+    object.__setattr__(proxy, "load_turn_dataset_result", fail_query)
     stale = proxy.refresh_turn_summary()
 
     assert stale["total"] == 3
