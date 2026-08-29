@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from openpyxl import load_workbook
@@ -17,13 +18,15 @@ from admission_statistical_reports import (
     COVERAGE_UNINSURED,
     SPECIALTY_ALL,
     AdmissionReportFilters,
+    ReportSnapshotStore,
+    SnapshotStaleError,
     build_admission_report_dataset,
     build_operational_period,
     build_turn_operational_period,
     coerce_hospital_datetime,
     search_ars_catalog,
 )
-from admission_v15_adapter import _HybridDatabaseProxy
+from admission_v15_adapter import ReportReadError, _HybridDatabaseProxy
 
 
 SOURCE_ID = "44444444-4444-4444-8444-444444444444"
@@ -266,6 +269,81 @@ def test_summary_cards_preview_and_records_share_one_result():
     )
 
 
+def test_snapshot_preserves_historical_representatives_in_chronological_order():
+    turns = (
+        {
+            "turn_id": 316,
+            "started_at": datetime(2026, 8, 27, 8),
+            "ends_at": datetime(2026, 8, 28, 8),
+            "representatives": (
+                {
+                    "user_id": "7",
+                    "username": "auxiliar.uno",
+                    "display_name": "Ana Pérez",
+                    "event_at": datetime(2026, 8, 27, 8),
+                },
+                {
+                    "user_id": "7",
+                    "username": "auxiliar.uno",
+                    "display_name": "Ana Pérez",
+                    "event_at": datetime(2026, 8, 27, 9),
+                },
+                {
+                    "user_id": "8",
+                    "username": "auxiliar.dos",
+                    "display_name": "Brenda Soto",
+                    "event_at": datetime(2026, 8, 27, 14),
+                },
+            ),
+        },
+    )
+
+    snapshot = build_admission_report_dataset(_ars_fixture(), _filters(), turns=turns)
+
+    assert snapshot.representatives == ("Ana Pérez", "Brenda Soto")
+    assert snapshot.summary["representantes"] == ("Ana Pérez", "Brenda Soto")
+    assert snapshot.summary["representante"] == "Ana Pérez, Brenda Soto"
+    assert snapshot.summary["representatives_by_turn"] == (
+        ("Turno actual", ("Ana Pérez", "Brenda Soto")),
+    )
+
+
+def test_snapshot_store_rejects_exports_after_any_filter_change():
+    empty_store = ReportSnapshotStore()
+    assert empty_store.snapshot is None
+    assert empty_store.invalidate_if_changed(_filters()) is False
+    with pytest.raises(SnapshotStaleError, match="Primero genere"):
+        empty_store.require_exportable()
+
+    original = _filters()
+    snapshot = build_admission_report_dataset(_ars_fixture(), original)
+    store = ReportSnapshotStore()
+    store.replace(snapshot)
+
+    assert store.require_exportable(original) is snapshot
+
+    changed = _filters(coverage=COVERAGE_INSURED)
+    store.invalidate_if_changed(changed)
+
+    with pytest.raises(SnapshotStaleError):
+        store.require_exportable(changed)
+
+
+def test_snapshot_exports_survive_database_loss_without_new_queries(tmp_path):
+    from ADMISION_PYSIDE6_V15 import facturacion_tabs_pyside6 as v15
+
+    snapshot = build_admission_report_dataset(_ars_fixture(), _filters())
+    pdf_path = tmp_path / "snapshot.pdf"
+    excel_path = tmp_path / "snapshot.xlsx"
+
+    assert v15.crear_pdf_reporte(snapshot.summary, destino=str(pdf_path)) == str(pdf_path)
+    assert v15.crear_excel_reporte_estadistico(
+        snapshot.summary, destino=str(excel_path)
+    ) == str(excel_path)
+    assert pdf_path.exists()
+    assert excel_path.exists()
+
+
 def test_malformed_historical_row_does_not_fail_the_whole_report():
     rows = [_row(1), {"attention_id": 2, "patient_name": None}]
 
@@ -350,6 +428,42 @@ class _CapturingConnection:
         return _Cursor(self.rows)
 
 
+class _ReportSourceConnection:
+    def __init__(self):
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, query, params=()):
+        query_text = str(query)
+        self.queries.append((query_text, tuple(params)))
+        if "admission_operational_turn_intervals" in query_text:
+            return _Cursor(
+                [
+                    {
+                        "turn_id": 316,
+                        "operational_source_id": SOURCE_ID,
+                        "started_at": datetime(2026, 8, 27, 8),
+                        "ends_at": datetime(2026, 8, 28, 8),
+                        "status": "CURRENT",
+                        "representatives": [
+                            {
+                                "user_id": "7",
+                                "username": "auxiliar",
+                                "display_name": "Ana Pérez",
+                                "event_at": "2026-08-27T08:00:00",
+                            }
+                        ],
+                    }
+                ]
+            )
+        return _Cursor([_row(1)])
+
+
 class _LocalDatabase:
     def obtener_atenciones_para_rango_real(self, *_args, **_kwargs):
         return []
@@ -382,6 +496,240 @@ def test_central_report_reader_uses_projection_and_operational_identity():
     assert "p.turn_id=%s" in connection.query
     assert connection.params[:2] == (SOURCE_ID, 316)
     assert "source_instance_id" not in connection.query.split("WHERE", 1)[1]
+
+
+def test_report_source_uses_one_pooled_connection_for_turns_and_records():
+    connection = _ReportSourceConnection()
+    factory_calls = 0
+
+    def connection_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return connection
+
+    runtime = SimpleNamespace(
+        offline=False,
+        logger=None,
+        host=SimpleNamespace(connection_factory=connection_factory),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id=SOURCE_ID,
+            turn_started_at=datetime(2026, 8, 27, 8),
+            turn_ends_at=datetime(2026, 8, 28, 8),
+        ),
+        _is_temporary_connection_error=lambda exc: isinstance(exc, TimeoutError),
+        _report_retry_delay_seconds=0,
+    )
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    source = proxy.load_statistical_report_source(
+        operational_source_id=SOURCE_ID,
+        turn_scope="Turno actual",
+        current_turn_id=316,
+        start_at=datetime(2026, 8, 27, 8),
+        end_at=datetime(2026, 8, 28, 8),
+    )
+
+    assert factory_calls == 1
+    assert len(connection.queries) == 2
+    assert source["turn_id"] == 316
+    assert source["records"][0]["attention_id"] == 1
+    assert source["turns"][0]["representatives"][0]["display_name"] == "Ana Pérez"
+
+
+def test_transient_report_timeout_retries_once_then_succeeds():
+    successful_connection = _ReportSourceConnection()
+    calls = 0
+    logger = Mock()
+
+    def connection_factory():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("connection timed out")
+        return successful_connection
+
+    runtime = SimpleNamespace(
+        offline=False,
+        logger=logger,
+        host=SimpleNamespace(connection_factory=connection_factory),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id=SOURCE_ID,
+            turn_started_at=datetime(2026, 8, 27, 8),
+            turn_ends_at=datetime(2026, 8, 28, 8),
+        ),
+        _is_temporary_connection_error=lambda exc: isinstance(exc, TimeoutError),
+        _report_retry_delay_seconds=0,
+    )
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    source = proxy.load_statistical_report_source(
+        operational_source_id=SOURCE_ID,
+        turn_scope="Turno actual",
+        current_turn_id=316,
+        start_at=datetime(2026, 8, 27, 8),
+        end_at=datetime(2026, 8, 28, 8),
+    )
+
+    assert calls == 2
+    assert len(source["records"]) == 1
+    logger.error.assert_called_once()
+
+
+def test_non_transient_report_query_error_is_classified_without_retry():
+    calls = 0
+
+    def connection_factory():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("column does_not_exist")
+
+    runtime = SimpleNamespace(
+        offline=False,
+        logger=None,
+        host=SimpleNamespace(connection_factory=connection_factory),
+        operational_session=SimpleNamespace(turn_id=316),
+        _is_temporary_connection_error=lambda _exc: False,
+        _report_retry_delay_seconds=0,
+    )
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    with pytest.raises(ReportReadError) as captured:
+        proxy.load_statistical_report_source(
+            operational_source_id=SOURCE_ID,
+            turn_scope="Turno actual",
+            current_turn_id=316,
+            start_at=datetime(2026, 8, 27, 8),
+            end_at=datetime(2026, 8, 28, 8),
+        )
+
+    assert calls == 1
+    assert captured.value.code == "REPORT_QUERY_ERROR"
+
+
+@pytest.mark.parametrize(
+    ("error", "temporary", "expected"),
+    (
+        (TimeoutError("timed out"), True, "REPORT_CONNECTION_TIMEOUT"),
+        (ConnectionError("connection refused"), True, "REPORT_DATABASE_UNAVAILABLE"),
+        (ValueError("invalid uuid"), False, "REPORT_DATA_ERROR"),
+        (ReportReadError("REPORT_DATA_ERROR", "safe"), False, "REPORT_DATA_ERROR"),
+    ),
+)
+def test_report_read_errors_have_safe_operational_categories(
+    error, temporary, expected
+):
+    runtime = SimpleNamespace(
+        _is_temporary_connection_error=lambda _exc: temporary,
+    )
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    assert proxy._classify_report_read_error(error).code == expected
+
+
+def test_all_turn_source_uses_period_prefilter_and_has_no_selected_turn():
+    connection = _ReportSourceConnection()
+    runtime = SimpleNamespace(
+        offline=False,
+        logger=None,
+        host=SimpleNamespace(connection_factory=lambda: connection),
+        operational_session=SimpleNamespace(turn_id=316),
+        _is_temporary_connection_error=lambda _exc: False,
+        _report_retry_delay_seconds=0,
+    )
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    source = proxy.load_statistical_report_source(
+        operational_source_id=SOURCE_ID,
+        turn_scope="Todos los turnos",
+        current_turn_id=316,
+        start_at=datetime(2026, 8, 1, 8),
+        end_at=datetime(2026, 9, 1, 8),
+    )
+
+    assert source["turn_id"] is None
+    assert source["selected_turn"] is None
+    record_query, record_params = connection.queries[-1]
+    assert "p.service_date BETWEEN %s AND %s" in record_query
+    assert record_params == (SOURCE_ID, "2026-07-31", "2026-09-01")
+
+
+def test_current_turn_fallback_and_missing_previous_are_explicit():
+    runtime = SimpleNamespace(
+        operational_session=SimpleNamespace(
+            turn_started_at=datetime(2026, 8, 27, 8),
+            turn_ends_at=datetime(2026, 8, 28, 8),
+        )
+    )
+    proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
+
+    fallback, turns = proxy._ensure_statistical_report_turn(
+        [],
+        source_id=SOURCE_ID,
+        turn_scope="Turno actual",
+        current_turn_id=316,
+    )
+
+    assert fallback["turn_id"] == 316
+    assert turns == [fallback]
+    with pytest.raises(ReportReadError) as captured:
+        proxy._ensure_statistical_report_turn(
+            [],
+            source_id=SOURCE_ID,
+            turn_scope="Turno anterior",
+            current_turn_id=316,
+        )
+    assert captured.value.code == "REPORT_DATA_ERROR"
+
+
+def test_offline_snapshot_loader_uses_local_source_and_persisted_turn():
+    requested = {}
+
+    class Local:
+        def obtener_atenciones_para_rango_real(self, start, end, **kwargs):
+            requested.update({"start": start, "end": end, **kwargs})
+            return [_row(1)]
+
+    runtime = SimpleNamespace(
+        offline=True,
+        logger=Mock(),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id=SOURCE_ID,
+            turn_started_at=datetime(2026, 8, 27, 8),
+            turn_ends_at=datetime(2026, 8, 28, 8),
+        ),
+    )
+    proxy = _HybridDatabaseProxy(Local(), runtime)
+
+    source = proxy.load_statistical_report_source(
+        operational_source_id=SOURCE_ID,
+        turn_scope="Turno actual",
+        current_turn_id=316,
+        start_at=datetime(2026, 8, 27, 8),
+        end_at=datetime(2026, 8, 28, 8),
+    )
+
+    assert len(source["records"]) == 1
+    assert source["turn_id"] == 316
+    assert requested["operational_turn_id"] == 316
+    runtime.logger.info.assert_called()
+
+
+def test_snapshot_loader_rejects_missing_operational_source_before_io():
+    proxy = _HybridDatabaseProxy(
+        _LocalDatabase(), SimpleNamespace(offline=False, logger=None)
+    )
+
+    with pytest.raises(ValueError):
+        proxy.load_statistical_report_source(
+            operational_source_id="",
+            turn_scope="Turno actual",
+            current_turn_id=316,
+            start_at=datetime(2026, 8, 27, 8),
+            end_at=datetime(2026, 8, 28, 8),
+        )
 
 
 def test_offline_report_reader_uses_local_replica_with_same_turn_identity():
@@ -516,6 +864,56 @@ def test_report_pdf_uses_the_same_filtered_summary_and_declares_filters(tmp_path
     assert "ARS EXCLUIR" in text
     assert "APS, HUMANO" in text
     assert "Total de pacientes del período: 55" in text
+
+
+def test_outputs_show_friendly_turn_and_persisted_representatives_without_id(tmp_path):
+    from ADMISION_PYSIDE6_V15 import facturacion_tabs_pyside6 as v15
+
+    friendly_label = (
+        "Turno actual · 27/08/2026 08:00 AM → 28/08/2026 08:00 AM"
+    )
+    turns = (
+        {
+            "turn_id": 316,
+            "started_at": datetime(2026, 8, 27, 8),
+            "representatives": (
+                {
+                    "user_id": "7",
+                    "username": "auxiliar",
+                    "display_name": "Ana Pérez",
+                    "event_at": datetime(2026, 8, 27, 8),
+                },
+            ),
+        },
+    )
+    dataset = build_admission_report_dataset(
+        [_row(1)], _filters(turn_label=friendly_label), turns=turns
+    )
+    pdf_path = tmp_path / "representantes.pdf"
+    excel_path = tmp_path / "representantes.xlsx"
+
+    v15.crear_pdf_reporte(dataset.summary, destino=str(pdf_path))
+    v15.crear_excel_reporte_estadistico(
+        dataset.summary, destino=str(excel_path)
+    )
+
+    pdf_text = "\n".join(
+        page.extract_text() or "" for page in PdfReader(pdf_path).pages
+    )
+    assert "ANA PÉREZ" in pdf_text
+    assert "ID 316" not in pdf_text
+    workbook = load_workbook(excel_path, data_only=True)
+    try:
+        listing = workbook["LISTADO DE PACIENTES"]
+        summary = workbook["RESUMEN ESTADÍSTICO"]
+        values = {
+            summary.cell(row, 1).value: summary.cell(row, 2).value
+            for row in range(1, summary.max_row + 1)
+        }
+        assert "ID 316" not in str(listing["A4"].value)
+        assert values["Representante(s)"] == "Ana Pérez"
+    finally:
+        workbook.close()
 
 
 def test_operational_and_report_excel_share_the_listing_builder_source():

@@ -608,7 +608,7 @@ def test_v15_turn_display_config_uses_the_adopted_central_snapshot():
     assert config["inicio_real_dt"].tzinfo is None
 
 
-def test_primary_representative_turn_path_does_not_use_user_transition_guard():
+def test_local_turn_materialization_never_invokes_a_central_transition():
     class _TurnDatabase:
         def obtener_o_crear_turno(self, _config, **_kwargs):
             return 77
@@ -625,16 +625,8 @@ def test_primary_representative_turn_path_does_not_use_user_transition_guard():
             self.transition_guard_calls = 0
             self.changed = []
 
-        def require_primary_turn_change(self):
+        def require_write(self):
             self.turn_guard_calls += 1
-
-        def require_primary_transition(self):
-            self.transition_guard_calls += 1
-            raise AssertionError("normal turn must not use user-transition guard")
-
-        def change_primary_turn(self, turn_id, *, shift_metadata):
-            self.changed.append((turn_id, dict(shift_metadata)))
-            return SimpleNamespace(committed=True)
 
     runtime = _Runtime()
     proxy = _HybridDatabaseProxy(_TurnDatabase(), runtime)
@@ -642,7 +634,7 @@ def test_primary_representative_turn_path_does_not_use_user_transition_guard():
     assert proxy.obtener_o_crear_turno({"turno_codigo": "8AM_8PM"}) == 77
     assert runtime.turn_guard_calls == 1
     assert runtime.transition_guard_calls == 0
-    assert runtime.changed == [(77, {"turno_codigo": "8AM_8PM"})]
+    assert runtime.changed == []
 
 
 def test_adopted_central_snapshot_updates_turn_and_representative_before_mirror():
@@ -697,23 +689,29 @@ def test_adopted_central_snapshot_updates_turn_and_representative_before_mirror(
 
 
 def test_turn_summary_uses_canonical_dataset_and_excludes_urgency_and_consultation():
+    rows = [
+        {"tipo_atencion": "EMERGENCIA", "hoja_normalizada": "GENERAL", "ars_display": "SIN SEGURO"},
+        {"tipo_atencion": "EMERGENCIA", "hoja_normalizada": "PEDIATRIA", "ars_display": "HUMANO"},
+        {"tipo_atencion": "EMERGENCIA", "hoja_normalizada": "GINECOLOGIA", "ars_display": ""},
+        {"tipo_atencion": "URGENCIA", "hoja_normalizada": "GENERAL", "ars_display": "HUMANO"},
+        {"tipo_atencion": "CONSULTA", "hoja_normalizada": "GENERAL", "ars_display": "HUMANO"},
+    ]
     runtime = SimpleNamespace(
         offline=False,
         host=SimpleNamespace(connection_factory=lambda: _CloudConnection()),
-        operational_session=SimpleNamespace(turn_id=316),
+        operational_session=SimpleNamespace(
+            turn_id=316,
+            operational_source_id="central-source",
+            generation=12,
+            operational_revision=6,
+        ),
         logger=logging.getLogger("test.turn-summary"),
     )
     proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
     object.__setattr__(
         proxy,
-        "build_current_admission_list_dataset",
-        lambda: [
-            {"tipo_atencion": "EMERGENCIA", "hoja_normalizada": "GENERAL", "ars_display": "SIN SEGURO"},
-            {"tipo_atencion": "EMERGENCIA", "hoja_normalizada": "PEDIATRIA", "ars_display": "HUMANO"},
-            {"tipo_atencion": "EMERGENCIA", "hoja_normalizada": "GINECOLOGIA", "ars_display": ""},
-            {"tipo_atencion": "URGENCIA", "hoja_normalizada": "GENERAL", "ars_display": "HUMANO"},
-            {"tipo_atencion": "CONSULTA", "hoja_normalizada": "GENERAL", "ars_display": "HUMANO"},
-        ],
+        "build_turn_dataset",
+        lambda **_kwargs: rows,
     )
 
     summary = proxy.refresh_turn_summary()

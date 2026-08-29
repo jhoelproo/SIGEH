@@ -19,7 +19,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from types import MethodType
 from typing import Any, ClassVar
 
@@ -120,6 +120,81 @@ class AdmissionV15EventBus(QObject):
 
 class AdmissionV15IntegrationError(RuntimeError):
     """V15 no pudo cargarse o construirse dentro de la aplicación principal."""
+
+
+class ReportReadError(RuntimeError):
+    """Safe, categorized failure while loading one statistical snapshot."""
+
+    def __init__(self, code: str, safe_message: str):
+        super().__init__(safe_message)
+        self.code = str(code)
+        self.safe_message = str(safe_message)
+
+
+class TurnDatasetStateError(RuntimeError):
+    """The operational identity was not valid enough to query a turn."""
+
+    def __init__(self, code: str):
+        self.code = str(code or "INVALID_DATASET_STATE")
+        super().__init__(self.code)
+
+
+@dataclass(frozen=True)
+class TurnSummarySnapshot:
+    """Versioned counts derived from one confirmed operational identity."""
+
+    operational_source_id: str
+    turn_id: int | None
+    generation: int
+    operational_revision: int
+    counts: Mapping[str, int]
+    refreshed_at: str
+    status: str
+    error_code: str = ""
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            **{key: int(value or 0) for key, value in self.counts.items()},
+            "_operational_source_id": self.operational_source_id,
+            "_turn_id": self.turn_id,
+            "_generation": self.generation,
+            "_operational_revision": self.operational_revision,
+            "_refreshed_at": self.refreshed_at,
+            "_status": self.status,
+            "_error_code": self.error_code,
+        }
+
+
+def _operational_identity_tuple(session: Any) -> tuple[str, int, int, int] | None:
+    source_id = str(getattr(session, "operational_source_id", "") or "").strip()
+    try:
+        turn_id = int(getattr(session, "turn_id", 0) or 0)
+        generation = int(getattr(session, "generation", 0) or 0)
+        revision = int(getattr(session, "operational_revision", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not source_id or turn_id <= 0:
+        return None
+    return source_id, turn_id, generation, revision
+
+
+def summary_result_matches_runtime_identity(
+    result: Mapping[str, Any], runtime: Any
+) -> bool:
+    """Reject a worker result when any operational identity component changed."""
+    current = _operational_identity_tuple(getattr(runtime, "operational_session", None))
+    if current is None:
+        return False
+    try:
+        incoming = (
+            str(result.get("_operational_source_id") or "").strip(),
+            int(result.get("_turn_id") or 0),
+            int(result.get("_generation") or 0),
+            int(result.get("_operational_revision") or 0),
+        )
+    except (TypeError, ValueError):
+        return False
+    return incoming == current
 
 
 class _BackgroundTaskSignals(QObject):
@@ -332,23 +407,6 @@ class _HybridAdmissionRuntime:
                 (perf_counter() - started) * 1000.0,
             )
             raise
-        repair_identity = getattr(
-            self.session_service, "repair_ambiguous_current_turn_identity", None
-        )
-        if self.attachment.role == self.StationRole.PRIMARY and callable(repair_identity):
-            repaired_session = repair_identity(
-                operational_session_id=self.attachment.operational_session.operational_session_id,
-                primary_device_id=self.device_id,
-            )
-            if repaired_session is not None:
-                from admission_hybrid import DeviceAttachment
-
-                self.attachment = DeviceAttachment(
-                    repaired_session,
-                    self.StationRole.PRIMARY,
-                    True,
-                    self.attachment.message,
-                )
         self._refresh_authoritative_state(reason="initial_attach")
         self._attachment_from_cache = False
         self.status_message = self.attachment.message or "Conectado."
@@ -1144,62 +1202,39 @@ class _HybridAdmissionRuntime:
             return {**self.state(), "local_mirror_pending": True}
         return self.state()
 
-    @staticmethod
-    def _matches_current_turn_metadata(
-        session: Any,
-        metadata: Mapping[str, Any],
-    ) -> bool:
-        """Avoids treating a replica-local SQLite id as a central turn id."""
-        requested_code = str(metadata.get("turno_codigo") or "").strip().upper()
-        current_code = str(getattr(session, "turn_code", "") or "").strip().upper()
-        if requested_code and requested_code != current_code:
-            return False
-        requested_date = str(metadata.get("fecha_base") or "").strip()
-        if not requested_date:
-            return bool(requested_code and current_code == requested_code)
-        try:
-            if "/" in requested_date:
-                requested_day = datetime.strptime(requested_date, "%d/%m/%Y").date()
-            else:
-                requested_day = datetime.fromisoformat(requested_date[:10]).date()
-            started_at = getattr(session, "turn_started_at", None)
-            if isinstance(started_at, str):
-                started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-            return bool(
-                requested_code
-                and current_code == requested_code
-                and started_at is not None
-                and started_at.date() == requested_day
-            )
-        except (TypeError, ValueError):
-            return False
-
-    def change_primary_turn(
+    def perform_explicit_turn_handoff(
         self,
-        turn_id: int | None,
+        turn_id: int | None = None,
         *,
         shift_metadata: Mapping[str, Any] | None = None,
     ):
+        """The only normal-operation boundary allowed to allocate a central turn."""
+        from admission_hybrid import (
+            AdmissionWriteBlocked,
+            ConnectivityState,
+            SAME_USER_HANDOFF_MESSAGE,
+            TRIGGER_USER_REQUESTED_HANDOFF,
+            evaluate_admission_access,
+            same_user,
+        )
+
         self.require_primary_turn_change()
         session = self.operational_session
         if session is None:
-            return None
+            raise AdmissionWriteBlocked("No existe una sesión operativa activa.")
         from dataclasses import replace
         from admission_hybrid import DeviceAttachment
 
         metadata = dict(shift_metadata or {})
-        if (
-            self._matches_current_turn_metadata(session, metadata)
-            and not self._pending_transition_id
-        ):
-            return self._last_transition_result
+        administrative_override = bool(metadata.get("administrative_override"))
+        override_reason = str(metadata.get("override_reason") or "").strip()
+        formal_handover = self.is_primary_shift_handover() and not administrative_override
+        if not administrative_override and not formal_handover:
+            raise AdmissionWriteBlocked(SAME_USER_HANDOFF_MESSAGE)
         if not self._pending_transition_id:
             import uuid
             self._pending_transition_id = str(uuid.uuid4())
 
-        administrative_override = bool(metadata.get("administrative_override"))
-        override_reason = str(metadata.get("override_reason") or "").strip()
-        formal_handover = self.is_primary_shift_handover() and not administrative_override
         if formal_handover:
             self.logger.info(
                 "PRIMARY_SHIFT_HANDOVER_START device_id=%s revision=%s",
@@ -1220,6 +1255,7 @@ class _HybridAdmissionRuntime:
                 reason="Relevo formal de turno PRIMARY V15",
                 invalidate_secondaries=True,
                 invalidate_only_previous_user_secondaries=True,
+                trigger=TRIGGER_USER_REQUESTED_HANDOFF,
             )
             self.logger.info(
                 "PRIMARY_SHIFT_HANDOVER_COMMIT device_id=%s revision=%s invalidated=%s",
@@ -1228,9 +1264,8 @@ class _HybridAdmissionRuntime:
                 len(result.invalidated_login_session_ids),
             )
         else:
-            # Same representative and administrative schedule corrections keep
-            # the representative unchanged. Manual representative correction is
-            # a separate, Admin-authorized operation.
+            # Extraordinary Admin turn correction remains explicitly separate
+            # from the normal representative+turn handoff.
             result = self.session_service.admin_set_admission_turn(
                 actor_user=self.current_user,
                 operational_session_id=session.operational_session_id,
@@ -1251,6 +1286,20 @@ class _HybridAdmissionRuntime:
         if result.committed:
             self._pending_transition_id = ""
         self._last_transition_result = result
+        identity_matches = same_user(changed, self.current_user)
+        access = evaluate_admission_access(
+            self.current_user,
+            {
+                "base_write_allowed": True,
+                "device_role": self.StationRole.PRIMARY,
+                "connection_state": ConnectivityState.CONNECTED,
+                "status": changed.status,
+                "reason_code": "TURN_CHANGE_COMMITTED",
+                "active_user_id": changed.active_user_id,
+                "active_username": changed.active_username,
+            },
+        )
+        message = "Conectado · Sincronizando réplica..."
         if self._operational_state is not None:
             confirmed_state = replace(
                 self._operational_state,
@@ -1268,10 +1317,17 @@ class _HybridAdmissionRuntime:
                 lease_generation=changed.lease_generation,
                 device_role=self.StationRole.PRIMARY,
                 device_attached=True,
-                write_allowed=True,
-                sync_state="ONLINE_SYNCED",
+                user_matches_operational=identity_matches,
+                write_allowed=bool(access.write_allowed),
+                connection_state=ConnectivityState.CONNECTED,
+                sync_state="LOCAL_MIRROR_PENDING",
                 reason_code="TURN_CHANGE_COMMITTED",
-                message="Conectado.",
+                message=message,
+                invalidated_reason="",
+                view_allowed=access.view_allowed,
+                can_manage_primary=access.can_manage_primary,
+                can_change_turn=access.can_change_turn,
+                can_generate_attention=access.can_generate_attention,
             )
             self.apply_operational_snapshot(
                 confirmed_state,
@@ -1279,31 +1335,29 @@ class _HybridAdmissionRuntime:
             )
         else:
             self.attachment = DeviceAttachment(
-                changed, self.StationRole.PRIMARY, True, "Conectado."
+                changed,
+                self.StationRole.PRIMARY,
+                bool(access.write_allowed),
+                message,
             )
-        try:
-            self.refresh_operational_state(force_remote=True)
-        except Exception:
-            self.logger.exception(
-                "Transición confirmada; el refresco remoto se reintentará por heartbeat"
-            )
-        if self.store:
-            try:
-                self.store.apply_remote_operational_state(
-                    changed,
-                    self.StationRole.PRIMARY,
-                    device_id=self.device_id,
-                    actor_user_id=self.user_id,
-                    actor_username=self.username,
-                )
-                self._mirror_v15_turn_config(changed)
-                self._last_mirrored_generation = changed.generation
-                self._last_mirrored_operational_revision = changed.operational_revision
-            except Exception:
-                self.logger.exception(
-                    "Transición confirmada; el espejo local se reintentará"
-                )
+        self.status_message = message
+        self.offline = False
+        self.offline_lease_valid = bool(access.write_allowed)
+        self._force_logout_emitted = False
+        self._pending_mirror_state = self._operational_state
         return result
+
+    def change_primary_turn(
+        self,
+        turn_id: int | None,
+        *,
+        shift_metadata: Mapping[str, Any] | None = None,
+    ):
+        """Compatibility alias requiring the same explicit handoff boundary."""
+        return self.perform_explicit_turn_handoff(
+            turn_id,
+            shift_metadata=shift_metadata,
+        )
 
 
     def admin_correct_current_turn_representative(
@@ -1375,6 +1429,8 @@ class _HybridAdmissionRuntime:
                 "connection_state": ConnectivityState.CONNECTED,
                 "status": changed.status,
                 "reason_code": "ADMIN_REPRESENTATIVE_CORRECTION_COMMITTED",
+                "active_user_id": changed.active_user_id,
+                "active_username": changed.active_username,
             },
         )
         representative = (
@@ -1739,7 +1795,10 @@ class _HybridAdmissionRuntime:
                     raise
                 self.connection_supervisor.mark_offline(exc)
                 cached = self.store.cached_attachment()
-                if cached is not None:
+                # A replica may lag or even contain an older turn. Once a
+                # central snapshot has been adopted, a network failure may
+                # mark it stale but must never replace its identity.
+                if self.attachment is None and cached is not None:
                     if self.app_user_can_operate_admission:
                         self.attachment = cached
                         self.offline_lease_valid = bool(cached.writable)
@@ -1747,11 +1806,22 @@ class _HybridAdmissionRuntime:
                         self._set_auxiliary_operational_state(
                             cached.operational_session
                         )
+                if self._operational_state is not None:
+                    from dataclasses import replace
+                    from admission_hybrid import ConnectivityState
+
+                    self._operational_state = replace(
+                        self._operational_state,
+                        connection_state=ConnectivityState.OFFLINE,
+                        sync_state="STALE_OPERATIONAL_SNAPSHOT",
+                        reason_code="CENTRAL_TEMPORARILY_UNAVAILABLE",
+                        message="Conexión temporalmente no verificada.",
+                    )
                 self.offline = True
                 self.status_message = (
-                    "Sin conexión · Admisión en solo lectura"
+                    "Conexión temporalmente no verificada · Admisión en solo lectura"
                     if not self.app_user_can_operate_admission
-                    else "Sin conexión · trabajando localmente"
+                    else "Conexión temporalmente no verificada · trabajando localmente"
                 )
                 return self.state()
 
@@ -1882,7 +1952,6 @@ class _HybridDatabaseProxy:
 
     _primary_methods: ClassVar[set[str]] = {
         "cerrar_turno_existente",
-        "obtener_o_crear_turno",
         "actualizar_representante_turno",
         "notify_shift_changed",
     }
@@ -1909,6 +1978,8 @@ class _HybridDatabaseProxy:
             "GINECOLOGIA": 0,
             "URGENCIAS": 0,
             "CONSULTAS": 0,
+            "_status": "INVALID_REFRESH",
+            "_error_code": "SUMMARY_NOT_LOADED",
         })
 
     @property
@@ -1927,8 +1998,46 @@ class _HybridDatabaseProxy:
     def refresh_turn_summary(self) -> dict[str, Any]:
         """Resumen derivado del mismo dataset canónico usado por Historial/Excel."""
         started = perf_counter()
-        rows = self.build_current_admission_list_dataset()
-        summary = {
+        session = self._runtime.operational_session
+        identity = _operational_identity_tuple(session)
+        if identity is None:
+            return self._stale_turn_summary(
+                error_code="TURN_ID_NOT_AVAILABLE",
+                started=started,
+            )
+        source_id, turn_id, generation, revision = identity
+        try:
+            rows = self.build_turn_dataset(
+                turn_id=turn_id,
+                operational_source_id=source_id,
+            )
+        except TurnDatasetStateError as exc:
+            return self._stale_turn_summary(
+                error_code=exc.code,
+                started=started,
+                identity=identity,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserves last valid snapshot
+            logger = getattr(self._runtime, "logger", None)
+            if logger is not None:
+                logger.exception(
+                    "TURN_SUMMARY_QUERY_FAILED exception_type=%s",
+                    type(exc).__name__,
+                )
+            return self._stale_turn_summary(
+                error_code="DB_ERROR",
+                started=started,
+                identity=identity,
+            )
+
+        if _operational_identity_tuple(self._runtime.operational_session) != identity:
+            return self._stale_turn_summary(
+                error_code="STALE_OPERATIONAL_SNAPSHOT",
+                started=started,
+                identity=identity,
+            )
+
+        counts = {
             "total": 0,
             "sin_seguro": 0,
             "GENERAL": 0,
@@ -1936,14 +2045,13 @@ class _HybridDatabaseProxy:
             "GINECOLOGIA": 0,
             "URGENCIAS": 0,
             "CONSULTAS": 0,
-            "_fuente": "DATASET_HIBRIDO_CANONICO",
         }
         for row in rows:
             attention_type = str(row.get("tipo_atencion") or "EMERGENCIA").upper()
             if attention_type == "URGENCIA":
-                summary["URGENCIAS"] += 1
+                counts["URGENCIAS"] += 1
             elif attention_type == "CONSULTA":
-                summary["CONSULTAS"] += 1
+                counts["CONSULTAS"] += 1
             else:
                 specialty = str(
                     row.get("hoja_normalizada") or row.get("specialty") or "GENERAL"
@@ -1953,20 +2061,36 @@ class _HybridDatabaseProxy:
                     else "GINECOLOGIA" if "GINE" in specialty
                     else "GENERAL"
                 )
-                summary[key] += 1
-                summary["total"] += 1
+                counts[key] += 1
+                counts["total"] += 1
             if str(row.get("ars_display") or row.get("canonical_ars") or "").upper() in {
                 "", "SIN SEGURO"
             }:
-                summary["sin_seguro"] += 1
+                counts["sin_seguro"] += 1
+        summary = TurnSummarySnapshot(
+            operational_source_id=source_id,
+            turn_id=turn_id,
+            generation=generation,
+            operational_revision=revision,
+            counts=counts,
+            refreshed_at=datetime.now(timezone.utc).isoformat(),
+            status="VALID",
+        ).to_mapping()
+        summary["_fuente"] = "DATASET_HIBRIDO_CANONICO"
         with self._summary_lock:
-            self._turn_summary = summary
+            object.__setattr__(self, "_turn_summary", summary)
         logger = getattr(self._runtime, "logger", None)
         if logger is not None:
             logger.info(
-                "TURN_SUMMARY_REFRESH turn_id=%s count=%s",
-                getattr(self._runtime.operational_session, "turn_id", None),
+                "TURN_SUMMARY_REFRESH turn_id=%s operational_source_id=%s "
+                "generation=%s operational_revision=%s status=VALID count=%s "
+                "source=DATASET_HIBRIDO_CANONICO error_code=- elapsed_ms=%.1f",
+                turn_id,
+                source_id,
+                generation,
+                revision,
                 len(rows),
+                (perf_counter() - started) * 1000.0,
             )
             logger.info(
                 "TURN_SUMMARY_COUNTS turn_id=%s total=%s sin_seguro=%s general=%s "
@@ -1978,6 +2102,63 @@ class _HybridDatabaseProxy:
                 (perf_counter() - started) * 1000.0,
             )
         return summary
+
+    def _stale_turn_summary(
+        self,
+        *,
+        error_code: str,
+        started: float,
+        identity: tuple[str, int, int, int] | None = None,
+    ) -> dict[str, Any]:
+        """Keep the last valid counts when an identity/query refresh is invalid."""
+        with self._summary_lock:
+            previous = dict(self._turn_summary)
+        had_valid = previous.get("_status") in {"VALID", "STALE"}
+        # Counts and identity are one immutable snapshot.  If the current
+        # turn changed while a refresh was failing, retaining the old counts
+        # under the new identity would leak the previous turn's total into
+        # the new one.  Keep the whole last-valid snapshot together; the GUI
+        # identity guard will discard it when the runtime already moved on.
+        fallback_identity = None
+        if had_valid and previous.get("_turn_id"):
+            fallback_identity = (
+                str(previous.get("_operational_source_id") or ""),
+                int(previous.get("_turn_id") or 0),
+                int(previous.get("_generation") or 0),
+                int(previous.get("_operational_revision") or 0),
+            )
+        elif identity is not None:
+            fallback_identity = identity
+        source_id, turn_id, generation, revision = fallback_identity or ("", 0, 0, 0)
+        previous.update(
+            {
+                "_operational_source_id": source_id,
+                "_turn_id": turn_id or None,
+                "_generation": generation,
+                "_operational_revision": revision,
+                "_refreshed_at": datetime.now(timezone.utc).isoformat(),
+                "_status": "STALE" if had_valid else "INVALID_REFRESH",
+                "_error_code": str(error_code or "INVALID_DATASET_STATE"),
+            }
+        )
+        with self._summary_lock:
+            object.__setattr__(self, "_turn_summary", dict(previous))
+        logger = getattr(self._runtime, "logger", None)
+        if logger is not None:
+            logger.warning(
+                "TURN_SUMMARY_REFRESH turn_id=%s operational_source_id=%s "
+                "generation=%s operational_revision=%s status=%s count=%s "
+                "source=LAST_VALID_SNAPSHOT error_code=%s elapsed_ms=%.1f",
+                turn_id or None,
+                source_id or "-",
+                generation,
+                revision,
+                previous["_status"],
+                int(previous.get("total") or 0),
+                previous["_error_code"],
+                (perf_counter() - started) * 1000.0,
+            )
+        return previous
 
     @staticmethod
     def _history_sort_key(row: Mapping[str, Any]):
@@ -2449,14 +2630,23 @@ class _HybridDatabaseProxy:
         effective_turn = int(turn_id or 0)
         operational_source = str(operational_source_id or "").strip()
         logger = getattr(self._runtime, "logger", None)
-        if effective_turn <= 0 or not operational_source:
+        if effective_turn <= 0:
             if logger is not None:
                 logger.warning(
-                    "CURRENT_TURN_DATASET turn_id=%s source=%s count=0 reason=TURN_ID_NOT_AVAILABLE",
+                    "CURRENT_TURN_DATASET turn_id=%s source=%s status=INVALID_DATASET_STATE "
+                    "reason=TURN_ID_NOT_AVAILABLE",
                     effective_turn,
                     operational_source or "-",
                 )
-            return []
+            raise TurnDatasetStateError("TURN_ID_NOT_AVAILABLE")
+        if not operational_source:
+            if logger is not None:
+                logger.warning(
+                    "CURRENT_TURN_DATASET turn_id=%s source=- status=INVALID_DATASET_STATE "
+                    "reason=OPERATIONAL_SOURCE_ID_NOT_AVAILABLE",
+                    effective_turn,
+                )
+            raise TurnDatasetStateError("OPERATIONAL_SOURCE_ID_NOT_AVAILABLE")
         if bool(getattr(self._runtime, "offline", False)):
             rows = self._local_list_rows(
                 effective_turn, operational_source, pending_only=False
@@ -2480,6 +2670,375 @@ class _HybridDatabaseProxy:
                 effective_turn, operational_source, len(result),
             )
         return result
+
+    @staticmethod
+    def _statistical_report_records_query(
+        *,
+        operational_source_id: str,
+        turn_id: int | None,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> tuple[str, tuple[Any, ...]]:
+        select_clause = """SELECT p.*,
+                          p.attention_id AS id,
+                          p.patient_name AS nombre,
+                          p.service_date AS fecha,
+                          p.service_time AS hora,
+                          p.specialty AS hoja,
+                          p.canonical_ars AS ars,
+                          p.nss_snapshot AS nss,
+                          p.cedula_snapshot AS cedula,
+                          p.service_type AS tipo_atencion
+                     FROM admission_attention_projection p
+                    WHERE COALESCE(p.is_deleted,FALSE)=FALSE
+                      AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
+                          IN ('ACTIVA','PENDIENTE')
+                      AND p.operational_source_id::TEXT=%s"""
+        order_clause = """ ORDER BY COALESCE(p.created_at_effective_utc,
+                                      NULLIF(p.synced_at,'')::TIMESTAMPTZ),
+                             COALESCE(p.origin_device_id,''),
+                             COALESCE(p.device_local_sequence,0),
+                             COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT)"""
+        if turn_id is not None:
+            return (
+                select_clause + " AND p.turn_id=%s" + order_clause,
+                (operational_source_id, int(turn_id)),
+            )
+        return (
+            select_clause + " AND p.service_date BETWEEN %s AND %s" + order_clause,
+            (
+                operational_source_id,
+                (start_at.date() - timedelta(days=1)).isoformat(),
+                end_at.date().isoformat(),
+            ),
+        )
+
+    @classmethod
+    def _query_statistical_report_records(
+        cls,
+        connection: Any,
+        *,
+        operational_source_id: str,
+        turn_id: int | None,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[dict[str, Any]]:
+        sql, params = cls._statistical_report_records_query(
+            operational_source_id=operational_source_id,
+            turn_id=turn_id,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        return [dict(row) for row in connection.execute(sql, params).fetchall()]
+
+    @staticmethod
+    def _query_statistical_report_turns(
+        connection: Any,
+        *,
+        operational_source_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        sql = """WITH report_turns AS (
+                     SELECT i.operational_session_id,i.generation,i.turn_id,
+                            s.operational_source_id::TEXT AS operational_source_id,
+                            i.started_at,
+                            COALESCE(i.ended_at,i.nominal_ends_at,s.turn_ends_at) AS ends_at,
+                            CASE
+                              WHEN s.turn_id=i.turn_id AND s.status='ACTIVE' THEN 'CURRENT'
+                              WHEN i.ended_at IS NULL THEN 'OPEN'
+                              ELSE 'CLOSED'
+                            END AS status,
+                            i.active_user_id,i.active_username
+                       FROM admission_operational_turn_intervals i
+                       JOIN admission_operational_sessions s
+                         ON s.operational_session_id=i.operational_session_id
+                      WHERE s.operational_source_id::TEXT=%s
+                        AND i.turn_id IS NOT NULL
+                      ORDER BY i.started_at DESC,i.generation DESC
+                      LIMIT %s
+                   ), representative_evidence AS (
+                     SELECT t.turn_id,t.started_at AS event_at,
+                            t.active_user_id AS user_id,t.active_username AS username
+                       FROM report_turns t
+                     UNION ALL
+                     SELECT t.turn_id,a.created_at AS event_at,
+                            NULLIF(a.details_json->>'new_user_id','') AS user_id,
+                            NULLIF(a.details_json->>'new_username','') AS username
+                       FROM report_turns t
+                       JOIN admission_operational_audit a
+                         ON a.operational_session_id=t.operational_session_id
+                        AND a.event_type='TURN_REPRESENTATIVE_ADMIN_CORRECTED'
+                        AND a.details_json->>'turn_id'=t.turn_id::TEXT
+                   )
+                   SELECT t.turn_id,t.operational_source_id,t.started_at,t.ends_at,t.status,
+                          COALESCE((
+                            SELECT jsonb_agg(
+                                     jsonb_build_object(
+                                       'user_id',COALESCE(e.user_id,''),
+                                       'username',COALESCE(e.username,''),
+                                       'display_name',COALESCE(
+                                         NULLIF(TRIM(u.full_name),''),
+                                         NULLIF(TRIM(e.username),''),''
+                                       ),
+                                       'event_at',e.event_at
+                                     ) ORDER BY e.event_at
+                                   )
+                              FROM representative_evidence e
+                              LEFT JOIN users u ON CAST(u.id AS TEXT)=e.user_id
+                             WHERE e.turn_id=t.turn_id
+                          ),'[]'::jsonb) AS representatives
+                     FROM report_turns t
+                    ORDER BY t.started_at DESC,t.generation DESC"""
+        return [
+            dict(row)
+            for row in connection.execute(
+                sql,
+                (
+                    operational_source_id,
+                    max(1, min(int(limit or 100), 500)),
+                ),
+            ).fetchall()
+        ]
+
+    def _classify_report_read_error(self, exc: BaseException) -> ReportReadError:
+        if isinstance(exc, ReportReadError):
+            return exc
+        text = str(exc or "").casefold()
+        temporary_types = getattr(self._runtime, "_temporary_errors", ())
+        temporary = isinstance(exc, temporary_types) or bool(
+            self._runtime._is_temporary_connection_error(exc)
+        )
+        if temporary and ("timeout" in text or "timed out" in text):
+            return ReportReadError(
+                "REPORT_CONNECTION_TIMEOUT",
+                "La conexión central tardó demasiado en responder.",
+            )
+        if temporary:
+            return ReportReadError(
+                "REPORT_DATABASE_UNAVAILABLE",
+                "La base central no está disponible temporalmente.",
+            )
+        data_tokens = ("invalid input syntax", "invalid uuid", "datatype mismatch")
+        if any(token in text for token in data_tokens):
+            return ReportReadError(
+                "REPORT_DATA_ERROR",
+                "El reporte encontró metadata histórica incompatible.",
+            )
+        return ReportReadError(
+            "REPORT_QUERY_ERROR",
+            "No fue posible completar la consulta del reporte.",
+        )
+
+    def _run_statistical_report_read(
+        self, operation: Callable[[], dict[str, Any]]
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        logger = getattr(self._runtime, "logger", None)
+        for attempt in (1, 2):
+            try:
+                result = operation()
+                if logger is not None:
+                    logger.info(
+                        "STATISTICAL_REPORT_READ_SUCCEEDED operation=load_snapshot "
+                        "attempt=%s connection_acquisitions=%s turn_rows=%s "
+                        "attention_rows=%s elapsed_ms=%.1f",
+                        attempt,
+                        attempt,
+                        len(result.get("turns") or ()),
+                        len(result.get("records") or ()),
+                        (perf_counter() - started) * 1000.0,
+                    )
+                return result
+            except Exception as exc:  # noqa: BLE001 - categorized DB boundary
+                classified = self._classify_report_read_error(exc)
+                if logger is not None:
+                    logger.error(
+                        "STATISTICAL_REPORT_READ_FAILED code=%s operation=load_snapshot "
+                        "exception_type=%s safe_error_message=%s attempt=%s elapsed_ms=%.1f",
+                        classified.code,
+                        type(exc).__name__,
+                        classified.safe_message,
+                        attempt,
+                        (perf_counter() - started) * 1000.0,
+                    )
+                if classified.code not in {
+                    "REPORT_CONNECTION_TIMEOUT",
+                    "REPORT_DATABASE_UNAVAILABLE",
+                } or attempt == 2:
+                    raise classified from exc
+                delay = max(
+                    0.0,
+                    float(getattr(self._runtime, "_report_retry_delay_seconds", 0.2)),
+                )
+                if delay:
+                    sleep(delay)
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _select_statistical_report_turn(
+        turns: Iterable[Mapping[str, Any]],
+        *,
+        turn_scope: str,
+        current_turn_id: int,
+    ) -> dict[str, Any] | None:
+        if turn_scope == "Todos los turnos":
+            return None
+        candidates = [dict(row) for row in turns]
+        if turn_scope == "Turno actual":
+            return next(
+                (
+                    row
+                    for row in candidates
+                    if int(row.get("turn_id") or 0) == int(current_turn_id or 0)
+                ),
+                None,
+            )
+        return next(
+            (
+                row
+                for row in candidates
+                if int(row.get("turn_id") or 0) != int(current_turn_id or 0)
+            ),
+            None,
+        )
+
+    def _ensure_statistical_report_turn(
+        self,
+        turns: list[dict[str, Any]],
+        *,
+        source_id: str,
+        turn_scope: str,
+        current_turn_id: int,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        selected = self._select_statistical_report_turn(
+            turns,
+            turn_scope=turn_scope,
+            current_turn_id=current_turn_id,
+        )
+        if turn_scope == "Todos los turnos" or selected is not None:
+            return selected, turns
+        if turn_scope == "Turno anterior":
+            raise ReportReadError(
+                "REPORT_DATA_ERROR",
+                "No existe un turno anterior central disponible.",
+            )
+        session = self._runtime.operational_session
+        fallback = {
+            "turn_id": int(current_turn_id),
+            "operational_source_id": source_id,
+            "started_at": getattr(session, "turn_started_at", None),
+            "ends_at": getattr(session, "turn_ends_at", None),
+            "status": "CURRENT",
+            "representatives": (),
+        }
+        return fallback, [fallback, *turns]
+
+    @staticmethod
+    def _statistical_report_source_result(
+        *,
+        turns: list[dict[str, Any]],
+        selected_turn: dict[str, Any] | None,
+        records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        turn_id = int(selected_turn["turn_id"]) if selected_turn is not None else None
+        return {
+            "turn_id": turn_id,
+            "selected_turn": selected_turn,
+            "turns": turns,
+            "records": records,
+        }
+
+    def _load_online_statistical_report_source(
+        self,
+        *,
+        source_id: str,
+        turn_scope: str,
+        current_turn_id: int,
+        start_at: datetime,
+        end_at: datetime,
+        limit: int,
+    ) -> dict[str, Any]:
+        with self._runtime.host.connection_factory() as connection:
+            turns = self._query_statistical_report_turns(
+                connection,
+                operational_source_id=source_id,
+                limit=limit,
+            )
+            selected, turns = self._ensure_statistical_report_turn(
+                turns,
+                source_id=source_id,
+                turn_scope=turn_scope,
+                current_turn_id=current_turn_id,
+            )
+            turn_id = int(selected["turn_id"]) if selected is not None else None
+            records = self._query_statistical_report_records(
+                connection,
+                operational_source_id=source_id,
+                turn_id=turn_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
+        return self._statistical_report_source_result(
+            turns=turns, selected_turn=selected, records=records
+        )
+
+    def _load_offline_statistical_report_source(
+        self,
+        *,
+        source_id: str,
+        turn_scope: str,
+        current_turn_id: int,
+        start_at: datetime,
+        end_at: datetime,
+        limit: int,
+    ) -> dict[str, Any]:
+        turns = self.list_statistical_report_turns(
+            operational_source_id=source_id, limit=limit
+        )
+        selected, turns = self._ensure_statistical_report_turn(
+            turns,
+            source_id=source_id,
+            turn_scope=turn_scope,
+            current_turn_id=current_turn_id,
+        )
+        turn_id = int(selected["turn_id"]) if selected is not None else None
+        records = self.list_statistical_report_records(
+            operational_source_id=source_id,
+            turn_id=turn_id,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        return self._statistical_report_source_result(
+            turns=turns, selected_turn=selected, records=records
+        )
+
+    def load_statistical_report_source(
+        self,
+        *,
+        operational_source_id: str,
+        turn_scope: str,
+        current_turn_id: int,
+        start_at: datetime,
+        end_at: datetime,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Load turn evidence and rows through one pooled connection acquisition."""
+        source_id = str(operational_source_id or "").strip()
+        if not source_id:
+            raise ValueError("El reporte requiere operational_source_id.")
+        arguments = {
+            "source_id": source_id,
+            "turn_scope": turn_scope,
+            "current_turn_id": current_turn_id,
+            "start_at": start_at,
+            "end_at": end_at,
+            "limit": limit,
+        }
+        if bool(getattr(self._runtime, "offline", False)):
+            return self._load_offline_statistical_report_source(**arguments)
+        return self._run_statistical_report_read(
+            lambda: self._load_online_statistical_report_source(**arguments)
+        )
 
     def list_statistical_report_records(
         self,
@@ -2520,48 +3079,14 @@ class _HybridDatabaseProxy:
                 )
             return rows
 
-        where = [
-            "COALESCE(p.is_deleted,FALSE)=FALSE",
-            "UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')",
-            "p.operational_source_id::TEXT=%s",
-        ]
-        params: list[Any] = [source_id]
-        if turn_id is not None:
-            where.append("p.turn_id=%s")
-            params.append(int(turn_id))
-        else:
-            # service_date is the compatible prefilter for baseline and newer
-            # projection rows.  One extra day on each side preserves overnight
-            # records; the dataset builder applies the exact effective timestamp.
-            where.append("p.service_date BETWEEN %s AND %s")
-            params.extend(
-                (
-                    (start_at.date() - timedelta(days=1)).isoformat(),
-                    end_at.date().isoformat(),
-                )
-            )
-        sql = f"""SELECT p.*,
-                          p.attention_id AS id,
-                          p.patient_name AS nombre,
-                          p.service_date AS fecha,
-                          p.service_time AS hora,
-                          p.specialty AS hoja,
-                          p.canonical_ars AS ars,
-                          p.nss_snapshot AS nss,
-                          p.cedula_snapshot AS cedula,
-                          p.service_type AS tipo_atencion
-                     FROM admission_attention_projection p
-                    WHERE {' AND '.join(where)}
-                    ORDER BY COALESCE(p.created_at_effective_utc,
-                                      NULLIF(p.synced_at,'')::TIMESTAMPTZ),
-                             COALESCE(p.origin_device_id,''),
-                             COALESCE(p.device_local_sequence,0),
-                             COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT)"""
         with self._runtime.host.connection_factory() as connection:
-            rows = [
-                dict(row)
-                for row in connection.execute(sql, tuple(params)).fetchall()
-            ]
+            rows = self._query_statistical_report_records(
+                connection,
+                operational_source_id=source_id,
+                turn_id=turn_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
         if logger is not None:
             logger.info(
                 "ADMISSION_STATISTICAL_REPORT_READ source=postgresql turn_id=%s "
@@ -2595,29 +3120,12 @@ class _HybridDatabaseProxy:
                     "status": "CURRENT_OFFLINE",
                 }
             ]
-        sql = """SELECT i.turn_id,s.operational_source_id::TEXT,
-                        i.started_at,
-                        COALESCE(i.ended_at,i.nominal_ends_at,s.turn_ends_at) AS ends_at,
-                        CASE
-                          WHEN s.turn_id=i.turn_id AND s.status='ACTIVE' THEN 'CURRENT'
-                          WHEN i.ended_at IS NULL THEN 'OPEN'
-                          ELSE 'CLOSED'
-                        END AS status,
-                        i.active_username
-                   FROM admission_operational_turn_intervals i
-                   JOIN admission_operational_sessions s
-                     ON s.operational_session_id=i.operational_session_id
-                  WHERE s.operational_source_id::TEXT=%s
-                    AND i.turn_id IS NOT NULL
-                  ORDER BY i.started_at DESC,i.generation DESC
-                  LIMIT %s"""
         with self._runtime.host.connection_factory() as connection:
-            return [
-                dict(row)
-                for row in connection.execute(
-                    sql, (source_id, max(1, min(int(limit or 100), 500)))
-                ).fetchall()
-            ]
+            return self._query_statistical_report_turns(
+                connection,
+                operational_source_id=source_id,
+                limit=limit,
+            )
 
     def build_current_admission_list_dataset(
         self,
@@ -2653,6 +3161,16 @@ class _HybridDatabaseProxy:
         return self._runtime.admin_correct_current_turn_representative(
             target, authorizing_admin=authorizing_admin
         )
+
+    def perform_explicit_turn_handoff(
+        self, *, shift_metadata: Mapping[str, Any]
+    ):
+        """Execute the central transaction before any local turn materialization."""
+        transition = self._runtime.perform_explicit_turn_handoff(
+            shift_metadata=shift_metadata
+        )
+        object.__setattr__(self, "_last_transition_result", transition)
+        return transition
 
     def __getattr__(self, name: str):
         if name == "search_patient_directory":
@@ -2725,6 +3243,17 @@ class _HybridDatabaseProxy:
                 return turns
             return central_turns
         guarded = name in self._primary_methods or name.startswith(self._write_prefixes)
+        if name == "obtener_o_crear_turno" and callable(value):
+            def materialize_local_turn(*args, **kwargs):
+                self._runtime.require_write()
+                result = value(*args, **kwargs)
+                self._runtime.logger.info(
+                    "LOCAL_TURN_MIRROR_MATERIALIZED local_turn_id=%s trigger=LOCAL_MIRROR",
+                    int(result or 0),
+                )
+                return result
+
+            return materialize_local_turn
         if not guarded or not callable(value):
             return value
 
@@ -2740,11 +3269,7 @@ class _HybridDatabaseProxy:
                         name,
                         stack,
                     )
-                if name in {
-                    "cerrar_turno_existente",
-                    "obtener_o_crear_turno",
-                    "notify_shift_changed",
-                }:
+                if name in {"cerrar_turno_existente", "notify_shift_changed"}:
                     # The turn guard decides whether this is a same-user turn
                     # change or a formal handover by another operator on the
                     # same PRIMARY. The runtime performs the matching command.
@@ -2754,13 +3279,6 @@ class _HybridDatabaseProxy:
             else:
                 self._runtime.require_write()
             result = value(*args, **kwargs)
-            if name == "obtener_o_crear_turno":
-                shift_metadata = dict(args[0]) if args and isinstance(args[0], Mapping) else {}
-                transition = self._runtime.change_primary_turn(
-                    int(result) if result else None,
-                    shift_metadata=shift_metadata,
-                )
-                object.__setattr__(self, "_last_transition_result", transition)
             return result
 
         return call
@@ -3003,6 +3521,21 @@ class _V15BackgroundRefreshCoordinator(QObject):
         self._summary_busy = False
         runtime = getattr(getattr(self.admission, "db", None), "_runtime", None)
         summary = dict(_summary or {})
+        if runtime is not None and not summary_result_matches_runtime_identity(
+            summary, runtime
+        ):
+            runtime.logger.warning(
+                "SUMMARY_REFRESH_DISCARDED reason=%s error=STALE_OPERATIONAL_SNAPSHOT "
+                "result_turn_id=%s result_generation=%s result_revision=%s",
+                self._summary_reason,
+                summary.get("_turn_id"),
+                summary.get("_generation"),
+                summary.get("_operational_revision"),
+            )
+            if self._summary_pending:
+                self._summary_pending = False
+                self.request_summary("pending_after_stale_result")
+            return
         fingerprint = tuple(
             (key, int(summary.get(key) or 0))
             for key in (

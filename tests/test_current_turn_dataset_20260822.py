@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sqlite3
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
-from admission_hybrid import OperationalSessionService
-from admission_v15_adapter import DEFAULT_V15_ROOT, _HybridDatabaseProxy, _load_v15_modules
+import pytest
+
+from admission_hybrid import (
+    AdmissionWriteBlocked,
+    OperationalSessionService,
+    operational_turn_duration_hours,
+)
+from admission_v15_adapter import (
+    DEFAULT_V15_ROOT,
+    TurnDatasetStateError,
+    _HybridAdmissionRuntime,
+    _HybridDatabaseProxy,
+    _V15BackgroundRefreshCoordinator,
+    _load_v15_modules,
+    _operational_identity_tuple,
+    summary_result_matches_runtime_identity,
+)
 
 
 SOURCE = "source-current"
@@ -131,6 +147,9 @@ def test_new_empty_turn_excludes_historical_rows_without_date_fallback():
     assert proxy.build_turn_dataset(
         turn_id=CURRENT_TURN, operational_source_id=SOURCE
     ) == []
+    summary = proxy.refresh_turn_summary()
+    assert summary["total"] == 0
+    assert summary["_status"] == "VALID"
 
 
 def test_general_urgency_and_consultation_keep_existing_summary_rules():
@@ -185,11 +204,223 @@ def test_excel_and_turn_report_use_the_same_explicit_central_dataset():
     assert summary["cantidad_urgencias"] == 1
 
 
-def test_turn_dataset_requires_both_central_identity_parts():
+def test_turn_dataset_rejects_missing_central_identity_instead_of_returning_empty():
     proxy, _connection = _proxy([])
 
-    assert proxy.build_turn_dataset(turn_id=CURRENT_TURN, operational_source_id="") == []
-    assert proxy.build_turn_dataset(turn_id=None, operational_source_id=SOURCE) == []
+    with pytest.raises(TurnDatasetStateError, match="OPERATIONAL_SOURCE_ID_NOT_AVAILABLE"):
+        proxy.build_turn_dataset(turn_id=CURRENT_TURN, operational_source_id="")
+    with pytest.raises(TurnDatasetStateError, match="TURN_ID_NOT_AVAILABLE"):
+        proxy.build_turn_dataset(turn_id=None, operational_source_id=SOURCE)
+
+
+def test_invalid_summary_refresh_retains_last_valid_count_instead_of_zero():
+    proxy, connection = _proxy([_row(1), _row(2), _row(3)])
+    valid = proxy.refresh_turn_summary()
+    assert valid["total"] == 3
+    assert valid["_status"] == "VALID"
+
+    connection.rows = []
+    proxy._runtime.operational_session = None
+    stale = proxy.refresh_turn_summary()
+
+    assert stale["total"] == 3
+    assert stale["_status"] == "STALE"
+    assert stale["_error_code"] == "TURN_ID_NOT_AVAILABLE"
+    assert proxy.resumen_turno_actual()["_status"] == "STALE"
+
+
+def test_summary_result_from_old_turn_cannot_apply_to_new_turn():
+    runtime = SimpleNamespace(
+        operational_session=SimpleNamespace(
+            operational_source_id=SOURCE,
+            turn_id=CURRENT_TURN,
+            generation=8,
+            operational_revision=10,
+        )
+    )
+    old_result = {
+        "_operational_source_id": SOURCE,
+        "_turn_id": PREVIOUS_TURN,
+        "_generation": 7,
+        "_operational_revision": 9,
+    }
+    current_result = {
+        "_operational_source_id": SOURCE,
+        "_turn_id": CURRENT_TURN,
+        "_generation": 8,
+        "_operational_revision": 10,
+    }
+
+    assert not summary_result_matches_runtime_identity(old_result, runtime)
+    assert summary_result_matches_runtime_identity(current_result, runtime)
+
+
+def test_operational_identity_helpers_reject_malformed_numeric_metadata():
+    runtime = SimpleNamespace(
+        operational_session=SimpleNamespace(
+            operational_source_id=SOURCE,
+            turn_id="invalid",
+            generation=1,
+            operational_revision=1,
+        )
+    )
+
+    assert _operational_identity_tuple(runtime.operational_session) is None
+    assert not summary_result_matches_runtime_identity(
+        {
+            "_operational_source_id": SOURCE,
+            "_turn_id": "invalid",
+            "_generation": 1,
+            "_operational_revision": 1,
+        },
+        SimpleNamespace(
+            operational_session=SimpleNamespace(
+                operational_source_id=SOURCE,
+                turn_id=CURRENT_TURN,
+                generation=1,
+                operational_revision=1,
+            )
+        ),
+    )
+
+
+def test_summary_refresh_classifies_dataset_and_stale_identity_failures():
+    proxy, _connection = _proxy([])
+    proxy._runtime.logger = logging.getLogger("test.summary-classification")
+
+    def invalid_dataset(**_kwargs):
+        raise TurnDatasetStateError("OPERATIONAL_SOURCE_ID_NOT_AVAILABLE")
+
+    object.__setattr__(proxy, "build_turn_dataset", invalid_dataset)
+    invalid = proxy.refresh_turn_summary()
+    assert invalid["_status"] == "INVALID_REFRESH"
+    assert invalid["_error_code"] == "OPERATIONAL_SOURCE_ID_NOT_AVAILABLE"
+
+    original_identity = proxy._runtime.operational_session
+
+    def changed_during_query(**_kwargs):
+        proxy._runtime.operational_session = SimpleNamespace(
+            operational_source_id=SOURCE,
+            turn_id=CURRENT_TURN + 1,
+            generation=2,
+            operational_revision=2,
+        )
+        return []
+
+    proxy._runtime.operational_session = original_identity
+    object.__setattr__(proxy, "build_turn_dataset", changed_during_query)
+    stale = proxy.refresh_turn_summary()
+    assert stale["_error_code"] == "STALE_OPERATIONAL_SNAPSHOT"
+
+    proxy._runtime.operational_session = original_identity
+    with pytest.raises(TurnDatasetStateError):
+        _HybridDatabaseProxy.build_turn_dataset(
+            proxy,
+            turn_id=CURRENT_TURN,
+            operational_source_id="",
+        )
+
+
+def test_explicit_handoff_requires_an_active_central_session():
+    runtime = object.__new__(_HybridAdmissionRuntime)
+    runtime.attachment = None
+    runtime.require_primary_turn_change = lambda: True
+
+    with pytest.raises(AdmissionWriteBlocked, match="sesión operativa activa"):
+        runtime.perform_explicit_turn_handoff(shift_metadata={})
+
+
+def test_statistical_read_retries_one_temporary_failure_and_lists_turns(monkeypatch):
+    proxy, connection = _proxy([])
+    connection.rows = [{"turn_id": CURRENT_TURN}]
+    sleeps = []
+    proxy._runtime.logger = logging.getLogger("test.report-retry")
+    proxy._runtime._temporary_errors = (ConnectionError,)
+    proxy._runtime._is_temporary_connection_error = lambda _exc: False
+    proxy._runtime._report_retry_delay_seconds = 0.001
+    monkeypatch.setattr(
+        "admission_v15_adapter.sleep", lambda delay: sleeps.append(delay)
+    )
+    attempts = []
+
+    def operation():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise ConnectionError("temporary unavailable")
+        return {"turns": (), "records": ()}
+
+    assert proxy._run_statistical_report_read(operation) == {
+        "turns": (),
+        "records": (),
+    }
+    assert sleeps == [0.001]
+    assert proxy.list_statistical_report_turns(
+        operational_source_id=SOURCE,
+        limit=5,
+    ) == [{"turn_id": CURRENT_TURN}]
+    assert connection.params == (SOURCE, 5)
+
+
+def test_proxy_handoff_and_stale_pending_worker_use_runtime_identity():
+    transition = SimpleNamespace(committed=True)
+    runtime = SimpleNamespace(
+        perform_explicit_turn_handoff=lambda **_kwargs: transition,
+        operational_session=SimpleNamespace(
+            operational_source_id=SOURCE,
+            turn_id=CURRENT_TURN,
+            generation=2,
+            operational_revision=2,
+        ),
+        logger=logging.getLogger("test.stale-summary-worker"),
+    )
+    proxy = _HybridDatabaseProxy(SimpleNamespace(), runtime)
+    assert proxy.perform_explicit_turn_handoff(
+        shift_metadata={"turno_codigo": "8AM_8AM"}
+    ) is transition
+    assert proxy.last_transition_result is transition
+
+    requested = []
+    controller = _V15BackgroundRefreshCoordinator.__new__(
+        _V15BackgroundRefreshCoordinator
+    )
+    controller._summary_busy = True
+    controller._summary_pending = True
+    controller._summary_reason = "old_turn"
+    controller.admission = SimpleNamespace(db=SimpleNamespace(_runtime=runtime))
+    controller.request_summary = lambda reason: requested.append(reason)
+    controller._summary_ready(
+        {
+            "_operational_source_id": SOURCE,
+            "_turn_id": PREVIOUS_TURN,
+            "_generation": 1,
+            "_operational_revision": 1,
+        }
+    )
+    assert requested == ["pending_after_stale_result"]
+
+
+def test_failed_first_refresh_of_new_turn_does_not_relabel_previous_counts():
+    proxy, _connection = _proxy([_row(1), _row(2), _row(3)])
+    valid = proxy.refresh_turn_summary()
+    assert valid["_turn_id"] == CURRENT_TURN
+
+    proxy._runtime.operational_session = SimpleNamespace(
+        operational_source_id=SOURCE,
+        turn_id=CURRENT_TURN + 1,
+        generation=1,
+        operational_revision=1,
+    )
+
+    def fail_query(**_kwargs):
+        raise RuntimeError("temporary database failure")
+
+    object.__setattr__(proxy, "build_turn_dataset", fail_query)
+    stale = proxy.refresh_turn_summary()
+
+    assert stale["total"] == 3
+    assert stale["_turn_id"] == CURRENT_TURN
+    assert stale["_status"] == "STALE"
+    assert not summary_result_matches_runtime_identity(stale, proxy._runtime)
 
 
 def test_next_central_turn_id_is_allocated_from_central_records_only():
@@ -198,6 +429,12 @@ def test_next_central_turn_id_is_allocated_from_central_records_only():
             return SimpleNamespace(fetchone=lambda: {"next_turn_id": 932})
 
     assert OperationalSessionService._allocate_next_central_turn_id(Connection()) == 932
+
+
+def test_operational_interval_duration_respects_24_and_12_hour_turn_codes():
+    assert operational_turn_duration_hours("8AM_8AM") == 24
+    assert operational_turn_duration_hours("8AM_8PM") == 12
+    assert operational_turn_duration_hours("8PM_8AM") == 12
 
 
 def test_ambiguous_current_turn_repair_changes_only_operational_identity():
@@ -300,22 +537,7 @@ def test_local_replica_filters_operational_source_and_turn_not_legacy_turn_id(tm
     assert [row["id"] for row in rows] == [1]
 
 
-def test_same_turn_metadata_never_compares_the_replica_local_turn_id():
-    session = SimpleNamespace(
-        turn_id=42,
-        turn_code="8AM_8AM",
-        turn_started_at="2026-08-22T14:00:00+00:00",
-    )
+def test_explicit_handoff_is_not_deduplicated_by_replica_turn_metadata():
+    from admission_v15_adapter import _HybridAdmissionRuntime
 
-    assert _HybridAdmissionRuntimeMatcher.matches(session) is True
-
-
-class _HybridAdmissionRuntimeMatcher:
-    @staticmethod
-    def matches(session):
-        from admission_v15_adapter import _HybridAdmissionRuntime
-
-        return _HybridAdmissionRuntime._matches_current_turn_metadata(
-            session,
-            {"turno_codigo": "8AM_8AM", "fecha_base": "22/08/2026"},
-        )
+    assert not hasattr(_HybridAdmissionRuntime, "_matches_current_turn_metadata")

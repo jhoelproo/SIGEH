@@ -43,6 +43,20 @@ OFFLINE_LOGIN_VALID_DAYS = 30
 LOCAL_SYNC_APPLY_BATCH_SIZE = 50
 MAX_CLOCK_DRIFT_MS = 5 * 60 * 1000
 OPERATIONAL_LOG = logging.getLogger("hospital.admission.operational")
+SAME_USER_HANDOFF_MESSAGE = (
+    "No se puede realizar el relevo.\n"
+    "El usuario seleccionado ya es el representante del turno actual.\n"
+    "Seleccione al usuario que recibirá el próximo turno."
+)
+TRIGGER_USER_REQUESTED_HANDOFF = "USER_REQUESTED_HANDOFF"
+TRIGGER_ADMIN_REPRESENTATIVE_CORRECTION = "ADMIN_REPRESENTATIVE_CORRECTION"
+TRIGGER_ADMIN_TURN_OVERRIDE = "ADMIN_TURN_OVERRIDE"
+TRIGGER_RECOVERY = "RECOVERY"
+
+
+def operational_turn_duration_hours(turn_code: Any) -> int:
+    """Return the persisted operational interval duration for a canonical code."""
+    return 24 if str(turn_code or "").strip().upper() == "8AM_8AM" else 12
 
 
 class AdmissionHybridError(RuntimeError):
@@ -3794,6 +3808,7 @@ class OperationalSessionService:
             if collision_count == 0:
                 return current
             repaired_turn_id = self._allocate_next_central_turn_id(con)
+            transition_uuid = str(uuid.uuid4())
             con.execute(
                 """UPDATE admission_operational_sessions
                        SET turn_id=%s,operational_revision=operational_revision+1,
@@ -3823,14 +3838,41 @@ class OperationalSessionService:
                     "new_turn_id": repaired_turn_id,
                     "historical_collision_count": collision_count,
                     "historical_rows_reassigned": 0,
+                    "trigger": TRIGGER_RECOVERY,
                 },
+                transition_id=transition_uuid,
             )
             repaired_row = con.execute(
                 """SELECT * FROM admission_operational_sessions
                     WHERE operational_session_id=%s""",
                 (operational_session_id,),
             ).fetchone()
-            return self._row_to_session(repaired_row)
+            repaired = self._row_to_session(repaired_row)
+            if repaired is not None:
+                identity_details = {
+                    "old_turn_id": current.turn_id,
+                    "new_turn_id": repaired.turn_id,
+                    "old_generation": current.generation,
+                    "new_generation": repaired.generation,
+                    "old_user_id": getattr(current, "active_user_id", ""),
+                    "new_user_id": getattr(repaired, "active_user_id", ""),
+                    "operational_source_id": current.operational_source_id,
+                    "device_id": primary_device_id,
+                    "transition_id": transition_uuid,
+                    "trigger": TRIGGER_RECOVERY,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                self._audit(
+                    con,
+                    session_id=operational_session_id,
+                    event_type="OPERATIONAL_IDENTITY_CHANGED",
+                    device_id=primary_device_id,
+                    username=current.active_username,
+                    generation=repaired.generation,
+                    transition_id=transition_uuid,
+                    details=identity_details,
+                )
+            return repaired
 
     def backfill_missing_turn_code(
         self,
@@ -4821,7 +4863,11 @@ class OperationalSessionService:
         actor_user: Mapping[str, Any] | Any = None,
         allocate_central_turn_id: bool = False,
     ) -> PrimaryTransitionResult:
-        """Cambia solo el turno; conserva representante, login y PRIMARY."""
+        """Extraordinary Admin override; normal operation must use handoff."""
+        if not administrative_override:
+            raise AdmissionWriteBlocked(
+                "Un turno nuevo requiere un relevo explícito a un representante diferente."
+            )
         transition_uuid = str(transition_id or uuid.uuid4())
         requested_turn_id = _as_int_or_none(new_turn_id)
 
@@ -4904,6 +4950,8 @@ class OperationalSessionService:
                 if allocate_central_turn_id
                 else requested_turn_id
             )
+            effective_turn_code = str(new_turn_code or current.turn_code or "").strip()
+            turn_duration_hours = operational_turn_duration_hours(effective_turn_code)
 
             if administrative_override:
                 self._audit(
@@ -4946,7 +4994,8 @@ class OperationalSessionService:
                        turn_code=COALESCE(NULLIF(%s,''),turn_code),
                        generation=%s,
                        operational_revision=operational_revision+1,
-                       turn_started_at=NOW(),turn_ends_at=NOW()+INTERVAL '12 hours',
+                       turn_started_at=NOW(),
+                       turn_ends_at=NOW()+(%s*INTERVAL '1 hour'),
                        changed_by=%s,change_reason=%s,updated_at=NOW(),
                        primary_last_seen=NOW()
                    WHERE operational_session_id=%s""",
@@ -4954,6 +5003,7 @@ class OperationalSessionService:
                     target_turn_id,
                     str(new_turn_code or "").strip(),
                     new_generation,
+                    turn_duration_hours,
                     str(changed_by or current.active_username),
                     str(reason or "Cambio de turno principal")[:240],
                     operational_session_id,
@@ -4970,7 +5020,8 @@ class OperationalSessionService:
                        operational_session_id,generation,turn_id,active_user_id,
                        active_username,started_at,nominal_ends_at,ended_at,
                        production_epoch_id
-                   ) VALUES(%s,%s,%s,%s,%s,NOW(),NOW()+INTERVAL '12 hours',NULL,
+                   ) VALUES(%s,%s,%s,%s,%s,NOW(),
+                            NOW()+(%s*INTERVAL '1 hour'),NULL,
                             (SELECT production_epoch_id
                                FROM admission_operational_sessions
                               WHERE operational_session_id=%s))
@@ -4981,6 +5032,7 @@ class OperationalSessionService:
                     target_turn_id,
                     current.active_user_id,
                     current.active_username,
+                    turn_duration_hours,
                     operational_session_id,
                 ),
             )
@@ -5005,6 +5057,7 @@ class OperationalSessionService:
                 "administrative_override": bool(administrative_override),
                 "actor_user_id": str(actor_user_id or ""),
                 "reason": str(reason or "")[:240],
+                "trigger": TRIGGER_ADMIN_TURN_OVERRIDE,
             }
             self._audit(
                 con,
@@ -5028,6 +5081,39 @@ class OperationalSessionService:
                 username=str(changed_by or current.active_username),
                 generation=changed.generation,
                 details={"transition_id": transition_uuid, **details},
+            )
+            identity_details = {
+                **details,
+                "transition_id": transition_uuid,
+                "old_user_id": current.active_user_id,
+                "new_user_id": changed.active_user_id,
+                "operational_source_id": current.operational_source_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._audit(
+                con,
+                session_id=operational_session_id,
+                event_type="OPERATIONAL_IDENTITY_CHANGED",
+                device_id=primary_device_id,
+                username=str(changed_by or current.active_username),
+                generation=changed.generation,
+                transition_id=transition_uuid,
+                details=identity_details,
+            )
+            OPERATIONAL_LOG.info(
+                "OPERATIONAL_IDENTITY_CHANGED old_turn_id=%s new_turn_id=%s "
+                "old_generation=%s new_generation=%s old_user_id=%s new_user_id=%s "
+                "operational_source_id=%s device_id=%s transition_id=%s trigger=%s",
+                current.turn_id,
+                changed.turn_id,
+                current.generation,
+                changed.generation,
+                current.active_user_id,
+                changed.active_user_id,
+                current.operational_source_id,
+                primary_device_id,
+                transition_uuid,
+                TRIGGER_ADMIN_TURN_OVERRIDE,
             )
 
         return PrimaryTransitionResult(
@@ -5083,16 +5169,17 @@ class OperationalSessionService:
         administrative_override: bool = False,
         allocate_central_turn_id: bool = False,
     ) -> PrimaryTransitionResult:
-        """Apply a permitted PRIMARY turn command without changing its representative."""
+        """Apply an explicit extraordinary Admin override without changing its representative."""
         actor_role = canonical_role(actor_user)
         if not user_can_operate_admission(actor_user):
             raise AdmissionWriteBlocked(
                 "El rol autenticado no puede cambiar el turno operativo de Admisión."
             )
-        if (
-            administrative_override
-            and actor_role != ADMISSION_ROLE_ADMINISTRATOR
-        ):
+        if not administrative_override:
+            raise AdmissionWriteBlocked(
+                "Un turno nuevo requiere un relevo explícito a un representante diferente."
+            )
+        if actor_role != ADMISSION_ROLE_ADMINISTRATOR:
             raise AdmissionWriteBlocked(
                 "Solo un Administrador puede aplicar una corrección manual fuera de horario."
             )
@@ -5146,6 +5233,7 @@ class OperationalSessionService:
         invalidate_secondaries: bool = True,
         invalidate_only_previous_user_secondaries: bool = False,
         allocate_central_turn_id: bool = False,
+        trigger: str = TRIGGER_USER_REQUESTED_HANDOFF,
     ) -> PrimaryTransitionResult:
         """Cambio central idempotente; PRIMARY pertenece al device, no al login."""
         if not user_can_be_assigned_admission_operator(new_user):
@@ -5214,6 +5302,8 @@ class OperationalSessionService:
                 raise AdmissionWriteBlocked(
                     "La sesión operativa cambió antes de aplicar. Actualice e intente de nuevo."
                 )
+            if same_user(current, new_user):
+                raise AdmissionWriteBlocked(SAME_USER_HANDOFF_MESSAGE)
             primary_row = con.execute(
                 """SELECT station_role,login_session_id
                    FROM admission_operational_devices
@@ -5229,57 +5319,8 @@ class OperationalSessionService:
                 if allocate_central_turn_id
                 else _as_int_or_none(new_turn_id)
             )
-            if (
-                same_user(current, new_user)
-                and target_turn_id == current.turn_id
-            ):
-                con.execute(
-                    """UPDATE admission_operational_sessions SET
-                           primary_login_session_id=%s,primary_last_seen=NOW(),updated_at=NOW()
-                       WHERE operational_session_id=%s""",
-                    (new_login_session_id, operational_session_id),
-                )
-                con.execute(
-                    """UPDATE admission_operational_devices SET
-                           login_session_id=%s,last_seen=NOW(),detached_at=NULL,
-                           invalidated_at=NULL,invalidated_reason=NULL,
-                           invalidated_generation=NULL,new_active_username=NULL
-                       WHERE operational_session_id=%s AND device_id=%s""",
-                    (new_login_session_id, operational_session_id, primary_device_id),
-                )
-                unchanged_row = con.execute(
-                    "SELECT * FROM admission_operational_sessions WHERE operational_session_id=%s",
-                    (operational_session_id,),
-                ).fetchone()
-                unchanged = self._row_to_session(unchanged_row) or current
-                self._audit(
-                    con,
-                    session_id=operational_session_id,
-                    event_type="PRIMARY_RELOGIN",
-                    device_id=primary_device_id,
-                    username=unchanged.active_username,
-                    generation=unchanged.generation,
-                    transition_id=transition_uuid,
-                    details={
-                        "turn_id": unchanged.turn_id,
-                        "generation": unchanged.generation,
-                        "requested_turn_id_ignored": _as_int_or_none(new_turn_id),
-                    },
-                )
-                return PrimaryTransitionResult(
-                    operational_session=unchanged,
-                    transition_id=transition_uuid,
-                    old_primary_login_session_id=current.primary_login_session_id,
-                    committed=True,
-                    old_turn_id=current.turn_id,
-                    new_turn_id=current.turn_id,
-                    old_generation=current.generation,
-                    new_generation=current.generation,
-                    old_user_id=current.active_user_id,
-                    new_user_id=current.active_user_id,
-                    old_username=current.active_username,
-                    new_username=current.active_username,
-                )
+            effective_turn_code = str(new_turn_code or current.turn_code or "").strip()
+            turn_duration_hours = operational_turn_duration_hours(effective_turn_code)
             if (
                 invalidate_secondaries
                 and invalidate_only_previous_user_secondaries
@@ -5333,12 +5374,14 @@ class OperationalSessionService:
                        primary_login_session_id=%s,turn_id=%s,
                        turn_code=COALESCE(NULLIF(%s,''),turn_code),generation=%s,
                        operational_revision=operational_revision+1,
-                       turn_started_at=NOW(),turn_ends_at=NOW()+INTERVAL '12 hours',
+                       turn_started_at=NOW(),
+                       turn_ends_at=NOW()+(%s*INTERVAL '1 hour'),
                        changed_by=%s,change_reason=%s,updated_at=NOW(),primary_last_seen=NOW()
                    WHERE operational_session_id=%s""",
                 (
                     new_username,new_user_id,display_name,new_login_session_id,
                     target_turn_id,str(new_turn_code or "").strip(),new_generation,
+                    turn_duration_hours,
                     str(changed_by or new_username),str(reason),operational_session_id,
                 ),
             )
@@ -5353,7 +5396,8 @@ class OperationalSessionService:
                        operational_session_id,generation,turn_id,active_user_id,
                        active_username,started_at,nominal_ends_at,ended_at,
                        production_epoch_id
-                   ) VALUES(%s,%s,%s,%s,%s,NOW(),NOW()+INTERVAL '12 hours',NULL,
+                   ) VALUES(%s,%s,%s,%s,%s,NOW(),
+                            NOW()+(%s*INTERVAL '1 hour'),NULL,
                             (SELECT production_epoch_id
                                FROM admission_operational_sessions
                               WHERE operational_session_id=%s))
@@ -5364,6 +5408,7 @@ class OperationalSessionService:
                     target_turn_id,
                     new_user_id,
                     new_username,
+                    turn_duration_hours,
                     operational_session_id,
                 ),
             )
@@ -5433,6 +5478,7 @@ class OperationalSessionService:
                     "secondary_sessions_invalidated": (
                         len(secondary_logins) if invalidate_secondaries else 0
                     ),
+                    "trigger": str(trigger or TRIGGER_USER_REQUESTED_HANDOFF),
                 },
             )
             # Evento de dominio consumible por heartbeats/diagnósticos. Vive en
@@ -5454,7 +5500,46 @@ class OperationalSessionService:
                     "old_turn_id": current.turn_id,
                     "new_turn_id": changed.turn_id,
                     "primary_device_id": primary_device_id,
+                    "trigger": str(trigger or TRIGGER_USER_REQUESTED_HANDOFF),
                 },
+            )
+            identity_details = {
+                "old_turn_id": current.turn_id,
+                "new_turn_id": changed.turn_id,
+                "old_generation": current.generation,
+                "new_generation": changed.generation,
+                "old_user_id": current.active_user_id,
+                "new_user_id": changed.active_user_id,
+                "operational_source_id": current.operational_source_id,
+                "device_id": primary_device_id,
+                "transition_id": transition_uuid,
+                "trigger": str(trigger or TRIGGER_USER_REQUESTED_HANDOFF),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._audit(
+                con,
+                session_id=operational_session_id,
+                event_type="OPERATIONAL_IDENTITY_CHANGED",
+                device_id=primary_device_id,
+                username=new_username,
+                generation=changed.generation,
+                transition_id=transition_uuid,
+                details=identity_details,
+            )
+            OPERATIONAL_LOG.info(
+                "OPERATIONAL_IDENTITY_CHANGED old_turn_id=%s new_turn_id=%s "
+                "old_generation=%s new_generation=%s old_user_id=%s new_user_id=%s "
+                "operational_source_id=%s device_id=%s transition_id=%s trigger=%s",
+                current.turn_id,
+                changed.turn_id,
+                current.generation,
+                changed.generation,
+                current.active_user_id,
+                changed.active_user_id,
+                current.operational_source_id,
+                primary_device_id,
+                transition_uuid,
+                str(trigger or TRIGGER_USER_REQUESTED_HANDOFF),
             )
         return PrimaryTransitionResult(
             operational_session=changed,
@@ -5719,7 +5804,47 @@ class OperationalSessionService:
                     ),
                     "old_operational_revision": current.operational_revision,
                     "new_operational_revision": updated.operational_revision,
+                    "trigger": TRIGGER_ADMIN_REPRESENTATIVE_CORRECTION,
                 },
+            )
+            correction_transition_id = str(uuid.uuid4())
+            correction_details = {
+                "old_turn_id": current.turn_id,
+                "new_turn_id": updated.turn_id,
+                "old_generation": current.generation,
+                "new_generation": updated.generation,
+                "old_user_id": current.active_user_id,
+                "new_user_id": updated.active_user_id,
+                "operational_source_id": current.operational_source_id,
+                "device_id": requester_device,
+                "transition_id": correction_transition_id,
+                "trigger": TRIGGER_ADMIN_REPRESENTATIVE_CORRECTION,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._audit(
+                con,
+                session_id=current.operational_session_id,
+                event_type="OPERATIONAL_IDENTITY_CHANGED",
+                device_id=requester_device,
+                username=verified_admin_username,
+                generation=updated.generation,
+                transition_id=correction_transition_id,
+                details=correction_details,
+            )
+            OPERATIONAL_LOG.info(
+                "OPERATIONAL_IDENTITY_CHANGED old_turn_id=%s new_turn_id=%s "
+                "old_generation=%s new_generation=%s old_user_id=%s new_user_id=%s "
+                "operational_source_id=%s device_id=%s transition_id=%s trigger=%s",
+                current.turn_id,
+                updated.turn_id,
+                current.generation,
+                updated.generation,
+                current.active_user_id,
+                updated.active_user_id,
+                current.operational_source_id,
+                requester_device,
+                correction_transition_id,
+                TRIGGER_ADMIN_REPRESENTATIVE_CORRECTION,
             )
 
             OPERATIONAL_LOG.info(
@@ -5776,6 +5901,7 @@ class OperationalSessionService:
         active_username: str, active_user_id: Any, turn_id: int | None,
         changed_by: str, reason: str = "Cambio de usuario principal",
     ) -> OperationalSession:
+        """Compatibility handoff: always allocates a new central turn identity."""
         current_snapshot = self.get_operational_session()
         if current_snapshot is None:
             raise AdmissionWriteBlocked("La sesión operativa ya no está activa.")
@@ -5784,38 +5910,13 @@ class OperationalSessionService:
             primary_device_id=device_id,
             new_login_session_id=login_session_id,
             new_user={"user_id": active_user_id, "username": active_username},
-            new_turn_id=turn_id,
+            new_turn_id=None,
             expected_generation=current_snapshot.generation,
             changed_by=changed_by,
             reason=reason,
+            allocate_central_turn_id=True,
+            trigger=TRIGGER_USER_REQUESTED_HANDOFF,
         ).operational_session
-        # Compatibilidad histórica: el bloque inferior no se alcanza; se
-        # conserva temporalmente para facilitar diffs de instalaciones previas.
-        with self.connection_factory() as con:
-            con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("admission-operational-session",))
-            row = con.execute("SELECT * FROM admission_operational_sessions WHERE operational_session_id=%s FOR UPDATE", (operational_session_id,)).fetchone()
-            current = self._row_to_session(row)
-            if not current or current.status != "ACTIVE" or current.primary_device_id != str(device_id):
-                raise AdmissionWriteBlocked("Solo la estaci\u00f3n principal puede cambiar el turno o usuario operativo.")
-            con.execute(
-                """UPDATE admission_operational_sessions SET
-                       active_username=%s,active_user_id=%s,primary_login_session_id=%s,
-                       turn_id=%s,generation=generation+1,changed_by=%s,change_reason=%s,
-                       updated_at=NOW(),primary_last_seen=NOW()
-                   WHERE operational_session_id=%s""",
-                (str(active_username).strip(),str(active_user_id or ""),str(login_session_id),
-                _as_int_or_none(turn_id),str(changed_by),str(reason),operational_session_id),
-            )
-            result = con.execute("SELECT * FROM admission_operational_sessions WHERE operational_session_id=%s", (operational_session_id,)).fetchone()
-            changed = self._row_to_session(result)
-            self._audit(
-                con, session_id=operational_session_id,
-                event_type="PRIMARY_USER_CHANGED", device_id=device_id,
-                username=str(active_username),
-                generation=changed.generation if changed else current.generation + 1,
-                details={"reason": str(reason)},
-            )
-        return self._row_to_session(result)  # type: ignore[return-value]
 
     def promote_secondary_to_primary(
         self, *, operational_session_id: str, device_id: str, login_session_id: str,

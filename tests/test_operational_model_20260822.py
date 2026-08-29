@@ -100,7 +100,15 @@ class _OperationalModelDB(_OperationalDB):
             )
             return _Result(rowcount=1)
         if upper.startswith("UPDATE ADMISSION_OPERATIONAL_SESSIONS SET TURN_ID=%S"):
-            turn_id, turn_code, generation, _actor, _reason, _session_id = params
+            (
+                turn_id,
+                turn_code,
+                generation,
+                _duration_hours,
+                _actor,
+                _reason,
+                _session_id,
+            ) = params
             self.session.update(
                 {
                     "turn_id": turn_id,
@@ -211,26 +219,46 @@ def test_representative_change_changes_only_representative_revision():
     assert changed.operational_revision == before["operational_revision"] + 1
 
 
-def test_turn_change_preserves_representative_and_primary_lease():
+def test_repeated_heartbeats_never_change_turn_generation_or_representative():
     database, service, session_id = _configured_service()
     before = deepcopy(database.session)
 
-    changed = service.admin_change_admission_turn(
-        actor_user={"id": 7, "username": "admin", "role": "administrador"},
-        operational_session_id=session_id,
-        primary_device_id="DEVICE-A",
-        new_turn_id=101,
-        new_turn_code="8PM_8AM",
-        expected_generation=before["generation"],
-        transition_id="e2369a80-0495-44af-97c3-42f0cf675ce3",
-    ).operational_session
+    for _index in range(25):
+        service.heartbeat(
+            operational_session_id=session_id,
+            device_id="DEVICE-A",
+        )
 
-    assert changed.turn_id == 101
-    assert changed.turn_code == "8PM_8AM"
-    assert changed.active_user_id == before["active_user_id"]
-    assert changed.primary_device_id == before["primary_device_id"]
-    assert changed.primary_login_session_id == before["primary_login_session_id"]
-    assert changed.generation == before["generation"] + 1
+    assert database.session["turn_id"] == before["turn_id"]
+    assert database.session["generation"] == before["generation"]
+    assert database.session["active_user_id"] == before["active_user_id"]
+
+
+def test_turn_only_change_is_blocked_without_explicit_admin_override():
+    database, service, session_id = _configured_service()
+    before = deepcopy(database.session)
+
+    with pytest.raises(AdmissionWriteBlocked, match="relevo explícito"):
+        service.transition_primary_turn(
+            operational_session_id=session_id,
+            primary_device_id="DEVICE-A",
+            new_turn_id=101,
+            expected_generation=before["generation"],
+            actor_user={"id": 7, "username": "admin", "role": "administrador"},
+        )
+
+    with pytest.raises(AdmissionWriteBlocked, match="relevo explícito"):
+        service.admin_change_admission_turn(
+            actor_user={"id": 7, "username": "admin", "role": "administrador"},
+            operational_session_id=session_id,
+            primary_device_id="DEVICE-A",
+            new_turn_id=101,
+            new_turn_code="8PM_8AM",
+            expected_generation=before["generation"],
+            transition_id="e2369a80-0495-44af-97c3-42f0cf675ce3",
+        )
+
+    assert database.session == before
 
 
 def test_admin_override_outside_nominal_schedule_preserves_representative_and_lease():

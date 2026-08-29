@@ -94,6 +94,8 @@ from admission_statistical_reports import (  # noqa: E402 - PROJECT_ROOT bootstr
     COVERAGE_UNINSURED,
     SPECIALTY_ALL,
     AdmissionReportFilters,
+    ReportSnapshotStore,
+    SnapshotStaleError,
     build_admission_report_dataset,
     build_operational_period,
     build_turn_operational_period,
@@ -5933,7 +5935,7 @@ def crear_pdf_reporte(resumen, destino=None):
             )
             y -= 13
         if representante_mayus:
-            c.drawString(margen_x, y, f"Auxiliar de facturación: {representante_mayus}")
+            c.drawString(margen_x, y, f"Representante(s): {representante_mayus}")
             y -= 13
         c.drawRightString(width - margen_x, height - 30, f"Página {page_no}")
         c.line(margen_x, y - 4, width - margen_x, y - 4)
@@ -5942,6 +5944,27 @@ def crear_pdf_reporte(resumen, destino=None):
     page_no = 1
     y = dibujar_encabezado(page_no)
     y = draw_summary_box(y)
+
+    representatives_by_turn = resumen.get("representatives_by_turn") or ()
+    if representatives_by_turn:
+        y = draw_section_title("REPRESENTANTES POR TURNO", y)
+        representative_widths = [usable_w * 0.48, usable_w * 0.52]
+        y = draw_table_header(y, ["Turno", "Representante(s)"], representative_widths)
+        for turn_label, representatives in representatives_by_turn:
+            if y < margen_y + 60:
+                c.showPage()
+                page_no += 1
+                y = dibujar_encabezado(page_no)
+                y = draw_section_title("REPRESENTANTES POR TURNO", y)
+                y = draw_table_header(
+                    y, ["Turno", "Representante(s)"], representative_widths
+                )
+            y = draw_table_row(
+                y,
+                [turn_label, ", ".join(representatives)],
+                representative_widths,
+            )
+        y -= 14
 
     por_seguro = resumen.get("por_seguro", []) or []
     sin_seguro_rows = [(s, n) for s, n in por_seguro if str(s).upper() == "SIN SEGURO"]
@@ -5996,7 +6019,7 @@ def crear_pdf_reporte(resumen, destino=None):
         f"Total de pacientes del período: {reportable_patient_count(resumen)}",
     )
     if representante_mayus:
-        c.drawRightString(width - margen_x, y, f"AUXILIAR: {representante_mayus}")
+        c.drawRightString(width - margen_x, y, f"REPRESENTANTE(S): {representante_mayus}")
 
     c.save()
     return pdf_path
@@ -6065,6 +6088,7 @@ def crear_excel_reporte_estadistico(resumen, destino=None):
         ("ARS seleccionadas", resumen.get("selected_ars_label") or "Ninguna"),
         ("Cobertura seleccionada", resumen.get("coverage_filter") or COVERAGE_ALL),
         ("Especialidad seleccionada", resumen.get("specialty_filter") or SPECIALTY_ALL),
+        ("Representante(s)", resumen.get("representante") or "No disponible"),
         ("Fecha/hora de generación", generated_label),
     ]
     for label, value in summary_rows:
@@ -6079,6 +6103,12 @@ def crear_excel_reporte_estadistico(resumen, destino=None):
     resumen_ws.append(["CONTEO POR ARS", "Cantidad"])
     for ars, cantidad in resumen.get("by_ars") or resumen.get("por_seguro") or []:
         resumen_ws.append([ars, int(cantidad)])
+    representatives_by_turn = resumen.get("representatives_by_turn") or ()
+    if representatives_by_turn:
+        resumen_ws.append([])
+        resumen_ws.append(["REPRESENTANTES POR TURNO", "Representante(s)"])
+        for turn_label, representatives in representatives_by_turn:
+            resumen_ws.append([turn_label, ", ".join(representatives)])
     _aplicar_formato_resumen_estadistico(resumen_ws)
     if resumen_ws["B2"].value != len(registros):
         wb.close()
@@ -6114,6 +6144,7 @@ def _aplicar_formato_resumen_estadistico(ws):
         "REPORTE ESTADÍSTICO",
         "CONTEO POR ESPECIALIDAD",
         "CONTEO POR ARS",
+        "REPRESENTANTES POR TURNO",
     }
     for row_number in range(1, ws.max_row + 1):
         if ws.cell(row_number, 1).value not in section_labels:
@@ -9238,7 +9269,8 @@ class App:
         self._cache_resumen_time = datetime.now().timestamp()
         APP_LOG.info(
             "TURN_SUMMARY_PANEL_APPLY reason=%s total=%s general=%s pediatria=%s "
-            "ginecologia=%s urgencias=%s consultas=%s",
+            "ginecologia=%s urgencias=%s consultas=%s status=%s error_code=%s "
+            "turn_id=%s generation=%s operational_revision=%s",
             str(reason or "background_refresh"),
             int(values.get("total", 0) or 0),
             int(values.get("GENERAL", 0) or 0),
@@ -9246,6 +9278,11 @@ class App:
             int(values.get("GINECOLOGIA", 0) or 0),
             int(values.get("URGENCIAS", 0) or 0),
             int(values.get("CONSULTAS", 0) or 0),
+            str(values.get("_status") or "UNKNOWN"),
+            str(values.get("_error_code") or "-"),
+            values.get("_turn_id"),
+            values.get("_generation"),
+            values.get("_operational_revision"),
         )
         self._actualizar_resumen_turno_panel(resumen=values)
 
@@ -9259,6 +9296,10 @@ class App:
                 fuente = "BD · Excel pendiente de actualización"
             if r.get("_fuente") == "EXCEL_RECUPERADO":
                 fuente = "Excel recuperado · revisión de sincronización"
+            if r.get("_status") == "STALE":
+                fuente = "Último resumen válido · conexión temporalmente no verificada"
+            elif r.get("_status") == "INVALID_REFRESH":
+                return
 
             if not bool(self.app_settings.get("show_turno_summary", True)):
                 total_texto = ""
@@ -9394,7 +9435,8 @@ class App:
         panel = tb.Frame(cont, padding=12, style="Card.TFrame")
         panel.pack(fill="x", pady=(0, 8))
         panel.columnconfigure(0, weight=3)
-        panel.columnconfigure(1, weight=2)
+        panel.columnconfigure(1, weight=0)
+        panel.columnconfigure(2, weight=2)
 
         filtros = tb.Frame(panel, style="Card.TFrame")
         filtros.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
@@ -9452,8 +9494,11 @@ class App:
             width=22,
         ).grid(row=5, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
 
+        ttk.Separator(panel, orient="vertical").grid(
+            row=0, column=1, sticky="ns", padx=(0, 12)
+        )
         ars_panel = tb.Frame(panel, style="Card.TFrame")
-        ars_panel.grid(row=0, column=1, sticky="nsew")
+        ars_panel.grid(row=0, column=2, sticky="nsew")
         ars_panel.columnconfigure(0, weight=1)
         tb.Label(ars_panel, text="ARS", font=("Arial", 11, "bold")).grid(
             row=0, column=0, sticky="w", padx=4, pady=(0, 8)
@@ -9505,26 +9550,26 @@ class App:
             panel,
             text="ⓘ Los turnos usan identidad operacional persistida y una ventana de 8:00 AM a 8:00 AM.",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(10, 0))
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=4, pady=(10, 0))
 
         cards = tb.Frame(cont, style="Root.TFrame")
         cards.pack(fill="x", pady=(0, 8))
         card_specs = (
-            ("total", "Total pacientes"),
-            ("insured", "Asegurados"),
-            ("uninsured", "Sin seguro"),
-            ("general", "General"),
-            ("pediatric", "Pediatría"),
-            ("gynecology", "Ginecología"),
+            ("total", "👥", "Total pacientes"),
+            ("insured", "🛡", "Asegurados"),
+            ("uninsured", "👤", "Sin seguro"),
+            ("general", "⚕", "General"),
+            ("pediatric", "🧒", "Pediatría"),
+            ("gynecology", "♀", "Ginecología"),
         )
         card_vars = {}
-        for column, (key, title) in enumerate(card_specs):
+        for column, (key, icon, title) in enumerate(card_specs):
             cards.columnconfigure(column, weight=1)
             card = tb.Frame(cards, padding=10, style="Card.TFrame")
             card.grid(row=0, column=column, sticky="nsew", padx=3)
             value_var = tk.StringVar(value="0")
             detail_var = tk.StringVar(value="0% del total")
-            tb.Label(card, text=title, anchor="center").pack(fill="x")
+            tb.Label(card, text=f"{icon}  {title}", anchor="center").pack(fill="x")
             tb.Label(card, textvariable=value_var, font=("Arial", 18, "bold"), anchor="center").pack(fill="x")
             tb.Label(card, textvariable=detail_var, style="Muted.TLabel", anchor="center").pack(fill="x")
             card_vars[key] = (value_var, detail_var)
@@ -9555,7 +9600,15 @@ class App:
             vista.column(column, width=width, anchor="center" if column in {"cantidad", "ars"} else "w")
 
         estado_var = tk.StringVar(value="Seleccione filtros y presione Generar reporte.")
-        ultimo = {"dataset": None, "pdf": "", "excel": ""}
+        snapshot_store = ReportSnapshotStore()
+        ultimo = {
+            "dataset": None,
+            "snapshot_store": snapshot_store,
+            "pdf": "",
+            "excel": "",
+        }
+        pdf_button = None
+        excel_button = None
 
         def _selected_ars():
             return tuple(name for name, variable in ars_vars.items() if variable.get())
@@ -9591,38 +9644,49 @@ class App:
                 card_vars[key][0].set(f"{int(count):,}")
                 card_vars[key][1].set(f"{float(percentage):.2f}% del total")
 
-        def _resolve_turn(scope, snapshot, period):
-            source_id = str(snapshot.get("operational_source_id") or "").strip()
-            if not source_id:
-                raise RuntimeError("No existe una identidad operacional central activa.")
-            if scope == "Todos los turnos":
-                return source_id, None, period.start_at, period.end_at, scope
-            turns = self.db.list_statistical_report_turns(
-                operational_source_id=source_id,
-                limit=100,
+        def _set_export_enabled(enabled):
+            state = "normal" if enabled else "disabled"
+            for button in (pdf_button, excel_button):
+                if button is not None:
+                    button.configure(state=state)
+
+        def _mark_snapshot_stale(*_):
+            if not snapshot_store.mark_stale():
+                return
+            _set_export_enabled(False)
+            estado_var.set("Filtros modificados · genere nuevamente antes de exportar.")
+
+        def _friendly_turn_label(scope, selected_turn, turn_period):
+            if selected_turn is None:
+                return scope
+            return (
+                f"{scope} · {turn_period.start_at:%d/%m/%Y %I:%M %p} → "
+                f"{turn_period.end_at:%d/%m/%Y %I:%M %p}"
             )
-            current_turn = int(snapshot.get("turn_id") or 0)
-            if scope == "Turno actual":
-                target = next((row for row in turns if int(row.get("turn_id") or 0) == current_turn), None)
-                target = target or {
-                    "turn_id": current_turn,
-                    "started_at": snapshot.get("turn_started_at"),
-                    "ends_at": snapshot.get("turn_ends_at"),
-                }
-            else:
-                target = next((row for row in turns if int(row.get("turn_id") or 0) != current_turn), None)
-                if target is None:
-                    raise RuntimeError("No existe un turno anterior central disponible.")
-            target_turn = int(target.get("turn_id") or 0)
-            if target_turn <= 0:
-                raise RuntimeError("El turno seleccionado no posee turn_id central.")
-            turn_period = build_turn_operational_period(
-                target.get("started_at"),
-                fallback_date=period.start_at.date(),
+
+        def _turns_for_snapshot(source, start_at, end_at):
+            selected = source.get("selected_turn")
+            if selected is not None:
+                return (selected,)
+            result = []
+            for turn in source.get("turns") or ():
+                turn_period = build_turn_operational_period(
+                    turn.get("started_at"), fallback_date=start_at.date()
+                )
+                if turn_period.start_at < end_at and start_at < turn_period.end_at:
+                    result.append(turn)
+            return tuple(result)
+
+        def _log_report_output_error(code, operation, error):
+            APP_LOG.error(
+                "STATISTICAL_REPORT_OUTPUT_FAILED category=REPORT_EXPORT_ERROR "
+                "code=%s operation=%s "
+                "exception_type=%s safe_error_message=%s",
+                code,
+                operation,
+                type(error).__name__,
+                "No fue posible generar el archivo solicitado.",
             )
-            start_at, end_at = turn_period.start_at, turn_period.end_at
-            label = f"{scope} · ID {target_turn}"
-            return source_id, target_turn, start_at, end_at, label
 
         def generar():
             try:
@@ -9637,14 +9701,32 @@ class App:
                 self.set_status("Generando reporte en segundo plano…", "process")
                 win.update_idletasks()
                 def _trabajo():
-                    source_id, turn_id, start_at, end_at, turn_label = _resolve_turn(
-                        scope, snapshot, period
-                    )
-                    records = self.db.list_statistical_report_records(
+                    source_id = str(snapshot.get("operational_source_id") or "").strip()
+                    current_turn_id = int(snapshot.get("turn_id") or 0)
+                    if not source_id or current_turn_id <= 0:
+                        raise RuntimeError(
+                            "No existe una identidad operacional central activa."
+                        )
+                    source = self.db.load_statistical_report_source(
                         operational_source_id=source_id,
-                        turn_id=turn_id,
-                        start_at=start_at,
-                        end_at=end_at,
+                        turn_scope=scope,
+                        current_turn_id=current_turn_id,
+                        start_at=period.start_at,
+                        end_at=period.end_at,
+                    )
+                    turn_id = source.get("turn_id")
+                    selected_turn = source.get("selected_turn")
+                    if selected_turn is not None:
+                        turn_period = build_turn_operational_period(
+                            selected_turn.get("started_at"),
+                            fallback_date=period.start_at.date(),
+                        )
+                        start_at, end_at = turn_period.start_at, turn_period.end_at
+                    else:
+                        turn_period = period
+                        start_at, end_at = period.start_at, period.end_at
+                    turn_label = _friendly_turn_label(
+                        scope, selected_turn, turn_period
                     )
                     filters = AdmissionReportFilters(
                         start_at=start_at,
@@ -9660,7 +9742,11 @@ class App:
                         ars_mode=ars_mode,
                         selected_ars=selected_ars,
                     )
-                    dataset = build_admission_report_dataset(records, filters)
+                    dataset = build_admission_report_dataset(
+                        source.get("records") or (),
+                        filters,
+                        turns=_turns_for_snapshot(source, start_at, end_at),
+                    )
                     APP_LOG.info(
                         "ADMISSION_STATISTICAL_REPORT_DATASET turn_id=%s rows=%s diagnostics=%s",
                         turn_id,
@@ -9670,23 +9756,38 @@ class App:
                     return dataset
 
                 def _ok(dataset):
+                    snapshot_store.replace(dataset)
                     ultimo.update({"dataset": dataset, "pdf": "", "excel": ""})
                     _load_dataset_into_ui(dataset)
+                    _set_export_enabled(bool(dataset.records))
                     total = int(dataset.summary["total_patients"])
                     estado_var.set(f"Reporte listo · {total:,} paciente(s) del dataset canónico.")
                     self.set_status("Reporte cargado", "ok")
                 def _error(e):
-                    estado_var.set("Error al generar reporte.")
-                    messagebox.showerror("Reporte", f"No se pudo generar el reporte:\n{str(e)}", parent=win)
+                    code = getattr(e, "code", None) or (
+                        "REPORT_DATA_ERROR"
+                        if isinstance(e, (TypeError, ValueError))
+                        else "REPORT_QUERY_ERROR"
+                    )
+                    estado_var.set(f"No se pudo actualizar el reporte · {code}.")
+                    messagebox.showerror(
+                        "Reporte",
+                        f"No se pudo generar el reporte.\nCódigo: {code}\n{str(e)}",
+                        parent=win,
+                    )
                 self._ejecutar_en_segundo_plano("Generando reporte…", _trabajo, _ok, _error)
             except Exception as e:
                 estado_var.set("Error al generar reporte.")
                 messagebox.showerror("Reporte", f"No se pudo generar el reporte:\n{str(e)}", parent=win)
 
         def guardar_pdf():
-            dataset = ultimo.get("dataset")
-            if dataset is None or not dataset.records:
-                messagebox.showinfo("Reporte", "Primero presione \"Generar reporte\" y espere a que termine la carga.")
+            try:
+                dataset = snapshot_store.require_exportable()
+            except SnapshotStaleError as exc:
+                messagebox.showinfo("Reporte", str(exc), parent=win)
+                return
+            if not dataset.records:
+                messagebox.showinfo("Reporte", "El reporte no contiene pacientes.", parent=win)
                 return
             def _trabajo():
                 return crear_pdf_reporte(dataset.summary)
@@ -9696,13 +9797,18 @@ class App:
                 estado_var.set(f"PDF creado: {os.path.basename(ruta)}")
                 self.set_status("PDF del reporte generado", "ok")
             def _error(error):
+                _log_report_output_error("REPORT_PDF_ERROR", "pdf", error)
                 messagebox.showerror("Reporte", f"No se pudo crear el PDF:\n{error}", parent=win)
             self._ejecutar_en_segundo_plano("Creando PDF…", _trabajo, _ok, _error)
 
         def guardar_excel_reporte():
-            dataset = ultimo.get("dataset")
-            if dataset is None or not dataset.records:
-                messagebox.showinfo("Reporte", "Primero genere un reporte con pacientes.", parent=win)
+            try:
+                dataset = snapshot_store.require_exportable()
+            except SnapshotStaleError as exc:
+                messagebox.showinfo("Reporte", str(exc), parent=win)
+                return
+            if not dataset.records:
+                messagebox.showinfo("Reporte", "El reporte no contiene pacientes.", parent=win)
                 return
             destination = filedialog.asksaveasfilename(
                 parent=win,
@@ -9719,6 +9825,7 @@ class App:
                 estado_var.set(f"Excel creado: {os.path.basename(ruta)}")
                 self.set_status("Excel del reporte exportado", "ok")
             def _error(error):
+                _log_report_output_error("REPORT_EXCEL_ERROR", "excel", error)
                 messagebox.showerror("Reporte", f"No se pudo exportar el Excel:\n{error}", parent=win)
             self._ejecutar_en_segundo_plano("Exportando Excel…", _trabajo, _ok, _error)
 
@@ -9733,7 +9840,9 @@ class App:
             establecer_fecha_selector(fecha_fin, fecha_base_operativa_actual())
             for variable in ars_vars.values():
                 variable.set(False)
+            snapshot_store.clear()
             ultimo.update({"dataset": None, "pdf": "", "excel": ""})
+            _set_export_enabled(False)
             vista.delete(*vista.get_children())
             for value_var, detail_var in card_vars.values():
                 value_var.set("0")
@@ -9769,9 +9878,11 @@ class App:
                 establecer_fecha_selector(fecha_fin, fin_date)
             else:
                 periodo_var.set("Rango")
+            _mark_snapshot_stale()
 
         def _marcar_rango(*_):
             periodo_var.set("Rango")
+            _mark_snapshot_stale()
 
         combo_periodo.bind("<<ComboboxSelected>>", _actualizar_fechas_por_periodo)
         fecha_inicio.bind("<<DateEntrySelected>>", _marcar_rango)
@@ -9779,11 +9890,23 @@ class App:
         fecha_fin.bind("<<DateEntrySelected>>", _marcar_rango)
         fecha_fin.bind("<KeyRelease>", _marcar_rango)
         ars_search_var.changed.connect(lambda _value: _refresh_ars_search())
+        for filter_variable in (
+            periodo_var,
+            turno_var,
+            especialidad_var,
+            cobertura_var,
+            ars_mode_var,
+            *ars_vars.values(),
+        ):
+            filter_variable.changed.connect(lambda _value: _mark_snapshot_stale())
         button_row = tb.Frame(barra, style="Card.TFrame")
         button_row.pack(fill="x")
         tb.Button(button_row, text="📊  Generar reporte", bootstyle=PRIMARY, command=generar, width=20).pack(side="left", padx=5, ipady=5)
-        tb.Button(button_row, text="📄  Crear / abrir PDF", bootstyle=SUCCESS, command=guardar_pdf, width=20).pack(side="left", padx=5, ipady=5)
-        tb.Button(button_row, text="📗  Exportar Excel", bootstyle=INFO, command=guardar_excel_reporte, width=18).pack(side="left", padx=5, ipady=5)
+        pdf_button = tb.Button(button_row, text="📄  Crear / abrir PDF", bootstyle=SUCCESS, command=guardar_pdf, width=20)
+        pdf_button.pack(side="left", padx=5, ipady=5)
+        excel_button = tb.Button(button_row, text="📗  Exportar Excel", bootstyle=INFO, command=guardar_excel_reporte, width=18)
+        excel_button.pack(side="left", padx=5, ipady=5)
+        _set_export_enabled(False)
         tb.Button(button_row, text="Limpiar filtros", bootstyle=SECONDARY, command=limpiar_filtros, width=16).pack(side="left", padx=5, ipady=5)
         tb.Button(button_row, text="Cerrar", bootstyle=SECONDARY, command=win.destroy, width=12).pack(side="right", padx=5, ipady=5)
         tb.Label(barra, textvariable=estado_var, style="Muted.TLabel").pack(
@@ -9807,6 +9930,8 @@ class App:
             "preview_card": preview_card,
             "generate": generar,
             "clear": limpiar_filtros,
+            "pdf_button": pdf_button,
+            "excel_button": excel_button,
             "state": ultimo,
         }
 
@@ -9829,21 +9954,36 @@ class App:
             )
 
             def _trabajo():
-                records = self.db.list_statistical_report_records(
+                source = self.db.load_statistical_report_source(
                     operational_source_id=source_id,
-                    turn_id=turn_id,
+                    turn_scope="Turno actual",
+                    current_turn_id=turn_id,
                     start_at=period.start_at,
                     end_at=period.end_at,
+                )
+                selected_turn = source.get("selected_turn") or {}
+                effective_period = build_turn_operational_period(
+                    selected_turn.get("started_at"),
+                    fallback_date=period.start_at.date(),
+                )
+                turn_label = (
+                    "Turno actual · "
+                    f"{effective_period.start_at:%d/%m/%Y %I:%M %p} → "
+                    f"{effective_period.end_at:%d/%m/%Y %I:%M %p}"
                 )
                 filters = AdmissionReportFilters(
-                    start_at=period.start_at,
-                    end_at=period.end_at,
-                    period_label=period.label,
-                    turn_label=f"Turno actual · ID {turn_id}",
+                    start_at=effective_period.start_at,
+                    end_at=effective_period.end_at,
+                    period_label=effective_period.label,
+                    turn_label=turn_label,
                     operational_source_id=source_id,
                     turn_id=turn_id,
                 )
-                dataset = build_admission_report_dataset(records, filters)
+                dataset = build_admission_report_dataset(
+                    source.get("records") or (),
+                    filters,
+                    turns=(selected_turn,),
+                )
                 if not dataset.records:
                     return "", dataset
                 return crear_pdf_reporte(dataset.summary), dataset
@@ -16291,6 +16431,15 @@ class App:
                     return
                 representante = nuevo_representante
                 candidato["representante"] = representante
+            elif not administrative_override:
+                messagebox.showerror(
+                    "No se puede realizar el relevo",
+                    "No se puede realizar el relevo.\n"
+                    "El usuario seleccionado ya es el representante del turno actual.\n"
+                    "Seleccione al usuario que recibirá el próximo turno.",
+                    parent=win,
+                )
+                return
             override_reason = ""
             if administrative_override:
                 if normalize_role(self.session_context.role) != ROLE_ADMIN:
@@ -16340,43 +16489,16 @@ class App:
                 )
                 return
 
-            if not guardar_turno_config(
-                representante,
-                turno_codigo,
-                fecha_base,
-                inicio_real=momento_cambio,
-                administrative_override=administrative_override,
-                override_reason=override_reason,
-            ):
-                messagebox.showerror(
-                    "Turno",
-                    "No se pudo guardar la configuración. El turno anterior permanece sin cambios.",
-                    parent=win,
-                )
-                return
-            if turno_saliente and not administrative_override:
-                self.db.cerrar_turno_existente(
-                    turno_saliente,
-                    momento_cambio,
-                    actor=self.session_context.username,
-                    actor_role=self.session_context.role,
-                    session_id=self.session_context.session_id,
-                )
-            guardar_representante_catalogo(representante, self.db)
-
-            turno_cfg_nuevo = cargar_turno_config(
-                permitir_vencido=administrative_override
+            transition = self.db.perform_explicit_turn_handoff(
+                shift_metadata=candidato
             )
-            if not turno_cfg_nuevo:
-                raise TurnoNoVigenteError("El turno guardado no quedó vigente.")
-            nuevo_turno_id = self.db.obtener_o_crear_turno(
-                turno_cfg_nuevo,
-                administrative_override=administrative_override,
-            )
-            transition = getattr(self.db, "last_transition_result", None)
-            committed = bool(getattr(transition, "committed", True))
+            committed = bool(getattr(transition, "committed", False))
             if not committed:
                 raise RuntimeError("La transición central no fue confirmada.")
+            changed_session = getattr(transition, "operational_session", None)
+            central_turn_id = int(getattr(changed_session, "turn_id", 0) or 0)
+            if central_turn_id <= 0:
+                raise RuntimeError("La transición central no devolvió un turn_id válido.")
             transition_id = str(getattr(transition, "transition_id", "") or "")
             if not transition_id:
                 import uuid
@@ -16385,10 +16507,50 @@ class App:
             # Desde aquí la operación central está confirmada. Ninguna
             # actualización de Excel/PDF/impresión puede convertirla en FAIL.
             post_commit_warnings = []
+            turno_cfg_nuevo = None
+            nuevo_turno_local_id = None
             try:
-                enqueue_excel_export_job(
-                    transition_id, int(nuevo_turno_id or 0), turno_cfg_nuevo
+                saved = guardar_turno_config(
+                    representante,
+                    turno_codigo,
+                    fecha_base,
+                    inicio_real=momento_cambio,
+                    administrative_override=administrative_override,
+                    override_reason=override_reason,
                 )
+                if not saved:
+                    raise RuntimeError("No se pudo guardar el espejo de configuración.")
+                if turno_saliente and not administrative_override:
+                    self.db.cerrar_turno_existente(
+                        turno_saliente,
+                        momento_cambio,
+                        actor=self.session_context.username,
+                        actor_role=self.session_context.role,
+                        session_id=self.session_context.session_id,
+                    )
+                guardar_representante_catalogo(representante, self.db)
+                turno_cfg_nuevo = cargar_turno_config(
+                    permitir_vencido=administrative_override
+                )
+                if not turno_cfg_nuevo:
+                    raise TurnoNoVigenteError("El espejo del turno no quedó disponible.")
+                nuevo_turno_local_id = self.db.obtener_o_crear_turno(
+                    turno_cfg_nuevo,
+                    administrative_override=administrative_override,
+                )
+            except Exception:
+                post_commit_warnings.append("LOCAL_MIRROR")
+                APP_LOG.exception(
+                    "Turno central confirmado; espejo local pendiente transition=%s turn_id=%s",
+                    transition_id,
+                    central_turn_id,
+                )
+
+            try:
+                if turno_cfg_nuevo:
+                    enqueue_excel_export_job(
+                        transition_id, central_turn_id, turno_cfg_nuevo
+                    )
             except Exception:
                 post_commit_warnings.append("EXCEL_QUEUE")
                 APP_LOG.exception(
@@ -16404,7 +16566,8 @@ class App:
                 post_commit_warnings.append("UI_REFRESH")
                 APP_LOG.exception("Turno confirmado; refresco visual pendiente")
             try:
-                self.db.notify_shift_changed(nuevo_turno_id)
+                if nuevo_turno_local_id:
+                    self.db.notify_shift_changed(nuevo_turno_local_id)
             except Exception:
                 post_commit_warnings.append("SHIFT_EVENT")
                 APP_LOG.exception("Turno confirmado; notificación local pendiente")
@@ -16417,17 +16580,18 @@ class App:
             if administrative_override:
                 APP_LOG.info(
                     "TURN_ADMIN_OVERRIDE_POST_COMMIT_SKIPPED turn_id=%s reason=%s",
-                    nuevo_turno_id,
+                    central_turn_id,
                     override_reason,
                 )
             else:
                 try:
-                    self.root.after(
-                        0,
-                        lambda saliente=turno_saliente, nuevo=turno_cfg_nuevo, momento=momento_cambio: (
-                            self._run_turn_post_commit_effects(saliente, nuevo, momento)
-                        ),
-                    )
+                    if turno_cfg_nuevo:
+                        self.root.after(
+                            0,
+                            lambda saliente=turno_saliente, nuevo=turno_cfg_nuevo, momento=momento_cambio: (
+                                self._run_turn_post_commit_effects(saliente, nuevo, momento)
+                            ),
+                        )
                 except Exception:
                     post_commit_warnings.append("POST_COMMIT_SCHEDULE")
                     APP_LOG.exception("Turno confirmado; efectos post-commit pendientes")
