@@ -153,7 +153,7 @@ def test_new_empty_turn_excludes_historical_rows_without_date_fallback():
     assert summary["_status"] == "VALID_EMPTY"
 
 
-def test_general_urgency_and_consultation_keep_existing_summary_rules():
+def test_total_counts_general_urgency_and_consultation_once_each():
     proxy, _connection = _proxy([
         _row(1),
         _row(2, "URGENCIA"),
@@ -162,7 +162,7 @@ def test_general_urgency_and_consultation_keep_existing_summary_rules():
 
     summary = proxy.refresh_turn_summary()
 
-    assert summary["total"] == 1
+    assert summary["total"] == 3
     assert summary["GENERAL"] == 1
     assert summary["URGENCIAS"] == 1
     assert summary["CONSULTAS"] == 1

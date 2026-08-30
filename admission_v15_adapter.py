@@ -292,6 +292,8 @@ class _HybridAdmissionRuntime:
         self._pending_mirror_state = None
         self._last_mirrored_generation = 0
         self._last_mirrored_operational_revision = 0
+        self._last_heartbeat_at = 0.0
+        self._last_patient_pull_at = 0.0
         self.connection_supervisor = ConnectionSupervisor(
             self._probe_operational_snapshot,
             reset_pool=self._reset_host_database_pool,
@@ -1655,6 +1657,40 @@ class _HybridAdmissionRuntime:
         )
         return rebound
 
+    def _heartbeat_if_due(self, attachment: Any, state: Any) -> None:
+        from admission_hybrid import HEARTBEAT_INTERVAL_SECONDS
+
+        heartbeat_now = perf_counter()
+        if (
+            attachment is None
+            or not state.device_attached
+            or heartbeat_now - self._last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS
+        ):
+            return
+        self.session_service.heartbeat(
+            operational_session_id=(
+                attachment.operational_session.operational_session_id
+            ),
+            device_id=self.device_id,
+        )
+        self._last_heartbeat_at = heartbeat_now
+
+    def _pull_patient_directory_if_due(self) -> int:
+        from admission_hybrid import PATIENT_DIRECTORY_POLL_SECONDS
+
+        patient_poll_now = perf_counter()
+        if (
+            self.patient_directory is None
+            or patient_poll_now - self._last_patient_pull_at
+            < PATIENT_DIRECTORY_POLL_SECONDS
+        ):
+            return 0
+        pulled = self.patient_directory.pull_incremental(limit=500)
+        self._last_patient_pull_at = patient_poll_now
+        if pulled:
+            self.logger.info("PATIENT_PULL_BATCH count=%s", pulled)
+        return int(pulled or 0)
+
     def synchronize(self) -> dict[str, Any]:
         with self._lock:
             if self.store is None or self.sync_service is None:
@@ -1751,29 +1787,22 @@ class _HybridAdmissionRuntime:
                     self.offline = False
                     self.offline_lease_valid = False
                     return self.state()
-                latest = self.attachment
-                if latest is not None and latest_state.device_attached:
-                    self.session_service.heartbeat(
-                        operational_session_id=latest.operational_session.operational_session_id,
-                        device_id=self.device_id,
-                    )
-                result = self.sync_service.synchronize_once()
+                self._heartbeat_if_due(self.attachment, latest_state)
+                result = self.sync_service.synchronize_once(
+                    operational_source_id=latest_state.operational_source_id,
+                    turn_id=int(latest_state.turn_id or 0),
+                    device_id=self.device_id,
+                    reason="timer",
+                )
                 result["reconciled"] = self.sync_service.reconcile_current_turn(
                     operational_source_id=latest_state.operational_source_id,
                     turn_id=latest_state.turn_id,
-                    force=bool(
-                        central_changed
-                        or any(
-                            int(result.get(name) or 0) > 0
-                            for name in ("pushed", "pulled", "recovered", "replayed", "backfilled")
-                        )
-                    ),
+                    # The incremental stream already materializes new events.
+                    # A full current-turn read is needed once per identity, not
+                    # after every push/pull or operational revision refresh.
+                    force=False,
                 )
-                patient_pulled = 0
-                if self.patient_directory is not None:
-                    patient_pulled = self.patient_directory.pull_incremental(limit=500)
-                    if patient_pulled:
-                        self.logger.info("PATIENT_PULL_BATCH count=%s", patient_pulled)
+                patient_pulled = self._pull_patient_directory_if_due()
                 result["patient_pulled"] = patient_pulled
                 if any(
                     int(result.get(name) or 0) > 0
@@ -2164,6 +2193,7 @@ class _HybridDatabaseProxy:
             "CONSULTAS": 0,
         }
         for row in rows:
+            counts["total"] += 1
             attention_type = str(
                 row.get("tipo_atencion") or row.get("service_type") or "EMERGENCIA"
             ).upper()
@@ -2184,7 +2214,6 @@ class _HybridDatabaseProxy:
                     else "GENERAL"
                 )
                 counts[key] += 1
-                counts["total"] += 1
             ars = str(
                 row.get("ars_display") or row.get("canonical_ars") or row.get("ars") or ""
             ).upper()
@@ -2451,7 +2480,7 @@ class _HybridDatabaseProxy:
         started = perf_counter()
         logger = getattr(self._runtime, "logger", None)
         if logger is not None:
-            logger.info("HISTORY_SYNC_START method=%s", method_name)
+            logger.info("HISTORY_QUERY_START method=%s", method_name)
         if self._runtime.offline:
             local_method = getattr(self._database, method_name)
             return sorted(
@@ -2544,6 +2573,12 @@ class _HybridDatabaseProxy:
         params.extend((limit + offset, 0))
         with self._runtime.host.connection_factory() as con:
             cloud_rows = [dict(row) for row in con.execute(sql, tuple(params)).fetchall()]
+        if logger is not None:
+            logger.info(
+                "HISTORY_CENTRAL_READ method=%s rows=%s source=CENTRAL",
+                method_name,
+                len(cloud_rows),
+            )
 
         # V15 still calls several local-id APIs. Materialize every central row
         # first, then replace the origin PC integer with this PC's exact local ID.
@@ -2578,7 +2613,7 @@ class _HybridDatabaseProxy:
                 # retries independently; the visible cloud rows remain valid.
                 if logger is not None:
                     logger.exception(
-                        "HISTORY_CACHE_HYDRATION_FAILED rows=%s",
+                        "HISTORY_READTHROUGH_HYDRATION_FAILED rows=%s",
                         len(cloud_rows),
                     )
 
@@ -2586,6 +2621,12 @@ class _HybridDatabaseProxy:
         pending_rows = self._pending_history_rows(
             method_name, names, values, limit, offset, logger
         )
+        if logger is not None:
+            logger.info(
+                "HISTORY_LOCAL_PENDING_COUNT method=%s rows=%s",
+                method_name,
+                len(pending_rows),
+            )
         by_uuid = {
             str(row.get("global_attention_id") or "").replace("-", "").lower(): row
             for row in cloud_rows
@@ -2598,12 +2639,26 @@ class _HybridDatabaseProxy:
         merged = sorted(by_uuid.values(), key=self._history_sort_key, reverse=True)
         result = merged[offset:offset + limit]
         if logger is not None:
+            estimated_bytes = sum(
+                len(str(row).encode("utf-8", errors="replace")) for row in cloud_rows
+            )
             logger.info(
-                "HISTORY_SYNC_DONE method=%s rows=%s elapsed_ms=%.1f",
-                method_name, len(result), (perf_counter() - started) * 1000.0,
+                "HISTORY_SYNC_DONE method=%s rows=%s cloud_rows=%s "
+                "estimated_bytes=%s elapsed_ms=%.1f",
+                method_name,
+                len(result),
+                len(cloud_rows),
+                estimated_bytes,
+                (perf_counter() - started) * 1000.0,
             )
             logger.info(
                 "HISTORY_REFRESH method=%s rows=%s", method_name, len(result)
+            )
+            logger.info(
+                "HISTORY_RESULT_COUNT method=%s rows=%s source=%s",
+                method_name,
+                len(result),
+                "CENTRAL_PLUS_PENDING" if pending_rows else "CENTRAL",
             )
         return result
 
@@ -2657,7 +2712,7 @@ class _HybridDatabaseProxy:
         )
         if logger is not None:
             logger.info(
-                "HISTORY_REFRESH method=%s rows=%s source=offline_replica "
+                "HISTORY_REFRESH method=%s rows=%s source=OFFLINE_LOCAL "
                 "elapsed_ms=%.1f",
                 method_name,
                 len(rows),
@@ -3610,6 +3665,8 @@ class _HybridCoordinator(QObject):
         self._pending = False
         self._mirror_busy = False
         self._stopped = False
+        self._failure_count = 0
+        self._retry_not_before = 0.0
         self._last_state_fingerprint = None
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(2)
@@ -3663,6 +3720,8 @@ class _HybridCoordinator(QObject):
     def _schedule(self) -> None:
         if self._stopped:
             return
+        if perf_counter() < self._retry_not_before:
+            return
         if self._busy or self._mirror_busy:
             self._pending = True
             return
@@ -3689,8 +3748,26 @@ class _HybridCoordinator(QObject):
             self._pending = False
             QTimer.singleShot(0, self._schedule)
 
+    def _record_connection_failure(self) -> None:
+        self._failure_count += 1
+        delay = bounded_sync_retry_delay(
+            self._failure_count,
+            str(getattr(self.runtime, "device_id", "")),
+        )
+        self._retry_not_before = perf_counter() + delay
+        self.runtime.logger.warning(
+            "SYNC_BACKOFF failures=%s delay_seconds=%.2f",
+            self._failure_count,
+            delay,
+        )
+
+    def _reset_connection_backoff(self) -> None:
+        self._failure_count = 0
+        self._retry_not_before = 0.0
+
     @Slot(object)
     def _login_reattach_succeeded(self, result: Any) -> None:
+        self._reset_connection_backoff()
         data = dict(result or {})
         fingerprint = self._state_fingerprint(data)
         if fingerprint != self._last_state_fingerprint:
@@ -3712,13 +3789,17 @@ class _HybridCoordinator(QObject):
     @Slot(str)
     def _login_reattach_failed(self, code: str) -> None:
         self.failed.emit(code)
+        self._record_connection_failure()
         self._busy = False
         self._pending = False
-        QTimer.singleShot(0, self._schedule)
 
     @Slot(object)
     def _sync_succeeded(self, result: Any) -> None:
         data = dict(result or {})
+        if bool(data.get("offline")):
+            self._record_connection_failure()
+        else:
+            self._reset_connection_backoff()
         fingerprint = self._state_fingerprint(data)
         if fingerprint != self._last_state_fingerprint:
             self._last_state_fingerprint = fingerprint
@@ -3763,6 +3844,7 @@ class _HybridCoordinator(QObject):
     @Slot(str)
     def _sync_failed(self, code: str) -> None:
         self.failed.emit(code)
+        self._record_connection_failure()
         self._finish_cycle()
 
 
@@ -4077,6 +4159,45 @@ def _bind_hybrid_shutdown(
 
 def _clean(value: Any, maximum: int) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", "", str(value or "").strip())[:maximum]
+
+
+def bounded_sync_retry_delay(failure_count: int, device_id: str = "") -> float:
+    """Exponential retry delay with deterministic per-device jitter."""
+    failures = max(1, int(failure_count))
+    base = min(60.0, 5.0 * (2 ** min(failures - 1, 4)))
+    seed = sum(ord(character) for character in f"{device_id}:{failures}") % 101
+    return base + (base * 0.2 * seed / 100.0)
+
+
+def _online_sync_status(
+    role: str, pending_sync_count: int
+) -> tuple[str, tuple[str, str, str]]:
+    station = "Principal" if str(role).upper() == "PRIMARY" else "Secundaria"
+    pending = max(0, int(pending_sync_count or 0))
+    if pending:
+        return (
+            f"Conectado · {station} · Pendiente de sincronización ({pending})",
+            ("#FFF4D6", "#7A4E00", "#E5C36A"),
+        )
+    return (
+        f"Conectado · {station} · Sincronizado",
+        ("#E8F7EE", "#17633A", "#9AD5B0"),
+    )
+
+
+def _bind_operational_file_logging(logger: logging.Logger, database_class: type) -> None:
+    """Route safe operational metrics to V15's existing rotating app log."""
+    module = sys.modules.get(str(getattr(database_class, "__module__", "")))
+    file_logger = getattr(module, "APP_LOG", None) if module is not None else None
+    handlers = tuple(getattr(file_logger, "handlers", ()) or ())
+    if not handlers:
+        return
+    for target in (logger, logging.getLogger("hospital.admission.operational")):
+        target.setLevel(logging.INFO)
+        for handler in handlers:
+            if handler not in target.handlers:
+                target.addHandler(handler)
+        target.propagate = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -4818,6 +4939,7 @@ class AdmissionV15Factory:
         logger = getattr(host, "logger", None) or logging.getLogger(
             "hospital.admission.v15"
         )
+        _bind_operational_file_logging(logger, modules.database_class)
         hybrid = _HybridAdmissionRuntime(host)
         gateway = EmbeddedMainAppGateway(
             current_user=getattr(host, "user", {}),
@@ -5078,9 +5200,9 @@ class AdmissionV15Factory:
                     text = f"Sin conexión · {station} · {pending} pendientes"
                     colors = ("#FFF4D6", "#7A4E00", "#E5C36A")
                 else:
-                    station = "Principal" if role == "PRIMARY" else "Secundaria"
-                    text = f"Conectado · {station} · Sincronizado"
-                    colors = ("#E8F7EE", "#17633A", "#9AD5B0")
+                    text, colors = _online_sync_status(
+                        role, int(state.get("pending_sync_count") or 0)
+                    )
                 status_label.setText(text)
                 status_label.setStyleSheet(
                     f"background:{colors[0]};color:{colors[1]};"

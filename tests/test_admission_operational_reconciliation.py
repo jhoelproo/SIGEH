@@ -75,8 +75,17 @@ def _local_database(path: Path) -> None:
 
 
 class _SyncService:
-    def synchronize_once(self):
+    def __init__(self):
+        self.sync_calls = []
+        self.reconcile_calls = []
+
+    def synchronize_once(self, **kwargs):
+        self.sync_calls.append(dict(kwargs))
         return {"pushed": 0, "pulled": 0}
+
+    def reconcile_current_turn(self, **kwargs):
+        self.reconcile_calls.append(dict(kwargs))
+        return 0
 
 
 class _SessionService:
@@ -452,6 +461,43 @@ def test_auxiliary_attaches_without_changing_central_operator_turn_or_generation
     assert host.current_shift["owner_username"] == "fernando"
     assert service.central.active_username == "fernando"
     assert service.central.generation == 42
+
+
+def test_online_idle_tick_throttles_heartbeat_and_patient_directory(tmp_path):
+    service = _SessionService(_session(), attached=True)
+    runtime, _host, _database_path = _runtime(
+        tmp_path,
+        {"id": 8, "username": "fernando", "role": "administrador"},
+        service,
+    )
+    runtime.attachment = DeviceAttachment(
+        _session(), StationRole.SECONDARY, True, "Conectado."
+    )
+    runtime._operational_state = service.get_central_admission_operational_state(
+        current_user=runtime.current_user,
+        current_session_id=runtime.login_session_id,
+        current_device_id=runtime.device_id,
+    )
+    runtime._last_mirrored_generation = 42
+    runtime._last_mirrored_operational_revision = (
+        runtime._operational_state.operational_revision
+    )
+    patient_directory = SimpleNamespace(
+        calls=0,
+        pull_incremental=lambda **_kwargs: (
+            setattr(patient_directory, "calls", patient_directory.calls + 1) or 0
+        ),
+    )
+    runtime.patient_directory = patient_directory
+
+    runtime.synchronize()
+    runtime.synchronize()
+
+    assert service.heartbeat_calls == 1
+    assert len(runtime.sync_service.sync_calls) == 2
+    assert runtime.sync_service.sync_calls[0]["turn_id"] == 316
+    assert runtime.sync_service.reconcile_calls[0]["force"] is False
+    assert patient_directory.calls == 1
 
 
 def test_secondary_never_reaches_primary_turn_mutation(tmp_path, caplog):

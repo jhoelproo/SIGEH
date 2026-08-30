@@ -689,7 +689,7 @@ def test_adopted_central_snapshot_updates_turn_and_representative_before_mirror(
     assert runtime.offline is False
 
 
-def test_turn_summary_uses_canonical_dataset_and_excludes_urgency_and_consultation():
+def test_turn_summary_total_includes_emergency_urgency_and_consultation():
     rows = [
         {"tipo_atencion": "EMERGENCIA", "hoja_normalizada": "GENERAL", "ars_display": "SIN SEGURO"},
         {"tipo_atencion": "EMERGENCIA", "hoja_normalizada": "PEDIATRIA", "ars_display": "HUMANO"},
@@ -721,7 +721,7 @@ def test_turn_summary_uses_canonical_dataset_and_excludes_urgency_and_consultati
 
     summary = proxy.refresh_turn_summary()
 
-    assert summary["total"] == 3
+    assert summary["total"] == 5
     assert summary["GENERAL"] == 1
     assert summary["PEDIATRIA"] == 1
     assert summary["GINECOLOGIA"] == 1
