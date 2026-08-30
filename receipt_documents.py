@@ -14,7 +14,7 @@ STORAGE_SNAPSHOT = "SNAPSHOT"
 STORAGE_HYBRID = "HYBRID"
 STORAGE_MODES = (STORAGE_LEGACY, STORAGE_SNAPSHOT, STORAGE_HYBRID)
 RECEIPT_TEMPLATE_VERSION = "receipt_html_v1"
-RECEIPT_SNAPSHOT_SCHEMA_VERSION = 1
+RECEIPT_SNAPSHOT_SCHEMA_VERSION = 2
 
 
 class ReceiptDocumentError(RuntimeError):
@@ -248,7 +248,11 @@ def build_receipt_snapshot(
                   r.admission_source_instance_id,r.turno_origen_id,
                   r.turno_procesamiento_id,r.herencia_estado,
                   r.revision_version,r.service_type,r.specialty_snapshot,
-                  r.document_storage_mode,
+                  r.document_storage_mode,r.verification_bypassed,
+                  r.verification_bypass_reason,r.verification_bypass_by,
+                  r.verification_bypass_role,r.verification_bypass_device,
+                  r.verification_bypass_at,r.receipt_origin,
+                  r.review_status,r.review_reason,
                   COALESCE(NULLIF(u.full_name,''),r.username,'Sistema')
                     AS visible_user
            FROM recibos r
@@ -308,6 +312,8 @@ def build_receipt_snapshot(
             "service_type": str(row["service_type"] or "EMERGENCIA"),
             "specialty": str(row["specialty_snapshot"] or ""),
             "revision_version": _int(row["revision_version"]),
+            "review_status": str(row.get("review_status") or "NOT_APPLICABLE"),
+            "review_reason": str(row.get("review_reason") or ""),
         },
         "patient": {
             "name": str(row["nombre"] or ""),
@@ -349,6 +355,17 @@ def build_receipt_snapshot(
             ),
             "template_version": RECEIPT_TEMPLATE_VERSION,
             "schema_version": RECEIPT_SNAPSHOT_SCHEMA_VERSION,
+        },
+        "bypass_audit": {
+            "verification_bypassed": bool(row.get("verification_bypassed")),
+            "reason": str(row.get("verification_bypass_reason") or ""),
+            "created_by": str(row.get("verification_bypass_by") or ""),
+            "role": str(row.get("verification_bypass_role") or ""),
+            "device": str(row.get("verification_bypass_device") or ""),
+            "created_at": str(row.get("verification_bypass_at") or ""),
+            "receipt_origin": str(row.get("receipt_origin") or ""),
+            "review_status": str(row.get("review_status") or "NOT_APPLICABLE"),
+            "review_reason": str(row.get("review_reason") or ""),
         },
         "links": {
             "admission_attention_id": (

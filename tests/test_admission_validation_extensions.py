@@ -188,7 +188,122 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
             params for sql, params in connection.calls
             if sql.startswith("INSERT INTO action_history")
         ]
-        self.assertTrue(any("UNLINKED_RECEIPT_CREATED" in params for params in actions))
+        self.assertTrue(any("BYPASS_RECEIPT_CREATED" in params for params in actions))
+
+    def test_bypass_authorization_controls_document_and_review_without_attention(self):
+        scenarios = (
+            ("123456", app.DOCUMENT_READY, app.AUTH_REVIEW_CLEAR, False),
+            ("ABC-123", app.DOCUMENT_READY, app.AUTH_REVIEW_PENDING, True),
+            ("", app.DOCUMENT_PRELIMINARY, app.AUTH_REVIEW_NOT_APPLICABLE, False),
+        )
+        for authorization, document_state, review_status, flagged in scenarios:
+            with self.subTest(authorization=authorization):
+                connection = _SaveConnection()
+                with patch.object(
+                    app,
+                    "get_user",
+                    return_value={"username": "audit", "role": app.ROLE_AUDIT},
+                ), patch.object(
+                    app, "db_connect", return_value=connection
+                ), patch.object(
+                    app,
+                    "save_receipt_document_snapshot",
+                    return_value={"version": 1},
+                ):
+                    app.save_receipt_with_items(
+                        None, 2, "Paciente", "2026-08-01", "DX", "HUMANO",
+                        0, 10, "", "audit", 0, "2026-08-01", [],
+                        authorization_number=authorization,
+                        verification_bypass={
+                            "reason": "emergencia administrativa",
+                            "role": app.ROLE_AUDIT,
+                        },
+                    )
+                insert_params = next(
+                    params
+                    for sql, params in connection.calls
+                    if sql.startswith("INSERT INTO recibos(")
+                )
+                self.assertIn(document_state, insert_params)
+                self.assertIn(review_status, insert_params)
+                actions = [
+                    params
+                    for sql, params in connection.calls
+                    if sql.startswith("INSERT INTO action_history")
+                ]
+                self.assertEqual(
+                    any("BYPASS_RECEIPT_REVIEW_FLAGGED" in row for row in actions),
+                    flagged,
+                )
+
+    def test_editing_existing_bypass_reclassifies_authorization_without_attention(self):
+        current = {
+            "estado_facturacion": app.BILLING_PENDING,
+            "revision_version": 0,
+            "total": 10,
+            "sala": 0,
+            "ars": "HUMANO",
+            "tipo_cobertura": "ASEGURADO",
+            "numero_autorizacion": "",
+            "estado_documento": app.DOCUMENT_PRELIMINARY,
+            "admission_atencion_id": None,
+            "admission_nss_snapshot": None,
+            "admission_cedula_snapshot": None,
+            "admission_source_instance_id": None,
+            "verification_bypassed": True,
+            "verification_bypass_role": app.ROLE_AUDIT,
+            "verification_bypass_device": "PC-2",
+            "receipt_origin": "MANUAL_PRIVILEGED",
+            "was_invoiced": False,
+        }
+
+        class EditingConnection(_SaveConnection):
+            def execute(self, sql, params=None):
+                compact = " ".join(str(sql).split())
+                if compact.startswith("SELECT estado_facturacion"):
+                    params = tuple(params or ())
+                    self.calls.append((compact, params))
+                    return _Cursor([current])
+                return super().execute(sql, params)
+
+        connection = EditingConnection()
+        with patch.object(
+            app, "db_connect", return_value=connection
+        ), patch.object(
+            app, "save_receipt_document_snapshot", return_value={"version": 2}
+        ):
+            saved_id = app.save_receipt_with_items(
+                77,
+                2,
+                "Paciente",
+                "2026-08-01",
+                "DX",
+                "HUMANO",
+                0,
+                10,
+                "",
+                "audit",
+                0,
+                "2026-08-01",
+                [],
+                authorization_number="ABC123",
+            )
+        self.assertEqual(saved_id, 77)
+        update_params = next(
+            params
+            for sql, params in connection.calls
+            if sql.startswith("UPDATE recibos SET nombre=")
+        )
+        self.assertIn(app.DOCUMENT_READY, update_params)
+        self.assertIn(app.AUTH_REVIEW_PENDING, update_params)
+        self.assertIn("INVALID_AUTHORIZATION_FORMAT", update_params)
+        self.assertTrue(
+            any(
+                "BYPASS_RECEIPT_REVIEW_FLAGGED" in params
+                for sql, params in connection.calls
+                if sql.startswith("INSERT INTO action_history")
+            )
+        )
 
     def test_bulk_wrapper_requests_one_tolerant_transaction(self):
         with patch.object(

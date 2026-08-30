@@ -244,7 +244,12 @@ class _MaintenanceAnalyzer(DatabaseCapacityAnalyzer):
         return True
 
     def analyze_event_retention(self, con, **kwargs):
-        return {"retention_safe": True, "candidate_floor": 5, "max_sequence": 10}
+        return {
+            "retention_safe": True,
+            "candidate_floor": 5,
+            "max_sequence": 10,
+            "retention_days": 180,
+        }
 
 
 def test_guarded_maintenance_requires_confirmation_and_revalidates():
@@ -252,16 +257,30 @@ def test_guarded_maintenance_requires_confirmation_and_revalidates():
     analyzer = _MaintenanceAnalyzer(con)
     with pytest.raises(PermissionError):
         analyzer.purge_safe_import_staging()
-    assert analyzer.purge_safe_import_staging(confirmed=True) == {
+    with pytest.raises(PermissionError, match="respaldo"):
+        analyzer.purge_safe_import_staging(confirmed=True)
+    assert analyzer.purge_safe_import_staging(
+        confirmed=True, backup_reference="backup-20260830"
+    ) == {
         "batches": 1,
         "rows": 2,
     }
     with pytest.raises(ValueError):
-        analyzer.prune_safe_events("UNKNOWN", confirmed=True)
+        analyzer.prune_safe_events(
+            "UNKNOWN", confirmed=True, backup_reference="backup-20260830"
+        )
     with pytest.raises(PermissionError):
         analyzer.prune_safe_events("ATTENTION")
-    attention = analyzer.prune_safe_events("ATTENTION", confirmed=True)
-    patient = analyzer.prune_safe_events("PATIENT_DIRECTORY", confirmed=True)
+    with pytest.raises(PermissionError, match="respaldo"):
+        analyzer.prune_safe_events("ATTENTION", confirmed=True)
+    attention = analyzer.prune_safe_events(
+        "ATTENTION", confirmed=True, backup_reference="backup-20260830"
+    )
+    patient = analyzer.prune_safe_events(
+        "PATIENT_DIRECTORY",
+        confirmed=True,
+        backup_reference="backup-20260830",
+    )
     assert attention == {"rows": 3, "floor": 5, "checkpoint": 10}
     assert patient == attention
 
@@ -272,15 +291,52 @@ def test_guarded_event_retention_refuses_unready_projection():
             return {"retention_safe": False, "candidate_floor": 0, "max_sequence": 10}
 
     with pytest.raises(RuntimeError):
-        _Unsafe(_MaintenanceConnection()).prune_safe_events("ATTENTION", confirmed=True)
+        _Unsafe(_MaintenanceConnection()).prune_safe_events(
+            "ATTENTION", confirmed=True, backup_reference="backup-20260830"
+        )
 
     class _NothingEligible(_MaintenanceAnalyzer):
         def analyze_event_retention(self, con, **kwargs):
             return {"retention_safe": True, "candidate_floor": 0, "max_sequence": 10}
 
     assert _NothingEligible(_MaintenanceConnection()).prune_safe_events(
-        "ATTENTION", confirmed=True
+        "ATTENTION", confirmed=True, backup_reference="backup-20260830"
     ) == {"rows": 0, "floor": 0, "checkpoint": 10}
+
+
+def test_event_retention_is_conservative_and_specific_per_stream(monkeypatch):
+    analyzer = DatabaseCapacityAnalyzer(lambda: object())
+    monkeypatch.setattr(analyzer, "_relation_exists", lambda *_args: True)
+
+    def fake_one(_con, sql, _params=()):
+        if "retention_days" in sql:
+            return {
+                "minimum_available_sequence": 0,
+                "checkpoint_sequence": 0,
+                "retention_days": 7,
+            }
+        if "MAX(sequence)" in sql and "WHERE" in sql:
+            return {"candidate_floor": 10, "candidate_rows": 10}
+        return {"min_sequence": 1, "max_sequence": 20, "rows": 20}
+
+    monkeypatch.setattr(analyzer, "_one", fake_one)
+    attention = analyzer.analyze_event_retention(
+        object(),
+        stream_name="ATTENTION",
+        table="admission_sync_events",
+        timestamp_column="received_at",
+        projection_ready=True,
+    )
+    patient = analyzer.analyze_event_retention(
+        object(),
+        stream_name="PATIENT_DIRECTORY",
+        table="admission_patient_directory_events",
+        timestamp_column="created_at",
+        projection_ready=True,
+    )
+    assert attention["retention_days"] == 180
+    assert patient["retention_days"] == 365
+    assert attention["recovery_mode"] == "PROJECTION_CHECKPOINT_BOOTSTRAP"
 
 
 def test_absent_optional_relations_have_zero_safe_cleanup():

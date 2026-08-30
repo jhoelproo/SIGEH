@@ -5444,6 +5444,27 @@ class OperationalSessionService:
                 if str(item.get("login_session_id") or "")
             )
             new_generation = current.generation + 1
+            handoff_details = {
+                "old_user_id": current.active_user_id,
+                "old_username": current.active_username,
+                "new_user_id": new_user_id,
+                "new_username": new_username,
+                "old_turn_id": current.turn_id,
+                "new_turn_id": target_turn_id,
+                "old_generation": current.generation,
+                "new_generation": new_generation,
+                "trigger": str(trigger or TRIGGER_USER_REQUESTED_HANDOFF),
+            }
+            self._audit(
+                con,
+                session_id=operational_session_id,
+                event_type="TURN_HANDOFF_REQUESTED",
+                device_id=primary_device_id,
+                username=new_username,
+                generation=current.generation,
+                transition_id=transition_uuid,
+                details=handoff_details,
+            )
             con.execute(
                 """UPDATE admission_operational_sessions SET
                        active_username=%s,active_user_id=%s,active_user_display_name=%s,
@@ -5555,6 +5576,19 @@ class OperationalSessionService:
                         len(secondary_logins) if invalidate_secondaries else 0
                     ),
                     "trigger": str(trigger or TRIGGER_USER_REQUESTED_HANDOFF),
+                },
+            )
+            self._audit(
+                con,
+                session_id=operational_session_id,
+                event_type="TURN_HANDOFF_COMMITTED",
+                device_id=primary_device_id,
+                username=new_username,
+                generation=changed.generation,
+                transition_id=transition_uuid,
+                details={
+                    **handoff_details,
+                    "operational_revision": changed.operational_revision,
                 },
             )
             # Evento de dominio consumible por heartbeats/diagnósticos. Vive en
@@ -6030,36 +6064,207 @@ class OperationalSessionService:
             )
         return self._row_to_session(result)  # type: ignore[return-value]
 
-    def force_transfer_admission_primary(
-        self,
+    @staticmethod
+    def _load_primary_transfer_stations(
+        con: Any, *, operational_session_id: str, stale_after_seconds: int
+    ) -> list[dict[str, Any]]:
+        rows = con.execute(
+            """SELECT d.device_id,d.login_session_id,d.device_name,
+                      d.station_role,d.last_seen,
+                      s.username AS login_username,s.is_active,
+                      s.last_seen AS login_last_seen,
+                      u.id AS user_id,u.role AS login_role,
+                      (d.last_seen >= NOW() - (%s || ' seconds')::interval
+                       AND CASE
+                             WHEN pg_input_is_valid(
+                                  NULLIF(BTRIM(s.last_seen),''),'timestamp'
+                             )
+                             THEN NULLIF(BTRIM(s.last_seen),'')::timestamp
+                                  >= LOCALTIMESTAMP
+                                     - (%s || ' seconds')::interval
+                             ELSE FALSE
+                           END)
+                          AS heartbeat_recent
+                 FROM admission_operational_devices d
+                 JOIN active_sessions s
+                   ON s.session_id=d.login_session_id
+                  AND s.device_id=d.device_id
+                 JOIN users u
+                   ON LOWER(TRIM(u.username))=LOWER(TRIM(s.username))
+                WHERE d.operational_session_id=%s
+                  AND d.detached_at IS NULL
+                  AND d.invalidated_at IS NULL
+                  AND s.is_active=1
+                ORDER BY d.station_role='PRIMARY' DESC,d.device_name,d.device_id""",
+            (
+                str(max(1, int(stale_after_seconds))),
+                str(max(1, int(stale_after_seconds))),
+                str(operational_session_id),
+            ),
+        ).fetchall()
+        stations = []
+        for row in rows:
+            data = _mapping(row)
+            if not data or not bool(data.get("heartbeat_recent")):
+                continue
+            data["health_status"] = "HEALTHY"
+            # The central operational service does not own the remote SQLite
+            # outbox, so it must not claim that a station is fully synchronized.
+            data["sync_status"] = "NOT_REPORTED"
+            stations.append(data)
+        return stations
+
+    def list_primary_transfer_candidates(
+        self, *, operational_session_id: str, stale_after_seconds: int = 120
+    ) -> list[dict[str, Any]]:
+        """Return only attached stations with a current central login/heartbeat."""
+        with self.connection_factory() as con:
+            if not self._active_sessions_available(con):
+                return []
+            return self._load_primary_transfer_stations(
+                con,
+                operational_session_id=str(operational_session_id),
+                stale_after_seconds=stale_after_seconds,
+            )
+
+    @staticmethod
+    def _normalize_primary_transfer_request(
         *,
-        operational_session_id: str,
-        device_id: str,
-        login_session_id: str,
-        admin_user_id: Any,
+        target_device_id: str,
+        target_login_session_id: str,
+        actor_device_id: str,
+        actor_login_session_id: str,
         admin_username: str,
         admin_role: Any,
         reason: str,
-    ) -> OperationalSession:
-        """Atomically transfer only the PRIMARY lease after local PIN approval.
-
-        The administrative PIN is verified by the existing ``AdminSecurity``
-        component before this command is submitted.  This database operation
-        repeats the role check and never changes the clinical turn, operational
-        user, operational generation, or closure-report state.
-        """
-        target_device = str(device_id or "").strip()
-        target_login = str(login_session_id or "").strip()
-        actor = str(admin_username or "").strip()
-        transfer_reason = str(reason or "").strip()
+    ) -> tuple[str, str, str, str, str, str]:
         if canonical_role({"role": admin_role}) != "administrador":
             raise AdmissionWriteBlocked(
                 "Solo un Administrador puede transferir la sesión principal."
             )
-        if not target_device or not target_login:
-            raise ValueError("La estación y la sesión de login son obligatorias.")
-        if not transfer_reason:
+        values = tuple(
+            str(value or "").strip()
+            for value in (
+                target_device_id,
+                target_login_session_id,
+                actor_device_id,
+                actor_login_session_id,
+                admin_username,
+                reason,
+            )
+        )
+        if not all(values[:5]):
+            raise ValueError("Actor, estación destino y sesiones son obligatorios.")
+        if not values[5]:
             raise ValueError("El motivo de la transferencia es obligatorio.")
+        return (
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5],
+        )
+
+    @staticmethod
+    def _validate_primary_transfer_participants(
+        *,
+        session: OperationalSession,
+        stations: list[dict[str, Any]],
+        actor_device: str,
+        actor_login: str,
+        target_device: str,
+        target_login: str,
+        admin_user_id: Any,
+        actor: str,
+    ) -> tuple[str, str]:
+        by_identity = {
+            (
+                str(item.get("device_id") or ""),
+                str(item.get("login_session_id") or ""),
+            ): item
+            for item in stations
+        }
+        old_primary_identity = (
+            str(session.primary_device_id or ""),
+            str(session.primary_login_session_id or ""),
+        )
+        if old_primary_identity not in by_identity:
+            raise AdmissionWriteBlocked(
+                "La estación principal debe permanecer conectada para transferir PRIMARY."
+            )
+        actor_data = by_identity.get((actor_device, actor_login))
+        actor_is_admin = bool(
+            actor_data
+            and same_user(
+                {"user_id": admin_user_id, "username": actor},
+                {
+                    "user_id": actor_data.get("user_id"),
+                    "username": actor_data.get("login_username"),
+                },
+            )
+            and canonical_role({"role": actor_data.get("login_role")})
+            == "administrador"
+        )
+        if not actor_is_admin:
+            raise AdmissionWriteBlocked(
+                "La sesión Admin conectada no autoriza esta transferencia."
+            )
+        target_data = by_identity.get((target_device, target_login))
+        if (
+            not target_data
+            or str(target_data.get("station_role") or "").upper() != "SECONDARY"
+        ):
+            raise AdmissionWriteBlocked(
+                "La estación destino no está conectada y disponible como SECONDARY."
+            )
+        return old_primary_identity
+
+    @staticmethod
+    def _ensure_primary_transfer_invariants(
+        before: OperationalSession, after: OperationalSession
+    ) -> None:
+        if (
+            after.turn_id != before.turn_id
+            or after.generation != before.generation
+            or after.active_user_id != before.active_user_id
+        ):
+            raise AdmissionWriteBlocked(
+                "La transferencia alteró el estado clínico y fue cancelada."
+            )
+
+    def force_transfer_admission_primary(
+        self,
+        *,
+        operational_session_id: str,
+        target_device_id: str,
+        target_login_session_id: str,
+        actor_device_id: str,
+        actor_login_session_id: str,
+        expected_operational_revision: int,
+        admin_user_id: Any,
+        admin_username: str,
+        admin_role: Any,
+        reason: str,
+        stale_after_seconds: int = 120,
+    ) -> OperationalSession:
+        """Atomically transfer PRIMARY between two healthy attached stations."""
+        (
+            target_device,
+            target_login,
+            actor_device,
+            actor_login,
+            actor,
+            transfer_reason,
+        ) = self._normalize_primary_transfer_request(
+            target_device_id=target_device_id,
+            target_login_session_id=target_login_session_id,
+            actor_device_id=actor_device_id,
+            actor_login_session_id=actor_login_session_id,
+            admin_username=admin_username,
+            admin_role=admin_role,
+            reason=reason,
+        )
 
         with self.connection_factory() as con:
             con.execute(
@@ -6074,145 +6279,112 @@ class OperationalSessionService:
             session = self._row_to_session(row)
             if session is None or session.status != "ACTIVE":
                 raise AdmissionWriteBlocked("La sesión operativa ya no está activa.")
-
-            if not self._active_sessions_available(con):
+            if int(expected_operational_revision) != session.operational_revision:
                 raise AdmissionWriteBlocked(
-                    "No fue posible validar la sesión autenticada actual."
+                    "El estado operacional cambió. Actualice y reintente."
                 )
-            actor_row = con.execute(
-                """SELECT s.username,s.device_id,s.is_active,
-                          u.id AS user_id,u.role
-                     FROM active_sessions s
-                     JOIN users u ON LOWER(TRIM(u.username))=LOWER(TRIM(s.username))
-                    WHERE s.session_id=%s
-                    FOR UPDATE""",
-                (target_login,),
-            ).fetchone()
-            actor_data = _mapping(actor_row)
-            if (
-                not actor_data
-                or not bool(actor_data.get("is_active"))
-                or str(actor_data.get("device_id") or "") != target_device
-                or not same_user(
-                    {"user_id": admin_user_id, "username": actor},
-                    {
-                        "user_id": actor_data.get("user_id"),
-                        "username": actor_data.get("username"),
-                    },
-                )
-                or canonical_role({"role": actor_data.get("role")})
-                != "administrador"
-            ):
-                raise AdmissionWriteBlocked(
-                    "La sesión autenticada actual no autoriza esta transferencia."
-                )
-
-            old_primary_device = str(session.primary_device_id or "")
-            old_primary_login = str(session.primary_login_session_id or "")
-            if old_primary_device == target_device:
+            if session.primary_device_id == target_device:
                 raise AdmissionWriteBlocked(
                     "Esta estación ya posee el acceso principal."
                 )
+            if not self._active_sessions_available(con):
+                raise AdmissionWriteBlocked(
+                    "No fue posible validar las sesiones conectadas."
+                )
+            stations = self._load_primary_transfer_stations(
+                con,
+                operational_session_id=session.operational_session_id,
+                stale_after_seconds=stale_after_seconds,
+            )
+            old_primary_identity = self._validate_primary_transfer_participants(
+                session=session,
+                stations=stations,
+                actor_device=actor_device,
+                actor_login=actor_login,
+                target_device=target_device,
+                target_login=target_login,
+                admin_user_id=admin_user_id,
+                actor=actor,
+            )
+
             audit_details = {
                 "admin_user_id": str(admin_user_id or ""),
-                "old_primary_device": old_primary_device,
+                "actor_device": actor_device,
+                "old_primary_device": old_primary_identity[0],
                 "new_primary_device": target_device,
-                "old_login_session": old_primary_login,
-                "new_login_session": target_login,
+                "expected_operational_revision": session.operational_revision,
                 "reason": transfer_reason[:240],
             }
             self._audit(
                 con,
                 session_id=session.operational_session_id,
-                event_type="ADMISSION_PRIMARY_TRANSFER_REQUESTED",
+                event_type="PRIMARY_TRANSFER_REQUESTED",
                 device_id=target_device,
                 username=actor,
                 generation=session.generation,
                 details=audit_details,
             )
-
-            # The former PRIMARY is explicitly detached so its heartbeat cannot
-            # silently re-acquire authority.  Its application login is revoked
-            # in the same central transaction and SessionHealthWorker performs
-            # the visible logout on that station.
-            con.execute(
+            demoted = con.execute(
+                """UPDATE admission_operational_devices SET station_role='SECONDARY'
+                    WHERE operational_session_id=%s AND device_id=%s
+                      AND station_role='PRIMARY' AND detached_at IS NULL""",
+                (session.operational_session_id, old_primary_identity[0]),
+            )
+            promoted = con.execute(
                 """UPDATE admission_operational_devices
-                      SET station_role='SECONDARY',last_seen=NOW(),
-                          detached_at=NOW(),invalidated_at=NOW(),
-                          invalidated_reason='PRIMARY_TRANSFERRED_ADMINISTRATIVELY',
-                          invalidated_generation=%s,new_active_username=%s
-                    WHERE operational_session_id=%s
-                      AND station_role='PRIMARY'
-                      AND device_id<>%s
-                      AND detached_at IS NULL""",
-                (
-                    session.generation,
-                    session.active_username,
-                    session.operational_session_id,
-                    target_device,
-                ),
+                      SET station_role='PRIMARY',login_session_id=%s,last_seen=NOW()
+                    WHERE operational_session_id=%s AND device_id=%s
+                      AND station_role='SECONDARY' AND detached_at IS NULL
+                      AND invalidated_at IS NULL""",
+                (target_login, session.operational_session_id, target_device),
             )
-            if old_primary_login:
-                con.execute(
-                    """UPDATE active_sessions
-                          SET is_active=0,logout_at=NOW(),
-                              logout_reason='PRIMARY_TRANSFERRED_ADMINISTRATIVELY'
-                        WHERE session_id=%s AND device_id=%s AND is_active=1""",
-                    (old_primary_login, old_primary_device),
+            if int(demoted.rowcount or 0) != 1 or int(promoted.rowcount or 0) != 1:
+                raise AdmissionWriteBlocked(
+                    "La topología cambió durante la transferencia. Actualice y reintente."
                 )
-                self._audit(
-                    con,
-                    session_id=session.operational_session_id,
-                    event_type="ADMISSION_PRIMARY_REVOKED",
-                    device_id=old_primary_device,
-                    username=session.active_username,
-                    generation=session.generation,
-                    details=audit_details,
-                )
-            con.execute(
-                """INSERT INTO admission_operational_devices(
-                       operational_session_id,device_id,login_session_id,
-                       device_name,station_role,attached_at,last_seen
-                   ) VALUES(%s,%s,%s,%s,'PRIMARY',NOW(),NOW())
-                   ON CONFLICT(operational_session_id,device_id) DO UPDATE SET
-                       login_session_id=EXCLUDED.login_session_id,
-                       station_role='PRIMARY',last_seen=NOW(),detached_at=NULL,
-                       invalidated_at=NULL,invalidated_reason=NULL,
-                       invalidated_generation=NULL,new_active_username=NULL""",
-                (
-                    session.operational_session_id,
-                    target_device,
-                    target_login,
-                    target_device,
-                ),
-            )
-            con.execute(
+            updated = con.execute(
                 """UPDATE admission_operational_sessions
                       SET primary_device_id=%s,primary_login_session_id=%s,
                           primary_last_seen=NOW(),lease_generation=lease_generation+1,
-                          updated_at=NOW(),change_reason='PRIMARY_FORCE_TRANSFER'
-                    WHERE operational_session_id=%s""",
-                (target_device, target_login, session.operational_session_id),
+                          operational_revision=operational_revision+1,
+                          updated_at=NOW(),change_reason='PRIMARY_REMOTE_TRANSFER'
+                    WHERE operational_session_id=%s AND operational_revision=%s""",
+                (
+                    target_device,
+                    target_login,
+                    session.operational_session_id,
+                    session.operational_revision,
+                ),
             )
+            if int(updated.rowcount or 0) != 1:
+                raise AdmissionWriteBlocked(
+                    "El estado operacional cambió. Actualice y reintente."
+                )
             result = con.execute(
                 "SELECT * FROM admission_operational_sessions "
                 "WHERE operational_session_id=%s",
                 (session.operational_session_id,),
             ).fetchone()
-            transferred = self._row_to_session(result) or session
+            transferred = self._row_to_session(result)
+            if transferred is None:
+                raise AdmissionWriteBlocked(
+                    "No fue posible confirmar la transferencia central."
+                )
+            self._ensure_primary_transfer_invariants(session, transferred)
             self._audit(
                 con,
                 session_id=session.operational_session_id,
-                event_type="ADMISSION_PRIMARY_TRANSFER_COMPLETED",
+                event_type="PRIMARY_TRANSFER_COMMITTED",
                 device_id=target_device,
                 username=actor,
                 generation=transferred.generation,
                 details={
                     **audit_details,
+                    "operational_revision": transferred.operational_revision,
                     "lease_generation": transferred.lease_generation,
                 },
             )
-        return self._row_to_session(result)  # type: ignore[return-value]
+        return transferred
 
     def force_transfer_primary(self, **kwargs: Any) -> OperationalSession:
         """Compatibility alias for callers from builds prior to 2026-08-20."""

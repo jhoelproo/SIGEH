@@ -17,8 +17,8 @@ SOURCE = Path(__file__).resolve().parents[1] / "admission_source"
 if str(SOURCE) not in sys.path:
     sys.path.insert(0, str(SOURCE))
 
-import facturacion_tabs as admission
-import admission_v15_adapter
+import facturacion_tabs as admission  # noqa: E402 - source path bootstrap
+import admission_v15_adapter  # noqa: E402 - source path bootstrap
 
 
 class _Entry:
@@ -243,7 +243,7 @@ def test_existing_admin_pin_uses_salted_pbkdf2_and_constant_time_compare(tmp_pat
     )
 
 
-def test_wrong_or_cancelled_admin_pin_never_calls_primary_transfer(monkeypatch):
+def test_remote_primary_transfer_uses_current_admin_without_second_pin(monkeypatch):
     calls = []
 
     class Runtime:
@@ -256,22 +256,152 @@ def test_wrong_or_cancelled_admin_pin_never_calls_primary_transfer(monkeypatch):
                 "role": "SECONDARY",
                 "primary_device_id": "PC-1",
                 "active_username": "admin",
+                "active_user_id": "USER-1",
                 "turn_id": 350,
+                "generation": 4,
+                "operational_session_id": "SESSION-1",
+                "operational_revision": 9,
             }
 
         @staticmethod
-        def force_transfer_admission_primary(*, reason):
-            calls.append(reason)
+        def list_primary_transfer_candidates():
+            return [
+                {
+                    "device_id": "PC-1",
+                    "device_name": "Admisión 1",
+                    "station_role": "PRIMARY",
+                    "login_session_id": "LOGIN-1",
+                },
+                {
+                    "device_id": "PC-2",
+                    "device_name": "Admisión 2",
+                    "station_role": "SECONDARY",
+                    "login_session_id": "LOGIN-2",
+                },
+            ]
+
+        @staticmethod
+        def force_transfer_admission_primary(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                primary_device_id="PC-2",
+                turn_id=350,
+                generation=4,
+                active_user_id="USER-1",
+            )
 
     app = admission.App.__new__(admission.App)
     app.root = object()
     app.db = SimpleNamespace(_runtime=Runtime())
     app.session_context = SimpleNamespace(role="administrador")
     app._primary_transfer_in_progress = False
-    app._solicitar_autorizacion_admin = lambda *_a, **_k: None
+    app._solicitar_autorizacion_admin = lambda *_a, **_k: pytest.fail(
+        "La transferencia no debe pedir una segunda credencial"
+    )
+    app._refresh_actions_menu_state = lambda: None
+    app._set_turn_change_controls_enabled = lambda _enabled: None
+    app.set_status = lambda *_a, **_k: None
+
+    def execute(_message, function, al_terminar=None, al_error=None):
+        try:
+            result = function()
+        except Exception as exc:
+            al_error(exc)
+        else:
+            al_terminar(result)
+
+    app._ejecutar_en_segundo_plano = execute
     monkeypatch.setattr(admission.messagebox, "showinfo", lambda *_a, **_k: None)
+    monkeypatch.setattr(admission.messagebox, "showwarning", lambda *_a, **_k: None)
+    monkeypatch.setattr(admission.messagebox, "showerror", lambda *_a, **_k: None)
+    monkeypatch.setattr(admission.messagebox, "askyesno", lambda *_a, **_k: True)
+    monkeypatch.setattr(admission.simpledialog, "askstring", lambda *_a, **_k: "Relevo técnico")
     app.request_transfer_admission_primary()
-    assert calls == []
+    assert calls == [
+        {
+            "target_device_id": "PC-2",
+            "target_login_session_id": "LOGIN-2",
+            "expected_operational_revision": 9,
+            "reason": "Relevo técnico",
+        }
+    ]
+
+
+def test_runtime_primary_candidate_adapter_enforces_admin_and_active_session():
+    from admission_hybrid import AdmissionWriteBlocked, StationRole
+
+    runtime = admission_v15_adapter._HybridAdmissionRuntime.__new__(
+        admission_v15_adapter._HybridAdmissionRuntime
+    )
+    runtime.host = SimpleNamespace(
+        user={"id": 7, "username": "operator", "role": "auxiliar"},
+        device_id="PC-2",
+        session_id="LOGIN-2",
+    )
+    runtime.StationRole = StationRole
+    runtime.attachment = None
+    runtime.session_service = SimpleNamespace()
+    with pytest.raises(AdmissionWriteBlocked):
+        runtime.list_primary_transfer_candidates()
+
+    runtime.host.user = {"id": 7, "username": "admin", "role": "administrador"}
+    with pytest.raises(AdmissionWriteBlocked):
+        runtime.list_primary_transfer_candidates()
+
+    runtime.attachment = SimpleNamespace(
+        operational_session=SimpleNamespace(operational_session_id="OP-1")
+    )
+    runtime.session_service = SimpleNamespace(
+        list_primary_transfer_candidates=lambda **kwargs: [kwargs]
+    )
+    assert runtime.list_primary_transfer_candidates() == [
+        {"operational_session_id": "OP-1"}
+    ]
+
+
+def test_runtime_primary_transfer_adapter_adopts_the_committed_lease():
+    from admission_hybrid import StationRole
+
+    calls = []
+    session = SimpleNamespace(
+        operational_session_id="OP-1", operational_revision=9
+    )
+    changed = SimpleNamespace(
+        primary_device_id="PC-2",
+        primary_login_session_id="LOGIN-2",
+        turn_id=350,
+        generation=4,
+        active_user_id="USER-1",
+        lease_generation=3,
+        operational_revision=10,
+    )
+    runtime = admission_v15_adapter._HybridAdmissionRuntime.__new__(
+        admission_v15_adapter._HybridAdmissionRuntime
+    )
+    runtime.host = SimpleNamespace(
+        user={"id": 7, "username": "admin", "role": "administrador"},
+        device_id="PC-2",
+        session_id="LOGIN-2",
+    )
+    runtime.StationRole = StationRole
+    runtime.attachment = SimpleNamespace(operational_session=session)
+    runtime._operational_state = None
+    runtime.session_service = SimpleNamespace(
+        force_transfer_admission_primary=lambda **kwargs: (
+            calls.append(kwargs) or changed
+        )
+    )
+
+    assert runtime.force_transfer_primary(
+        target_device_id="PC-2",
+        target_login_session_id="LOGIN-2",
+        expected_operational_revision=None,
+        reason="Mantenimiento",
+    ) is changed
+    assert runtime.attachment.role is StationRole.PRIMARY
+    assert runtime.status_message == "Conectado · Principal · Sincronizado"
+    assert runtime.offline is False and runtime.offline_lease_valid is True
+    assert calls[0]["expected_operational_revision"] == 9
 
 
 @pytest.mark.parametrize("theme", ["oscuro", "claro"])
@@ -356,7 +486,10 @@ def test_primary_transfer_and_representative_correction_are_separate_flows():
         "def request_transfer_admission_primary", 1
     )[1].split("def request_force_primary_transfer", 1)[0]
     assert "authorize_shift_change" not in transfer_block
-    assert "force_transfer_admission_primary" in transfer_block
+    assert "request_primary_transfer" in transfer_block
+    coordinator = (SOURCE.parent / "primary_transfer_ui.py").read_text(encoding="utf-8")
+    assert "force_transfer_admission_primary" in coordinator
+    assert "authorize_shift_change" not in coordinator
 
 
 @pytest.mark.parametrize(
