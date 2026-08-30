@@ -38,11 +38,33 @@ from sqlite_write_coordinator import (
 
 MAX_ACTIVE_SESSION_DEVICES = 2
 DEFAULT_OFFLINE_LEASE_SECONDS = 15 * 60
-SYNC_TICK_SECONDS = 2
+# The timer is only a lightweight incremental poll. Ten seconds keeps
+# cross-station propagation prompt without issuing heavy reads while idle.
+SYNC_TICK_SECONDS = 10
+HEARTBEAT_INTERVAL_SECONDS = 30
+PATIENT_DIRECTORY_POLL_SECONDS = 30
 OFFLINE_LOGIN_VALID_DAYS = 30
 LOCAL_SYNC_APPLY_BATCH_SIZE = 50
 MAX_CLOCK_DRIFT_MS = 5 * 60 * 1000
 OPERATIONAL_LOG = logging.getLogger("hospital.admission.operational")
+
+
+def _estimated_transport_bytes(values: Iterable[Mapping[str, Any]]) -> int:
+    """Estimate wire payload without logging clinical content."""
+    return sum(
+        len(
+            json.dumps(
+                dict(value),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        for value in values
+    )
+
+
 SAME_USER_HANDOFF_MESSAGE = (
     "No se puede realizar el relevo.\n"
     "El usuario seleccionado ya es el representante del turno actual.\n"
@@ -775,6 +797,28 @@ def _as_int_or_none(value: Any) -> int | None:
         return int(value) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+
+def _first_positive_int(*values: Any) -> int | None:
+    for value in values:
+        candidate = _as_int_or_none(value)
+        if candidate is not None and candidate > 0:
+            return candidate
+    return None
+
+
+def _resolve_projection_turn_id(
+    *,
+    payload_turn_id: Any,
+    event_turn_id: Any,
+    existing_turn_id: Any,
+) -> int:
+    """Resolve durable turn identity without treating absent metadata as turn zero."""
+    return _first_positive_int(
+        payload_turn_id,
+        event_turn_id,
+        existing_turn_id,
+    ) or 0
 
 
 def _normalize_service_date(value: Any) -> str:
@@ -2264,6 +2308,11 @@ class OfflineAdmissionStore:
             actor_username = str(
                 runtime["actor_username"] or runtime["active_username"] or ""
             )
+            turn_id = _resolve_projection_turn_id(
+                payload_turn_id=data.get("operational_turn_id"),
+                event_turn_id=runtime["operational_turn_id"],
+                existing_turn_id=data.get("turno_id"),
+            )
             payload = {
                 "event_type": "DETAIL_SHEET_GENERATED",
                 "attention_id": int(data.get("id") or 0),
@@ -2281,6 +2330,7 @@ class OfflineAdmissionStore:
                 "service_time": str(data.get("hora") or ""),
                 "service_type": str(data.get("tipo_atencion") or "EMERGENCIA"),
                 "source_status": str(data.get("estado") or "ACTIVA"),
+                "turn_id": turn_id,
                 "source_instance_id": str(con.execute(
                     "SELECT valor FROM app_metadata WHERE clave='integration.source_instance_id'"
                 ).fetchone()[0]),
@@ -2315,7 +2365,7 @@ class OfflineAdmissionStore:
                     str(runtime["operational_session_id"]),
                     str(runtime["operational_source_id"]),
                     int(runtime["generation"]),
-                    int(data.get("operational_turn_id") or runtime["operational_turn_id"] or 0),
+                    turn_id,
                     str(runtime["device_id"]),
                     actor_user_id,
                     actor_username,
@@ -2328,6 +2378,14 @@ class OfflineAdmissionStore:
                     int(data.get("server_revision") or 0),
                     now,
                 ),
+            )
+            OPERATIONAL_LOG.info(
+                "ATTENTION_OUTBOX_QUEUED global_attention_id=%s event_uuid=%s "
+                "operation=DETAIL_SHEET_GENERATED turn_id=%s device_id=%s",
+                str(data.get("global_attention_id") or "-"),
+                event_uuid,
+                turn_id,
+                str(runtime["device_id"] or "-"),
             )
             return True
 
@@ -2796,11 +2854,17 @@ class OfflineAdmissionStore:
         return int(row[0]) if row and str(row[0]).isdigit() else 0
 
     def set_last_cloud_cursor(self, cursor: int) -> None:
+        """Advance the durable cursor monotonically; normal sync never rewinds."""
         with self.connection() as con:
+            previous = con.execute(
+                "SELECT state_value FROM sync_state WHERE state_key='last_cloud_cursor'"
+            ).fetchone()
+            previous_value = int(previous[0]) if previous and str(previous[0]).isdigit() else 0
+            next_value = max(previous_value, max(0, int(cursor)))
             con.execute(
                 """INSERT INTO sync_state(state_key,state_value,updated_at) VALUES('last_cloud_cursor',?,?)
                    ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value,
-                   updated_at=excluded.updated_at""", (str(max(0, int(cursor))), _timestamp()),
+                   updated_at=excluded.updated_at""", (str(next_value), _timestamp()),
             )
 
     def already_applied(self, event_uuid: str) -> bool:
@@ -2818,12 +2882,16 @@ class OfflineAdmissionStore:
                 "INSERT OR IGNORE INTO sync_applied_events(event_uuid,applied_at) VALUES(?,?)",
                 (str(event_uuid), _timestamp()),
             )
+            previous = con.execute(
+                "SELECT state_value FROM sync_state WHERE state_key='last_cloud_cursor'"
+            ).fetchone()
+            previous_value = int(previous[0]) if previous and str(previous[0]).isdigit() else 0
             con.execute(
                 """INSERT INTO sync_state(state_key,state_value,updated_at)
                    VALUES('last_cloud_cursor',?,?)
                    ON CONFLICT(state_key) DO UPDATE SET
                      state_value=excluded.state_value,updated_at=excluded.updated_at""",
-                (str(max(0, int(cursor))), _timestamp()),
+                (str(max(previous_value, max(0, int(cursor)))), _timestamp()),
             )
 
     def make_event(
@@ -3509,13 +3577,21 @@ class OfflineAdmissionStore:
                         sequence,
                     )
                 if advance_cursor:
+                    current = con.execute(
+                        "SELECT state_value FROM sync_state WHERE state_key='last_cloud_cursor'"
+                    ).fetchone()
+                    current_value = (
+                        int(current[0])
+                        if current and str(current[0]).isdigit()
+                        else 0
+                    )
                     con.execute(
                         """INSERT INTO sync_state(state_key,state_value,updated_at)
                            VALUES('last_cloud_cursor',?,?)
                            ON CONFLICT(state_key) DO UPDATE SET
                              state_value=excluded.state_value,
                              updated_at=excluded.updated_at""",
-                        (str(sequence), _timestamp()),
+                        (str(max(current_value, sequence)), _timestamp()),
                     )
                     OPERATIONAL_LOG.info(
                         "ADMISSION_SYNC_CURSOR_ADVANCED sequence=%s", sequence
@@ -6852,7 +6928,7 @@ class AdmissionCloudRepository:
         )
         is_restore = operation == "RESTORE_ATTENTION"
         existing_tombstone = con.execute(
-            """SELECT is_deleted,server_revision
+            """SELECT is_deleted,server_revision,turn_id,original_turn_id
                FROM admission_attention_projection
                WHERE global_attention_id=%s""",
             (global_attention_id,),
@@ -6927,8 +7003,17 @@ class AdmissionCloudRepository:
         reconciliation_status = str(
             payload.get("reconciliation_status") or "DIRECT"
         ).upper()
-        original_turn_id = _as_int_or_none(
-            payload.get("original_turn_id") or payload.get("turn_id")
+        existing_turn_id = existing_tombstone[2] if existing_tombstone else None
+        existing_original_turn_id = existing_tombstone[3] if existing_tombstone else None
+        projection_turn_id = _resolve_projection_turn_id(
+            payload_turn_id=payload.get("turn_id"),
+            event_turn_id=event.turn_id,
+            existing_turn_id=existing_turn_id,
+        )
+        original_turn_id = _first_positive_int(
+            payload.get("original_turn_id"),
+            existing_original_turn_id,
+            projection_turn_id,
         )
         payload_json = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, default=str
@@ -6953,7 +7038,7 @@ class AdmissionCloudRepository:
         ).hexdigest()
         values = (
             patient_id,
-            _as_int_or_none(payload.get("turn_id")) or 0,
+            projection_turn_id,
             service_date,
             str(payload.get("service_time") or ""),
             name,
@@ -7072,7 +7157,7 @@ class AdmissionCloudRepository:
                 source_instance_id,
                 attention_id,
                 patient_id,
-                _as_int_or_none(payload.get("turn_id")) or 0,
+                projection_turn_id,
                 service_date,
                 str(payload.get("service_time") or ""),
                 name,
@@ -7166,6 +7251,17 @@ class AdmissionCloudRepository:
             ).fetchone()
             if event.entity_type.casefold() == "attention":
                 self._materialize_attention(con, event, current_version + 1)
+                OPERATIONAL_LOG.info(
+                    "ATTENTION_CENTRAL_PROJECTED global_attention_id=%s "
+                    "event_uuid=%s operation=%s event_turn_id=%s "
+                    "payload_turn_id=%s sequence=%s",
+                    event.entity_uuid,
+                    event.event_uuid,
+                    event.operation,
+                    event.turn_id,
+                    event.payload.get("turn_id"),
+                    int(row[0]),
+                )
             return int(row[0])
 
     def push_event(self, event: SyncEvent) -> int:
@@ -7705,16 +7801,16 @@ class AdmissionCloudRepository:
             ).fetchall()
         return [_mapping(row) for row in rows]
 
-    def event_window(self) -> dict[str, int]:
+    def event_window(self) -> dict[str, Any]:
         """Returns the retained incremental window and its projection checkpoint."""
         with self.connection_factory() as con:
             row = con.execute(
                 """SELECT f.minimum_available_sequence,f.checkpoint_sequence,
-                          COALESCE(MAX(e.sequence),0) AS latest_sequence
+                          COALESCE((SELECT MAX(e.sequence)
+                                      FROM admission_sync_events e),0) AS latest_sequence,
+                          NOW() AS server_time
                      FROM admission_replication_event_floors f
-                     LEFT JOIN admission_sync_events e ON TRUE
-                    WHERE f.stream_name='ATTENTION'
-                    GROUP BY f.minimum_available_sequence,f.checkpoint_sequence"""
+                    WHERE f.stream_name='ATTENTION'"""
             ).fetchone()
         data = _mapping(row)
         return {
@@ -7723,7 +7819,22 @@ class AdmissionCloudRepository:
             ),
             "checkpoint_sequence": int(data.get("checkpoint_sequence") or 0),
             "latest_sequence": int(data.get("latest_sequence") or 0),
+            "server_time": data.get("server_time"),
         }
+
+    def projection_has_attention(self, global_attention_id: str) -> bool:
+        """Confirm that a blocked historical event is represented centrally."""
+        try:
+            normalized = str(uuid.UUID(str(global_attention_id)))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        with self.connection_factory() as con:
+            row = con.execute(
+                """SELECT 1 FROM admission_attention_projection
+                    WHERE global_attention_id=%s::UUID LIMIT 1""",
+                (normalized,),
+            ).fetchone()
+        return bool(row)
 
     def projection_snapshot_events(
         self, *, after_global_attention_id: str = "", limit: int = 500
@@ -7873,9 +7984,39 @@ class AdmissionSyncService:
     def __init__(self, store: OfflineAdmissionStore, cloud: AdmissionCloudRepository):
         self.store = store
         self.cloud = cloud
-        self._initial_reconciliation_complete = False
-        self._projection_backfill_complete = False
-        self._last_pull_metrics = {"fetch_ms": 0.0, "apply_ms": 0.0}
+        self._local_recovery_complete = False
+        self._last_reconciled_turn_identity: tuple[str, int] | None = None
+        self._stalled_pull_fingerprint: tuple[int, int] | None = None
+        self._stalled_event: dict[str, Any] | None = None
+        self._expired_event_window: dict[str, Any] | None = None
+        self._last_recovery_queries = 0
+        cursor_reader = getattr(self.store, "last_cloud_cursor", None)
+        initial_cursor = int(cursor_reader()) if callable(cursor_reader) else 0
+        self._last_pull_metrics: dict[str, Any] = {
+            "fetch_ms": 0.0,
+            "apply_ms": 0.0,
+            "requests": 0,
+            "rows": 0,
+            "estimated_bytes": 0,
+            "cursor_before": initial_cursor,
+            "cursor_after": initial_cursor,
+            "latest_sequence": 0,
+            "duplicates": 0,
+            "stalled": False,
+            "guarded": False,
+        }
+
+    def _load_event_window(self, *, fallback_limit: int) -> dict[str, Any]:
+        loader = getattr(self.cloud, "event_window", None)
+        if callable(loader):
+            return dict(loader() or {})
+        # Compatibility for in-memory/offline transports predating the head
+        # probe. They still perform one bounded incremental pull, never two.
+        return {
+            "minimum_available_sequence": 0,
+            "latest_sequence": self.store.last_cloud_cursor()
+            + max(1, int(fallback_limit)),
+        }
 
     def bootstrap_from_projection(self, *, batch_size: int = 500) -> int:
         """Rebuilds a stale/new replica before entering the retained event window."""
@@ -7925,25 +8066,54 @@ class AdmissionSyncService:
         )
         return total
 
-    def _bootstrap_if_cursor_expired(self, *, batch_size: int) -> int:
+    def _bootstrap_if_cursor_expired(
+        self, *, batch_size: int, window: Mapping[str, Any] | None = None
+    ) -> int:
         window_loader = getattr(self.cloud, "event_window", None)
         if not callable(window_loader):
             return 0
-        window = dict(window_loader() or {})
-        floor = int(window.get("minimum_available_sequence") or 0)
+        event_window = dict(window or window_loader() or {})
+        floor = int(event_window.get("minimum_available_sequence") or 0)
         if self.store.last_cloud_cursor() >= floor:
             return 0
         return self.bootstrap_from_projection(batch_size=batch_size)
 
     def push_outbox(self, *, limit: int = 100) -> dict[str, int]:
-        result = {"pushed": 0, "conflicts": 0, "retry": 0}
+        result = {
+            "pushed": 0,
+            "conflicts": 0,
+            "retry": 0,
+            "push_bytes_estimated": 0,
+            "push_requests": 0,
+        }
         events = self.store.pending_events(limit)
+        for event in events:
+            OPERATIONAL_LOG.info(
+                "ATTENTION_PUSH_START global_attention_id=%s event_uuid=%s "
+                "operation=%s turn_id=%s",
+                event.entity_uuid,
+                event.event_uuid,
+                event.operation,
+                event.turn_id,
+            )
+        result["push_bytes_estimated"] = sum(
+            len(event.payload_json().encode("utf-8")) for event in events
+        )
+        result["push_requests"] = int(bool(events))
         try:
             uploaded = self.cloud.push_events(events)
         except Exception as exc:  # noqa: BLE001 - límite de transporte externo
             if is_temporary_connection_error(exc):
                 for event in events:
                     self.store.mark_retry(event.event_uuid, exc)
+                    OPERATIONAL_LOG.warning(
+                        "ATTENTION_PUSH_RETRY global_attention_id=%s event_uuid=%s "
+                        "operation=%s error_type=%s",
+                        event.entity_uuid,
+                        event.event_uuid,
+                        event.operation,
+                        type(exc).__name__,
+                    )
                 result["retry"] = len(events)
                 return result
             uploaded = {}
@@ -7954,11 +8124,20 @@ class AdmissionSyncService:
             if normalized_uuid in uploaded:
                 acknowledged.append(event.event_uuid)
                 result["pushed"] += 1
+                OPERATIONAL_LOG.info(
+                    "ATTENTION_PUSH_ACK global_attention_id=%s event_uuid=%s "
+                    "operation=%s sequence=%s",
+                    event.entity_uuid,
+                    event.event_uuid,
+                    event.operation,
+                    int(uploaded[normalized_uuid]),
+                )
                 continue
             remaining.append(event)
         self.store.mark_uploaded_batch(acknowledged)
         fallback_acknowledged: list[str] = []
         for event in remaining:
+            result["push_requests"] += 1
             try:
                 self.cloud.push_event(event)
             except SyncConflict as exc:
@@ -7977,12 +8156,27 @@ class AdmissionSyncService:
             except Exception as exc:
                 if is_temporary_connection_error(exc):
                     self.store.mark_retry(event.event_uuid, exc)
+                    OPERATIONAL_LOG.warning(
+                        "ATTENTION_PUSH_RETRY global_attention_id=%s event_uuid=%s "
+                        "operation=%s error_type=%s",
+                        event.entity_uuid,
+                        event.event_uuid,
+                        event.operation,
+                        type(exc).__name__,
+                    )
                     result["retry"] += 1
                     break
                 raise
             else:
                 fallback_acknowledged.append(event.event_uuid)
                 result["pushed"] += 1
+                OPERATIONAL_LOG.info(
+                    "ATTENTION_PUSH_ACK global_attention_id=%s event_uuid=%s "
+                    "operation=%s sequence=INDIVIDUAL",
+                    event.entity_uuid,
+                    event.event_uuid,
+                    event.operation,
+                )
         self.store.mark_uploaded_batch(fallback_acknowledged)
         return result
 
@@ -7991,21 +8185,130 @@ class AdmissionSyncService:
         apply_remote_event: Callable[[Mapping[str, Any]], None] | None = None,
         *,
         limit: int = 200,
+        window: Mapping[str, Any] | None = None,
     ) -> int:
-        bootstrapped = self._bootstrap_if_cursor_expired(batch_size=limit)
+        explicit_runtime_window = window is not None
+        event_window = dict(window or self._load_event_window(fallback_limit=limit))
+        bootstrapped = 0
         cursor = self.store.last_cloud_cursor()
+        latest_sequence = int(event_window.get("latest_sequence") or 0)
+        floor = int(event_window.get("minimum_available_sequence") or 0)
+        if cursor < floor:
+            if not explicit_runtime_window:
+                bootstrapped = self._bootstrap_if_cursor_expired(
+                    batch_size=limit,
+                    window=event_window,
+                )
+                cursor = self.store.last_cloud_cursor()
+            else:
+                self._expired_event_window = event_window
+                self._last_pull_metrics = {
+                    "fetch_ms": 0.0,
+                    "apply_ms": 0.0,
+                    "requests": 0,
+                    "rows": 0,
+                    "estimated_bytes": 0,
+                    "cursor_before": cursor,
+                    "cursor_after": cursor,
+                    "latest_sequence": latest_sequence,
+                    "duplicates": 0,
+                    "stalled": True,
+                    "guarded": True,
+                    "error_code": "CURSOR_BELOW_RETAINED_FLOOR",
+                }
+                OPERATIONAL_LOG.warning(
+                    "ADMISSION_SYNC_CURSOR_EXPIRED cursor=%s floor=%s latest_sequence=%s",
+                    cursor,
+                    floor,
+                    latest_sequence,
+                )
+                return 0
+        fingerprint = (cursor, latest_sequence)
+        if latest_sequence <= cursor:
+            self._last_pull_metrics = {
+                "fetch_ms": 0.0,
+                "apply_ms": 0.0,
+                "requests": 0,
+                "rows": 0,
+                "estimated_bytes": 0,
+                "cursor_before": cursor,
+                "cursor_after": cursor,
+                "latest_sequence": latest_sequence,
+                "duplicates": 0,
+                "stalled": False,
+                "guarded": False,
+            }
+            return bootstrapped
+        if self._stalled_pull_fingerprint == fingerprint:
+            self._last_pull_metrics = {
+                "fetch_ms": 0.0,
+                "apply_ms": 0.0,
+                "requests": 0,
+                "rows": 0,
+                "estimated_bytes": 0,
+                "cursor_before": cursor,
+                "cursor_after": cursor,
+                "latest_sequence": latest_sequence,
+                "duplicates": 0,
+                "stalled": True,
+                "guarded": True,
+            }
+            OPERATIONAL_LOG.warning(
+                "EGRESS_LOOP_GUARD_TRIGGERED cursor=%s latest_sequence=%s",
+                cursor,
+                latest_sequence,
+            )
+            return bootstrapped
         fetch_started = perf_counter()
         events = self.cloud.events_after(cursor, limit=limit)
         fetch_ms = (perf_counter() - fetch_started) * 1000.0
+        event_ids = [str(event.get("event_uuid") or "") for event in events]
+        duplicates = len(event_ids) - len(set(event_ids))
+        estimated_bytes = _estimated_transport_bytes(events)
         apply_started = perf_counter()
         if apply_remote_event is None:
             applied_count = self.store.apply_remote_events(events)
-            self._last_pull_metrics = {
-                "fetch_ms": fetch_ms,
-                "apply_ms": (perf_counter() - apply_started) * 1000.0,
-            }
-            return bootstrapped + applied_count
-        apply_event = apply_remote_event
+            applied = applied_count
+        else:
+            applied = self._apply_with_callback(events, cursor, apply_remote_event)
+        cursor_after = self.store.last_cloud_cursor()
+        stalled = bool(events and cursor_after <= cursor)
+        if stalled:
+            self._stalled_pull_fingerprint = fingerprint
+            self._stalled_event = dict(events[0])
+            OPERATIONAL_LOG.error(
+                "EGRESS_LOOP_GUARD_TRIGGERED cursor=%s latest_sequence=%s "
+                "rows=%s estimated_bytes=%s blocker_sequence=%s",
+                cursor,
+                latest_sequence,
+                len(events),
+                estimated_bytes,
+                int(events[0].get("sequence") or 0),
+            )
+        elif cursor_after > cursor:
+            self._stalled_pull_fingerprint = None
+            self._stalled_event = None
+        self._last_pull_metrics = {
+            "fetch_ms": fetch_ms,
+            "apply_ms": (perf_counter() - apply_started) * 1000.0,
+            "requests": 1,
+            "rows": len(events),
+            "estimated_bytes": estimated_bytes,
+            "cursor_before": cursor,
+            "cursor_after": cursor_after,
+            "latest_sequence": latest_sequence,
+            "duplicates": duplicates,
+            "stalled": stalled,
+            "guarded": False,
+        }
+        return bootstrapped + applied
+
+    def _apply_with_callback(
+        self,
+        events: Iterable[Mapping[str, Any]],
+        cursor: int,
+        apply_event: Callable[[Mapping[str, Any]], None],
+    ) -> int:
         applied = 0
         for event in events:
             event_uuid = str(event.get("event_uuid") or "")
@@ -8014,52 +8317,20 @@ class AdmissionSyncService:
             if already and not self.store.is_remote_event_materialized(event):
                 self.store.discard_applied_event(event_uuid)
                 already = False
-                OPERATIONAL_LOG.warning(
-                    "ADMISSION_SYNC_STALE_ACK_REPAIRED event_uuid=%s sequence=%s",
-                    event_uuid,
-                    sequence,
-                )
-            if event_uuid and not already:
-                try:
-                    apply_event(event)
-                except SyncConflict as exc:
-                    OPERATIONAL_LOG.warning(
-                        "ADMISSION_SYNC_EVENT_APPLY_FAILED event_uuid=%s sequence=%s reason=%s",
-                        event_uuid,
-                        sequence,
-                        type(exc).__name__,
-                    )
-                    break
-                if not self.store.is_remote_event_materialized(event):
-                    OPERATIONAL_LOG.warning(
-                        "ADMISSION_SYNC_EVENT_APPLY_FAILED event_uuid=%s sequence=%s reason=NOT_MATERIALIZED",
-                        event_uuid,
-                        sequence,
-                    )
-                    break
-                self.store.mark_applied_and_advance(event_uuid, sequence)
-                applied += 1
-                OPERATIONAL_LOG.info(
-                    "ADMISSION_SYNC_EVENT_APPLIED event_uuid=%s sequence=%s",
-                    event_uuid,
-                    sequence,
-                )
-            elif already:
-                self.store.set_last_cloud_cursor(sequence)
-                OPERATIONAL_LOG.info(
-                    "ADMISSION_SYNC_CURSOR_ADVANCED sequence=%s", sequence
-                )
-            else:
-                OPERATIONAL_LOG.warning(
-                    "ADMISSION_SYNC_EVENT_APPLY_FAILED sequence=%s reason=MISSING_EVENT_UUID",
-                    sequence,
-                )
+            if not event_uuid:
                 break
-        self._last_pull_metrics = {
-            "fetch_ms": fetch_ms,
-            "apply_ms": (perf_counter() - apply_started) * 1000.0,
-        }
-        return bootstrapped + applied
+            if already:
+                self.store.set_last_cloud_cursor(sequence)
+                continue
+            try:
+                apply_event(event)
+            except SyncConflict:
+                break
+            if not self.store.is_remote_event_materialized(event):
+                break
+            self.store.mark_applied_and_advance(event_uuid, sequence)
+            applied += 1
+        return applied
 
     def reconcile_current_turn(
         self,
@@ -8105,6 +8376,7 @@ class AdmissionSyncService:
                 missing_before,
             )
         materialized = self.store.hydrate_remote_events(events) if events else 0
+        estimated_bytes = _estimated_transport_bytes(events)
         unresolved = sum(
             not self.store.is_remote_event_materialized(event) for event in events
         )
@@ -8118,12 +8390,87 @@ class AdmissionSyncService:
             return materialized
         self._last_reconciled_turn_identity = identity
         OPERATIONAL_LOG.info(
-            "CURRENT_TURN_RECONCILE_DONE source=%s turn_id=%s count=%s",
+            "CURRENT_TURN_RECONCILE_DONE source=%s turn_id=%s count=%s "
+            "rows=%s estimated_bytes=%s",
             source_id,
             effective_turn_id,
             materialized,
+            len(events),
+            estimated_bytes,
         )
         return materialized
+
+    def recover_stalled_historical_cursor(
+        self,
+        *,
+        operational_source_id: str,
+        turn_id: int,
+    ) -> int:
+        """Checkpoint an old blocked stream only after current-turn recovery.
+
+        Historical projection rows remain authoritative in PostgreSQL and are
+        loaded on demand. They must not be inserted into the currently open
+        local day, whose clinical uniqueness constraints are intentionally
+        stricter. A blocker belonging to the active turn is never skipped.
+        """
+        blocker = dict(self._stalled_event or {})
+        expired_window = dict(self._expired_event_window or {})
+        metrics = dict(self._last_pull_metrics)
+        self._last_recovery_queries = 0
+        source_id = str(operational_source_id or "").strip()
+        effective_turn = int(turn_id or 0)
+        if (not blocker and not expired_window) or not source_id or effective_turn <= 0:
+            return 0
+        if blocker:
+            payload = OfflineAdmissionStore._event_payload(blocker)
+            blocker_source = str(
+                blocker.get("operational_source_id")
+                or payload.get("operational_source_id")
+                or ""
+            ).strip()
+            blocker_turn = _as_int_or_none(
+                blocker.get("turn_id") or payload.get("turn_id")
+            )
+            if blocker_source == source_id and blocker_turn == effective_turn:
+                OPERATIONAL_LOG.error(
+                    "ADMISSION_SYNC_CURRENT_TURN_BLOCKED cursor=%s blocker_sequence=%s",
+                    metrics.get("cursor_before"),
+                    blocker.get("sequence"),
+                )
+                return 0
+            entity_uuid = str(blocker.get("entity_uuid") or "").strip()
+            projection_check = getattr(self.cloud, "projection_has_attention", None)
+            if not callable(projection_check):
+                return 0
+            self._last_recovery_queries += 1
+            if not projection_check(entity_uuid):
+                return 0
+        if callable(getattr(self.cloud, "current_turn_attention_events", None)):
+            self._last_recovery_queries += 1
+        self.reconcile_current_turn(
+            operational_source_id=source_id,
+            turn_id=effective_turn,
+            force=True,
+        )
+        if self._last_reconciled_turn_identity != (source_id, effective_turn):
+            return 0
+        previous_cursor = self.store.last_cloud_cursor()
+        checkpoint = max(previous_cursor, int(metrics.get("latest_sequence") or 0))
+        if checkpoint <= previous_cursor:
+            return 0
+        self.store.set_last_cloud_cursor(checkpoint)
+        self._stalled_pull_fingerprint = None
+        self._stalled_event = None
+        self._expired_event_window = None
+        OPERATIONAL_LOG.warning(
+            "ADMISSION_SYNC_HISTORICAL_CHECKPOINT_RECOVERY cursor_before=%s "
+            "cursor_after=%s blocker_sequence=%s current_turn=%s",
+            previous_cursor,
+            checkpoint,
+            blocker.get("sequence"),
+            effective_turn,
+        )
+        return checkpoint
 
     def get_attention_by_global_id(
         self,
@@ -8196,66 +8543,101 @@ class AdmissionSyncService:
         """Download the retained central event history in bounded local batches."""
         total = self._bootstrap_if_cursor_expired(batch_size=batch_size)
         for _batch in range(max(1, int(max_batches))):
-            cursor = self.store.last_cloud_cursor()
-            events = self.cloud.events_after(cursor, limit=batch_size)
-            if not events:
-                break
-            total += self.store.apply_remote_events(events)
-            if progress is not None:
+            before = self.store.last_cloud_cursor()
+            window = self._load_event_window(fallback_limit=batch_size)
+            pulled = self.pull_cloud_changes(limit=batch_size, window=window)
+            total += pulled
+            after = self.store.last_cloud_cursor()
+            if progress is not None and pulled:
                 progress(total)
-            if len(events) < max(1, min(int(batch_size), 500)):
+            if after <= before or after >= int(window.get("latest_sequence") or 0):
                 break
         return total
 
-    def synchronize_once(self, *, push_limit: int = 100, pull_limit: int = 200) -> dict[str, Any]:
+    def synchronize_once(
+        self,
+        *,
+        push_limit: int = 100,
+        pull_limit: int = 200,
+        operational_source_id: str = "",
+        turn_id: int = 0,
+        device_id: str = "",
+        reason: str = "timer",
+    ) -> dict[str, Any]:
         """Ejecuta un ciclo incremental sin recargar el historial completo."""
         cycle_started = perf_counter()
-        # Remote-first prevents stale local copies from reviving cloud tombstones.
-        replayed = 0
-        backfilled = 0
-        clock = self.store.update_server_time_offset(self.cloud.server_time())
-        if not self._projection_backfill_complete:
-            event_backfilled = self.cloud.backfill_projection_events(limit=pull_limit)
-            payload_loader = getattr(self.cloud, "backfill_projection_payloads", None)
-            payload_backfilled = (
-                int(payload_loader(limit=pull_limit)) if callable(payload_loader) else 0
+        window = self._load_event_window(fallback_limit=pull_limit)
+        server_time = window.get("server_time") or self.cloud.server_time()
+        clock = self.store.update_server_time_offset(server_time)
+        # Pull once before push so remote tombstones/conflicts win over stale
+        # local outbox records without needing the former second full pull.
+        pulled = self.pull_cloud_changes(limit=pull_limit, window=window)
+        checkpoint_recovered = 0
+        if bool(self._last_pull_metrics.get("stalled")):
+            checkpoint_recovered = self.recover_stalled_historical_cursor(
+                operational_source_id=operational_source_id,
+                turn_id=turn_id,
             )
-            backfilled = event_backfilled + payload_backfilled
-            self._projection_backfill_complete = bool(
-                event_backfilled < max(1, min(int(pull_limit), 500))
-                and payload_backfilled < max(1, min(int(pull_limit), 500))
-            )
-        pulled_before_push = self.pull_cloud_changes(limit=pull_limit)
-        pull_fetch_ms = float(self._last_pull_metrics["fetch_ms"])
-        pull_apply_ms = float(self._last_pull_metrics["apply_ms"])
         # Legacy recovery is bounded and only queues records that have a durable
-        # global identity and no prior outbox event.
-        recovered = self.store.queue_missing_attention_events(limit=push_limit)
-        if not self._initial_reconciliation_complete:
-            replayed = self.cloud.rematerialize_attention_events(
-                self.store.recent_attention_entity_ids(limit=push_limit)
-            )
-            self._initial_reconciliation_complete = True
+        # global identity and no prior outbox event. Once empty it is not polled
+        # again every tick; ordinary writes create their outbox atomically.
+        recovered = 0
+        if not self._local_recovery_complete:
+            recovered = self.store.queue_missing_attention_events(limit=push_limit)
+            self._local_recovery_complete = recovered < max(1, int(push_limit))
         push_started = perf_counter()
         pushed = self.push_outbox(limit=push_limit)
         push_ms = (perf_counter() - push_started) * 1000.0
-        pulled_after_push = self.pull_cloud_changes(limit=pull_limit)
-        pull_fetch_ms += float(self._last_pull_metrics["fetch_ms"])
-        pull_apply_ms += float(self._last_pull_metrics["apply_ms"])
+        cursor_after = self.store.last_cloud_cursor()
         total_ms = (perf_counter() - cycle_started) * 1000.0
-        return {
+        result = {
             **pushed,
-            "pulled": pulled_before_push + pulled_after_push,
+            "pulled": pulled,
             "recovered": recovered,
-            "replayed": replayed,
-            "backfilled": backfilled,
+            "replayed": 0,
+            "backfilled": 0,
+            "checkpoint_recovered": checkpoint_recovered,
             "server_time_offset_ms": int(clock["server_time_offset_ms"]),
             "clock_drift_detected": int(bool(clock["drift_detected"])),
             "sync_push_ms": round(push_ms, 3),
-            "sync_pull_ms": round(pull_fetch_ms, 3),
-            "sync_apply_ms": round(pull_apply_ms, 3),
+            "sync_pull_ms": round(float(self._last_pull_metrics["fetch_ms"]), 3),
+            "sync_apply_ms": round(float(self._last_pull_metrics["apply_ms"]), 3),
             "sync_total_ms": round(total_ms, 3),
+            "pull_requests": int(self._last_pull_metrics.get("requests") or 0),
+            "pull_rows": int(self._last_pull_metrics.get("rows") or 0),
+            "pull_bytes_estimated": int(
+                self._last_pull_metrics.get("estimated_bytes") or 0
+            ),
+            "duplicate_events": int(self._last_pull_metrics.get("duplicates") or 0),
+            "cursor_before": int(self._last_pull_metrics.get("cursor_before") or 0),
+            "cursor_after": cursor_after,
+            "central_queries": 1
+            + int(self._last_pull_metrics.get("requests") or 0)
+            + int(self._last_recovery_queries)
+            + int(pushed.get("push_requests") or 0),
         }
+        OPERATIONAL_LOG.info(
+            "SYNC_CYCLE_METRICS cycle_id=%s device_id=%s reason=%s "
+            "duration_ms=%.1f push_events=%s "
+            "push_bytes_estimated=%s pull_requests=%s pull_rows=%s "
+            "pull_bytes_estimated=%s cursor_before=%s cursor_after=%s "
+            "duplicates=%s central_queries=%s guarded=%s",
+            str(uuid.uuid4()),
+            str(device_id or "-"),
+            str(reason or "timer"),
+            total_ms,
+            result["pushed"],
+            result["push_bytes_estimated"],
+            result["pull_requests"],
+            result["pull_rows"],
+            result["pull_bytes_estimated"],
+            result["cursor_before"],
+            result["cursor_after"],
+            result["duplicate_events"],
+            result["central_queries"],
+            str(bool(self._last_pull_metrics.get("guarded"))).lower(),
+        )
+        return result
 
 
 class AdmissionSeedService:
@@ -8409,6 +8791,7 @@ __all__ = [
     "ADMISSION_ROLE_AUXILIARY",
     "ADMISSION_ROLE_MEDICAL_AUDIT",
     "MAX_ACTIVE_SESSION_DEVICES",
+    "PATIENT_DIRECTORY_POLL_SECONDS",
     "SYNC_TICK_SECONDS",
     "AdmissionAccessDecision",
     "AdmissionCloudRepository",

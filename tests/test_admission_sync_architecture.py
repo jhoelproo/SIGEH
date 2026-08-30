@@ -286,6 +286,7 @@ def test_secondary_detail_sheet_event_is_visible_on_primary(tmp_path: Path):
     assert sync2.synchronize_once()["pushed"] == 1
     sync1.synchronize_once()
     assert cloud.latest[entity_uuid]["operation"] == "DETAIL_SHEET_GENERATED"
+    assert cloud.latest[entity_uuid]["payload_json"]["turn_id"] == 350
     with closing(sqlite3.connect(pc1_path)) as connection:
         assert connection.execute(
             "SELECT hoja,sync_state FROM atenciones WHERE global_attention_id=?",

@@ -1,0 +1,149 @@
+SIGEH — VALIDACIÓN TÉCNICA DE LA CORRECCIÓN DE SHARED POOLER EGRESS
+Fecha: 2026-08-30
+Rama local: codex/sigeh-egress-audit
+Base: bd1fd52 (SIGEH 1.0.8)
+Estado de release al cerrar QA: CANDIDATO VALIDADO PARA SIGEH 1.0.9
+
+1. CAUSA RAÍZ DEMOSTRADA
+
+La réplica SQLite productiva auditada tenía last_cloud_cursor=49, mientras el
+stream central admission_sync_events alcanzaba sequence=123087.
+
+El primer evento no aplicable era sequence=50, operación RECONCILE, pertenecía
+a un turno histórico (turn_id=240) y sí estaba representado en la proyección
+central. La estación local estaba operando el turn_id=3946. Al intentar insertar
+ese evento histórico en el día local actualmente abierto se producía:
+
+sqlite3.IntegrityError:
+UNIQUE constraint failed: atenciones.dia_operativo_id, atenciones.paciente_id
+
+La ruta anterior detenía la aplicación del lote, no avanzaba el cursor y, sin
+embargo, volvía a descargar el mismo lote en el siguiente ciclo.
+
+Secuencia anterior:
+
+QTimer cada 2 segundos
+→ synchronize_once()
+→ pull_cloud_changes() antes del push
+→ descarga 200 eventos desde cursor 49
+→ falla el primer evento histórico
+→ cursor permanece 49
+→ pull_cloud_changes() nuevamente después del push
+→ descarga los mismos 200 eventos
+→ siguiente tick repite el patrón
+
+No se encontró fuga de conexiones: el pool devuelve o cierra las conexiones.
+Tampoco se encontró un doble PRIMARY central activo durante la auditoría. El
+single-flight/coalescing del coordinador ya existía; no fue la causa principal.
+
+2. EVIDENCIA CENTRAL (LECTURA SOLAMENTE)
+
+- admission_sync_events: 43,552 filas; max sequence=123,087.
+- Tamaño total de payload_json del stream: 55,762,061 bytes.
+- Tamaño promedio de payload_json: 1,280 bytes.
+- admission_attention_projection: 28,010 filas; promedio aproximado 1,941 bytes.
+- admission_patient_directory_events: 24,964 filas; max sequence=25,339.
+- Consulta incremental repetida registrada en pg_stat_statements:
+  168,821 llamadas y 26,284,882 filas devueltas.
+- Una página real de 200 eventos serializados midió aproximadamente 329,831 bytes.
+
+La anomalía coincide temporalmente con el crecimiento del stream/baseline del
+27/08. El temporizador de 2 segundos era anterior; el nuevo evento histórico
+incompatible en sequence=50 convirtió ese defecto latente en un loop de egress.
+
+3. CORRECCIÓN IMPLEMENTADA
+
+- Un solo pull incremental por ciclo; se eliminó el segundo pull redundante.
+- Consulta liviana de cabecera antes de solicitar payloads.
+- Si latest_sequence <= cursor, no se ejecuta SELECT de eventos.
+- Cursor durable monotónico: nunca retrocede en sincronización normal.
+- Guard EGRESS_LOOP_GUARD_TRIGGERED para impedir descargar repetidamente un
+  mismo lote cuyo cursor no progresa.
+- Recovery histórico controlado: confirma la entidad en la proyección central,
+  reconcilia exclusivamente el turno vigente y avanza al checkpoint. Nunca
+  omite silenciosamente un bloqueo que pertenezca al turno actual.
+- Cursor expirado: el ciclo normal recupera la proyección del turno vigente sin
+  descargar el historial completo. El bootstrap total queda reservado para la
+  operación explícita existente.
+- queue_missing_attention_events deja de inspeccionar en cada tick después de
+  completar la recuperación local.
+- Backfill y rematerialización completa fueron retirados del ciclo normal.
+- Reconciliación del turno actual una vez por identidad, no después de cada
+  push/pull o revisión operacional.
+- Heartbeat limitado a 30 segundos.
+- Ciclo incremental limitado a 10 segundos.
+- Directorio de pacientes limitado a 30 segundos y sin consulta de payload si
+  la cabecera confirma que no hay secuencias nuevas.
+- Retry con exponential backoff, jitter determinista y límite de 60–72 segundos.
+- Métricas seguras: SYNC_CYCLE_METRICS, bytes estimados, filas, requests,
+  cursores, duplicados, queries y motivo; sin datos clínicos.
+- Logging operacional conectado al archivo rotativo existente de V15.
+- Historial permanece on-demand. Se agregó medición de filas/bytes; no se creó
+  un timer nuevo ni se modificó su universo funcional.
+
+4. ANTES Y DESPUÉS (POR ESTACIÓN, 15 MINUTOS IDLE)
+
+Métrica                              Antes              Después
+-----------------------------------  ------------------  ------------------
+Ticks de sincronización              450                 90
+Pulls pesados de atenciones          900                 1 inicial; luego 0
+Filas del lote transferidas          180,000             200 iniciales
+Transferencia del lote repetido      283.10 MiB          0.315 MiB inicial
+Proyección por hora                  1.11 GiB            tráfico liviano
+Filas duplicadas transferidas        179,800             0 tras checkpoint
+Full history loads                   0                   0
+Sentencias centrales estimadas       ~4,500              <=273
+Préstamos del pool estimados          ~4,050              <=242
+Conexiones físicas filtradas          0                   0
+Cursor                               49 inmóvil          49 → 123087 durable
+
+La columna “Después” proviene de 90 ciclos deterministas simulados usando el
+contrato real de sincronización. No constituye todavía una observación de 15
+minutos de dos estaciones físicas en el hospital.
+
+“Préstamos del pool” significa reutilizaciones controladas de conexiones del
+pool, no aperturas físicas nuevas. Las cifras de queries/leases son un máximo
+estructural calculado de las rutas ejecutadas; SYNC_CYCLE_METRICS permitirá
+obtener los valores observados por estación durante staging.
+
+5. PRUEBAS Y CALIDAD
+
+- Suite completa: 770 passed, 23 skipped, 57 subtests passed, 0 failed.
+- Pruebas focales finales después de la limpieza de complejidad: 22 passed.
+- Cobertura diferencial final: 97% (220 líneas cambiadas, 6 no cubiertas).
+  admission_hybrid.py=98.7%; admission_v15_adapter.py=93.2%;
+  patient_directory.py=100%.
+- Ruff lint: PASS.
+- py_compile: PASS.
+- git diff --check: PASS.
+- Complejidad: no se agregaron incidencias C901; synchronize bajó de 18 a 15.
+  Permanecen funciones heredadas sobre el objetivo 10.
+- Type checker: NO VERIFICADO; el proyecto no incluye mypy/pyright configurado.
+- Build PyInstaller final: PASS. Resultado local en dist/SIGEH.
+- Smoke del ejecutable contra producción: NO EJECUTADO para evitar mutaciones
+  centrales no autorizadas durante el arranque.
+
+6. PROTECCIÓN DE PRODUCCIÓN
+
+No se ejecutó SEED, MERGE, cambio/cierre de turno, reimportación de baseline,
+recreación de PostgreSQL, borrado de SQLite, reset de cursor ni reset de
+pg_stat_statements. PostgreSQL fue auditado con conexión read-only y la prueba
+del error SQLite se realizó sobre una copia.
+
+No hubo migraciones ni mutaciones de datos productivos. El hotfix fue integrado
+en el candidato 1.0.9 después de la autorización posterior de lanzamiento; la
+fuente canónica y la metadata del paquete indican SIGEH 1.0.9.
+
+7. RIESGOS Y OBSERVACIÓN PENDIENTE
+
+- Verificar consumo real durante 1 h, 6 h y 24 h en una instalación controlada.
+- Ejecutar prueba física con PC-A y PC-B idle y registrar métricas agregadas.
+- Confirmar un paciente nuevo y una ráfaga de 10 pacientes entre estaciones.
+- Simular timeout real y recuperación para confirmar el backoff en el entorno.
+- Historial sigue usando p.* + latest payload en la consulta on-demand. No es la
+  causa del loop, pero puede separarse list/detail en una tarea posterior y
+  controlada si las métricas muestran un costo relevante al abrir la ventana.
+
+La observación real de 1 h, 6 h y 24 h sigue siendo un control posterior a la
+instalación en ambas estaciones; no se puede simular como evidencia hospitalaria.
+El código, el paquete y sus pruebas automatizadas sí quedaron listos para release.

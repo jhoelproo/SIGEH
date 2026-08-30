@@ -18,7 +18,6 @@ from admission_hybrid import (
     OfflineAdmissionStore,
     OperationalSession,
     StationRole,
-    SyncConflict,
     SyncEvent,
     deterministic_event_order_key,
     select_effective_turn_interval,
@@ -470,4 +469,4 @@ def test_stress_two_pcs_200_attentions_converge_without_loss_or_duplicates(tmp_p
         assert len(set(identities)) == 200
         ordered_ids.append(identities)
     assert ordered_ids[0] == ordered_ids[1]
-    assert SYNC_TICK_SECONDS == 2
+    assert SYNC_TICK_SECONDS == 10

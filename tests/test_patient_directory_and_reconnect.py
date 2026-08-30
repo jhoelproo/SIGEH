@@ -3,7 +3,11 @@ from __future__ import annotations
 import sqlite3
 
 from admission_hybrid import ConnectionSupervisor, same_user
-from patient_directory import PatientDirectoryService, normalize_patient_document
+from patient_directory import (
+    LocalPatientDirectory,
+    PatientDirectoryService,
+    normalize_patient_document,
+)
 
 
 def _create_v15_database(path):
@@ -93,3 +97,38 @@ def test_same_admin_uses_canonical_identity_not_display_name():
         "full_name": "Administrador del sistema",
     }
     assert same_user(central, local)
+
+
+def test_patient_directory_cursor_is_monotonic_for_hydrate_and_direct_updates(tmp_path):
+    database = tmp_path / "patient-cursor.db"
+    _create_v15_database(database)
+    local = LocalPatientDirectory(database)
+
+    local.hydrate_many([], final_sequence=25)
+    local.hydrate_many([], final_sequence=5)
+    local.set_patient_cursor(40)
+    local.set_patient_cursor(10)
+
+    assert local.patient_cursor() == 40
+
+
+def test_patient_incremental_idle_uses_head_probe_without_event_payload_query(tmp_path):
+    database = tmp_path / "patient-idle.db"
+    _create_v15_database(database)
+    service = PatientDirectoryService(database, lambda: None)
+    service.local.set_patient_cursor(15)
+
+    class _IdleCentral:
+        event_calls = 0
+
+        def event_window(self):
+            return {"minimum_available_sequence": 0, "latest_sequence": 15}
+
+        def events_after(self, *_args, **_kwargs):
+            self.event_calls += 1
+            return []
+
+    service.central = _IdleCentral()
+
+    assert service.pull_incremental() == 0
+    assert service.central.event_calls == 0

@@ -470,11 +470,12 @@ class CentralPatientDirectoryRepository:
         with self.connection_factory() as con:
             row = con.execute(
                 """SELECT f.minimum_available_sequence,f.checkpoint_sequence,
-                          COALESCE(MAX(e.sequence),0) AS latest_sequence
+                          COALESCE((SELECT MAX(e.sequence)
+                                      FROM admission_patient_directory_events e),0)
+                              AS latest_sequence
                      FROM admission_replication_event_floors f
-                     LEFT JOIN admission_patient_directory_events e ON TRUE
                     WHERE f.stream_name='PATIENT_DIRECTORY'
-                    GROUP BY f.minimum_available_sequence,f.checkpoint_sequence"""
+                    """
             ).fetchone()
         data = _mapping(row)
         return {
@@ -796,12 +797,17 @@ class LocalPatientDirectory:
             for patient in patients:
                 self._hydrate_on_connection(con, patient)
             if final_sequence is not None:
+                current = con.execute(
+                    """SELECT state_value FROM patient_directory_state
+                        WHERE state_key='cloud_cursor'"""
+                ).fetchone()
+                current_sequence = int(current[0] or 0) if current else 0
                 con.execute(
                     """INSERT INTO patient_directory_state(state_key,state_value,updated_at)
                        VALUES('cloud_cursor',?,?)
                        ON CONFLICT(state_key) DO UPDATE SET
                          state_value=excluded.state_value,updated_at=excluded.updated_at""",
-                    (str(int(final_sequence)), _timestamp()),
+                    (str(max(current_sequence, int(final_sequence))), _timestamp()),
                 )
         return len(patients)
 
@@ -833,12 +839,17 @@ class LocalPatientDirectory:
         with connect_local_sqlite(
             self.database, operation="patient-directory-cursor"
         ) as con:
+            current = con.execute(
+                """SELECT state_value FROM patient_directory_state
+                    WHERE state_key='cloud_cursor'"""
+            ).fetchone()
+            current_sequence = int(current[0] or 0) if current else 0
             con.execute(
                 """INSERT INTO patient_directory_state(state_key,state_value,updated_at)
                    VALUES('cloud_cursor',?,?)
                    ON CONFLICT(state_key) DO UPDATE SET
                      state_value=excluded.state_value,updated_at=excluded.updated_at""",
-                (str(int(sequence)), _timestamp()),
+                (str(max(current_sequence, int(sequence))), _timestamp()),
             )
 
 
@@ -895,12 +906,15 @@ class PatientDirectoryService:
     def pull_incremental(self, *, limit: int = 500) -> int:
         cursor = self.local.patient_cursor()
         window_loader = getattr(self.central, "event_window", None)
+        window: dict[str, Any] = {}
         if callable(window_loader):
             window = dict(window_loader() or {})
             floor = int(window.get("minimum_available_sequence") or 0)
             if cursor < floor:
                 self.bootstrap_from_projection(batch_size=limit, window=window)
                 cursor = self.local.patient_cursor()
+            if int(window.get("latest_sequence") or 0) <= cursor:
+                return 0
         events = self.central.events_after(cursor, limit=limit)
         if not events:
             return 0
