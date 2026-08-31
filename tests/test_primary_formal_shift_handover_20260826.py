@@ -284,6 +284,8 @@ def test_formal_handover_changes_turn_and_rep_but_only_logs_out_old_rep_secondar
     assert database.devices["PC-OTHER-SECONDARY"]["detached_at"] is None
     assert database.active_sessions["login-other-secondary"]["is_active"] is True
     assert any(item["event"] == "OPERATIONAL_GENERATION_CHANGED" for item in database.audit)
+    assert any(item["event"] == "TURN_HANDOFF_REQUESTED" for item in database.audit)
+    assert any(item["event"] == "TURN_HANDOFF_COMMITTED" for item in database.audit)
     identity_event = next(
         item for item in database.audit
         if item["event"] == "OPERATIONAL_IDENTITY_CHANGED"

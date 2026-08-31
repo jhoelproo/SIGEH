@@ -75,6 +75,7 @@ class _OperationalDB:
                 "operational_source_id": str(source_id),
                 "status": "ACTIVE",
                 "generation": 1,
+                "operational_revision": 1,
                 "lease_generation": 0,
                 "primary_last_seen": "now",
                 "updated_at": "now",
@@ -147,6 +148,30 @@ class _OperationalDB:
                 return _Result(None)
             actor["is_active"] = active
             return _Result(actor)
+        if "SELECT D.DEVICE_ID,D.LOGIN_SESSION_ID,D.DEVICE_NAME" in upper:
+            sid = str(params[-1])
+            rows = []
+            for row in self.devices.values():
+                login_id = str(row.get("login_session_id") or "")
+                actor = deepcopy(self.active_session_users.get(login_id, {}))
+                if (
+                    row.get("operational_session_id") != sid
+                    or row.get("detached_at") is not None
+                    or row.get("invalidated_at") is not None
+                    or not self.active_sessions.get(login_id)
+                ):
+                    continue
+                rows.append(
+                    {
+                        **deepcopy(row),
+                        "login_username": actor.get("username", ""),
+                        "is_active": True,
+                        "user_id": actor.get("user_id", ""),
+                        "login_role": actor.get("role", ""),
+                        "heartbeat_recent": bool(row.get("healthy", True)),
+                    }
+                )
+            return _Result(rows=rows)
         if "SELECT PRIMARY_LAST_SEEN < NOW()" in upper:
             return _Result((False,))
         if "SELECT LOGIN_SESSION_ID,STATION_ROLE" in upper:
@@ -172,6 +197,8 @@ class _OperationalDB:
                     "login_session_id": str(login_id),
                     "device_name": str(device_name),
                     "station_role": "PRIMARY",
+                    "last_seen": "now",
+                    "healthy": True,
                     "detached_at": None,
                     "invalidated_at": None,
                     "invalidated_reason": None,
@@ -201,6 +228,8 @@ class _OperationalDB:
                 "login_session_id": str(login_id),
                 "device_name": str(device_name),
                 "station_role": str(role),
+                "last_seen": "now",
+                "healthy": True,
                 "detached_at": None,
                 "invalidated_at": None,
                 "invalidated_reason": None,
@@ -260,14 +289,32 @@ class _OperationalDB:
         if upper.startswith(
             "UPDATE ADMISSION_OPERATIONAL_SESSIONS SET PRIMARY_DEVICE_ID=%S,PRIMARY_LOGIN_SESSION_ID=%S"
         ):
-            device_id, login_id, _sid = params
+            device_id, login_id, _sid, *rest = params
+            if rest and int(rest[0]) != int(self.session["operational_revision"]):
+                return _Result(rowcount=0)
             self.session.update({
                 "primary_device_id": str(device_id),
                 "primary_login_session_id": str(login_id),
             })
             if "LEASE_GENERATION=LEASE_GENERATION+1" in upper:
                 self.session["lease_generation"] += 1
+            if "OPERATIONAL_REVISION=OPERATIONAL_REVISION+1" in upper:
+                self.session["operational_revision"] += 1
             return _Result(rowcount=1)
+        if upper.startswith(
+            "UPDATE ADMISSION_OPERATIONAL_DEVICES SET STATION_ROLE='SECONDARY' WHERE"
+        ):
+            sid, device_id = map(str, params)
+            row = self.devices.get(device_id)
+            if (
+                row
+                and row.get("operational_session_id") == sid
+                and row.get("detached_at") is None
+                and row.get("station_role") == "PRIMARY"
+            ):
+                row["station_role"] = "SECONDARY"
+                return _Result(rowcount=1)
+            return _Result(rowcount=0)
         if upper.startswith(
             "UPDATE ADMISSION_OPERATIONAL_DEVICES SET STATION_ROLE='SECONDARY',LAST_SEEN=NOW()"
         ):
@@ -895,7 +942,7 @@ def test_five_consecutive_primary_transitions_preserve_invariants():
         assert service.validate_operational_invariants()["valid"]
 
 
-def test_admin_force_transfer_changes_only_primary_lease():
+def test_admin_remote_transfer_changes_only_primary_lease_and_keeps_both_logins():
     database, service = _service()
     primary = _configured_primary(
         database, service, username="admin", user_id=7, login_role="administrador",
@@ -908,8 +955,11 @@ def test_admin_force_transfer_changes_only_primary_lease():
     before = primary.operational_session
     changed = service.force_transfer_admission_primary(
         operational_session_id=before.operational_session_id,
-        device_id="PC-2",
-        login_session_id="S-1",
+        target_device_id="PC-2",
+        target_login_session_id="S-1",
+        actor_device_id="PC-1",
+        actor_login_session_id="P-1",
+        expected_operational_revision=before.operational_revision,
         admin_user_id=7,
         admin_username="admin",
         admin_role="administrador",
@@ -921,20 +971,16 @@ def test_admin_force_transfer_changes_only_primary_lease():
     assert changed.active_user_id == before.active_user_id
     assert changed.generation == before.generation
     assert changed.lease_generation == before.lease_generation + 1
+    assert changed.operational_revision == before.operational_revision + 1
     assert database.devices["PC-1"]["station_role"] == "SECONDARY"
-    assert database.devices["PC-1"]["detached_at"] == "now"
-    assert database.devices["PC-1"]["invalidated_reason"] == (
-        "PRIMARY_TRANSFERRED_ADMINISTRATIVELY"
-    )
+    assert database.devices["PC-1"]["detached_at"] is None
+    assert database.devices["PC-1"]["invalidated_reason"] is None
     assert database.devices["PC-2"]["station_role"] == "PRIMARY"
-    assert database.active_sessions["P-1"] is False
-    assert database.logout_reasons["P-1"] == (
-        "PRIMARY_TRANSFERRED_ADMINISTRATIVELY"
-    )
+    assert database.active_sessions["P-1"] is True
+    assert database.active_sessions["S-1"] is True
     events = {item["event"] for item in database.audit}
-    assert "ADMISSION_PRIMARY_TRANSFER_REQUESTED" in events
-    assert "ADMISSION_PRIMARY_REVOKED" in events
-    assert "ADMISSION_PRIMARY_TRANSFER_COMPLETED" in events
+    assert "PRIMARY_TRANSFER_REQUESTED" in events
+    assert "PRIMARY_TRANSFER_COMMITTED" in events
 
     # A fresh login on the revoked computer is attached as SECONDARY; it does
     # not regain PRIMARY while PC-2 still owns the central lease.
@@ -953,8 +999,11 @@ def test_admin_force_transfer_changes_only_primary_lease():
 
     transferred_back = service.force_transfer_admission_primary(
         operational_session_id=before.operational_session_id,
-        device_id="PC-1",
-        login_session_id="P-2",
+        target_device_id="PC-1",
+        target_login_session_id="P-2",
+        actor_device_id="PC-2",
+        actor_login_session_id="S-1",
+        expected_operational_revision=changed.operational_revision,
         admin_user_id=7,
         admin_username="admin",
         admin_role="administrador",
@@ -964,7 +1013,118 @@ def test_admin_force_transfer_changes_only_primary_lease():
     assert transferred_back.turn_id == before.turn_id
     assert transferred_back.active_user_id == before.active_user_id
     assert transferred_back.generation == before.generation
-    assert database.active_sessions["S-1"] is False
+    assert database.active_sessions["S-1"] is True
+
+
+def test_remote_primary_candidates_require_current_active_healthy_logins():
+    database, service = _service()
+    session = _configured_primary(
+        database, service, username="admin", user_id=7,
+        login_role="administrador", device_id="PC-1",
+        login_session_id="P-1", turn_id=350,
+    ).operational_session
+    service.attach_device(
+        login_username="operator", login_user_id=8, login_role="auxiliar",
+        device_id="PC-2", login_session_id="S-1", turn_id=350,
+    )
+    candidates = service.list_primary_transfer_candidates(
+        operational_session_id=session.operational_session_id
+    )
+    assert {row["device_id"] for row in candidates} == {"PC-1", "PC-2"}
+    assert {row["health_status"] for row in candidates} == {"HEALTHY"}
+    assert {row["sync_status"] for row in candidates} == {"NOT_REPORTED"}
+    database.devices["PC-2"]["healthy"] = False
+    assert {
+        row["device_id"]
+        for row in service.list_primary_transfer_candidates(
+            operational_session_id=session.operational_session_id
+        )
+    } == {"PC-1"}
+
+
+def test_remote_transfer_rejects_stale_current_primary_and_stale_revision():
+    database, service = _service()
+    session = _configured_primary(
+        database, service, username="admin", user_id=7,
+        login_role="administrador", device_id="PC-1",
+        login_session_id="P-1", turn_id=350,
+    ).operational_session
+    service.attach_device(
+        login_username="operator", login_user_id=8, login_role="auxiliar",
+        device_id="PC-2", login_session_id="S-1", turn_id=350,
+    )
+    database.devices["PC-1"]["healthy"] = False
+    with pytest.raises(AdmissionWriteBlocked, match="principal.*conectada"):
+        service.force_transfer_admission_primary(
+            operational_session_id=session.operational_session_id,
+            target_device_id="PC-2", target_login_session_id="S-1",
+            actor_device_id="PC-1", actor_login_session_id="P-1",
+            expected_operational_revision=session.operational_revision,
+            admin_user_id=7, admin_username="admin",
+            admin_role="administrador", reason="Cambio remoto",
+        )
+    database.devices["PC-1"]["healthy"] = True
+    with pytest.raises(AdmissionWriteBlocked, match="cambió"):
+        service.force_transfer_admission_primary(
+            operational_session_id=session.operational_session_id,
+            target_device_id="PC-2", target_login_session_id="S-1",
+            actor_device_id="PC-1", actor_login_session_id="P-1",
+            expected_operational_revision=999,
+            admin_user_id=7, admin_username="admin",
+            admin_role="administrador", reason="Cambio remoto",
+        )
+
+
+def test_competing_remote_transfer_loses_on_expected_revision():
+    database, service = _service()
+    session = _configured_primary(
+        database,
+        service,
+        username="admin",
+        user_id=7,
+        login_role="administrador",
+        device_id="PC-1",
+        login_session_id="P-1",
+        turn_id=350,
+    ).operational_session
+    service.attach_device(
+        login_username="operator",
+        login_user_id=8,
+        login_role="auxiliar",
+        device_id="PC-2",
+        login_session_id="S-1",
+        turn_id=350,
+    )
+    winner = service.force_transfer_admission_primary(
+        operational_session_id=session.operational_session_id,
+        target_device_id="PC-2",
+        target_login_session_id="S-1",
+        actor_device_id="PC-1",
+        actor_login_session_id="P-1",
+        expected_operational_revision=session.operational_revision,
+        admin_user_id=7,
+        admin_username="admin",
+        admin_role="administrador",
+        reason="Primera solicitud",
+    )
+    with pytest.raises(AdmissionWriteBlocked, match="cambió"):
+        service.force_transfer_admission_primary(
+            operational_session_id=session.operational_session_id,
+            target_device_id="PC-2",
+            target_login_session_id="S-1",
+            actor_device_id="PC-1",
+            actor_login_session_id="P-1",
+            expected_operational_revision=session.operational_revision,
+            admin_user_id=7,
+            admin_username="admin",
+            admin_role="administrador",
+            reason="Solicitud concurrente obsoleta",
+        )
+    assert winner.primary_device_id == "PC-2"
+    assert sum(
+        row["station_role"] == "PRIMARY" and row.get("detached_at") is None
+        for row in database.devices.values()
+    ) == 1
 
 
 def test_transfer_is_rejected_when_target_is_already_primary():
@@ -982,8 +1142,11 @@ def test_transfer_is_rejected_when_target_is_already_primary():
     with pytest.raises(AdmissionWriteBlocked, match="ya posee"):
         service.force_transfer_admission_primary(
             operational_session_id=session.operational_session_id,
-            device_id="PC-1",
-            login_session_id="P-1",
+            target_device_id="PC-1",
+            target_login_session_id="P-1",
+            actor_device_id="PC-1",
+            actor_login_session_id="P-1",
+            expected_operational_revision=session.operational_revision,
             admin_user_id=7,
             admin_username="admin",
             admin_role="administrador",
@@ -1001,7 +1164,9 @@ def test_non_admin_cannot_force_primary_transfer():
     with pytest.raises(AdmissionWriteBlocked):
         service.force_transfer_admission_primary(
             operational_session_id=session.operational_session_id,
-            device_id="PC-1", login_session_id="P-1",
+            target_device_id="PC-1", target_login_session_id="P-1",
+            actor_device_id="PC-1", actor_login_session_id="P-1",
+            expected_operational_revision=session.operational_revision,
             admin_user_id=9, admin_username="audit",
             admin_role="facturador de auditoria", reason="No autorizado",
         )

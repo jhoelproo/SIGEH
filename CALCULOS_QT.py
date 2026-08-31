@@ -465,9 +465,47 @@ AUDIT_ASSIGNMENT_UNASSIGNED = "SIN_ASIGNAR"
 AUDIT_ASSIGNMENT_MINE = "MIAS"
 AUDIT_ASSIGNMENT_OTHERS = "OTRAS"
 DOCUMENT_PRELIMINARY = "PRELIMINAR"
+# Estado documental completo: el recibo puede entrar a auditoría y producir
+# sus salidas oficiales. FINAL se reserva para la validación posterior de la
+# auditoría; no representa una completitud distinta del contenido del recibo.
 DOCUMENT_READY = "LISTO_AUDITORIA"
 DOCUMENT_FINAL = "FINAL"
 DOCUMENT_STATES = (DOCUMENT_PRELIMINARY, DOCUMENT_READY, DOCUMENT_FINAL)
+AUTH_REVIEW_NOT_APPLICABLE = "NOT_APPLICABLE"
+AUTH_REVIEW_CLEAR = "CLEAR"
+AUTH_REVIEW_PENDING = "PENDING_REVIEW"
+AUTH_REVIEW_STATES = (
+    AUTH_REVIEW_NOT_APPLICABLE,
+    AUTH_REVIEW_CLEAR,
+    AUTH_REVIEW_PENDING,
+)
+
+
+def authorization_min_digits() -> int:
+    """Configured minimum; six preserves every numeric production format found."""
+    try:
+        configured = int(os.environ.get("SIGEH_AUTHORIZATION_MIN_DIGITS", "6"))
+    except (TypeError, ValueError):
+        return 6
+    return min(20, max(1, configured))
+
+
+def classify_privileged_bypass_authorization(
+    authorization: str,
+) -> tuple[str, str, str]:
+    """Separate document completeness from authorization quality review."""
+    normalized = str(authorization or "").strip()
+    if not normalized:
+        return (
+            DOCUMENT_PRELIMINARY,
+            AUTH_REVIEW_NOT_APPLICABLE,
+            "AUTHORIZATION_MISSING",
+        )
+    if not normalized.isascii() or not normalized.isdigit():
+        return DOCUMENT_READY, AUTH_REVIEW_PENDING, "INVALID_AUTHORIZATION_FORMAT"
+    if len(normalized) < authorization_min_digits():
+        return DOCUMENT_READY, AUTH_REVIEW_PENDING, "AUTHORIZATION_TOO_SHORT"
+    return DOCUMENT_READY, AUTH_REVIEW_CLEAR, ""
 
 
 def billing_is_ready_for_audit(*, patient_validated: bool, authorization: str) -> bool:
@@ -475,7 +513,7 @@ def billing_is_ready_for_audit(*, patient_validated: bool, authorization: str) -
     return bool(patient_validated and str(authorization or "").strip())
 DOCUMENT_STATE_LABELS = {
     DOCUMENT_PRELIMINARY: "Preliminar - requiere autorización",
-    DOCUMENT_READY: "Listo para auditoría",
+    DOCUMENT_READY: "Documento completo - listo para auditoría",
     DOCUMENT_FINAL: "Documento final validado",
 }
 BILLING_STATUSES = (
@@ -1225,6 +1263,8 @@ CREATE TABLE IF NOT EXISTS recibos(
   autorizacion_at TEXT,
   autorizacion_por TEXT,
   estado_documento TEXT NOT NULL DEFAULT 'PRELIMINAR',
+  review_status TEXT NOT NULL DEFAULT 'NOT_APPLICABLE',
+  review_reason TEXT,
   motivo_no_facturado_codigo TEXT,
   auditoria_asignada_a TEXT,
   auditoria_asignada_at TEXT,
@@ -2720,6 +2760,26 @@ def _apply_billing_admission_bridge_identity_migration(con):
     con.executescript(migration_path.read_text(encoding="utf-8"))
 
 
+def _apply_billing_bypass_authorization_review_migration(con):
+    """Add review flags without changing receipts, attention identity or turns."""
+    con.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        ("billing-bypass-authorization-review-v1",),
+    )
+    migration_path = (
+        Path(APP_DIR)
+        / "migrations"
+        / "20260830_billing_bypass_authorization_review.sql"
+    )
+    if getattr(sys, "frozen", False):
+        migration_path = Path(BUNDLE_DIR) / "migrations" / migration_path.name
+    if not migration_path.exists():
+        raise RuntimeError(
+            "No se encontró la migración de revisión de autorización bypass."
+        )
+    con.executescript(migration_path.read_text(encoding="utf-8"))
+
+
 def _apply_admission_hybrid_migration(con):
     """Añade coordinación central y eventos sin alterar atenciones legacy."""
     con.execute(
@@ -2884,6 +2944,7 @@ def db_init():
         _apply_billing_shift_closure_snapshot_migration(con)
         _apply_admission_validation_history_migration(con)
         _apply_billing_admission_bridge_identity_migration(con)
+        _apply_billing_bypass_authorization_review_migration(con)
         _apply_admission_hybrid_migration(con)
 
         projection_columns = {
@@ -2953,6 +3014,8 @@ def db_init():
             "autorizacion_at": "TEXT",
             "autorizacion_por": "TEXT",
             "estado_documento": "TEXT NOT NULL DEFAULT 'PRELIMINAR'",
+            "review_status": "TEXT NOT NULL DEFAULT 'NOT_APPLICABLE'",
+            "review_reason": "TEXT",
             "motivo_no_facturado_codigo": "TEXT",
             "auditoria_asignada_a": "TEXT",
             "auditoria_asignada_at": "TEXT",
@@ -10667,14 +10730,20 @@ def save_receipt_with_items(
 
     editing = recibo_id is not None
     authorization_number = str(authorization_number or "").strip()
-    document_state = (
-        DOCUMENT_READY
-        if billing_is_ready_for_audit(
-            patient_validated=bool(admission_attention),
-            authorization=authorization_number,
+    if bypass_data and not admission_attention:
+        document_state, review_status, review_reason = (
+            classify_privileged_bypass_authorization(authorization_number)
         )
-        else DOCUMENT_PRELIMINARY
-    )
+    else:
+        document_state = (
+            DOCUMENT_READY
+            if billing_is_ready_for_audit(
+                patient_validated=bool(admission_attention),
+                authorization=authorization_number,
+            )
+            else DOCUMENT_PRELIMINARY
+        )
+        review_status, review_reason = AUTH_REVIEW_NOT_APPLICABLE, ""
     authorization_changed_at = now_str() if authorization_number else None
     authorization_actor = (username or "Sistema") if authorization_number else None
     admission_values = list(_admission_values(admission_attention))
@@ -10700,7 +10769,8 @@ def save_receipt_with_items(
                           tipo_cobertura, numero_autorizacion, estado_documento,
                           admission_atencion_id, admission_nss_snapshot,
                           admission_cedula_snapshot, admission_source_instance_id,
-                          verification_bypassed, receipt_origin,
+                          verification_bypassed, verification_bypass_role,
+                          verification_bypass_device, receipt_origin,
                           EXISTS(
                               SELECT 1 FROM recibo_facturacion_history h
                               WHERE h.recibo_id=recibos.id AND h.estado_nuevo='FACTURADO'
@@ -10710,6 +10780,10 @@ def save_receipt_with_items(
             ).fetchone()
             if not current:
                 raise ValueError("El recibo que intentas editar ya no existe.")
+            if bool(current.get("verification_bypassed")) and not admission_attention:
+                document_state, review_status, review_reason = (
+                    classify_privileged_bypass_authorization(authorization_number)
+                )
             current_status = str(current["estado_facturacion"] or BILLING_UNCLASSIFIED)
             if current_status not in (BILLING_PENDING, BILLING_UNCLASSIFIED):
                 raise ValueError(
@@ -10751,6 +10825,7 @@ def save_receipt_with_items(
                            WHEN COALESCE(numero_autorizacion,'')<>%s THEN %s
                            ELSE autorizacion_por END,
                        estado_documento=%s,
+                       review_status=%s,review_reason=%s,
                        auditoria_asignada_a=NULL, auditoria_asignada_at=NULL,
                        auditoria_checklist_json=NULL, auditoria_preflight_json=NULL,
                        auditoria_riesgo=0,
@@ -10790,7 +10865,7 @@ def save_receipt_with_items(
                     float(sala), float(total), int(is_backdated), authorization_number,
                     authorization_number, authorization_changed_at,
                     authorization_number, authorization_actor,
-                    document_state,
+                    document_state, review_status, review_reason or None,
                     admission_values[0], admission_values[1],
                     admission_values[0], admission_values[2],
                     admission_values[0], admission_values[3],
@@ -10841,7 +10916,8 @@ def save_receipt_with_items(
                        numero, nombre, fecha, dx, ars, tipo_cobertura, sala, total, pdf_filename,
                        username, created_at, is_backdated, pdf_synced,
                        estado_facturacion, estado_facturacion_at, numero_autorizacion,
-                       autorizacion_at, autorizacion_por, estado_documento
+                       autorizacion_at, autorizacion_por, estado_documento,
+                       review_status,review_reason
                        ,document_storage_mode
                        ,admission_atencion_id, admission_paciente_id,
                        admission_nss_snapshot, admission_cedula_snapshot,
@@ -10855,7 +10931,7 @@ def save_receipt_with_items(
                        herencia_procesada_por,
                        service_type, specialty_snapshot, admission_username_snapshot
                    ) VALUES(
-                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,
                        %s,
                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                        %s,%s,%s,%s,%s,%s,%s,%s
@@ -10869,6 +10945,8 @@ def save_receipt_with_items(
                     authorization_number, authorization_changed_at,
                     authorization_actor,
                     document_state,
+                    review_status,
+                    review_reason or None,
                     new_receipt_storage_mode(),
                     *admission_values[:10], admission_values[15],
                     admission_values[10], admission_values[11],
@@ -10919,7 +10997,8 @@ def save_receipt_with_items(
                 (
                     saved_id, BILLING_PENDING, str(username or "Sistema"), now_str(),
                     "Creación del recibo",
-                    "Listo para auditoría" if document_state == DOCUMENT_READY
+                    "Documento completo; listo para auditoría"
+                    if document_state == DOCUMENT_READY
                     else "Documento preliminar pendiente de autorización",
                     "",
                     float(total), ars or "",
@@ -10951,7 +11030,7 @@ def save_receipt_with_items(
             _insert_action_history(
                 con,
                 str(username or "Sistema"),
-                "UNLINKED_RECEIPT_CREATED",
+                "BYPASS_RECEIPT_CREATED",
                 (
                     f"Recibo {numero}; motivo={bypass_data['reason']}; "
                     f"dispositivo={bypass_data['device']}"
@@ -10961,6 +11040,42 @@ def save_receipt_with_items(
                 entity_id=str(saved_id),
                 role=bypass_data["role"],
                 created_at=event_at,
+            )
+            if review_status == AUTH_REVIEW_PENDING:
+                _insert_action_history(
+                    con,
+                    str(username or "Sistema"),
+                    "BYPASS_RECEIPT_REVIEW_FLAGGED",
+                    (
+                        f"Recibo {numero}; motivo_revision={review_reason}; "
+                        f"dispositivo={bypass_data['device']}"
+                    ),
+                    module="Facturación",
+                    entity_type="recibo",
+                    entity_id=str(saved_id),
+                    role=bypass_data["role"],
+                    created_at=event_at,
+                )
+
+        if (
+            editing
+            and bool(current.get("verification_bypassed"))
+            and not admission_attention
+            and review_status == AUTH_REVIEW_PENDING
+        ):
+            _insert_action_history(
+                con,
+                str(username or "Sistema"),
+                "BYPASS_RECEIPT_REVIEW_FLAGGED",
+                (
+                    f"Recibo {numero}; motivo_revision={review_reason}; "
+                    "origen=EDICION_RECIBO_BYPASS"
+                ),
+                module="Facturación",
+                entity_type="recibo",
+                entity_id=str(saved_id),
+                role=str(current.get("verification_bypass_role") or ""),
+                created_at=now_str(),
             )
 
         if (
@@ -11644,7 +11759,8 @@ def list_receipts_history_rows(*, _connection=None, limit=100, offset=0, **filte
                             THEN GREATEST(0, CURRENT_DATE-NULLIF(r.created_at,'')::timestamp::date)
                             ELSE 0 END AS auditoria_antiguedad_dias,
                        r.auditoria_riesgo, r.admission_atencion_id
-                       ,r.verification_bypassed,r.receipt_origin
+                       ,r.verification_bypassed,r.receipt_origin,
+                       r.review_status,r.review_reason
                 FROM recibos r
                 WHERE {where_sql}
                 ORDER BY r.id DESC
@@ -12637,7 +12753,7 @@ def _audit_preflight_from_connection(
                   numero_autorizacion, estado_documento, admission_atencion_id,
                   admission_nss_snapshot, admission_cedula_snapshot,
                   admission_source_instance_id, document_storage_mode,
-                  verification_bypassed, receipt_origin,
+                  verification_bypassed, receipt_origin,review_status,review_reason,
                   EXISTS(
                       SELECT 1 FROM recibo_document_versions v
                       WHERE v.recibo_id=recibos.id AND v.is_current=TRUE
@@ -12735,6 +12851,11 @@ def _audit_preflight_from_connection(
         )
     if int(row["is_backdated"] or 0):
         warnings.append("El recibo fue generado con fecha de servicio atrasada.")
+    if str(row["review_status"] or "") == AUTH_REVIEW_PENDING:
+        warnings.append(
+            "La autorización del bypass requiere revisión: "
+            + str(row["review_reason"] or "FORMATO_NO_CONFIRMADO")
+        )
     try:
         generated = datetime.fromisoformat(str(row["created_at"] or "")[:19])
         age_days = max(0, (datetime.now() - generated).days)
@@ -12770,6 +12891,10 @@ def _audit_preflight_from_connection(
         "verification_bypassed": bool(row["verification_bypassed"]),
         "receipt_origin": str(row["receipt_origin"] or "LEGACY_UNLINKED"),
         "document_state": str(row["estado_documento"] or DOCUMENT_PRELIMINARY),
+        "review_status": str(
+            row["review_status"] or AUTH_REVIEW_NOT_APPLICABLE
+        ),
+        "review_reason": str(row["review_reason"] or ""),
         "calculated_total": calculated_total,
         "age_days": age_days,
         "risk_score": risk,
@@ -25969,6 +26094,11 @@ class ReceiptHistoryDialog(QDialog):
                 if row_data.get("verification_bypassed")
                 and not row_data.get("admission_atencion_id")
                 else document_state_label(row_data.get("estado_documento"))
+            )
+            + (
+                " · REVISIÓN PENDIENTE"
+                if row_data.get("review_status") == AUTH_REVIEW_PENDING
+                else ""
             ),
             row_data.get("numero_autorizacion") or "", pdf_path,
         ]
@@ -28911,6 +29041,25 @@ def billing_readiness_presentation(
         authorization=authorization,
     )
     if privileged_unlinked:
+        document_state, review_status, review_reason = (
+            classify_privileged_bypass_authorization(authorization)
+        )
+        if document_state == DOCUMENT_READY:
+            if review_status == AUTH_REVIEW_PENDING:
+                text = (
+                    "COMPLETO · REVISIÓN PENDIENTE."
+                    if low_height
+                    else "DOCUMENTO COMPLETO · REVISIÓN PENDIENTE: la autorización "
+                    "requiere revisión "
+                    f"({review_reason})."
+                )
+            else:
+                text = (
+                    "LISTO · Bypass autorizado."
+                    if low_height
+                    else "LISTO PARA AUDITORÍA · Bypass autorizado y autorización válida."
+                )
+            return "ready", True, text
         text = (
             "ROL AUTORIZADO · Validación previa opcional."
             if low_height

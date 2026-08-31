@@ -1,0 +1,73 @@
+SIGEH 1.1.0 — VALIDACIÓN PREPRODUCCIÓN
+Fecha: 2026-08-30
+Rama: codex/sigeh-1.1.0-production
+Versión canónica durante preparación: 1.0.9
+Release v1.1.0 publicada: NO
+
+IMPLEMENTACIÓN
+- PRIMARY remoto Admin con selección de SECONDARY saludable: IMPLEMENTADO.
+- Sin contraseña adicional: IMPLEMENTADO.
+- Advisory lock + row lock + expected revision + transacción: IMPLEMENTADO.
+- Conservación de turno/generation/representante/logins: IMPLEMENTADO.
+- Eventos PRIMARY_TRANSFER_REQUESTED/COMMITTED: IMPLEMENTADO.
+- Relevo normal REQUESTED/COMMITTED en transacción existente: IMPLEMENTADO.
+- Bypass con autorización completa y revisión separada: IMPLEMENTADO.
+- Migración review_status/review_reason: PREPARADA, NO APLICADA A PRODUCCIÓN.
+- Retención por stream y backup obligatorio: IMPLEMENTADO, SIN PURGA.
+
+POSTGRESQL READ-ONLY
+- Captura: 2026-08-30 19:25:25 UTC.
+- Tamaño: 366,414,995 bytes (349 MB).
+- Proyección: 28,010 filas.
+- Tombstones: 27,763.
+- Recibos activos: 5,216.
+- Eventos atención: 43,552.
+- Eventos directorio: 24,964.
+- Staging: 18,557 filas, lote ANALYZED/incompleto; protegido.
+- PDF externos verificados: 0; protegido.
+- Estaciones con login adjunto: 1.
+- Estaciones saludables en ventana: 0.
+- Bypass existentes: 2; con autorización: 0.
+- Filas eliminadas: 0.
+
+PRUEBAS EJECUTADAS
+- Focal inicial: 76 PASS, 2 FAIL (pruebas obsoletas/texto), corregidas.
+- Focal corregida: 77 PASS + 3 subtests PASS.
+- Focal ampliada: 101 PASS, 1 SKIP integración real, 3 subtests PASS.
+- Conteo/historial/egreso/offline/turnos: 187 PASS.
+- Refactor transferencia: 40 PASS.
+- Suite completa (segunda y última ejecución permitida, antes de extraer el
+  coordinador GUI sin cambiar contrato): 798 PASS, 23 SKIP, 60 subtests PASS,
+  0 FAIL (138.82 s).
+- Regresión posterior al coordinador GUI compartido: 20 PASS, 14 deselected.
+- Ramas dirigidas de coordinador/adaptador/migración: 21 PASS y 1 PASS.
+- py_compile de módulos modificados: PASS.
+- Ruff módulos nuevos/modulares: PASS.
+- Ruff complejidad: función nueva de transferencia <=10; incidencias heredadas
+  permanecen fuera del alcance.
+- git diff --check: PASS (solo avisos CRLF del worktree).
+- Black: NO VERIFICADO, no instalado.
+- Mypy: NO VERIFICADO, no instalado/configurado.
+- Build PyInstaller 6.19.0: PASS.
+  Entrada de credencial y SumatraPDF tomadas de recursos locales existentes
+  mediante SIGEH_DATABASE_BUNDLE/SIGEH_SUMATRA_PDF; no se modificaron.
+- Smoke ejecutable launcher --self-test: PASS, exit 0.
+- Smoke paquete V15: PASS, exit 0.
+- Smoke PDF empaquetado: PASS, exit 0.
+- Smoke reportes empaquetados: PASS, exit 0; 5 archivos PDF/XLSX.
+- Cobertura diferencial lines: PASS, 97% (umbral 90%).
+- Cobertura diferencial branches: PASS, 87.3% (umbral 85%).
+- Regresión total: PASS en la segunda suite completa; el refactor posterior se
+  validó con las suites dirigidas indicadas y no se repitió una tercera vez.
+
+GATE DE PRODUCCIÓN
+- Dos estaciones saludables simultáneas: FAIL / condición externa ausente.
+- Transferencia física PC-A → PC-B: NO VERIFICADO.
+- Propagación GUI en ambas PC: NO VERIFICADO.
+- Backup PostgreSQL recuperable: NO VERIFICADO.
+- Backup SQLite de ambas estaciones: NO VERIFICADO.
+- Medición egress 1 h/6 h/24 h: NO VERIFICADO.
+
+ESTADO FINAL: NO APROBADO PARA ENTREGA
+Motivo: el usuario exige pruebas críticas reales antes de considerar v1.1.0
+terminada y hoy no existen dos estaciones saludables ni evidencia de backup.

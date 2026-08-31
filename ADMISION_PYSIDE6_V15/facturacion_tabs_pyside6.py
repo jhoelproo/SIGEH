@@ -24,7 +24,7 @@ import threading
 import logging
 from dataclasses import dataclass
 from types import MappingProxyType
-V15_SOURCE_BUILD_ID = "20260821_ADMIN_REP_FORCE_V1"
+V15_SOURCE_BUILD_ID = "20260830_V1010_REMOTE_PRIMARY_V1"
 from logging.handlers import RotatingFileHandler
 
 # Preparación del entorno del proyecto antes de importar emergency_core.
@@ -75,6 +75,7 @@ from emergency_core.session_context import (
     normalize_role,
 )
 from emergency_core.single_instance import SingleInstanceGuard
+from primary_transfer_ui import request_primary_transfer
 
 # PDF / Excel
 from reportlab.pdfgen import canvas
@@ -6427,7 +6428,7 @@ class App:
         self.transfer_primary_menu_action = None
         if normalize_role(getattr(self.session_context, "role", "")) == ROLE_ADMIN:
             self.transfer_primary_menu_action = self.actions_menu.add_command(
-                label="Transferir acceso principal",
+                label="Transferir PRIMARY a otra estación",
                 command=self.request_transfer_admission_primary,
             )
         self.actions_menu.add_command(label="Historial", command=self.abrir_historial)
@@ -14947,7 +14948,7 @@ class App:
                 ).grid(row=1, column=0, sticky="ew", pady=(6, 10))
                 self._primary_transfer_config_button = tb.Button(
                     primary_card,
-                    text="HACER ESTA COMPUTADORA PRINCIPAL",
+                    text="TRANSFERIR PRIMARY A OTRA ESTACIÓN",
                     bootstyle=WARNING,
                     command=lambda: self.request_transfer_admission_primary(parent=win),
                     state="disabled",
@@ -15002,16 +15003,14 @@ class App:
                         normalize_role(self.session_context.role) == ROLE_ADMIN
                         and runtime is not None
                         and not bool(getattr(runtime, "offline", False))
-                        and role != "PRIMARY"
                         and not self._primary_transfer_in_progress
                     )
                     self._primary_transfer_config_button.configure(
                         state="normal" if enabled else "disabled"
                     )
                     hint = (
-                        "Esta computadora ya posee la sesión principal."
-                        if role == "PRIMARY"
-                        else "Solo cambia qué estación posee PRIMARY; no modifica el turno ni el representante."
+                        "Permite elegir otra estación conectada. Solo cambia qué "
+                        "estación posee PRIMARY; no modifica turno ni representante."
                     )
                     primary_hint_var.set(hint)
                     try:
@@ -15985,7 +15984,7 @@ class App:
                 and runtime is not None
                 and not bool(getattr(runtime, "offline", False))
                 and not self._primary_transfer_in_progress
-                and str(snapshot.get("role") or "").upper() != "PRIMARY"
+                and bool(snapshot.get("operational_session_id"))
             )
             if self.transfer_primary_menu_action is not None:
                 self.transfer_primary_menu_action.setEnabled(transfer_enabled)
@@ -16076,131 +16075,15 @@ class App:
         return "break"
 
     def request_transfer_admission_primary(self, *, parent=None):
-        """Transfer only the central PRIMARY lease from the current Admin login."""
+        """Transfer PRIMARY to another connected station without changing the turn."""
         parent = parent or self.root
-        if normalize_role(self.session_context.role) != ROLE_ADMIN:
-            messagebox.showwarning(
-                "Transferir acceso principal",
-                "Solo un Administrador puede realizar esta operación.",
-                parent=parent,
-            )
-            return
-        runtime = getattr(self.db, "_runtime", None)
-        if runtime is None or bool(getattr(runtime, "offline", False)):
-            messagebox.showwarning(
-                "Transferir acceso principal",
-                "Se requiere conexión central para transferir PRIMARY.",
-                parent=parent,
-            )
-            return
-        if self._primary_transfer_in_progress:
-            return
-        before = dict(runtime.state() or {})
-        if str(before.get("role") or "").upper() == "PRIMARY":
-            messagebox.showinfo(
-                "Transferir acceso principal",
-                "Esta estación ya posee el acceso principal.",
-                parent=parent,
-            )
-            return
-        summary = (
-            "Computadora actual:\n"
-            f"{getattr(runtime, 'device_id', '') or 'No disponible'}\n\n"
-            f"Rol actual:\n{str(before.get('role') or 'NONE').upper()}\n\n"
-            "Computadora principal actual:\n"
-            f"{before.get('primary_device_id') or 'Sin asignar'}\n\n"
-            "Usuario operativo:\n"
-            f"{before.get('active_user_display_name') or before.get('active_username') or 'No disponible'}\n\n"
-            f"Turno:\n{before.get('turn_id') or 'No disponible'}"
-        )
-        messagebox.showinfo(
-            "TRANSFERIR SESIÓN PRINCIPAL", summary, parent=parent
-        )
-        actor = self._solicitar_autorizacion_admin(
-            "TRANSFERIR_ACCESO_PRINCIPAL", parent=parent, force=True
-        )
-        if not actor:
-            return
-        reason = simpledialog.askstring(
-            "Motivo de la transferencia",
-            "Indique el motivo de la transferencia de PRIMARY:",
+        request_primary_transfer(
+            self,
             parent=parent,
-        )
-        if reason is None:
-            return
-        reason = reason.strip()
-        if not reason:
-            messagebox.showwarning(
-                "Motivo requerido", "Debe indicar un motivo breve.", parent=parent
-            )
-            return
-        if not messagebox.askyesno(
-            "Transferir acceso principal",
-            "Esta operación transferirá el acceso PRINCIPAL de Admisión "
-            "a esta computadora.\n\n"
-            "La estación principal anterior perderá su sesión actual.\n\n"
-            "El turno y el usuario operativo de Admisión NO serán "
-            "modificados.\n\n¿Desea continuar?",
-            parent=parent,
-        ):
-            return
-        self._primary_transfer_in_progress = True
-        self._refresh_actions_menu_state()
-
-        def transfer():
-            return runtime.force_transfer_admission_primary(reason=reason)
-
-        def finish(changed):
-            self._primary_transfer_in_progress = False
-            self._refresh_actions_menu_state()
-            self._set_turn_change_controls_enabled(True)
-            self.set_status("Conectado · Principal · Sincronizado", "ok")
-            refresh_panel = getattr(self, "_refresh_primary_config_panel", None)
-            if callable(refresh_panel):
-                refresh_panel()
-            if (
-                changed.turn_id != before.get("turn_id")
-                or changed.generation != before.get("generation")
-            ):
-                APP_LOG.critical(
-                    "PRIMARY_FORCE_TRANSFER_INVARIANT_FAILED turn_before=%s "
-                    "turn_after=%s generation_before=%s generation_after=%s",
-                    before.get("turn_id"), changed.turn_id,
-                    before.get("generation"), changed.generation,
-                )
-                messagebox.showerror(
-                    "Transferir acceso principal",
-                    "La transferencia no conservó el estado operativo esperado.",
-                    parent=parent,
-                )
-                return
-            messagebox.showinfo(
-                "Transferencia completada",
-                "Esta estación es ahora PRIMARY. El turno y el usuario "
-                "operativo permanecen sin cambios.",
-                parent=parent,
-            )
-
-        def failed(exc):
-            self._primary_transfer_in_progress = False
-            self._refresh_actions_menu_state()
-            self.set_status("No se pudo transferir PRIMARY", "error")
-            refresh_panel = getattr(self, "_refresh_primary_config_panel", None)
-            if callable(refresh_panel):
-                refresh_panel()
-            APP_LOG.error(
-                "Falló la transferencia administrativa de PRIMARY",
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            messagebox.showerror(
-                "Transferir acceso principal", str(exc), parent=parent
-            )
-
-        self._ejecutar_en_segundo_plano(
-            "Transfiriendo acceso PRIMARY...",
-            transfer,
-            al_terminar=finish,
-            al_error=failed,
+            messagebox=messagebox,
+            simpledialog=simpledialog,
+            logger=APP_LOG,
+            is_admin=normalize_role(self.session_context.role) == ROLE_ADMIN,
         )
 
     def request_force_primary_transfer(self):

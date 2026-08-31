@@ -34,7 +34,7 @@ from admission_bridge import (
 from app_resources import get_app_logo_path
 
 _V15_PACKAGE = "ADMISION_PYSIDE6_V15"
-_EXPECTED_V15_SOURCE_BUILD_ID = "20260821_ADMIN_REP_FORCE_V1"
+_EXPECTED_V15_SOURCE_BUILD_ID = "20260830_V1010_REMOTE_PRIMARY_V1"
 
 
 def _default_v15_root() -> Path:
@@ -1535,7 +1535,29 @@ class _HybridAdmissionRuntime:
 
         return changed
 
-    def force_transfer_admission_primary(self, *, reason: str):
+    def list_primary_transfer_candidates(self) -> list[dict[str, Any]]:
+        """Load centrally connected stations eligible for a PRIMARY transfer."""
+        from admission_hybrid import AdmissionWriteBlocked, canonical_role
+
+        if canonical_role(self.current_user) != "administrador":
+            raise AdmissionWriteBlocked(
+                "Solo un Administrador puede consultar estaciones conectadas."
+            )
+        session = self.operational_session
+        if session is None:
+            raise AdmissionWriteBlocked("No existe una sesión operativa activa.")
+        return self.session_service.list_primary_transfer_candidates(
+            operational_session_id=session.operational_session_id
+        )
+
+    def force_transfer_admission_primary(
+        self,
+        *,
+        target_device_id: str,
+        target_login_session_id: str,
+        reason: str,
+        expected_operational_revision: int | None = None,
+    ):
         """Transfer the central lease without mutating turn/user/generation."""
         from admission_hybrid import (
             AdmissionWriteBlocked,
@@ -1552,8 +1574,15 @@ class _HybridAdmissionRuntime:
             raise AdmissionWriteBlocked("No existe una sesión operativa activa.")
         changed = self.session_service.force_transfer_admission_primary(
             operational_session_id=session.operational_session_id,
-            device_id=self.device_id,
-            login_session_id=self.login_session_id,
+            target_device_id=target_device_id,
+            target_login_session_id=target_login_session_id,
+            actor_device_id=self.device_id,
+            actor_login_session_id=self.login_session_id,
+            expected_operational_revision=(
+                session.operational_revision
+                if expected_operational_revision is None
+                else int(expected_operational_revision)
+            ),
             admin_user_id=self.user_id,
             admin_username=self.username,
             admin_role=self.current_user.get("role"),
@@ -1563,9 +1592,19 @@ class _HybridAdmissionRuntime:
         # inmediatamente en memoria y dejamos el refresco remoto periódico al
         # coordinador. Esto evita round-trips extra después del commit y hace
         # que la UI deje de mostrar "Transfiriendo..." de inmediato.
-        message = "Conectado · Principal · Sincronizado"
+        is_local_primary = changed.primary_device_id == self.device_id
+        local_role = (
+            self.StationRole.PRIMARY
+            if is_local_primary
+            else self.StationRole.SECONDARY
+        )
+        message = (
+            "Conectado · Principal · Sincronizado"
+            if is_local_primary
+            else "Conectado · Secundaria · Sincronizado"
+        )
         self.attachment = DeviceAttachment(
-            changed, self.StationRole.PRIMARY, True, message
+            changed, local_role, True, message
         )
         if self._operational_state is not None:
             from dataclasses import replace
@@ -1574,12 +1613,12 @@ class _HybridAdmissionRuntime:
                 self._operational_state,
                 primary_device_id=changed.primary_device_id,
                 primary_login_session_id=changed.primary_login_session_id,
-                device_role=self.StationRole.PRIMARY,
+                device_role=local_role,
                 device_attached=True,
                 write_allowed=True,
                 lease_generation=changed.lease_generation,
                 operational_revision=changed.operational_revision,
-                reason_code="ADMIN_PRIMARY_TRANSFER_COMPLETED",
+                reason_code="PRIMARY_TRANSFER_COMMITTED",
                 message=message,
                 invalidated_reason="",
                 sync_state="ONLINE_SYNCED",
@@ -1591,9 +1630,21 @@ class _HybridAdmissionRuntime:
         self.status_message = message
         return changed
 
-    def force_transfer_primary(self, *, reason: str):
+    def force_transfer_primary(
+        self,
+        *,
+        target_device_id: str,
+        target_login_session_id: str,
+        reason: str,
+        expected_operational_revision: int | None = None,
+    ):
         """Compatibility alias for the former UI entry point."""
-        return self.force_transfer_admission_primary(reason=reason)
+        return self.force_transfer_admission_primary(
+            target_device_id=target_device_id,
+            target_login_session_id=target_login_session_id,
+            reason=reason,
+            expected_operational_revision=expected_operational_revision,
+        )
 
 
     def _reattach_matching_device(self, state: Any):

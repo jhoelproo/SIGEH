@@ -1,0 +1,72 @@
+SIGEH 1.0.10 — VALIDACIÓN DE PRERELEASE DE PRUEBA
+Fecha local: 2026-08-31
+Destino de publicación: jhoelproo/SIGEH
+Despliegue hospitalario: NO AUTORIZADO / NO REALIZADO
+
+1. IDENTIDAD
+
+- APP_VERSION: 1.0.10.
+- version_config.json fuente y paquete: 1.0.10.
+- Build ID diagnóstico V15: 20260830_V1010_REMOTE_PRIMARY_V1.
+- SIGEH 1.1.0 queda reservado para una release posterior.
+
+2. PRUEBAS AUTOMATIZADAS
+
+- Regresión focal final de versión, updater, empaquetado, bypass y evidencia:
+  76 passed, 3 subtests passed, 0 failed.
+- Suite completa ejecutada durante este cierre antes del cambio exclusivo de
+  metadata: 821 passed, 23 skipped, 60 subtests passed, 0 failed.
+- Recolector multestación: 7 passed; cobertura combinada 98%, line coverage
+  98.8% y branch coverage 91.7%.
+- Ruff en módulos nuevos/modificados acotados: PASS.
+- compileall y git diff --check: PASS.
+- El archivo V15 heredado conserva incidencias globales de lint fuera de
+  alcance; no se debilitó la configuración ni se hizo refactorización masiva.
+
+3. BUILD Y PAQUETE FINAL
+
+- PyInstaller 6.19.0 / Python 3.14.7.
+- Build limpio del ejecutable principal: PASS.
+- Build limpio de SIGEH_Updater.exe: PASS.
+- Archivo: SIGEH-1.0.10-windows-x64.zip.
+- SHA-256:
+  987740bc5e10dcc7cbd42890f1e309f200562bb4e19d4a1dc4fba5979bd05106
+- Contenido: 1811 entradas; cero SQLite, logs, .env, bundle o configuración
+  protegida; ejecutables, versión y migración requeridos presentes.
+
+4. HEALTH CHECKS DESDE EL ZIP FINAL EXTRAÍDO
+
+- Launcher: PASS.
+- PostgreSQL y migraciones: PASS.
+- V15/Historial: PASS, incluida construcción del widget y apertura de Historial.
+- PDF: PASS.
+- Reportes: PASS.
+- Excel: PASS.
+- Updater: PASS.
+- Artefactos generados y abiertos: 4 PDF / 6 páginas; 2 Excel / 4 hojas.
+
+5. ROLLBACK
+
+- Simulacro sobre copia controlada del paquete final: PASS.
+- Se forzó fallo del health check y el updater devolvió código 1.
+- Ejecutables anteriores, SQLite ficticia y configuración privada se
+  restauraron byte por byte; el respaldo de 1.0.10 fue creado.
+
+6. BASE DE DATOS Y EGRESO
+
+- La migración billing_bypass_authorization_review es aditiva e idempotente.
+- No se ejecutó SEED, MERGE, truncate, baseline, reset de turno, borrado de
+  SQLite, regeneración de UUID ni eliminación de datos.
+- La consulta pesada auditada aumentó 4 llamadas / 800 filas en unas 12.5 h
+  tras el hotfix, proyección técnica ampliamente inferior a 5 GB/mes.
+- El valor facturado del panel debe confirmarse después del reinicio del ciclo.
+
+7. LIMITACIÓN DECLARADA
+
+- Gates con dos PCs reales: NO PROBADO / BLOQUEADO POR ENTORNO FÍSICO.
+- Igualdad exacta Hospital/PostgreSQL/Secondary, atención controlada, relevo y
+  transferencia PRIMARY física no se declaran PASS.
+- Por esa razón v1.0.10 se publica como prerelease de prueba, no como candidata
+  autorizada para despliegue hospitalario masivo.
+
+ESTADO: APROBADA PARA PUBLICACIÓN COMO PRERELEASE DE PRUEBA

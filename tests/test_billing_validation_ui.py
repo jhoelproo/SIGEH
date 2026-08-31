@@ -1,6 +1,7 @@
 import inspect
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -83,6 +84,141 @@ class BillingValidationUiTests(unittest.TestCase):
             "ROL AUTORIZADO · Puede crear el recibo sin validar previamente al paciente.",
         )
         self.assertNotIn("Â·", text)
+
+    def test_privileged_bypass_ui_marks_valid_and_suspicious_auth_complete(self):
+        state, ready, text = app.billing_readiness_presentation(
+            patient_validated=False,
+            authorization="123456",
+            privileged_unlinked=True,
+        )
+        self.assertEqual((state, ready), ("ready", True))
+        self.assertIn("LISTO PARA AUDITORÍA", text)
+
+        state, ready, text = app.billing_readiness_presentation(
+            patient_validated=False,
+            authorization="ABC123",
+            privileged_unlinked=True,
+        )
+        self.assertEqual((state, ready), ("ready", True))
+        self.assertIn("REVISIÓN PENDIENTE", text)
+        self.assertIn("INVALID_AUTHORIZATION_FORMAT", text)
+
+    def test_privileged_bypass_document_and_review_classification(self):
+        self.assertEqual(
+            app.classify_privileged_bypass_authorization(""),
+            (
+                app.DOCUMENT_PRELIMINARY,
+                app.AUTH_REVIEW_NOT_APPLICABLE,
+                "AUTHORIZATION_MISSING",
+            ),
+        )
+        self.assertEqual(
+            app.classify_privileged_bypass_authorization("123456"),
+            (app.DOCUMENT_READY, app.AUTH_REVIEW_CLEAR, ""),
+        )
+        self.assertEqual(
+            app.classify_privileged_bypass_authorization("12345"),
+            (
+                app.DOCUMENT_READY,
+                app.AUTH_REVIEW_PENDING,
+                "AUTHORIZATION_TOO_SHORT",
+            ),
+        )
+        self.assertEqual(
+            app.classify_privileged_bypass_authorization("AUT-123456"),
+            (
+                app.DOCUMENT_READY,
+                app.AUTH_REVIEW_PENDING,
+                "INVALID_AUTHORIZATION_FORMAT",
+            ),
+        )
+        self.assertEqual(
+            app.classify_privileged_bypass_authorization("١٢٣٤٥٦"),
+            (
+                app.DOCUMENT_READY,
+                app.AUTH_REVIEW_PENDING,
+                "INVALID_AUTHORIZATION_FORMAT",
+            ),
+        )
+
+    def test_ready_state_is_visible_as_complete_in_ui_and_pdf(self):
+        self.assertEqual(
+            app.document_state_label(app.DOCUMENT_READY),
+            "Documento completo - listo para auditoría",
+        )
+        template = (
+            Path(__file__).parents[1] / "pdf_engine" / "template.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('estado_documento == "LISTO_AUDITORIA"', template)
+        self.assertIn("DOCUMENTO COMPLETO", template)
+        self.assertIn('estado_documento == "FINAL"', template)
+
+    def test_authorization_minimum_is_configurable_and_safely_bounded(self):
+        with patch.dict(os.environ, {"SIGEH_AUTHORIZATION_MIN_DIGITS": "7"}):
+            self.assertEqual(app.authorization_min_digits(), 7)
+        with patch.dict(os.environ, {"SIGEH_AUTHORIZATION_MIN_DIGITS": "invalid"}):
+            self.assertEqual(app.authorization_min_digits(), 6)
+
+    def test_bypass_review_migration_is_idempotent_and_non_destructive(self):
+        sql = (
+            Path(__file__).parents[1]
+            / "migrations"
+            / "20260830_billing_bypass_authorization_review.sql"
+        ).read_text(encoding="utf-8")
+        normalized = sql.upper()
+        self.assertIn("ADD COLUMN IF NOT EXISTS REVIEW_STATUS", normalized)
+        self.assertIn("ADD COLUMN IF NOT EXISTS REVIEW_REASON", normalized)
+        self.assertIn("ESTADO_DOCUMENTO='LISTO_AUDITORIA'", normalized)
+        self.assertIn(
+            "LISTO_AUDITORIA IS THE COMPLETE-DOCUMENT STATE",
+            normalized,
+        )
+        self.assertIn("VERIFICATION_BYPASSED", normalized)
+        self.assertNotIn("DELETE FROM", normalized)
+        self.assertNotIn("DROP TABLE", normalized)
+        self.assertNotIn("TRUNCATE", normalized)
+        build_spec = (Path(__file__).parents[1] / "build_app.spec").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "20260830_billing_bypass_authorization_review.sql", build_spec
+        )
+
+    def test_bypass_review_migration_loader_supports_source_and_frozen_paths(self):
+        class Connection:
+            def __init__(self):
+                self.executed = []
+                self.scripts = []
+
+            def execute(self, *args):
+                self.executed.append(args)
+
+            def executescript(self, sql):
+                self.scripts.append(sql)
+
+        source_connection = Connection()
+        with patch.object(app.sys, "frozen", False, create=True):
+            app._apply_billing_bypass_authorization_review_migration(
+                source_connection
+            )
+        self.assertIn("ADD COLUMN IF NOT EXISTS review_status", source_connection.scripts[0])
+
+        frozen_connection = Connection()
+        with (
+            patch.object(app.sys, "frozen", True, create=True),
+            patch.object(app, "BUNDLE_DIR", str(Path(__file__).parents[1])),
+        ):
+            app._apply_billing_bypass_authorization_review_migration(
+                frozen_connection
+            )
+        self.assertEqual(source_connection.scripts, frozen_connection.scripts)
+
+        with (
+            patch.object(app.sys, "frozen", True, create=True),
+            patch.object(app, "BUNDLE_DIR", str(Path(__file__).parent)),
+            self.assertRaises(RuntimeError),
+        ):
+            app._apply_billing_bypass_authorization_review_migration(Connection())
 
     def test_claim_worker_performs_one_reservation_call(self):
         result = object()

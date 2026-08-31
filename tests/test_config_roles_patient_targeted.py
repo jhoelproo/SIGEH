@@ -20,7 +20,6 @@ from admission_hybrid import (  # noqa: E402
     StationRole,
     evaluate_admission_access,
 )
-from emergency_core.security import AdminSecurity  # noqa: E402
 
 
 def _load_operational_fake():
@@ -33,7 +32,9 @@ def _load_operational_fake():
     return module._OperationalDB()
 
 
-def test_config_roles_primary_transfer_and_pin(tmp_path: Path):
+def test_config_roles_remote_primary_transfer_uses_authenticated_admin_session(
+    tmp_path: Path,
+):
     aux = evaluate_admission_access(
         {"role": "auxiliar"},
         {
@@ -135,16 +136,6 @@ def test_config_roles_primary_transfer_and_pin(tmp_path: Path):
     assert database.session["active_user_id"] == "22"
     assert database.session["generation"] == before.generation
 
-    pin = AdminSecurity(tmp_path / "admin_pin.json", tmp_path / "admin_audit.jsonl")
-    pin.setup("246810", actor="admin")
-    assert pin.verify(
-        "246811", actor="admin", action="ADMISSION_PRIMARY_TRANSFER"
-    ) is False
-    assert database.session["primary_device_id"] == "PC-1"
-    assert pin.verify(
-        "246810", actor="admin", action="ADMISSION_PRIMARY_TRANSFER"
-    ) is True
-
     database.active_sessions["ADMIN-S2"] = True
     database.active_session_users["ADMIN-S2"] = {
         "username": "admin",
@@ -154,8 +145,11 @@ def test_config_roles_primary_transfer_and_pin(tmp_path: Path):
     }
     changed = service.force_transfer_admission_primary(
         operational_session_id=before.operational_session_id,
-        device_id="PC-2",
-        login_session_id="ADMIN-S2",
+        target_device_id="PC-2",
+        target_login_session_id="ADMIN-S2",
+        actor_device_id="PC-2",
+        actor_login_session_id="ADMIN-S2",
+        expected_operational_revision=before.operational_revision,
         admin_user_id=7,
         admin_username="admin",
         admin_role="administrador",
@@ -166,10 +160,8 @@ def test_config_roles_primary_transfer_and_pin(tmp_path: Path):
     assert changed.active_user_id == before.active_user_id == "22"
     assert changed.generation == before.generation
     assert changed.lease_generation == before.lease_generation + 1
-    assert database.active_sessions["AUX-P1"] is False
-    assert database.devices["PC-1"]["invalidated_reason"] == (
-        "PRIMARY_TRANSFERRED_ADMINISTRATIVELY"
-    )
+    assert database.active_sessions["AUX-P1"] is True
+    assert database.devices["PC-1"]["invalidated_reason"] is None
 
     database.active_sessions["AUDIT-S3"] = True
     database.active_session_users["AUDIT-S3"] = {
@@ -181,8 +173,11 @@ def test_config_roles_primary_transfer_and_pin(tmp_path: Path):
     with pytest.raises(AdmissionWriteBlocked):
         service.force_transfer_admission_primary(
             operational_session_id=before.operational_session_id,
-            device_id="PC-3",
-            login_session_id="AUDIT-S3",
+            target_device_id="PC-3",
+            target_login_session_id="AUDIT-S3",
+            actor_device_id="PC-3",
+            actor_login_session_id="AUDIT-S3",
+            expected_operational_revision=changed.operational_revision,
             admin_user_id=9,
             admin_username="audit",
             admin_role="facturador de auditoria",

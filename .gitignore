@@ -17,6 +17,7 @@ coverage.xml
 # Compilaciones y ejecutables
 build/
 dist/
+release/
 dist-preview/
 dist-preview-ux/
 dist-preview-reports/

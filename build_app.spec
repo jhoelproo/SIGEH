@@ -25,13 +25,6 @@ V15_PACKAGE = "ADMISION_PYSIDE6_V15"
 V15_SOURCE = (ROOT / V15_PACKAGE).resolve()
 V15_ASSETS = V15_SOURCE / "assets"
 V15_TEMPLATES = V15_SOURCE / "HOJAS"
-DATABASE_BUNDLE = Path(
-    os.environ.get("SIGEH_DATABASE_BUNDLE", ROOT / "database_url.bundle")
-).resolve()
-if not DATABASE_BUNDLE.is_file():
-    raise FileNotFoundError(
-        "Falta database_url.bundle. Defina SIGEH_DATABASE_BUNDLE para el build de producción."
-    )
 V15_MODULE_FILES = tuple(
     V15_SOURCE / name
     for name in (
@@ -58,6 +51,9 @@ ADMISSION_VALIDATION_MIGRATION = (
 )
 BILLING_ADMISSION_BRIDGE_MIGRATION = (
     ROOT / "migrations" / "20260828_billing_admission_bridge_identity.sql"
+)
+BILLING_BYPASS_REVIEW_MIGRATION = (
+    ROOT / "migrations" / "20260830_billing_bypass_authorization_review.sql"
 )
 ARS_HONORARIUM_MIGRATION = (
     ROOT / "migrations" / "20260820_ars_honorarium_prompt.sql"
@@ -133,6 +129,8 @@ REQUIRED_FILES = [
     ROOT / "report_documents.py",
     ROOT / "responsive_validation.py",
     ADMISSION_VALIDATION_MIGRATION,
+    BILLING_ADMISSION_BRIDGE_MIGRATION,
+    BILLING_BYPASS_REVIEW_MIGRATION,
     ARS_HONORARIUM_MIGRATION,
     PRIMARY_LEASE_MIGRATION,
     SUMATRA_PDF,
@@ -265,7 +263,6 @@ def collect_qt_icu_runtime():
 QT_ICU_BINARIES = collect_qt_icu_runtime()
 
 main_datas = [
-    (str(DATABASE_BUNDLE), "."),
     (str(ASSETS / "logo.jpg"), "assets"),
     (str(ASSETS / "favicon.ico"), "assets"),
     (str(PDF_ENGINE / "template.html"), "pdf_engine"),
@@ -275,6 +272,7 @@ main_datas = [
     (str(ROOT / "version_config.json"), "."),
     (str(ADMISSION_VALIDATION_MIGRATION), "migrations"),
     (str(BILLING_ADMISSION_BRIDGE_MIGRATION), "migrations"),
+    (str(BILLING_BYPASS_REVIEW_MIGRATION), "migrations"),
     (str(ARS_HONORARIUM_MIGRATION), "migrations"),
     (str(PRIMARY_LEASE_MIGRATION), "migrations"),
     (str(ADMISSION_CORE), "admission_source/emergency_core"),
@@ -346,6 +344,11 @@ main_analysis = Analysis(
     noarchive=False,
     optimize=0,
 )
+main_analysis.datas = [
+    entry
+    for entry in main_analysis.datas
+    if not str(entry[0]).casefold().endswith(".log")
+]
 main_pyz = PYZ(main_analysis.pure)
 main_exe = EXE(
     main_pyz,

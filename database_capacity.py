@@ -21,13 +21,22 @@ CAPACITY_SAMPLE_INTERVAL = timedelta(hours=6)
 MINIMUM_TREND_SPAN = timedelta(days=3)
 IMPORT_COMPLETED_RETENTION = timedelta(days=7)
 IMPORT_FAILED_RETENTION = timedelta(days=30)
-EVENT_RETENTION = timedelta(days=7)
 ACTIVE_IMPORT_STATUSES = frozenset({"ANALYZING", "APPLYING"})
 CAPACITY_LOG = logging.getLogger("database_capacity")
 
 EVENT_STREAMS = {
     "ATTENTION": ("admission_sync_events", "received_at"),
     "PATIENT_DIRECTORY": ("admission_patient_directory_events", "created_at"),
+}
+EVENT_RETENTION_POLICIES = {
+    # Attention events carry recovery/tombstone semantics.  Six months keeps a
+    # deliberately long offline-recovery window after the projection checkpoint.
+    "ATTENTION": {"minimum_days": 180, "classification": "TECHNICAL_RETENTION"},
+    # Patient-directory events change less frequently and are retained longer.
+    "PATIENT_DIRECTORY": {
+        "minimum_days": 365,
+        "classification": "TECHNICAL_RETENTION",
+    },
 }
 
 
@@ -71,8 +80,8 @@ CREATE TABLE IF NOT EXISTS admission_replication_event_floors(
 INSERT INTO admission_replication_event_floors(
   stream_name,minimum_available_sequence,checkpoint_sequence,retention_days
 ) VALUES
-  ('ATTENTION',0,0,7),
-  ('PATIENT_DIRECTORY',0,0,7)
+  ('ATTENTION',0,0,180),
+  ('PATIENT_DIRECTORY',0,0,365)
 ON CONFLICT(stream_name) DO NOTHING;
 """
 
@@ -304,11 +313,27 @@ class DatabaseCapacityAnalyzer:
             "batches": rows,
         }
 
-    def purge_safe_import_staging(self, *, confirmed: bool = False) -> dict[str, int]:
+    @staticmethod
+    def _require_verified_backup(
+        *, confirmed: bool, backup_reference: str
+    ) -> str:
         if not confirmed:
             raise PermissionError(
                 "La purga segura requiere confirmación administrativa."
             )
+        reference = str(backup_reference or "").strip()
+        if not reference:
+            raise PermissionError(
+                "La purga requiere la referencia de un respaldo recuperable verificado."
+            )
+        return reference
+
+    def purge_safe_import_staging(
+        self, *, confirmed: bool = False, backup_reference: str = ""
+    ) -> dict[str, int]:
+        backup = self._require_verified_backup(
+            confirmed=confirmed, backup_reference=backup_reference
+        )
         with self.connection_factory() as con:
             con.execute(
                 "SELECT pg_advisory_xact_lock(hashtext('admission-import-staging-cleanup'))"
@@ -339,6 +364,13 @@ class DatabaseCapacityAnalyzer:
                     (batch_id, f"{IMPORT_COMPLETED_RETENTION.days} days"),
                 ).fetchall()
                 deleted += len(row)
+        CAPACITY_LOG.info(
+            "DATABASE_RETENTION_CLEANUP stream=IMPORT_STAGING rows=%s "
+            "batches=%s backup_reference=%s",
+            deleted,
+            len(batch_ids),
+            backup,
+        )
         return {"batches": len(batch_ids), "rows": deleted}
 
     def analyze_pdf_storage(self, con: Any | None = None) -> dict[str, Any]:
@@ -452,7 +484,20 @@ class DatabaseCapacityAnalyzer:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         current = now or datetime.now(timezone.utc)
-        cutoff = current - EVENT_RETENTION
+        policy = EVENT_RETENTION_POLICIES[stream_name]
+        floor_row = {}
+        if self._relation_exists(con, "public.admission_replication_event_floors"):
+            floor_row = self._one(
+                con,
+                """SELECT minimum_available_sequence,checkpoint_sequence,
+                          retention_days
+                     FROM admission_replication_event_floors WHERE stream_name=%s""",
+                (stream_name,),
+            )
+        retention_days = max(
+            int(policy["minimum_days"]), int(floor_row.get("retention_days") or 0)
+        )
+        cutoff = current - timedelta(days=retention_days)
         candidate = self._one(
             con,
             f"""SELECT COALESCE(MAX(sequence),0) AS candidate_floor,
@@ -466,14 +511,6 @@ class DatabaseCapacityAnalyzer:
             f"SELECT COALESCE(MIN(sequence),0) AS min_sequence,"
             f"COALESCE(MAX(sequence),0) AS max_sequence,COUNT(*) AS rows FROM {table}",
         )
-        floor_row = {}
-        if self._relation_exists(con, "public.admission_replication_event_floors"):
-            floor_row = self._one(
-                con,
-                """SELECT minimum_available_sequence,checkpoint_sequence
-                     FROM admission_replication_event_floors WHERE stream_name=%s""",
-                (stream_name,),
-            )
         return {
             **window,
             **candidate,
@@ -483,18 +520,25 @@ class DatabaseCapacityAnalyzer:
             "retention_safe": bool(
                 projection_ready and int(candidate.get("candidate_floor") or 0) > 0
             ),
-            "retention_days": EVENT_RETENTION.days,
+            "retention_days": retention_days,
+            "classification": policy["classification"],
+            "recovery_mode": "PROJECTION_CHECKPOINT_BOOTSTRAP",
         }
 
     def prune_safe_events(
-        self, stream_name: str, *, confirmed: bool = False
+        self,
+        stream_name: str,
+        *,
+        confirmed: bool = False,
+        backup_reference: str = "",
     ) -> dict[str, int]:
         """Prunes one verified stream behind an atomic projection checkpoint."""
         normalized = str(stream_name or "").upper()
         if normalized not in EVENT_STREAMS:
             raise ValueError("Flujo de eventos no reconocido.")
-        if not confirmed:
-            raise PermissionError("La retención requiere confirmación administrativa.")
+        backup = self._require_verified_backup(
+            confirmed=confirmed, backup_reference=backup_reference
+        )
         if not self.ensure_schema():
             raise RuntimeError(
                 "No fue posible preparar el checkpoint de retención de eventos."
@@ -539,7 +583,8 @@ class DatabaseCapacityAnalyzer:
                     json.dumps(
                         {
                             "policy": "PROJECTION_CHECKPOINT",
-                            "retention_days": EVENT_RETENTION.days,
+                            "retention_days": int(plan["retention_days"]),
+                            "backup_reference": backup,
                         }
                     ),
                     normalized,
@@ -550,14 +595,17 @@ class DatabaseCapacityAnalyzer:
                       WHERE sequence<=%s
                         AND {timestamp_column}<NOW()-%s::INTERVAL
                       RETURNING sequence""",
-                (candidate_floor, f"{EVENT_RETENTION.days} days"),
+                (candidate_floor, f"{int(plan['retention_days'])} days"),
             ).fetchall()
         CAPACITY_LOG.info(
-            "%s_EVENT_RETENTION_RUN rows=%s floor=%s checkpoint=%s",
+            "DATABASE_RETENTION_CLEANUP stream=%s rows=%s floor=%s "
+            "checkpoint=%s retention_days=%s backup_reference=%s",
             normalized,
             len(deleted),
             candidate_floor,
             checkpoint,
+            int(plan["retention_days"]),
+            backup,
         )
         return {
             "rows": len(deleted),

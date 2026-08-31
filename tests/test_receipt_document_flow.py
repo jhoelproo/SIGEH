@@ -38,7 +38,9 @@ class ReceiptDocumentFlowTests(unittest.TestCase):
         })
         self.assertIn("Autorización: <b>AUT-001</b>", html)
         self.assertNotIn('<div class="preliminary-watermark"', html)
-        self.assertNotIn("document-state-banner ready-banner", html)
+        self.assertIn("document-state-banner ready-banner", html)
+        self.assertIn("DOCUMENTO COMPLETO", html)
+        self.assertIn("Listo para auditoría", html)
 
     def test_history_palette_distinguishes_preliminary_and_ready(self):
         preliminary = app.receipt_history_palette(

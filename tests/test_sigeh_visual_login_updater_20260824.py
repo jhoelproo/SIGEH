@@ -189,6 +189,20 @@ def test_release_rejects_packaged_operational_database(tmp_path):
         release_packaging.validate_no_operational_database(dist)
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    ["_internal/database_url.bundle", "_internal/debug.log", ".env"],
+)
+def test_release_rejects_credentials_and_runtime_files(tmp_path, relative_path):
+    dist = tmp_path / "SIGEH"
+    forbidden = dist / relative_path
+    forbidden.parent.mkdir(parents=True)
+    forbidden.write_bytes(b"must-not-ship")
+
+    with pytest.raises(ValueError, match="credenciales o archivos runtime"):
+        release_packaging.validate_no_credentials_or_runtime_files(dist)
+
+
 def test_failed_health_check_rolls_back_complete_install(tmp_path, monkeypatch):
     install = tmp_path / "SIGEH"
     payload = tmp_path / "payload"
@@ -464,7 +478,6 @@ def test_release_packaging_helpers_and_cli(tmp_path, monkeypatch):
 
     dist = tmp_path / "SIGEH"
     _write_payload(dist)
-    (dist / "_internal" / "database_url.bundle").write_bytes(b"protected")
     updater_exe = tmp_path / "SIGEH_Updater.exe"
     updater_exe.write_bytes(b"updater")
     monkeypatch.setattr(
@@ -499,7 +512,6 @@ def test_release_guard_requires_updater_and_builds_complete_assets(tmp_path):
         raise AssertionError("El guard permitió una distribución sin updater")
     updater_exe = tmp_path / "SIGEH_Updater.exe"
     updater_exe.write_bytes(b"MZ-updater")
-    (dist / "_internal" / "database_url.bundle").write_bytes(b"protected")
     result = prepare_release(dist, updater_exe, tmp_path / "release", version="1.0.2")
     assert result["archive"].is_file()
     expected_version = {"product": "SIGEH", "version": "1.0.2"}
