@@ -25,13 +25,6 @@ V15_PACKAGE = "ADMISION_PYSIDE6_V15"
 V15_SOURCE = (ROOT / V15_PACKAGE).resolve()
 V15_ASSETS = V15_SOURCE / "assets"
 V15_TEMPLATES = V15_SOURCE / "HOJAS"
-DATABASE_BUNDLE = Path(
-    os.environ.get("SIGEH_DATABASE_BUNDLE", ROOT / "database_url.bundle")
-).resolve()
-if not DATABASE_BUNDLE.is_file():
-    raise FileNotFoundError(
-        "Falta database_url.bundle. Defina SIGEH_DATABASE_BUNDLE para el build de producción."
-    )
 V15_MODULE_FILES = tuple(
     V15_SOURCE / name
     for name in (
@@ -270,7 +263,6 @@ def collect_qt_icu_runtime():
 QT_ICU_BINARIES = collect_qt_icu_runtime()
 
 main_datas = [
-    (str(DATABASE_BUNDLE), "."),
     (str(ASSETS / "logo.jpg"), "assets"),
     (str(ASSETS / "favicon.ico"), "assets"),
     (str(PDF_ENGINE / "template.html"), "pdf_engine"),
@@ -352,6 +344,11 @@ main_analysis = Analysis(
     noarchive=False,
     optimize=0,
 )
+main_analysis.datas = [
+    entry
+    for entry in main_analysis.datas
+    if not str(entry[0]).casefold().endswith(".log")
+]
 main_pyz = PYZ(main_analysis.pure)
 main_exe = EXE(
     main_pyz,

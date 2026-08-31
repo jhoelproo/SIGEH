@@ -17,7 +17,6 @@ REQUIRED_DIST_ENTRIES = (
     Path("SIGEH_Updater.exe"),
     Path("CALCULOS_QT.exe"),
     Path("_internal"),
-    Path("_internal/database_url.bundle"),
     Path("version_config.json"),
     Path("_internal/version_config.json"),
 )
@@ -33,6 +32,12 @@ OPERATIONAL_DATABASE_SUFFIXES = (
     ".db-wal",
     ".db-shm",
 )
+FORBIDDEN_RELEASE_NAMES = {
+    ".env",
+    "database_url.bundle",
+    "database_url.protected",
+}
+FORBIDDEN_RELEASE_SUFFIXES = (".log", ".tmp")
 
 
 def validate_no_operational_database(dist_dir: Path) -> None:
@@ -48,6 +53,23 @@ def validate_no_operational_database(dist_dir: Path) -> None:
         )
 
 
+def validate_no_credentials_or_runtime_files(dist_dir: Path) -> None:
+    forbidden = tuple(
+        path.relative_to(dist_dir)
+        for path in Path(dist_dir).rglob("*")
+        if path.is_file()
+        and (
+            path.name.casefold() in FORBIDDEN_RELEASE_NAMES
+            or path.name.casefold().endswith(FORBIDDEN_RELEASE_SUFFIXES)
+        )
+    )
+    if forbidden:
+        raise ValueError(
+            "La distribución contiene credenciales o archivos runtime: "
+            + ", ".join(map(str, forbidden))
+        )
+
+
 def validate_dist(dist_dir: Path) -> tuple[Path, ...]:
     dist_dir = Path(dist_dir).resolve()
     missing = tuple(
@@ -60,6 +82,7 @@ def validate_dist(dist_dir: Path) -> tuple[Path, ...]:
             "Distribución SIGEH incompleta: " + ", ".join(map(str, missing))
         )
     validate_no_operational_database(dist_dir)
+    validate_no_credentials_or_runtime_files(dist_dir)
     return tuple(dist_dir / relative for relative in REQUIRED_DIST_ENTRIES)
 
 

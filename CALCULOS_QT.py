@@ -465,6 +465,9 @@ AUDIT_ASSIGNMENT_UNASSIGNED = "SIN_ASIGNAR"
 AUDIT_ASSIGNMENT_MINE = "MIAS"
 AUDIT_ASSIGNMENT_OTHERS = "OTRAS"
 DOCUMENT_PRELIMINARY = "PRELIMINAR"
+# Estado documental completo: el recibo puede entrar a auditoría y producir
+# sus salidas oficiales. FINAL se reserva para la validación posterior de la
+# auditoría; no representa una completitud distinta del contenido del recibo.
 DOCUMENT_READY = "LISTO_AUDITORIA"
 DOCUMENT_FINAL = "FINAL"
 DOCUMENT_STATES = (DOCUMENT_PRELIMINARY, DOCUMENT_READY, DOCUMENT_FINAL)
@@ -510,7 +513,7 @@ def billing_is_ready_for_audit(*, patient_validated: bool, authorization: str) -
     return bool(patient_validated and str(authorization or "").strip())
 DOCUMENT_STATE_LABELS = {
     DOCUMENT_PRELIMINARY: "Preliminar - requiere autorización",
-    DOCUMENT_READY: "Listo para auditoría",
+    DOCUMENT_READY: "Documento completo - listo para auditoría",
     DOCUMENT_FINAL: "Documento final validado",
 }
 BILLING_STATUSES = (
@@ -10994,7 +10997,8 @@ def save_receipt_with_items(
                 (
                     saved_id, BILLING_PENDING, str(username or "Sistema"), now_str(),
                     "Creación del recibo",
-                    "Listo para auditoría" if document_state == DOCUMENT_READY
+                    "Documento completo; listo para auditoría"
+                    if document_state == DOCUMENT_READY
                     else "Documento preliminar pendiente de autorización",
                     "",
                     float(total), ars or "",

@@ -235,6 +235,9 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
                     any("BYPASS_RECEIPT_REVIEW_FLAGGED" in row for row in actions),
                     flagged,
                 )
+                executed_sql = "\n".join(sql for sql, _params in connection.calls)
+                self.assertNotIn("INSERT INTO admission_attention", executed_sql)
+                self.assertEqual(app._admission_values(None)[15], "")
 
     def test_editing_existing_bypass_reclassifies_authorization_without_attention(self):
         current = {

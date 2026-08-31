@@ -27,9 +27,11 @@ UPDATE recibos
  WHERE COALESCE(review_status,'NOT_APPLICABLE')='NOT_APPLICABLE'
    AND COALESCE(verification_bypassed,FALSE)=TRUE;
 
--- A bypass receipt with an authorization is document-complete even when the
--- value still requires audit review.  Keep empty bypass receipts preliminary
--- and never downgrade a receipt that has already reached FINAL.
+-- LISTO_AUDITORIA is the complete-document state in the receipt workflow:
+-- the official PDF/export can be emitted and the receipt can enter audit.
+-- FINAL remains reserved for the later audit validation. A bypass receipt
+-- with an authorization is therefore complete even when the value requires
+-- review. Keep empty bypass receipts preliminary and never downgrade FINAL.
 UPDATE recibos
    SET estado_documento='LISTO_AUDITORIA'
  WHERE COALESCE(verification_bypassed,FALSE)=TRUE

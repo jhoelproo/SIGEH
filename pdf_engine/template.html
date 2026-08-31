@@ -15,6 +15,15 @@
       <b>VERSIÓN PRELIMINAR</b>
       <span>Documento editable para revisión. No representa facturación confirmada.</span>
     </section>
+    {% elif estado_documento == "LISTO_AUDITORIA" %}
+    <section class="document-state-banner ready-banner">
+      <b>DOCUMENTO COMPLETO</b>
+      <span>Listo para auditoría{% if numero_autorizacion %} · Autorización registrada{% endif %}.</span>
+    </section>
+    {% elif estado_documento == "FINAL" %}
+    <section class="document-state-banner final-banner">
+      <b>DOCUMENTO FINAL VALIDADO</b>
+    </section>
     {% endif %}
 
     <!-- ================= ENCABEZADO ================= -->

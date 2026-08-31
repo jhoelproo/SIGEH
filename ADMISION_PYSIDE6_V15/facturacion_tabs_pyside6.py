@@ -24,7 +24,7 @@ import threading
 import logging
 from dataclasses import dataclass
 from types import MappingProxyType
-V15_SOURCE_BUILD_ID = "20260830_V110_REMOTE_PRIMARY_V1"
+V15_SOURCE_BUILD_ID = "20260830_V1010_REMOTE_PRIMARY_V1"
 from logging.handlers import RotatingFileHandler
 
 # Preparación del entorno del proyecto antes de importar emergency_core.

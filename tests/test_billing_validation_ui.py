@@ -141,6 +141,18 @@ class BillingValidationUiTests(unittest.TestCase):
             ),
         )
 
+    def test_ready_state_is_visible_as_complete_in_ui_and_pdf(self):
+        self.assertEqual(
+            app.document_state_label(app.DOCUMENT_READY),
+            "Documento completo - listo para auditoría",
+        )
+        template = (
+            Path(__file__).parents[1] / "pdf_engine" / "template.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('estado_documento == "LISTO_AUDITORIA"', template)
+        self.assertIn("DOCUMENTO COMPLETO", template)
+        self.assertIn('estado_documento == "FINAL"', template)
+
     def test_authorization_minimum_is_configurable_and_safely_bounded(self):
         with patch.dict(os.environ, {"SIGEH_AUTHORIZATION_MIN_DIGITS": "7"}):
             self.assertEqual(app.authorization_min_digits(), 7)
@@ -157,6 +169,10 @@ class BillingValidationUiTests(unittest.TestCase):
         self.assertIn("ADD COLUMN IF NOT EXISTS REVIEW_STATUS", normalized)
         self.assertIn("ADD COLUMN IF NOT EXISTS REVIEW_REASON", normalized)
         self.assertIn("ESTADO_DOCUMENTO='LISTO_AUDITORIA'", normalized)
+        self.assertIn(
+            "LISTO_AUDITORIA IS THE COMPLETE-DOCUMENT STATE",
+            normalized,
+        )
         self.assertIn("VERIFICATION_BYPASSED", normalized)
         self.assertNotIn("DELETE FROM", normalized)
         self.assertNotIn("DROP TABLE", normalized)

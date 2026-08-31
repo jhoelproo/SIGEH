@@ -34,7 +34,7 @@ from admission_bridge import (
 from app_resources import get_app_logo_path
 
 _V15_PACKAGE = "ADMISION_PYSIDE6_V15"
-_EXPECTED_V15_SOURCE_BUILD_ID = "20260830_V110_REMOTE_PRIMARY_V1"
+_EXPECTED_V15_SOURCE_BUILD_ID = "20260830_V1010_REMOTE_PRIMARY_V1"
 
 
 def _default_v15_root() -> Path:
