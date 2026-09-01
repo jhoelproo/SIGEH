@@ -44,7 +44,7 @@ SYNC_TICK_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 PATIENT_DIRECTORY_POLL_SECONDS = 30
 OFFLINE_LOGIN_VALID_DAYS = 30
-LOCAL_SYNC_APPLY_BATCH_SIZE = 50
+LOCAL_SYNC_APPLY_BATCH_SIZE = 20
 MAX_CLOCK_DRIFT_MS = 5 * 60 * 1000
 OPERATIONAL_LOG = logging.getLogger("hospital.admission.operational")
 
@@ -1656,14 +1656,16 @@ class OfflineAdmissionStore:
         self._initialized = False
 
     @contextmanager
-    def connection(self) -> Iterator[sqlite3.Connection]:
+    def connection(
+        self, operation: str = "admission-local-write"
+    ) -> Iterator[sqlite3.Connection]:
         if isinstance(self._database, sqlite3.Connection) or (
             not isinstance(self._database, (str, Path))
             and hasattr(self._database, "execute")
         ):
             yield self._database
             return
-        con = connect_local_sqlite(str(self._database), operation="admission-local-write")
+        con = connect_local_sqlite(str(self._database), operation=operation)
         con.row_factory = sqlite3.Row
         try:
             yield con
@@ -1819,6 +1821,27 @@ class OfflineAdmissionStore:
             if "atenciones" in tables:
                 con.execute(
                     "CREATE INDEX IF NOT EXISTS idx_atenciones_global_patient ON atenciones(global_patient_id)"
+                )
+                # Central UUIDs contain hyphens while legacy/local UUIDs may
+                # not.  Read-through sync compares their normalized form; an
+                # ordinary index cannot serve that expression and caused a
+                # full table scan for every event in a hydration batch.
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_atenciones_global_attention_normalized "
+                    "ON atenciones(REPLACE(LOWER(global_attention_id),'-',''))"
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_atenciones_global_patient_normalized "
+                    "ON atenciones(REPLACE(LOWER(global_patient_id),'-',''))"
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pacientes_global_patient_normalized "
+                    "ON pacientes(REPLACE(LOWER(global_patient_id),'-',''))"
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sync_attention_alias_remote_normalized "
+                    "ON sync_attention_aliases("
+                    "REPLACE(LOWER(remote_global_attention_id),'-',''))"
                 )
                 con.execute(
                     "CREATE INDEX IF NOT EXISTS idx_atenciones_turn_deleted ON atenciones(operational_turn_id,is_deleted)"
@@ -2083,7 +2106,7 @@ class OfflineAdmissionStore:
         self.initialize()
         actor_id = str(actor_user_id or session.active_user_id or "")
         actor_name = str(actor_username or session.active_username or "")
-        with self.connection() as con:
+        with self.connection("operational-runtime-context") as con:
             con.execute(
                 """INSERT INTO sync_runtime_context(
                        singleton,operational_session_id,generation,device_id,
@@ -3449,12 +3472,13 @@ class OfflineAdmissionStore:
             )
         return bool(
             con.execute(
-                """SELECT 1 FROM atenciones a
-                   LEFT JOIN sync_attention_aliases alias
-                     ON alias.local_attention_id=a.id
-                   WHERE REPLACE(LOWER(a.global_attention_id),'-','')=
+                """SELECT 1 FROM atenciones
+                   WHERE REPLACE(LOWER(global_attention_id),'-','')=
                          REPLACE(LOWER(?),'-','')
-                      OR REPLACE(LOWER(alias.remote_global_attention_id),'-','')=
+                   UNION ALL
+                   SELECT 1 FROM sync_attention_aliases alias
+                   JOIN atenciones a ON a.id=alias.local_attention_id
+                   WHERE REPLACE(LOWER(alias.remote_global_attention_id),'-','')=
                          REPLACE(LOWER(?),'-','')
                    LIMIT 1""",
                 (global_attention_id, global_attention_id),
@@ -3483,7 +3507,7 @@ class OfflineAdmissionStore:
     ) -> int:
         """Apply a bounded cloud batch so sync cannot monopolize the writer."""
         applied = 0
-        with self.connection() as con:
+        with self.connection("sync-apply-batch") as con:
             batch_store = OfflineAdmissionStore(con)
             batch_store._initialized = True
             for event in events:

@@ -126,6 +126,50 @@ def test_local_creation_assigns_uuid_sequence_and_atomic_outbox(tmp_path: Path):
     assert store.pending_count() == 2
 
 
+def test_normalized_global_identity_queries_use_runtime_indexes(tmp_path: Path):
+    database = tmp_path / "indexed-replica.db"
+    create_v15_database(database)
+    store = OfflineAdmissionStore(database)
+    store.initialize()
+
+    with sqlite3.connect(database) as connection:
+        attention_id = str(uuid.uuid4())
+        attention_plan = connection.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT 1 FROM atenciones
+                WHERE REPLACE(LOWER(global_attention_id),'-','')=
+                      REPLACE(LOWER(?),'-','')
+               UNION ALL
+               SELECT 1 FROM sync_attention_aliases alias
+               JOIN atenciones a ON a.id=alias.local_attention_id
+                WHERE REPLACE(LOWER(alias.remote_global_attention_id),'-','')=
+                      REPLACE(LOWER(?),'-','')
+               LIMIT 1""",
+            (attention_id, attention_id),
+        ).fetchall()
+        patient_plan = connection.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT 1 FROM pacientes
+                WHERE REPLACE(LOWER(global_patient_id),'-','')=
+                      REPLACE(LOWER(?),'-','') LIMIT 1""",
+            (str(uuid.uuid4()),),
+        ).fetchall()
+
+    assert any(
+        "idx_atenciones_global_attention_normalized" in str(row)
+        for row in attention_plan
+    )
+    assert any(
+        "idx_sync_attention_alias_remote_normalized" in str(row)
+        for row in attention_plan
+    )
+    assert not any("SCAN atenciones" in str(row) for row in attention_plan)
+    assert any(
+        "idx_pacientes_global_patient_normalized" in str(row)
+        for row in patient_plan
+    )
+
+
 def test_sync_schemas_contain_required_hybrid_metadata():
     for column in (
         "operational_source_id",

@@ -35,7 +35,11 @@ except ImportError:  # Ejecución directa del entrypoint standalone.
     from project_bootstrap import bootstrap_project_root
 PROJECT_ROOT = bootstrap_project_root()
 
-from sqlite_write_coordinator import connect_local_sqlite, prepare_sqlite_database
+from sqlite_write_coordinator import (
+    connect_local_sqlite,
+    prepare_sqlite_database,
+    run_with_bounded_sqlite_busy_retry,
+)
 from admission_refresh_coordinator import CoalescedRefreshGate, history_rows_fingerprint
 from display_layout import (
     DENSITY_AUTO,
@@ -1597,11 +1601,19 @@ class DatabaseManager:
         except Exception:
             APP_LOG.exception("No se pudo notificar el cambio al turno #%s", turn_id)
 
-    def _connect(self):
+    def _connect(
+        self,
+        *,
+        operation="v15-local-write",
+        lock_timeout=None,
+    ):
         # Una conexión independiente por consumidor; el coordinador global
         # serializa únicamente las transacciones de escritura de V15/sync/PDF.
         # WAL se prepara una vez en bootstrap y no se renegocia en cada connect.
-        return connect_local_sqlite(self.db_name, operation="v15-local-write")
+        options = {"operation": operation}
+        if lock_timeout is not None:
+            options["lock_timeout"] = float(lock_timeout)
+        return connect_local_sqlite(self.db_name, **options)
 
     def _init_db(self):
         result = migrate_database(self.db_name, self.backup_manager, APP_LOG)
@@ -2354,7 +2366,7 @@ class DatabaseManager:
         if tipo_atencion not in ("EMERGENCIA", "URGENCIA", "CONSULTA"):
             tipo_atencion = "EMERGENCIA"
 
-        with closing(self._connect()) as conn:
+        with closing(self._connect(operation="attention-local-save")) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.cursor()
@@ -2671,7 +2683,9 @@ class DatabaseManager:
         if incrementar_intento:
             assignments.append("intentos=intentos+1")
         params.append(int(atencion_id))
-        with closing(self._connect()) as conn:
+        with closing(
+            self._connect(operation="output-state", lock_timeout=0.35)
+        ) as conn:
             conn.execute(
                 f"UPDATE trabajos_salida SET {', '.join(assignments)} WHERE atencion_id=?",
                 params,
@@ -2680,7 +2694,9 @@ class DatabaseManager:
         APP_LOG.info("Salida atención #%s · %s=%s", int(atencion_id), etapa, estado)
 
     def limpiar_error_trabajo_salida(self, atencion_id):
-        with closing(self._connect()) as conn:
+        with closing(
+            self._connect(operation="output-state-clear", lock_timeout=0.35)
+        ) as conn:
             conn.execute(
                 """
                 UPDATE trabajos_salida SET ultimo_error=NULL,updated_at=datetime('now','localtime')
@@ -11567,6 +11583,52 @@ class App:
             and self.app_settings.get("print_auto_hoja", False)
         )
 
+    def _actualizar_trabajo_salida_seguro(
+        self,
+        atencion_id,
+        etapa,
+        estado,
+        **kwargs,
+    ):
+        """Persist output metadata without stranding the admission worker.
+
+        The attention and its outbox event were committed before this worker
+        starts.  A temporarily busy mirror may defer this idempotent metadata
+        update, but it must never suppress the UI completion callback.
+        """
+        try:
+            run_with_bounded_sqlite_busy_retry(
+                f"output-state-{str(etapa).lower()}",
+                lambda: self.db.actualizar_trabajo_salida(
+                    atencion_id,
+                    etapa,
+                    estado,
+                    **kwargs,
+                ),
+            )
+            return True
+        except Exception as exc:
+            APP_LOG.exception(
+                "LOCAL_BUSY_FAILED operation=output-state attention_id=%s "
+                "stage=%s state=%s exception_type=%s",
+                int(atencion_id),
+                str(etapa),
+                str(estado),
+                type(exc).__name__,
+            )
+            return False
+
+    def _obtener_trabajo_salida_seguro(self, atencion_id):
+        try:
+            return self.db.obtener_trabajo_salida(atencion_id) or {}
+        except Exception as exc:
+            APP_LOG.exception(
+                "OUTPUT_STATE_READ_FAILED attention_id=%s exception_type=%s",
+                int(atencion_id),
+                type(exc).__name__,
+            )
+            return {}
+
     def _render_immediate_attention_pdf(
         self,
         atencion_id,
@@ -11580,7 +11642,9 @@ class App:
         hoja_actual = str(hoja or "GENERAL").upper()
         if hoja_actual not in RUTA_HOJAS:
             hoja_actual = "GENERAL"
-        self.db.actualizar_trabajo_salida(atencion_id, "pdf", "PROCESANDO")
+        self._actualizar_trabajo_salida_seguro(
+            atencion_id, "pdf", "PROCESANDO"
+        )
         render_started = _time.perf_counter()
         APP_LOG.info(
             "PDF_RENDER_START attention_id=%s elapsed_ms=%.1f thread=%s",
@@ -11592,7 +11656,9 @@ class App:
         render_ms = (_time.perf_counter() - render_started) * 1000.0
         if not ruta_pdf or not os.path.isfile(ruta_pdf) or os.path.getsize(ruta_pdf) <= 0:
             raise RuntimeError("No fue posible generar temporalmente la hoja.")
-        self.db.actualizar_trabajo_salida(atencion_id, "pdf", "COMPLETADO")
+        self._actualizar_trabajo_salida_seguro(
+            atencion_id, "pdf", "COMPLETADO"
+        )
         APP_LOG.info(
             "PDF_RENDER_DONE attention_id=%s elapsed_ms=%.1f thread=%s",
             atencion_id,
@@ -11641,6 +11707,110 @@ class App:
                 "warning",
             )
 
+    def _procesar_impresion_salida(self, atencion_id, output, flow_started_at):
+        if not output or not output.should_print:
+            return ""
+        try:
+            self._actualizar_trabajo_salida_seguro(
+                atencion_id, "impresion", "PROCESANDO"
+            )
+            print_started = _time.perf_counter()
+            APP_LOG.info(
+                "PDF_PRINT_START attention_id=%s elapsed_ms=%.1f thread=%s",
+                atencion_id,
+                (print_started - flow_started_at) * 1000.0,
+                threading.current_thread().name,
+            )
+            if not imprimir_pdf(
+                output.pdf_path,
+                copias=max(
+                    1,
+                    int(self.app_settings.get("print_copies_hoja", 1) or 1),
+                ),
+            ):
+                raise RuntimeError("No fue posible enviar la hoja a la impresora.")
+            self._actualizar_trabajo_salida_seguro(
+                atencion_id,
+                "impresion",
+                "ENVIADO_A_IMPRESORA",
+                incrementar_intento=True,
+            )
+            APP_LOG.info(
+                "PDF_PRINT_DONE attention_id=%s elapsed_ms=%.1f thread=%s",
+                atencion_id,
+                (_time.perf_counter() - print_started) * 1000.0,
+                threading.current_thread().name,
+            )
+            return ""
+        except Exception as exc:
+            APP_LOG.exception("PRINT_ERROR attention_id=%s", atencion_id)
+            self._actualizar_trabajo_salida_seguro(
+                atencion_id,
+                "impresion",
+                "FALLIDO",
+                error=str(exc),
+                incrementar_intento=True,
+            )
+            return str(exc)
+
+    def _procesar_excel_salida(
+        self,
+        atencion_id,
+        trabajo,
+        turno_cfg,
+        flow_started_at,
+    ):
+        if trabajo.get("excel_estado") == "COMPLETADO":
+            return ""
+        try:
+            excel_started = _time.perf_counter()
+            APP_LOG.info(
+                "PDF_EXCEL_START attention_id=%s elapsed_ms=%.1f thread=%s",
+                atencion_id,
+                (excel_started - flow_started_at) * 1000.0,
+                threading.current_thread().name,
+            )
+            self._actualizar_trabajo_salida_seguro(
+                atencion_id, "excel", "PROCESANDO"
+            )
+            effective_turn = turno_cfg or self.db.obtener_turno_config_atencion(
+                atencion_id
+            )
+            if not effective_turn:
+                raise TurnoNoVigenteError(
+                    "No se pudo reconstruir el contexto del turno."
+                )
+            reconstruir_excel_turno(self.db, effective_turn)
+            self._actualizar_trabajo_salida_seguro(
+                atencion_id, "excel", "COMPLETADO"
+            )
+            APP_LOG.info(
+                "PDF_EXCEL_DONE attention_id=%s elapsed_ms=%.1f thread=%s",
+                atencion_id,
+                (_time.perf_counter() - excel_started) * 1000.0,
+                threading.current_thread().name,
+            )
+            return ""
+        except Exception as exc:
+            APP_LOG.exception("EXCEL_ERROR attention_id=%s", atencion_id)
+            self._actualizar_trabajo_salida_seguro(
+                atencion_id, "excel", "FALLIDO", error=str(exc)
+            )
+            return str(exc)
+
+    def _limpiar_error_trabajo_salida_seguro(self, atencion_id):
+        try:
+            run_with_bounded_sqlite_busy_retry(
+                "output-state-clear-error",
+                lambda: self.db.limpiar_error_trabajo_salida(atencion_id),
+            )
+        except Exception as exc:
+            APP_LOG.exception(
+                "OUTPUT_STATE_CLEAR_FAILED attention_id=%s exception_type=%s",
+                int(atencion_id),
+                type(exc).__name__,
+            )
+
     def _procesar_salida_atencion(
         self,
         atencion_id,
@@ -11653,7 +11823,7 @@ class App:
         """Render the immediate sheet first; secondary work never delays its opening."""
         flow_started_at = float(flow_started_at or _time.perf_counter())
         errores = {}
-        trabajo = self.db.obtener_trabajo_salida(atencion_id) or {}
+        trabajo = self._obtener_trabajo_salida_seguro(atencion_id)
         output = None
         should_print = self._should_print_immediate_attention(trabajo)
         try:
@@ -11673,75 +11843,32 @@ class App:
         except Exception as exc:
             errores["PDF"] = str(exc)
             APP_LOG.exception("PDF_RENDER_ERROR attention_id=%s", atencion_id)
-            self.db.actualizar_trabajo_salida(atencion_id, "pdf", "FALLIDO", error=str(exc))
+            self._actualizar_trabajo_salida_seguro(
+                atencion_id, "pdf", "FALLIDO", error=str(exc)
+            )
 
-        if output and output.should_print:
-            try:
-                self.db.actualizar_trabajo_salida(atencion_id, "impresion", "PROCESANDO")
-                print_started = _time.perf_counter()
-                APP_LOG.info(
-                    "PDF_PRINT_START attention_id=%s elapsed_ms=%.1f thread=%s",
-                    atencion_id,
-                    (print_started - flow_started_at) * 1000.0,
-                    threading.current_thread().name,
-                )
-                if not imprimir_pdf(
-                    output.pdf_path,
-                    copias=max(1, int(self.app_settings.get("print_copies_hoja", 1) or 1)),
-                ):
-                    raise RuntimeError("No fue posible enviar la hoja a la impresora.")
-                self.db.actualizar_trabajo_salida(
-                    atencion_id, "impresion", "ENVIADO_A_IMPRESORA", incrementar_intento=True
-                )
-                APP_LOG.info(
-                    "PDF_PRINT_DONE attention_id=%s elapsed_ms=%.1f thread=%s",
-                    atencion_id,
-                    (_time.perf_counter() - print_started) * 1000.0,
-                    threading.current_thread().name,
-                )
-            except Exception as exc:
-                errores["Impresión"] = str(exc)
-                APP_LOG.exception("PRINT_ERROR attention_id=%s", atencion_id)
-                self.db.actualizar_trabajo_salida(
-                    atencion_id, "impresion", "FALLIDO", error=str(exc), incrementar_intento=True
-                )
+        print_error = self._procesar_impresion_salida(
+            atencion_id, output, flow_started_at
+        )
+        if print_error:
+            errores["Impresión"] = print_error
 
         if output:
             programar_limpieza_pdf_temporal(output.pdf_path, espera_segundos=90)
 
-        if trabajo.get("excel_estado") != "COMPLETADO":
-            try:
-                excel_started = _time.perf_counter()
-                APP_LOG.info(
-                    "PDF_EXCEL_START attention_id=%s elapsed_ms=%.1f thread=%s",
-                    atencion_id,
-                    (excel_started - flow_started_at) * 1000.0,
-                    threading.current_thread().name,
-                )
-                self.db.actualizar_trabajo_salida(atencion_id, "excel", "PROCESANDO")
-                if not turno_cfg:
-                    turno_cfg = self.db.obtener_turno_config_atencion(atencion_id)
-                if not turno_cfg:
-                    raise TurnoNoVigenteError("No se pudo reconstruir el contexto del turno.")
-                reconstruir_excel_turno(self.db, turno_cfg)
-                self.db.actualizar_trabajo_salida(atencion_id, "excel", "COMPLETADO")
-                APP_LOG.info(
-                    "PDF_EXCEL_DONE attention_id=%s elapsed_ms=%.1f thread=%s",
-                    atencion_id,
-                    (_time.perf_counter() - excel_started) * 1000.0,
-                    threading.current_thread().name,
-                )
-            except Exception as exc:
-                errores["Excel"] = str(exc)
-                APP_LOG.exception("EXCEL_ERROR attention_id=%s", atencion_id)
-                self.db.actualizar_trabajo_salida(
-                    atencion_id, "excel", "FALLIDO", error=str(exc)
-                )
+        excel_error = self._procesar_excel_salida(
+            atencion_id,
+            trabajo,
+            turno_cfg,
+            flow_started_at,
+        )
+        if excel_error:
+            errores["Excel"] = excel_error
 
-        trabajo = self.db.obtener_trabajo_salida(atencion_id) or {}
+        trabajo = self._obtener_trabajo_salida_seguro(atencion_id)
         if trabajo.get("excel_estado") == "COMPLETADO" and not errores:
-            self.db.limpiar_error_trabajo_salida(atencion_id)
-        trabajo = self.db.obtener_trabajo_salida(atencion_id) or {}
+            self._limpiar_error_trabajo_salida_seguro(atencion_id)
+        trabajo = self._obtener_trabajo_salida_seguro(atencion_id)
         resultado = {
             "atencion_id": int(atencion_id),
             "errores": errores,
