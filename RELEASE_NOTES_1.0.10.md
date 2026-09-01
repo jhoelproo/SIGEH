@@ -9,6 +9,15 @@ las pruebas físicas con dos estaciones siguen pendientes.
 - Conserva las protecciones de v1.0.8/v1.0.9: un error de identidad, red o
   réplica local no se interpreta como cero pacientes; el resumen mantiene el
   último snapshot válido y un cambio N → 0 exige confirmación central.
+- Corrige la contención SQLite que podía dejar la estación PRIMARY esperando
+  indefinidamente después de generar una hoja. La hidratación local usa lotes
+  más cortos e índices normalizados para las identidades globales.
+- Las actualizaciones auxiliares de PDF, impresión y Excel usan reintentos
+  acotados y siempre devuelven el control a la interfaz. Una réplica ocupada
+  temporalmente ya no deja el flujo de salida permanentemente bloqueado.
+- Registra el propietario de cada escritor SQLite y alerta sobre transacciones
+  largas sin interrumpirlas, para diagnosticar futuros bloqueos sin exponer
+  información clínica.
 - El historial online continúa leyendo PostgreSQL y combinando únicamente los
   pendientes locales de la estación, deduplicados por `global_attention_id`.
 - El relevo normal registra `TURN_HANDOFF_REQUESTED` y
