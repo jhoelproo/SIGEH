@@ -34,6 +34,29 @@ python -m PyInstaller --noconfirm --clean build_app.spec
 El resultado completo se genera en `dist/SIGEH`. Una release contiene la
 carpeta completa; nunca debe publicarse solo `CALCULOS_QT.exe`.
 
+### Instalación limpia del hospital
+
+El ZIP público no contiene configuración ni credenciales del backend. Para una
+instalación hospitalaria nueva se genera un artefacto **interno y no
+publicable** mediante el bootstrap portable ya existente:
+
+```powershell
+python release_packaging.py `
+  --dist dist/SIGEH `
+  --updater dist/SIGEH_Updater.exe `
+  --output release-internal `
+  --version 1.0.10 `
+  --internal-deployment `
+  --backend-bundle C:\ruta-segura\database_url.bundle
+```
+
+La opción es deliberadamente explícita: el empaquetador continúa rechazando
+esa configuración en el canal público. El ZIP interno debe transferirse por el
+canal privado del hospital, no adjuntarse a GitHub ni conservarse en el
+repositorio. Cada paquete genera checksum, manifest de componentes y manifest
+recursivo de archivos para comprobar que dos estaciones recibieron exactamente
+el mismo artefacto.
+
 ## Actualizaciones automáticas
 
 `SIGEH.exe` consulta exclusivamente releases de
