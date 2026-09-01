@@ -1,3 +1,5 @@
+import json
+
 import portable_launcher
 
 
@@ -50,6 +52,19 @@ def test_launcher_fails_when_database_configuration_cannot_be_resolved(
 
     assert portable_launcher.main() == 5
     assert errors and "base de datos central" in errors[0]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "lanzador_log.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.startswith("{")
+    ]
+    backend_event = next(
+        event for event in events if event["event"] == "BACKEND_BOOTSTRAP"
+    )
+    assert backend_event["status"] == "FAIL"
+    assert backend_event["error_code"] == "CONFIGURATION_MISSING"
+    assert backend_event["credentials_present"] is False
 
 
 def test_self_test_validates_install_without_launching(tmp_path, monkeypatch):
@@ -79,3 +94,44 @@ def test_self_test_rejects_missing_internal_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(portable_launcher.sys, "argv", ["SIGEH.exe", "--self-test"])
 
     assert portable_launcher.main() == 3
+
+
+def test_launcher_logs_failed_launch_with_traceback_and_without_database_url(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "CALCULOS_QT.exe").write_bytes(b"test")
+    (tmp_path / "_internal").mkdir()
+    secret = "postgresql://user:do-not-log@central.example/hospital"
+    monkeypatch.setattr(portable_launcher, "portable_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        portable_launcher,
+        "install_database_url_for_child",
+        lambda environment, base_dir: environment.setdefault("DATABASE_URL", secret),
+    )
+    monkeypatch.setattr(
+        portable_launcher,
+        "describe_database_configuration",
+        lambda *_args, **_kwargs: {
+            "config_source": "portable_bundle",
+            "project_ref_redacted": "cent…mple",
+            "host_redacted": "cent…mple",
+            "port": 5432,
+            "database": "hospital",
+            "ssl_mode": "require",
+            "credentials_present": True,
+        },
+    )
+    monkeypatch.setattr(
+        portable_launcher.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("launch failed")),
+    )
+    monkeypatch.setattr(portable_launcher, "show_error", lambda _message: None)
+
+    assert portable_launcher.main() == 6
+    log_text = (tmp_path / "lanzador_log.txt").read_text(encoding="utf-8")
+    assert "launch_main" in log_text
+    assert "OSError" in log_text
+    assert "traceback" in log_text
+    assert secret not in log_text
+    assert "do-not-log" not in log_text

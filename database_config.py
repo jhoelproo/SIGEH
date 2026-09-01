@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Mapping
+from urllib.parse import parse_qs, urlparse
 
 
 CANONICAL_DATABASE_KEY = "DATABASE_URL"
@@ -39,11 +40,7 @@ def read_protected_env(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if (
-            len(value) >= 2
-            and value[0] == value[-1]
-            and value[0] in {"'", '"'}
-        ):
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
         values[key] = value
     return values
@@ -64,19 +61,31 @@ def _dpapi(value: bytes, *, protect: bool) -> bytes:
     kernel32 = ctypes.windll.kernel32
     source = ctypes.create_string_buffer(value)
     entropy = ctypes.create_string_buffer(_DPAPI_ENTROPY)
-    source_blob = _DataBlob(len(value), ctypes.cast(source, ctypes.POINTER(ctypes.c_byte)))
+    source_blob = _DataBlob(
+        len(value), ctypes.cast(source, ctypes.POINTER(ctypes.c_byte))
+    )
     entropy_blob = _DataBlob(
         len(_DPAPI_ENTROPY), ctypes.cast(entropy, ctypes.POINTER(ctypes.c_byte))
     )
     target_blob = _DataBlob()
     if protect:
         success = crypt32.CryptProtectData(
-            ctypes.byref(source_blob), None, ctypes.byref(entropy_blob), None, None, 0,
+            ctypes.byref(source_blob),
+            None,
+            ctypes.byref(entropy_blob),
+            None,
+            None,
+            0,
             ctypes.byref(target_blob),
         )
     else:
         success = crypt32.CryptUnprotectData(
-            ctypes.byref(source_blob), None, ctypes.byref(entropy_blob), None, None, 0,
+            ctypes.byref(source_blob),
+            None,
+            ctypes.byref(entropy_blob),
+            None,
+            None,
+            0,
             ctypes.byref(target_blob),
         )
     if not success:
@@ -114,9 +123,7 @@ def _bundle_stream(key: bytes, nonce: bytes, length: int) -> bytes:
     chunks: list[bytes] = []
     counter = 0
     while sum(map(len, chunks)) < length:
-        chunks.append(
-            hashlib.sha256(key + nonce + counter.to_bytes(4, "big")).digest()
-        )
+        chunks.append(hashlib.sha256(key + nonce + counter.to_bytes(4, "big")).digest())
         counter += 1
     return b"".join(chunks)[:length]
 
@@ -148,7 +155,7 @@ def read_bundled_database_url(path: Path) -> str:
         raw = path.read_bytes().strip()
         if not raw.startswith(_BUNDLE_PREFIX):
             return ""
-        payload = base64.urlsafe_b64decode(raw[len(_BUNDLE_PREFIX):])
+        payload = base64.urlsafe_b64decode(raw[len(_BUNDLE_PREFIX) :])
         if len(payload) <= 48:
             return ""
         nonce, tag, encrypted = payload[:16], payload[16:48], payload[48:]
@@ -157,9 +164,11 @@ def read_bundled_database_url(path: Path) -> str:
         if not hmac.compare_digest(tag, expected):
             return ""
         stream = _bundle_stream(key, nonce, len(encrypted))
-        return bytes(left ^ right for left, right in zip(encrypted, stream)).decode(
-            "utf-8"
-        ).strip()
+        return (
+            bytes(left ^ right for left, right in zip(encrypted, stream))
+            .decode("utf-8")
+            .strip()
+        )
     except Exception:
         return ""
 
@@ -172,6 +181,82 @@ def _bundled_config_paths(root: Path) -> tuple[Path, ...]:
         if resource_path not in paths:
             paths.append(resource_path)
     return tuple(paths)
+
+
+def _resolve_database_url_with_source(
+    root: Path,
+    environment: Mapping[str, str],
+) -> tuple[str, str]:
+    inherited_value = str(environment.get(CANONICAL_DATABASE_KEY) or "").strip()
+    if inherited_value:
+        return inherited_value, "environment"
+
+    for path in _bundled_config_paths(root):
+        bundled_value = read_bundled_database_url(path)
+        if bundled_value:
+            return bundled_value, "portable_bundle"
+
+    sealed_value = read_sealed_database_url(root / SEALED_DATABASE_FILE)
+    if sealed_value:
+        return sealed_value, "dpapi_protected"
+
+    local_value = str(
+        read_protected_env(root / ".env").get(CANONICAL_DATABASE_KEY) or ""
+    ).strip()
+    if local_value:
+        return local_value, "local_env_file"
+    return "", "missing"
+
+
+def _redact_identifier(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    if len(normalized) <= 8:
+        return "…"
+    suffix = normalized[-4:]
+    if suffix.startswith("."):
+        suffix = suffix[1:]
+    return f"{normalized[:4]}…{suffix}"
+
+
+def describe_database_configuration(
+    base_dir: os.PathLike[str] | str | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Describe el bootstrap central sin devolver usuario, contraseña ni URL."""
+    root = Path(base_dir).resolve() if base_dir is not None else application_root()
+    process_environment = os.environ if environment is None else environment
+    value, source = _resolve_database_url_with_source(root, process_environment)
+    description: dict[str, object] = {
+        "config_source": source,
+        "project_ref_redacted": "",
+        "host_redacted": "",
+        "port": None,
+        "database": "",
+        "ssl_mode": "",
+        "credentials_present": False,
+    }
+    if not value:
+        return description
+    try:
+        parsed = urlparse(value)
+        username = parsed.username or ""
+        project_ref = username.partition(".")[2]
+        description.update(
+            {
+                "project_ref_redacted": _redact_identifier(project_ref),
+                "host_redacted": _redact_identifier(parsed.hostname or ""),
+                "port": parsed.port,
+                "database": parsed.path.lstrip("/"),
+                "ssl_mode": parse_qs(parsed.query).get("sslmode", [""])[0],
+                "credentials_present": bool(parsed.username and parsed.password),
+            }
+        )
+    except (TypeError, ValueError):
+        description["credentials_present"] = bool(value)
+    return description
 
 
 def resolve_database_url(
@@ -188,28 +273,15 @@ def resolve_database_url(
     reemplazar accidentalmente la configuración incluida.
     """
     root = Path(base_dir).resolve() if base_dir is not None else application_root()
-    sealed_value = read_sealed_database_url(root / SEALED_DATABASE_FILE)
-    bundled_value = next(
-        (read_bundled_database_url(path) for path in _bundled_config_paths(root)
-         if read_bundled_database_url(path)),
-        "",
-    )
-    protected_values = read_protected_env(root / ".env")
     process_environment = os.environ if environment is None else environment
-
-    local_value = str(
-        protected_values.get(CANONICAL_DATABASE_KEY) or ""
-    ).strip()
-    inherited_value = str(
-        process_environment.get(CANONICAL_DATABASE_KEY) or ""
-    ).strip()
     # El entorno explícito permite la configuración central administrada.  La
     # copia incluida protege los despliegues portables y el archivo local queda
     # como contingencia; ninguno de los tres valores se registra o muestra.
     # ``prefer_local_file`` se conserva para compatibilidad de llamadas viejas,
     # pero no altera la prioridad documentada de la distribución.
     del prefer_local_file
-    return inherited_value or bundled_value or sealed_value or local_value
+    value, _source = _resolve_database_url_with_source(root, process_environment)
+    return value
 
 
 def install_database_url_for_child(
@@ -234,9 +306,8 @@ def configured_database_keys(
 ) -> set[str]:
     root = Path(base_dir).resolve() if base_dir is not None else application_root()
     keys = set(read_protected_env(root / ".env"))
-    if (
-        read_sealed_database_url(root / SEALED_DATABASE_FILE)
-        or any(read_bundled_database_url(path) for path in _bundled_config_paths(root))
+    if read_sealed_database_url(root / SEALED_DATABASE_FILE) or any(
+        read_bundled_database_url(path) for path in _bundled_config_paths(root)
     ):
         keys.add(CANONICAL_DATABASE_KEY)
     return keys
