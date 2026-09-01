@@ -82,6 +82,7 @@ def test_internal_release_injects_bootstrap_only_into_private_archive(tmp_path: 
     manifest = json.loads(result["manifest"].read_text(encoding="utf-8"))
     assert manifest["distribution_channel"] == "internal"
     assert manifest["backend_bootstrap"] == "portable_bundle"
+    assert manifest["published_at"] == manifest["packaged_at"]
     assert manifest["sha256"] == sha256_file(result["archive"])
     component_names = set(manifest["components"])
     assert component_names == {"SIGEH.exe", "CALCULOS_QT.exe", "SIGEH_Updater.exe"}
