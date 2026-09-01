@@ -201,6 +201,7 @@ def prepare_release(
         "entrypoint": "SIGEH.exe",
         "updater": "SIGEH_Updater.exe",
         "packaged_at": packaged_at,
+        "published_at": packaged_at,
         "minimum_supported_version": "1.0.0",
         "distribution_channel": channel,
         "publishable": not internal_deployment,
