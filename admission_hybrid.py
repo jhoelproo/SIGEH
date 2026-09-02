@@ -266,6 +266,7 @@ def evaluate_admission_access(
                 "reason_code",
                 "active_user_id",
                 "active_username",
+                "turn_id",
             )
         }
     )
