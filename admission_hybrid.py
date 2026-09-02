@@ -97,6 +97,10 @@ class AdmissionWriteBlocked(AdmissionHybridError):
     code = "ADMISSION_WRITE_BLOCKED"
 
 
+class TransitionIdCollision(AdmissionWriteBlocked):
+    code = "TRANSITION_ID_COLLISION"
+
+
 class SyncConflict(AdmissionHybridError):
     code = "SYNC_CONFLICT"
 
@@ -748,6 +752,78 @@ class PrimaryTransitionResult:
     old_username: str = ""
     new_username: str = ""
     warnings: tuple[str, ...] = ()
+    idempotent_replay: bool = False
+    recovered_after_commit: bool = False
+
+
+HANDOFF_TRANSITION_EVENT = "TURN_HANDOFF_TRANSITION"
+HANDOFF_TRANSITION_COMMITTED = "COMMITTED"
+HANDOFF_TRANSITION_REQUESTED = "REQUESTED"
+HANDOFF_TRANSITION_TYPE = "PRIMARY_USER_HANDOFF"
+ADMIN_TURN_OVERRIDE_TRANSITION_TYPE = "ADMIN_TURN_OVERRIDE"
+HANDOFF_CONTRACT_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffTransitionRequest:
+    transition_id: str
+    transition_type: str
+    operational_session_id: str
+    operational_source_id: str
+    previous_turn_id: int | None
+    previous_generation: int
+    expected_operational_revision: int
+    current_representative_id: str
+    target_representative_id: str
+    actor_user_id: str
+    actor_username: str
+    primary_device_id: str
+    target_login_session_id: str
+    requested_turn_id: int | None
+    allocate_central_turn_id: bool
+    new_turn_code: str
+    trigger: str
+    reason: str
+    invalidate_secondaries: bool
+    invalidate_only_previous_user_secondaries: bool
+
+    def as_mapping(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "HandoffTransitionRequest":
+        return cls(
+            transition_id=str(value.get("transition_id") or ""),
+            transition_type=str(value.get("transition_type") or ""),
+            operational_session_id=str(value.get("operational_session_id") or ""),
+            operational_source_id=str(value.get("operational_source_id") or ""),
+            previous_turn_id=_as_int_or_none(value.get("previous_turn_id")),
+            previous_generation=int(value.get("previous_generation") or 0),
+            expected_operational_revision=int(
+                value.get("expected_operational_revision") or 0
+            ),
+            current_representative_id=str(
+                value.get("current_representative_id") or ""
+            ),
+            target_representative_id=str(
+                value.get("target_representative_id") or ""
+            ),
+            actor_user_id=str(value.get("actor_user_id") or ""),
+            actor_username=str(value.get("actor_username") or ""),
+            primary_device_id=str(value.get("primary_device_id") or ""),
+            target_login_session_id=str(
+                value.get("target_login_session_id") or ""
+            ),
+            requested_turn_id=_as_int_or_none(value.get("requested_turn_id")),
+            allocate_central_turn_id=bool(value.get("allocate_central_turn_id")),
+            new_turn_code=str(value.get("new_turn_code") or ""),
+            trigger=str(value.get("trigger") or ""),
+            reason=str(value.get("reason") or ""),
+            invalidate_secondaries=bool(value.get("invalidate_secondaries")),
+            invalidate_only_previous_user_secondaries=bool(
+                value.get("invalidate_only_previous_user_secondaries")
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3825,6 +3901,285 @@ class OperationalSessionService:
         )
 
     @staticmethod
+    def _decode_audit_details(value: Any) -> dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except (TypeError, ValueError):
+                return {}
+            return dict(decoded) if isinstance(decoded, Mapping) else {}
+        return {}
+
+    @staticmethod
+    def _is_transition_unique_violation(exc: BaseException) -> bool:
+        current: BaseException | None = exc
+        while current is not None:
+            sqlstate = str(
+                getattr(current, "pgcode", "")
+                or getattr(current, "sqlstate", "")
+                or ""
+            )
+            diagnostic = getattr(current, "diag", None)
+            constraint = str(
+                getattr(diagnostic, "constraint_name", "") or ""
+            )
+            if (
+                sqlstate == "23505"
+                and constraint == "uq_admission_operational_transition"
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    @staticmethod
+    def _handoff_semantic_differences(
+        stored: HandoffTransitionRequest,
+        requested: HandoffTransitionRequest,
+    ) -> tuple[str, ...]:
+        stored_values = stored.as_mapping()
+        requested_values = requested.as_mapping()
+        return tuple(
+            field_name
+            for field_name in stored_values
+            if stored_values[field_name] != requested_values[field_name]
+        )
+
+    @staticmethod
+    def _log_handoff_request(request: HandoffTransitionRequest) -> None:
+        OPERATIONAL_LOG.info(
+            "HANDOFF_REQUEST transition_id=%s actor_user_id=%s device_id=%s "
+            "source_id=%s expected_turn_id=%s expected_generation=%s "
+            "expected_revision=%s current_rep=%s target_rep=%s transition_type=%s",
+            request.transition_id,
+            request.actor_user_id,
+            request.primary_device_id,
+            request.operational_source_id,
+            request.previous_turn_id,
+            request.previous_generation,
+            request.expected_operational_revision,
+            request.current_representative_id,
+            request.target_representative_id,
+            request.transition_type,
+        )
+
+    @staticmethod
+    def _load_handoff_transition(con: Any, transition_id: str) -> dict[str, Any]:
+        row = con.execute(
+            """SELECT operational_session_id,event_type,details_json
+                 FROM admission_operational_audit
+                WHERE transition_id=%s
+                LIMIT 1""",
+            (str(transition_id),),
+        ).fetchone()
+        return _mapping(row)
+
+    def _reserve_handoff_transition(
+        self,
+        con: Any,
+        *,
+        request: HandoffTransitionRequest,
+        username: str,
+    ) -> dict[str, Any]:
+        """Reserve one transition id, recovering a concurrent unique conflict."""
+        con.execute("SAVEPOINT handoff_transition_reservation")
+        try:
+            self._audit(
+                con,
+                session_id=request.operational_session_id,
+                event_type=HANDOFF_TRANSITION_EVENT,
+                device_id=request.primary_device_id,
+                username=username,
+                generation=request.previous_generation,
+                transition_id=request.transition_id,
+                details={
+                    "contract_version": HANDOFF_CONTRACT_VERSION,
+                    "status": HANDOFF_TRANSITION_REQUESTED,
+                    "request": request.as_mapping(),
+                    "result": {},
+                },
+            )
+        except Exception as exc:
+            con.execute("ROLLBACK TO SAVEPOINT handoff_transition_reservation")
+            con.execute("RELEASE SAVEPOINT handoff_transition_reservation")
+            if not self._is_transition_unique_violation(exc):
+                raise
+            OPERATIONAL_LOG.warning(
+                "HANDOFF_TRANSITION_EXISTS transition_id=%s source=unique_violation",
+                request.transition_id,
+            )
+            existing = self._load_handoff_transition(con, request.transition_id)
+            if not existing:
+                raise AdmissionWriteBlocked(
+                    "HANDOFF_TRANSITION_STATE_MISMATCH: el identificador está ocupado "
+                    "pero no fue posible cargar su transición."
+                ) from exc
+            return existing
+        con.execute("RELEASE SAVEPOINT handoff_transition_reservation")
+        OPERATIONAL_LOG.info(
+            "HANDOFF_TRANSITION_INSERT transition_id=%s transition_type=%s",
+            request.transition_id,
+            request.transition_type,
+        )
+        return {}
+
+    def _recover_committed_handoff(
+        self,
+        *,
+        transition_row: Mapping[str, Any],
+        request: HandoffTransitionRequest,
+        current: OperationalSession,
+    ) -> PrimaryTransitionResult:
+        payload = self._decode_audit_details(transition_row.get("details_json"))
+        stored_request_value = payload.get("request")
+        if (
+            str(transition_row.get("event_type") or "") != HANDOFF_TRANSITION_EVENT
+            or int(payload.get("contract_version") or 0) != HANDOFF_CONTRACT_VERSION
+            or not isinstance(stored_request_value, Mapping)
+        ):
+            OPERATIONAL_LOG.error(
+                "HANDOFF_COLLISION event=TRANSITION_ID_COLLISION transition_id=%s "
+                "reason=legacy_or_invalid_contract",
+                request.transition_id,
+            )
+            raise TransitionIdCollision(
+                "TRANSITION_ID_COLLISION: el identificador pertenece a una transición "
+                "sin el contrato semántico requerido."
+            )
+        stored_request = HandoffTransitionRequest.from_mapping(stored_request_value)
+        differences = self._handoff_semantic_differences(stored_request, request)
+        if differences:
+            OPERATIONAL_LOG.error(
+                "HANDOFF_COLLISION event=TRANSITION_ID_COLLISION transition_id=%s fields=%s",
+                request.transition_id,
+                ",".join(differences),
+            )
+            raise TransitionIdCollision(
+                "TRANSITION_ID_COLLISION: la transición existente representa otra "
+                f"operación ({', '.join(differences)})."
+            )
+        if str(payload.get("status") or "") != HANDOFF_TRANSITION_COMMITTED:
+            raise AdmissionWriteBlocked(
+                "HANDOFF_TRANSITION_NOT_COMMITTED: la transición existe pero no está "
+                "confirmada."
+            )
+        result = payload.get("result")
+        if not isinstance(result, Mapping):
+            result = {}
+        expected_state = {
+            "operational_session_id": request.operational_session_id,
+            "operational_source_id": request.operational_source_id,
+            "turn_id": _as_int_or_none(result.get("new_turn_id")),
+            "generation": int(result.get("new_generation") or 0),
+            "operational_revision": int(
+                result.get("new_operational_revision") or 0
+            ),
+            "active_user_id": request.target_representative_id,
+            "primary_device_id": request.primary_device_id,
+            "primary_login_session_id": request.target_login_session_id,
+            "status": "ACTIVE",
+        }
+        current_values = {
+            "operational_session_id": current.operational_session_id,
+            "operational_source_id": current.operational_source_id,
+            "turn_id": current.turn_id,
+            "generation": current.generation,
+            "operational_revision": current.operational_revision,
+            "active_user_id": current.active_user_id,
+            "primary_device_id": current.primary_device_id,
+            "primary_login_session_id": current.primary_login_session_id,
+            "status": current.status,
+        }
+        state_differences = tuple(
+            name for name, expected in expected_state.items()
+            if current_values[name] != expected
+        )
+        if state_differences:
+            OPERATIONAL_LOG.error(
+                "HANDOFF_STATE_MISMATCH transition_id=%s fields=%s",
+                request.transition_id,
+                ",".join(state_differences),
+            )
+            raise AdmissionWriteBlocked(
+                "HANDOFF_STATE_MISMATCH: el estado central no corresponde al resultado "
+                f"confirmado ({', '.join(state_differences)})."
+            )
+        OPERATIONAL_LOG.info(
+            "HANDOFF_IDEMPOTENT_REPLAY transition_id=%s turn_id=%s generation=%s",
+            request.transition_id,
+            current.turn_id,
+            current.generation,
+        )
+        OPERATIONAL_LOG.info(
+            "HANDOFF_POST_COMMIT_RECOVERY transition_id=%s operational_revision=%s",
+            request.transition_id,
+            current.operational_revision,
+        )
+        invalidated = result.get("invalidated_login_session_ids") or ()
+        return PrimaryTransitionResult(
+            operational_session=current,
+            transition_id=request.transition_id,
+            invalidated_login_session_ids=tuple(str(item) for item in invalidated),
+            old_primary_login_session_id=str(
+                result.get("old_primary_login_session_id") or ""
+            ),
+            committed=True,
+            old_turn_id=_as_int_or_none(result.get("old_turn_id")),
+            new_turn_id=_as_int_or_none(result.get("new_turn_id")),
+            old_generation=int(result.get("old_generation") or 0),
+            new_generation=int(result.get("new_generation") or 0),
+            old_user_id=str(result.get("old_user_id") or ""),
+            new_user_id=str(result.get("new_user_id") or ""),
+            old_username=str(result.get("old_username") or ""),
+            new_username=str(result.get("new_username") or ""),
+            idempotent_replay=True,
+            recovered_after_commit=True,
+        )
+
+    @staticmethod
+    def _commit_handoff_transition(
+        con: Any,
+        *,
+        request: HandoffTransitionRequest,
+        result: Mapping[str, Any],
+        username: str,
+        generation: int,
+    ) -> None:
+        updated = con.execute(
+            """UPDATE admission_operational_audit
+                  SET username=%s,generation=%s,details_json=%s::jsonb
+                WHERE transition_id=%s AND event_type=%s""",
+            (
+                str(username),
+                int(generation),
+                json.dumps(
+                    {
+                        "contract_version": HANDOFF_CONTRACT_VERSION,
+                        "status": HANDOFF_TRANSITION_COMMITTED,
+                        "request": request.as_mapping(),
+                        "result": dict(result),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                request.transition_id,
+                HANDOFF_TRANSITION_EVENT,
+            ),
+        )
+        if int(getattr(updated, "rowcount", 0) or 0) != 1:
+            raise AdmissionWriteBlocked(
+                "HANDOFF_TRANSITION_STATE_MISMATCH: no fue posible confirmar el ledger "
+                "idempotente."
+            )
+        OPERATIONAL_LOG.info(
+            "HANDOFF_COMMIT transition_id=%s transition_type=%s generation=%s",
+            request.transition_id,
+            request.transition_type,
+            generation,
+        )
+
+    @staticmethod
     def _allocate_next_central_turn_id(con: Any) -> int:
         """Allocates a central-only turn identity under the operational lock."""
         row = con.execute(
@@ -4955,6 +5310,10 @@ class OperationalSessionService:
         primary_device_id: str,
         new_turn_id: int | None,
         expected_generation: int,
+        expected_operational_revision: int | None = None,
+        expected_previous_turn_id: int | None = None,
+        expected_operational_source_id: str = "",
+        expected_current_representative_id: Any = None,
         new_turn_code: str = "",
         transition_id: str | None = None,
         changed_by: str = "",
@@ -4977,12 +5336,7 @@ class OperationalSessionService:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 ("admission-operational-session",),
             )
-            duplicate = con.execute(
-                """SELECT operational_session_id,details_json
-                     FROM admission_operational_audit
-                    WHERE transition_id=%s LIMIT 1""",
-                (transition_uuid,),
-            ).fetchone()
+            duplicate = self._load_handoff_transition(con, transition_uuid)
             row = con.execute(
                 """SELECT * FROM admission_operational_sessions
                     WHERE operational_session_id=%s FOR UPDATE""",
@@ -4991,37 +5345,78 @@ class OperationalSessionService:
             current = self._row_to_session(row)
             if not current or current.status != "ACTIVE":
                 raise AdmissionWriteBlocked("La sesión operativa ya no está activa.")
+            request = HandoffTransitionRequest(
+                transition_id=transition_uuid,
+                transition_type=ADMIN_TURN_OVERRIDE_TRANSITION_TYPE,
+                operational_session_id=str(operational_session_id),
+                operational_source_id=str(
+                    expected_operational_source_id or current.operational_source_id
+                ),
+                previous_turn_id=(
+                    _as_int_or_none(expected_previous_turn_id)
+                    if expected_previous_turn_id is not None
+                    else current.turn_id
+                ),
+                previous_generation=int(expected_generation),
+                expected_operational_revision=int(
+                    expected_operational_revision
+                    if expected_operational_revision is not None
+                    else current.operational_revision
+                ),
+                current_representative_id=str(
+                    canonical_user_id(expected_current_representative_id)
+                    or str(expected_current_representative_id or "").strip()
+                    or current.active_user_id
+                ),
+                target_representative_id=current.active_user_id,
+                actor_user_id=str(actor_user_id or ""),
+                actor_username=str(changed_by or ""),
+                primary_device_id=str(primary_device_id),
+                target_login_session_id=current.primary_login_session_id,
+                requested_turn_id=requested_turn_id,
+                allocate_central_turn_id=bool(allocate_central_turn_id),
+                new_turn_code=str(new_turn_code or "").strip(),
+                trigger=TRIGGER_ADMIN_TURN_OVERRIDE,
+                reason=str(reason or ""),
+                invalidate_secondaries=False,
+                invalidate_only_previous_user_secondaries=False,
+            )
+            self._log_handoff_request(request)
 
             if duplicate:
-                duplicate_data = _mapping(duplicate)
-                details_value = duplicate_data.get("details_json") or {}
-                if isinstance(details_value, str):
-                    try:
-                        details_value = json.loads(details_value)
-                    except (TypeError, ValueError):
-                        details_value = {}
-                details = dict(details_value or {})
-                return PrimaryTransitionResult(
-                    operational_session=current,
-                    transition_id=transition_uuid,
-                    committed=True,
-                    old_turn_id=_as_int_or_none(details.get("old_turn_id")),
-                    new_turn_id=current.turn_id,
-                    old_generation=int(details.get("old_generation") or current.generation),
-                    new_generation=current.generation,
-                    old_user_id=current.active_user_id,
-                    new_user_id=current.active_user_id,
-                    old_username=current.active_username,
-                    new_username=current.active_username,
+                OPERATIONAL_LOG.info(
+                    "HANDOFF_TRANSITION_EXISTS transition_id=%s source=preflight",
+                    transition_uuid,
+                )
+                return self._recover_committed_handoff(
+                    transition_row=duplicate,
+                    request=request,
+                    current=current,
                 )
 
+            if current.operational_source_id != request.operational_source_id:
+                raise AdmissionWriteBlocked(
+                    "La identidad operacional cambió antes de aplicar. Actualice e intente de nuevo."
+                )
+            if current.turn_id != request.previous_turn_id:
+                raise AdmissionWriteBlocked(
+                    "El turno cambió antes de aplicar. Actualice e intente de nuevo."
+                )
             if current.primary_device_id != str(primary_device_id):
                 raise AdmissionWriteBlocked(
                     "Solo el dispositivo principal puede cambiar el turno."
                 )
-            if current.generation != int(expected_generation):
+            if current.generation != request.previous_generation:
                 raise AdmissionWriteBlocked(
                     "La sesión operativa cambió antes de aplicar. Actualice e intente de nuevo."
+                )
+            if current.operational_revision != request.expected_operational_revision:
+                raise AdmissionWriteBlocked(
+                    "La revisión operacional cambió antes de aplicar. Actualice e intente de nuevo."
+                )
+            if current.active_user_id != request.current_representative_id:
+                raise AdmissionWriteBlocked(
+                    "El representante cambió antes de aplicar. Actualice e intente de nuevo."
                 )
             primary_row = con.execute(
                 """SELECT station_role FROM admission_operational_devices
@@ -5051,6 +5446,28 @@ class OperationalSessionService:
                 if allocate_central_turn_id
                 else requested_turn_id
             )
+            if current.turn_id != target_turn_id:
+                raced_transition = self._reserve_handoff_transition(
+                    con,
+                    request=request,
+                    username=str(changed_by or current.active_username),
+                )
+                if raced_transition:
+                    replay_row = con.execute(
+                        "SELECT * FROM admission_operational_sessions "
+                        "WHERE operational_session_id=%s FOR UPDATE",
+                        (operational_session_id,),
+                    ).fetchone()
+                    replay_state = self._row_to_session(replay_row)
+                    if replay_state is None:
+                        raise AdmissionWriteBlocked(
+                            "HANDOFF_STATE_MISMATCH: no fue posible releer el estado central."
+                        )
+                    return self._recover_committed_handoff(
+                        transition_row=raced_transition,
+                        request=request,
+                        current=replay_state,
+                    )
             effective_turn_code = str(new_turn_code or current.turn_code or "").strip()
             turn_duration_hours = operational_turn_duration_hours(effective_turn_code)
 
@@ -5062,8 +5479,8 @@ class OperationalSessionService:
                     device_id=primary_device_id,
                     username=str(changed_by or current.active_username),
                     generation=current.generation,
-                    transition_id=transition_uuid,
                     details={
+                        "transition_id": transition_uuid,
                         "actor_user_id": str(actor_user_id or ""),
                         "old_turn_id": current.turn_id,
                         "new_turn_id": target_turn_id,
@@ -5146,6 +5563,7 @@ class OperationalSessionService:
                 raise AdmissionWriteBlocked("No fue posible confirmar el nuevo turno.")
 
             details = {
+                "transition_id": transition_uuid,
                 "old_turn_id": current.turn_id,
                 "new_turn_id": changed.turn_id,
                 "old_generation": current.generation,
@@ -5160,6 +5578,26 @@ class OperationalSessionService:
                 "reason": str(reason or "")[:240],
                 "trigger": TRIGGER_ADMIN_TURN_OVERRIDE,
             }
+            self._commit_handoff_transition(
+                con,
+                request=request,
+                result={
+                    "old_turn_id": current.turn_id,
+                    "new_turn_id": changed.turn_id,
+                    "old_generation": current.generation,
+                    "new_generation": changed.generation,
+                    "old_operational_revision": current.operational_revision,
+                    "new_operational_revision": changed.operational_revision,
+                    "old_user_id": current.active_user_id,
+                    "new_user_id": changed.active_user_id,
+                    "old_username": current.active_username,
+                    "new_username": changed.active_username,
+                    "old_primary_login_session_id": current.primary_login_session_id,
+                    "invalidated_login_session_ids": [],
+                },
+                username=str(changed_by or current.active_username),
+                generation=changed.generation,
+            )
             self._audit(
                 con,
                 session_id=operational_session_id,
@@ -5171,7 +5609,6 @@ class OperationalSessionService:
                 device_id=primary_device_id,
                 username=str(changed_by or current.active_username),
                 generation=changed.generation,
-                transition_id=transition_uuid,
                 details=details,
             )
             self._audit(
@@ -5198,7 +5635,6 @@ class OperationalSessionService:
                 device_id=primary_device_id,
                 username=str(changed_by or current.active_username),
                 generation=changed.generation,
-                transition_id=transition_uuid,
                 details=identity_details,
             )
             OPERATIONAL_LOG.info(
@@ -5264,6 +5700,10 @@ class OperationalSessionService:
         primary_device_id: str,
         new_turn_id: int | None,
         expected_generation: int,
+        expected_operational_revision: int | None = None,
+        expected_previous_turn_id: int | None = None,
+        expected_operational_source_id: str = "",
+        expected_current_representative_id: Any = None,
         new_turn_code: str = "",
         transition_id: str | None = None,
         reason: str = "Cambio administrativo de turno",
@@ -5301,6 +5741,10 @@ class OperationalSessionService:
             new_turn_id=new_turn_id,
             new_turn_code=new_turn_code,
             expected_generation=expected_generation,
+            expected_operational_revision=expected_operational_revision,
+            expected_previous_turn_id=expected_previous_turn_id,
+            expected_operational_source_id=expected_operational_source_id,
+            expected_current_representative_id=expected_current_representative_id,
             transition_id=transition_id,
             changed_by=actor_username,
             reason=reason,
@@ -5327,6 +5771,11 @@ class OperationalSessionService:
         new_user: Mapping[str, Any] | Any,
         new_turn_id: int | None,
         expected_generation: int,
+        expected_operational_revision: int | None = None,
+        expected_previous_turn_id: int | None = None,
+        expected_operational_source_id: str = "",
+        expected_current_representative_id: Any = None,
+        actor_user_id: Any = None,
         new_turn_code: str = "",
         transition_id: str | None = None,
         changed_by: str = "",
@@ -5360,11 +5809,6 @@ class OperationalSessionService:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 ("admission-operational-session",),
             )
-            duplicate = con.execute(
-                """SELECT operational_session_id,details_json FROM admission_operational_audit
-                   WHERE transition_id=%s LIMIT 1""",
-                (transition_uuid,),
-            ).fetchone()
             row = con.execute(
                 """SELECT * FROM admission_operational_sessions
                    WHERE operational_session_id=%s FOR UPDATE""",
@@ -5373,35 +5817,83 @@ class OperationalSessionService:
             current = self._row_to_session(row)
             if not current or current.status != "ACTIVE":
                 raise AdmissionWriteBlocked("La sesión operativa ya no está activa.")
+            request = HandoffTransitionRequest(
+                transition_id=transition_uuid,
+                transition_type=HANDOFF_TRANSITION_TYPE,
+                operational_session_id=str(operational_session_id),
+                operational_source_id=str(
+                    expected_operational_source_id or current.operational_source_id
+                ),
+                previous_turn_id=(
+                    _as_int_or_none(expected_previous_turn_id)
+                    if expected_previous_turn_id is not None
+                    else current.turn_id
+                ),
+                previous_generation=int(expected_generation),
+                expected_operational_revision=int(
+                    expected_operational_revision
+                    if expected_operational_revision is not None
+                    else current.operational_revision
+                ),
+                current_representative_id=str(
+                    canonical_user_id(expected_current_representative_id)
+                    or str(expected_current_representative_id or "").strip()
+                    or current.active_user_id
+                ),
+                target_representative_id=str(new_user_id),
+                actor_user_id=str(
+                    canonical_user_id(actor_user_id)
+                    or str(actor_user_id or "").strip()
+                    or new_user_id
+                ),
+                actor_username=str(changed_by or new_username),
+                primary_device_id=str(primary_device_id),
+                target_login_session_id=str(new_login_session_id),
+                requested_turn_id=_as_int_or_none(new_turn_id),
+                allocate_central_turn_id=bool(allocate_central_turn_id),
+                new_turn_code=str(new_turn_code or "").strip(),
+                trigger=str(trigger or TRIGGER_USER_REQUESTED_HANDOFF),
+                reason=str(reason or ""),
+                invalidate_secondaries=bool(invalidate_secondaries),
+                invalidate_only_previous_user_secondaries=bool(
+                    invalidate_only_previous_user_secondaries
+                ),
+            )
+            self._log_handoff_request(request)
+            duplicate = self._load_handoff_transition(con, transition_uuid)
             if duplicate:
-                duplicate_data = _mapping(duplicate)
-                details_value = duplicate_data.get("details_json") or {}
-                if isinstance(details_value, str):
-                    try:
-                        details_value = json.loads(details_value)
-                    except (TypeError, ValueError):
-                        details_value = {}
-                details = dict(details_value or {})
-                return PrimaryTransitionResult(
-                    operational_session=current,
-                    transition_id=transition_uuid,
-                    committed=True,
-                    old_turn_id=_as_int_or_none(details.get("old_turn_id")),
-                    new_turn_id=current.turn_id,
-                    old_generation=int(details.get("old_generation") or 0),
-                    new_generation=current.generation,
-                    old_user_id=str(details.get("old_user_id") or ""),
-                    new_user_id=current.active_user_id,
-                    old_username=str(details.get("old_username") or ""),
-                    new_username=current.active_username,
+                OPERATIONAL_LOG.info(
+                    "HANDOFF_TRANSITION_EXISTS transition_id=%s source=preflight",
+                    transition_uuid,
+                )
+                return self._recover_committed_handoff(
+                    transition_row=duplicate,
+                    request=request,
+                    current=current,
+                )
+            if current.operational_source_id != request.operational_source_id:
+                raise AdmissionWriteBlocked(
+                    "La identidad operacional cambió antes de aplicar. Actualice e intente de nuevo."
+                )
+            if current.turn_id != request.previous_turn_id:
+                raise AdmissionWriteBlocked(
+                    "El turno cambió antes de aplicar. Actualice e intente de nuevo."
                 )
             if current.primary_device_id != str(primary_device_id):
                 raise AdmissionWriteBlocked(
                     "Solo el dispositivo principal puede cambiar el usuario operativo."
                 )
-            if current.generation != int(expected_generation):
+            if current.generation != request.previous_generation:
                 raise AdmissionWriteBlocked(
                     "La sesión operativa cambió antes de aplicar. Actualice e intente de nuevo."
+                )
+            if current.operational_revision != request.expected_operational_revision:
+                raise AdmissionWriteBlocked(
+                    "La revisión operacional cambió antes de aplicar. Actualice e intente de nuevo."
+                )
+            if current.active_user_id != request.current_representative_id:
+                raise AdmissionWriteBlocked(
+                    "El representante cambió antes de aplicar. Actualice e intente de nuevo."
                 )
             if same_user(current, new_user):
                 raise AdmissionWriteBlocked(SAME_USER_HANDOFF_MESSAGE)
@@ -5420,6 +5912,27 @@ class OperationalSessionService:
                 if allocate_central_turn_id
                 else _as_int_or_none(new_turn_id)
             )
+            raced_transition = self._reserve_handoff_transition(
+                con,
+                request=request,
+                username=new_username,
+            )
+            if raced_transition:
+                replay_row = con.execute(
+                    "SELECT * FROM admission_operational_sessions "
+                    "WHERE operational_session_id=%s FOR UPDATE",
+                    (operational_session_id,),
+                ).fetchone()
+                replay_state = self._row_to_session(replay_row)
+                if replay_state is None:
+                    raise AdmissionWriteBlocked(
+                        "HANDOFF_STATE_MISMATCH: no fue posible releer el estado central."
+                    )
+                return self._recover_committed_handoff(
+                    transition_row=raced_transition,
+                    request=request,
+                    current=replay_state,
+                )
             effective_turn_code = str(new_turn_code or current.turn_code or "").strip()
             turn_duration_hours = operational_turn_duration_hours(effective_turn_code)
             if (
@@ -5470,6 +5983,7 @@ class OperationalSessionService:
             )
             new_generation = current.generation + 1
             handoff_details = {
+                "transition_id": transition_uuid,
                 "old_user_id": current.active_user_id,
                 "old_username": current.active_username,
                 "new_user_id": new_user_id,
@@ -5487,7 +6001,6 @@ class OperationalSessionService:
                 device_id=primary_device_id,
                 username=new_username,
                 generation=current.generation,
-                transition_id=transition_uuid,
                 details=handoff_details,
             )
             con.execute(
@@ -5579,6 +6092,29 @@ class OperationalSessionService:
             changed = self._row_to_session(changed_row)
             if changed is None:
                 raise AdmissionWriteBlocked("No fue posible confirmar la transición operativa.")
+            transition_result_details = {
+                "old_turn_id": current.turn_id,
+                "new_turn_id": changed.turn_id,
+                "old_generation": current.generation,
+                "new_generation": changed.generation,
+                "old_operational_revision": current.operational_revision,
+                "new_operational_revision": changed.operational_revision,
+                "old_user_id": current.active_user_id,
+                "new_user_id": changed.active_user_id,
+                "old_username": current.active_username,
+                "new_username": changed.active_username,
+                "old_primary_login_session_id": current.primary_login_session_id,
+                "invalidated_login_session_ids": list(
+                    secondary_logins if invalidate_secondaries else ()
+                ),
+            }
+            self._commit_handoff_transition(
+                con,
+                request=request,
+                result=transition_result_details,
+                username=new_username,
+                generation=changed.generation,
+            )
             self._audit(
                 con,
                 session_id=operational_session_id,
@@ -5586,8 +6122,8 @@ class OperationalSessionService:
                 device_id=primary_device_id,
                 username=new_username,
                 generation=changed.generation,
-                transition_id=transition_uuid,
                 details={
+                    "transition_id": transition_uuid,
                     "old_user_id": current.active_user_id,
                     "old_username": current.active_username,
                     "new_user_id": new_user_id,
@@ -5610,8 +6146,8 @@ class OperationalSessionService:
                 device_id=primary_device_id,
                 username=new_username,
                 generation=changed.generation,
-                transition_id=transition_uuid,
                 details={
+                    "transition_id": transition_uuid,
                     **handoff_details,
                     "operational_revision": changed.operational_revision,
                 },
@@ -5658,7 +6194,6 @@ class OperationalSessionService:
                 device_id=primary_device_id,
                 username=new_username,
                 generation=changed.generation,
-                transition_id=transition_uuid,
                 details=identity_details,
             )
             OPERATIONAL_LOG.info(

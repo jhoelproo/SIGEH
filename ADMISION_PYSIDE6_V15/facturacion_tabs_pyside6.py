@@ -16550,8 +16550,9 @@ class App:
                 raise RuntimeError("La transición central no devolvió un turn_id válido.")
             transition_id = str(getattr(transition, "transition_id", "") or "")
             if not transition_id:
-                import uuid
-                transition_id = str(uuid.uuid4())
+                raise RuntimeError(
+                    "La transición central confirmada no devolvió su transition_id."
+                )
 
             # Desde aquí la operación central está confirmada. Ninguna
             # actualización de Excel/PDF/impresión puede convertirla en FAIL.

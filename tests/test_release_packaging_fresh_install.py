@@ -51,6 +51,23 @@ def test_public_release_cannot_receive_backend_bundle(tmp_path: Path):
         )
 
 
+def test_release_rejects_python_cache_artifacts(tmp_path: Path):
+    dist = _write_distribution(tmp_path / "dist")
+    updater = tmp_path / "updater.exe"
+    updater.write_bytes(b"updater")
+    cache = dist / "_internal" / "module" / "__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "runtime.cpython-314.pyc").write_bytes(b"compiled-cache")
+
+    with pytest.raises(ValueError, match="archivos runtime"):
+        prepare_release(
+            dist,
+            updater,
+            tmp_path / "release",
+            version="1.1.1",
+        )
+
+
 def test_internal_release_injects_bootstrap_only_into_private_archive(tmp_path: Path):
     dist = _write_distribution(tmp_path / "dist")
     updater = tmp_path / "updater.exe"

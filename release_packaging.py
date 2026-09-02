@@ -38,7 +38,8 @@ FORBIDDEN_RELEASE_NAMES = {
     "database_url.bundle",
     "database_url.protected",
 }
-FORBIDDEN_RELEASE_SUFFIXES = (".log", ".tmp")
+FORBIDDEN_RELEASE_SUFFIXES = (".log", ".tmp", ".pyc", ".pyo")
+FORBIDDEN_RELEASE_DIRECTORIES = {"__pycache__"}
 
 
 def validate_no_operational_database(dist_dir: Path) -> None:
@@ -62,6 +63,11 @@ def validate_no_credentials_or_runtime_files(dist_dir: Path) -> None:
         and (
             path.name.casefold() in FORBIDDEN_RELEASE_NAMES
             or path.name.casefold().endswith(FORBIDDEN_RELEASE_SUFFIXES)
+            or any(
+                parent.name.casefold() in FORBIDDEN_RELEASE_DIRECTORIES
+                for parent in path.parents
+                if parent != dist_dir
+            )
         )
     )
     if forbidden:

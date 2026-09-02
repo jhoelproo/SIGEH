@@ -293,6 +293,7 @@ class _HybridAdmissionRuntime:
         self._shutdown_started = False
         self._force_logout_emitted = False
         self._pending_transition_id = ""
+        self._pending_transition_context: dict[str, Any] = {}
         self._last_transition_result = None
         self._pending_sync_count = 0
         self._pending_mirror_state = None
@@ -1273,6 +1274,7 @@ class _HybridAdmissionRuntime:
             ConnectivityState,
             SAME_USER_HANDOFF_MESSAGE,
             TRIGGER_USER_REQUESTED_HANDOFF,
+            canonical_user_id,
             evaluate_admission_access,
             same_user,
         )
@@ -1287,12 +1289,33 @@ class _HybridAdmissionRuntime:
         metadata = dict(shift_metadata or {})
         administrative_override = bool(metadata.get("administrative_override"))
         override_reason = str(metadata.get("override_reason") or "").strip()
-        formal_handover = self.is_primary_shift_handover() and not administrative_override
+        recovering_pending_handoff = bool(
+            getattr(self, "_pending_transition_id", "")
+            and getattr(self, "_pending_transition_context", {})
+        )
+        formal_handover = bool(
+            (
+                self.is_primary_shift_handover()
+                or recovering_pending_handoff
+            )
+            and not administrative_override
+        )
         if not administrative_override and not formal_handover:
             raise AdmissionWriteBlocked(SAME_USER_HANDOFF_MESSAGE)
         if not self._pending_transition_id:
             import uuid
             self._pending_transition_id = str(uuid.uuid4())
+            self._pending_transition_context = {
+                "expected_generation": session.generation,
+                "expected_operational_revision": session.operational_revision,
+                "expected_previous_turn_id": session.turn_id,
+                "expected_operational_source_id": session.operational_source_id,
+                "expected_current_representative_id": session.active_user_id,
+                "actor_user_id": canonical_user_id(self.current_user),
+            }
+        pending_context = dict(
+            getattr(self, "_pending_transition_context", {}) or {}
+        )
 
         if formal_handover:
             self.logger.info(
@@ -1308,7 +1331,33 @@ class _HybridAdmissionRuntime:
                 new_turn_id=turn_id,
                 allocate_central_turn_id=True,
                 new_turn_code=str(metadata.get("turno_codigo") or ""),
-                expected_generation=session.generation,
+                expected_generation=int(
+                    pending_context.get("expected_generation", session.generation)
+                ),
+                expected_operational_revision=int(
+                    pending_context.get(
+                        "expected_operational_revision",
+                        session.operational_revision,
+                    )
+                ),
+                expected_previous_turn_id=pending_context.get(
+                    "expected_previous_turn_id", session.turn_id
+                ),
+                expected_operational_source_id=str(
+                    pending_context.get(
+                        "expected_operational_source_id",
+                        session.operational_source_id,
+                    )
+                ),
+                expected_current_representative_id=str(
+                    pending_context.get(
+                        "expected_current_representative_id",
+                        session.active_user_id,
+                    )
+                ),
+                actor_user_id=pending_context.get(
+                    "actor_user_id", canonical_user_id(self.current_user)
+                ),
                 transition_id=self._pending_transition_id,
                 changed_by=self.username,
                 reason="Relevo formal de turno PRIMARY V15",
@@ -1332,7 +1381,30 @@ class _HybridAdmissionRuntime:
                 new_turn_id=turn_id,
                 allocate_central_turn_id=True,
                 new_turn_code=str(metadata.get("turno_codigo") or ""),
-                expected_generation=session.generation,
+                expected_generation=int(
+                    pending_context.get("expected_generation", session.generation)
+                ),
+                expected_operational_revision=int(
+                    pending_context.get(
+                        "expected_operational_revision",
+                        session.operational_revision,
+                    )
+                ),
+                expected_previous_turn_id=pending_context.get(
+                    "expected_previous_turn_id", session.turn_id
+                ),
+                expected_operational_source_id=str(
+                    pending_context.get(
+                        "expected_operational_source_id",
+                        session.operational_source_id,
+                    )
+                ),
+                expected_current_representative_id=str(
+                    pending_context.get(
+                        "expected_current_representative_id",
+                        session.active_user_id,
+                    )
+                ),
                 transition_id=self._pending_transition_id,
                 reason=(
                     override_reason
@@ -1344,6 +1416,7 @@ class _HybridAdmissionRuntime:
         changed = result.operational_session
         if result.committed:
             self._pending_transition_id = ""
+            self._pending_transition_context = {}
         self._last_transition_result = result
         identity_matches = same_user(changed, self.current_user)
         access = evaluate_admission_access(

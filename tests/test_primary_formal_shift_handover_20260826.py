@@ -130,6 +130,24 @@ def test_turn_button_rejects_live_policy_denial_on_primary():
     assert reason_code == "ROLE_NOT_ALLOWED"
 
 
+def test_turn_double_submit_is_ignored_before_opening_a_second_dialog(monkeypatch):
+    app = object.__new__(App)
+    app._turn_change_in_progress = True
+    app._turn_change_committing = True
+    app.root = object()
+    interactions = []
+    app._dialogo_turno = lambda: interactions.append("dialog")
+    monkeypatch.setattr(
+        "ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6.messagebox.askyesno",
+        lambda *_args, **_kwargs: interactions.append("confirm") or True,
+    )
+
+    result = app.request_change_admission_turn()
+
+    assert result == "break"
+    assert interactions == []
+
+
 def test_turn_guard_allows_handover_even_though_patient_writes_remain_read_only():
     now = datetime.now(timezone.utc)
     session = OperationalSession(
@@ -252,12 +270,32 @@ class _HandoverDatabase:
         sql = " ".join(str(query).split())
         upper = sql.upper()
         params = tuple(params or ())
+        if upper.startswith(("SAVEPOINT ", "ROLLBACK TO SAVEPOINT ", "RELEASE SAVEPOINT ")):
+            return _Result(rowcount=0)
         if "PG_ADVISORY_XACT_LOCK" in upper:
             return _Result((True,))
         if "TO_REGCLASS('PUBLIC.ACTIVE_SESSIONS')" in upper:
             return _Result(("active_sessions",))
-        if "SELECT OPERATIONAL_SESSION_ID,DETAILS_JSON" in upper:
-            return _Result(None)
+        if (
+            "SELECT OPERATIONAL_SESSION_ID,DETAILS_JSON" in upper
+            or "SELECT OPERATIONAL_SESSION_ID,EVENT_TYPE,DETAILS_JSON" in upper
+        ):
+            transition_id = str(params[0])
+            match = next(
+                (
+                    item for item in self.audit
+                    if item.get("transition_id") == transition_id
+                ),
+                None,
+            )
+            return _Result(
+                {
+                    "operational_session_id": "op-1",
+                    "event_type": match["event"],
+                    "details_json": match["details"],
+                }
+                if match else None
+            )
         if upper.startswith("SELECT * FROM ADMISSION_OPERATIONAL_SESSIONS"):
             return _Result(deepcopy(self.session))
         if "SELECT STATION_ROLE,LOGIN_SESSION_ID" in upper:
@@ -326,7 +364,27 @@ class _HandoverDatabase:
                     self.active_sessions[str(session_id)]["is_active"] = False
             return _Result(rowcount=len(session_ids))
         if upper.startswith("INSERT INTO ADMISSION_OPERATIONAL_AUDIT"):
-            self.audit.append({"event": params[1], "details": params[5]})
+            self.audit.append(
+                {
+                    "event": params[1],
+                    "details": params[5],
+                    "transition_id": str(params[6]) if params[6] else None,
+                }
+            )
+            return _Result(rowcount=1)
+        if upper.startswith("UPDATE ADMISSION_OPERATIONAL_AUDIT SET USERNAME"):
+            _username, _generation, details, transition_id, event_type = params
+            match = next(
+                (
+                    item for item in self.audit
+                    if item.get("transition_id") == str(transition_id)
+                    and item.get("event") == str(event_type)
+                ),
+                None,
+            )
+            if not match:
+                return _Result(rowcount=0)
+            match["details"] = details
             return _Result(rowcount=1)
         raise AssertionError(f"SQL no simulado: {sql} | {params}")
 
@@ -438,6 +496,33 @@ class _RuntimeTransitionService:
         )
 
 
+class _PostCommitResponseLossService(_RuntimeTransitionService):
+    def __init__(self, changed_session):
+        super().__init__(changed_session)
+        self.response_lost = True
+
+    def transition_primary_user(self, **kwargs):
+        self.handover_calls.append(kwargs)
+        if self.response_lost:
+            self.response_lost = False
+            raise TimeoutError("respuesta perdida después del commit")
+        return PrimaryTransitionResult(
+            operational_session=self.changed_session,
+            transition_id=kwargs["transition_id"],
+            committed=True,
+            old_turn_id=500,
+            new_turn_id=501,
+            old_generation=7,
+            new_generation=8,
+            old_user_id="10",
+            new_user_id="11",
+            old_username="aux_anterior",
+            new_username="aux_nuevo",
+            idempotent_replay=True,
+            recovered_after_commit=True,
+        )
+
+
 def _runtime_for_handover():
     now = datetime.now(timezone.utc)
     current = OperationalSession(
@@ -526,12 +611,66 @@ def test_adapter_routes_normal_different_user_turn_to_atomic_handover():
     assert call["allocate_central_turn_id"] is True
     assert call["invalidate_only_previous_user_secondaries"] is True
     assert call["new_user"]["username"] == "aux_nuevo"
+    assert call["expected_previous_turn_id"] == 500
+    assert call["expected_generation"] == 7
+    assert call["expected_operational_revision"] == 7
+    assert call["expected_operational_source_id"] == "source-1"
+    assert call["expected_current_representative_id"] == "10"
+    assert call["actor_user_id"] == "11"
+    assert runtime._pending_transition_id == ""
+    assert runtime._pending_transition_context == {}
     committed_state = runtime.applied_states[-1]
     assert committed_state.turn_id == 501
     assert committed_state.user_matches_operational is True
     assert committed_state.write_allowed is True
     assert committed_state.can_change_turn is True
     assert committed_state.can_generate_attention is True
+
+
+def test_adapter_retries_post_commit_loss_with_the_exact_original_contract():
+    runtime = _runtime_for_handover()
+    recovery_service = _PostCommitResponseLossService(
+        runtime.session_service.changed_session
+    )
+    runtime.session_service = recovery_service
+
+    with pytest.raises(TimeoutError, match="respuesta perdida"):
+        runtime.perform_explicit_turn_handoff(
+            shift_metadata={"turno_codigo": "8PM_8AM"}
+        )
+    pending_id = runtime._pending_transition_id
+    original_contract = dict(runtime._pending_transition_context)
+
+    changed = recovery_service.changed_session
+    runtime.attachment = DeviceAttachment(
+        changed,
+        StationRole.PRIMARY,
+        True,
+        "Estado central ya confirmado",
+    )
+    runtime._operational_state = replace(
+        runtime._operational_state,
+        active_user_id=changed.active_user_id,
+        active_username=changed.active_username,
+        turn_id=changed.turn_id,
+        generation=changed.generation,
+        operational_revision=changed.operational_revision,
+        user_matches_operational=True,
+        write_allowed=True,
+    )
+
+    recovered = runtime.perform_explicit_turn_handoff(
+        shift_metadata={"turno_codigo": "8PM_8AM"}
+    )
+
+    assert recovered.idempotent_replay is True
+    assert len(recovery_service.handover_calls) == 2
+    first, second = recovery_service.handover_calls
+    assert first["transition_id"] == pending_id == second["transition_id"]
+    for field, value in original_contract.items():
+        assert second[field] == value
+    assert runtime._pending_transition_id == ""
+    assert runtime._pending_transition_context == {}
 
 
 def test_administrative_schedule_override_stays_turn_only_and_keeps_rep_flow_separate():

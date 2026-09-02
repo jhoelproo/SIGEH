@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import json
+from threading import RLock
 
 import pytest
 
@@ -29,6 +32,20 @@ class _Result:
         return list(self._rows)
 
 
+class _TransitionUniqueViolation(RuntimeError):
+    pgcode = "23505"
+
+    class diag:
+        constraint_name = "uq_admission_operational_transition"
+
+
+class _OtherUniqueViolation(RuntimeError):
+    pgcode = "23505"
+
+    class diag:
+        constraint_name = "unrelated_unique_constraint"
+
+
 class _OperationalDB:
     def __init__(self):
         self.source_id = "11111111-1111-4111-8111-111111111111"
@@ -38,17 +55,29 @@ class _OperationalDB:
         self.active_session_users = {}
         self.logout_reasons = {}
         self.audit = []
+        self.handoff_mutation_count = 0
+        self.enforce_transition_unique = False
+        self.hide_transition_lookup_once = False
+        self.session_on_unique_violation = None
+        self.audit_insert_error = None
+        self.force_transition_unique_without_row = False
+        self.audit_update_rowcount = 1
+        self._transaction_lock = RLock()
 
     def __enter__(self):
+        self._transaction_lock.acquire()
         return self
 
     def __exit__(self, exc_type, _exc, _tb):
+        self._transaction_lock.release()
         return False
 
     def execute(self, query, params=()):
         sql = " ".join(str(query).split())
         upper = sql.upper()
         params = tuple(params or ())
+        if upper.startswith(("SAVEPOINT ", "ROLLBACK TO SAVEPOINT ", "RELEASE SAVEPOINT ")):
+            return _Result(rowcount=0)
         if "PG_ADVISORY_XACT_LOCK" in upper:
             return _Result((True,))
         if "TO_REGCLASS('PUBLIC.ACTIVE_SESSIONS')" in upper:
@@ -83,8 +112,14 @@ class _OperationalDB:
                 "turn_ends_at": (started + timedelta(hours=12)).isoformat(),
             }
             return _Result(rowcount=1)
-        if "SELECT OPERATIONAL_SESSION_ID,DETAILS_JSON FROM ADMISSION_OPERATIONAL_AUDIT" in upper:
+        if (
+            "SELECT OPERATIONAL_SESSION_ID,DETAILS_JSON FROM ADMISSION_OPERATIONAL_AUDIT" in upper
+            or "SELECT OPERATIONAL_SESSION_ID,EVENT_TYPE,DETAILS_JSON FROM ADMISSION_OPERATIONAL_AUDIT" in upper
+        ):
             transition_id = str(params[0])
+            if self.hide_transition_lookup_once:
+                self.hide_transition_lookup_once = False
+                return _Result(None)
             match = next(
                 (item for item in self.audit if item.get("transition_id") == transition_id),
                 None,
@@ -92,6 +127,7 @@ class _OperationalDB:
             return _Result(
                 {
                     "operational_session_id": match["session_id"],
+                    "event_type": match["event"],
                     "details_json": match["details"],
                 }
                 if match else None
@@ -239,6 +275,21 @@ class _OperationalDB:
             return _Result(rowcount=1)
         if upper.startswith("INSERT INTO ADMISSION_OPERATIONAL_AUDIT"):
             sid, event, device, username, generation, details, transition_id = params
+            if self.audit_insert_error is not None:
+                raise self.audit_insert_error
+            if self.force_transition_unique_without_row and transition_id:
+                raise _TransitionUniqueViolation("duplicate transition id without visible row")
+            if (
+                self.enforce_transition_unique
+                and transition_id
+                and any(
+                    item.get("transition_id") == str(transition_id)
+                    for item in self.audit
+                )
+            ):
+                if self.session_on_unique_violation is not None:
+                    self.session = deepcopy(self.session_on_unique_violation)
+                raise _TransitionUniqueViolation("duplicate transition id")
             self.audit.append({
                 "session_id": str(sid), "event": str(event),
                 "device_id": str(device), "username": str(username),
@@ -256,6 +307,12 @@ class _OperationalDB:
         if "SELECT STATION_ROLE,LOGIN_SESSION_ID" in upper:
             row = self.devices.get(str(params[1]))
             return _Result(deepcopy(row) if row and row.get("detached_at") is None else None)
+        if "SELECT STATION_ROLE FROM ADMISSION_OPERATIONAL_DEVICES" in upper:
+            row = self.devices.get(str(params[1]))
+            return _Result(
+                (row.get("station_role"),)
+                if row and row.get("detached_at") is None else None
+            )
         if "SELECT DEVICE_ID,LOGIN_SESSION_ID FROM ADMISSION_OPERATIONAL_DEVICES" in upper:
             sid, primary = map(str, params)
             rows = [
@@ -389,7 +446,47 @@ class _OperationalDB:
                 "turn_id": turn_id,
                 "turn_code": str(turn_code),
                 "generation": int(generation),
+                "operational_revision": int(self.session["operational_revision"]) + 1,
             })
+            self.handoff_mutation_count += 1
+            return _Result(rowcount=1)
+        if upper.startswith("UPDATE ADMISSION_OPERATIONAL_SESSIONS SET TURN_ID"):
+            (
+                turn_id,
+                turn_code,
+                generation,
+                _duration_hours,
+                _changed_by,
+                _reason,
+                _sid,
+            ) = params
+            self.session.update(
+                turn_id=int(turn_id),
+                turn_code=str(turn_code),
+                generation=int(generation),
+                operational_revision=int(self.session["operational_revision"]) + 1,
+            )
+            self.handoff_mutation_count += 1
+            return _Result(rowcount=1)
+        if upper.startswith("UPDATE ADMISSION_OPERATIONAL_AUDIT SET USERNAME"):
+            username, generation, details, transition_id, event_type = params
+            match = next(
+                (
+                    item for item in self.audit
+                    if item.get("transition_id") == str(transition_id)
+                    and item.get("event") == str(event_type)
+                ),
+                None,
+            )
+            if not match:
+                return _Result(rowcount=0)
+            if self.audit_update_rowcount != 1:
+                return _Result(rowcount=self.audit_update_rowcount)
+            match.update(
+                username=str(username),
+                generation=int(generation),
+                details=details,
+            )
             return _Result(rowcount=1)
         if upper.startswith("UPDATE ADMISSION_OPERATIONAL_DEVICES SET STATION_ROLE='PRIMARY'"):
             login_id, _sid, device_id = params
@@ -792,12 +889,408 @@ def test_primary_transition_invalidates_exact_secondaries_and_is_idempotent():
         operational_session_id=primary.operational_session.operational_session_id,
         primary_device_id="PC-1",new_login_session_id="P-NEW",
         new_user={"id": 8,"username": "usuario_b","role": "administrador"},new_turn_id=20,
-        expected_generation=2,transition_id="22222222-2222-4222-8222-222222222222",
+        expected_generation=1,
+        expected_operational_revision=1,
+        expected_previous_turn_id=10,
+        expected_operational_source_id=primary.operational_session.operational_source_id,
+        expected_current_representative_id="7",
+        actor_user_id="8",
+        transition_id="22222222-2222-4222-8222-222222222222",
     )
     assert duplicate.operational_session.generation == 2
     assert duplicate.committed is True
     assert duplicate.new_generation == 2
     assert duplicate.new_turn_id == 20
+
+
+HANDOFF_TRANSITION_ID = "22222222-2222-4222-8222-222222222223"
+
+
+def _strict_handoff_request(
+    service,
+    primary,
+    *,
+    transition_id=HANDOFF_TRANSITION_ID,
+    new_user=None,
+    new_login_session_id="P-NEW",
+    new_turn_id=20,
+    previous_turn_id=10,
+    previous_generation=1,
+    previous_revision=1,
+    current_representative_id="7",
+    actor_user_id="8",
+    expected_operational_source_id=None,
+):
+    target = new_user or {
+        "id": 8,
+        "username": "usuario_b",
+        "full_name": "USUARIO B",
+        "role": "administrador",
+    }
+    return service.transition_primary_user(
+        operational_session_id=primary.operational_session.operational_session_id,
+        primary_device_id="PC-1",
+        new_login_session_id=new_login_session_id,
+        new_user=target,
+        new_turn_id=new_turn_id,
+        expected_generation=previous_generation,
+        expected_operational_revision=previous_revision,
+        expected_previous_turn_id=previous_turn_id,
+        expected_operational_source_id=(
+            expected_operational_source_id
+            or primary.operational_session.operational_source_id
+        ),
+        expected_current_representative_id=current_representative_id,
+        actor_user_id=actor_user_id,
+        transition_id=transition_id,
+    )
+
+
+def _strict_handoff_fixture():
+    database, service = _service()
+    primary = _configured_primary(
+        database,
+        service,
+        username="admin",
+        user_id=7,
+        device_id="PC-1",
+        login_session_id="P-OLD",
+        turn_id=10,
+        login_role="administrador",
+    )
+    database.active_sessions.update({"P-OLD": True, "P-NEW": True})
+    return database, service, primary
+
+
+def _canonical_transition_rows(database, transition_id=HANDOFF_TRANSITION_ID):
+    return [
+        row for row in database.audit
+        if row.get("transition_id") == transition_id
+    ]
+
+
+def test_handoff_contract_a_normal_creates_one_transition_and_one_turn():
+    database, service, primary = _strict_handoff_fixture()
+
+    result = _strict_handoff_request(service, primary)
+
+    assert result.committed is True
+    assert result.idempotent_replay is False
+    assert database.handoff_mutation_count == 1
+    assert len(_canonical_transition_rows(database)) == 1
+
+
+def test_handoff_contract_b_same_request_same_id_is_idempotent_success():
+    database, service, primary = _strict_handoff_fixture()
+    first = _strict_handoff_request(service, primary)
+
+    replay = _strict_handoff_request(service, primary)
+
+    assert replay.committed is True
+    assert replay.idempotent_replay is True
+    assert replay.new_turn_id == first.new_turn_id
+    assert replay.new_generation == first.new_generation
+    assert database.handoff_mutation_count == 1
+    assert len(_canonical_transition_rows(database)) == 1
+
+
+def test_handoff_contract_c_same_id_different_request_is_hard_collision():
+    database, service, primary = _strict_handoff_fixture()
+    first = _strict_handoff_request(service, primary)
+
+    with pytest.raises(AdmissionWriteBlocked, match="TRANSITION_ID_COLLISION"):
+        _strict_handoff_request(
+            service,
+            primary,
+            new_user={
+                "id": 9,
+                "username": "usuario_c",
+                "full_name": "USUARIO C",
+                "role": "administrador",
+            },
+            new_login_session_id="P-C",
+            new_turn_id=30,
+            previous_turn_id=first.new_turn_id,
+            previous_generation=first.new_generation,
+            previous_revision=first.operational_session.operational_revision,
+            current_representative_id="8",
+            actor_user_id="9",
+        )
+
+    assert database.handoff_mutation_count == 1
+    assert len(_canonical_transition_rows(database)) == 1
+    assert database.session["turn_id"] == 20
+    assert database.session["active_user_id"] == "8"
+
+
+def test_handoff_contract_d_post_commit_response_loss_adopts_committed_result():
+    database, service, primary = _strict_handoff_fixture()
+    committed_but_response_lost = _strict_handoff_request(service, primary)
+    assert committed_but_response_lost.committed is True
+
+    recovered = _strict_handoff_request(service, primary)
+
+    assert recovered.idempotent_replay is True
+    assert recovered.recovered_after_commit is True
+    assert recovered.operational_session.turn_id == 20
+    assert recovered.operational_session.active_user_id == "8"
+    assert database.handoff_mutation_count == 1
+    assert len(_canonical_transition_rows(database)) == 1
+
+
+def test_handoff_contract_e_concurrent_same_request_has_one_effective_transition():
+    database, service, primary = _strict_handoff_fixture()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _index: _strict_handoff_request(service, primary),
+                range(2),
+            )
+        )
+
+    assert sum(result.idempotent_replay for result in results) == 1
+    assert database.handoff_mutation_count == 1
+    assert len(_canonical_transition_rows(database)) == 1
+
+
+def test_handoff_contract_f_new_operation_uses_new_id_and_creates_one_new_turn():
+    database, service, primary = _strict_handoff_fixture()
+    first = _strict_handoff_request(service, primary)
+    database.active_sessions["P-C"] = True
+
+    second = _strict_handoff_request(
+        service,
+        primary,
+        transition_id="33333333-3333-4333-8333-333333333334",
+        new_user={
+            "id": 9,
+            "username": "usuario_c",
+            "full_name": "USUARIO C",
+            "role": "administrador",
+        },
+        new_login_session_id="P-C",
+        new_turn_id=30,
+        previous_turn_id=first.new_turn_id,
+        previous_generation=first.new_generation,
+        previous_revision=first.operational_session.operational_revision,
+        current_representative_id="8",
+        actor_user_id="9",
+    )
+
+    assert second.transition_id != first.transition_id
+    assert second.new_turn_id == 30
+    assert database.handoff_mutation_count == 2
+    assert len(
+        [row for row in database.audit if row.get("transition_id")]
+    ) == 2
+
+
+def test_unique_violation_reloads_exact_transition_and_never_generates_new_id():
+    database, service, primary = _strict_handoff_fixture()
+    database.enforce_transition_unique = True
+    original_state = deepcopy(database.session)
+    first = _strict_handoff_request(service, primary)
+    committed_state = deepcopy(database.session)
+    database.session = original_state
+    database.session_on_unique_violation = committed_state
+    database.hide_transition_lookup_once = True
+
+    recovered = _strict_handoff_request(service, primary)
+
+    assert recovered.transition_id == first.transition_id
+    assert recovered.idempotent_replay is True
+    assert database.handoff_mutation_count == 1
+    assert len(_canonical_transition_rows(database)) == 1
+
+
+def test_transition_contract_parsers_and_unique_classifier_cover_invalid_inputs():
+    _database, service = _service()
+    assert service._decode_audit_details({"status": "COMMITTED"}) == {
+        "status": "COMMITTED"
+    }
+    assert service._decode_audit_details("not-json") == {}
+    assert service._decode_audit_details(42) == {}
+    wrapper = RuntimeError("wrapper")
+    wrapper.__cause__ = _TransitionUniqueViolation("duplicate")
+    assert service._is_transition_unique_violation(wrapper) is True
+    assert service._is_transition_unique_violation(_OtherUniqueViolation()) is False
+    assert service._is_transition_unique_violation(RuntimeError("other")) is False
+
+
+def test_non_unique_reservation_error_is_never_reclassified_as_idempotent():
+    database, service, primary = _strict_handoff_fixture()
+    database.audit_insert_error = RuntimeError("storage failed")
+
+    with pytest.raises(RuntimeError, match="storage failed"):
+        _strict_handoff_request(service, primary)
+
+    assert database.handoff_mutation_count == 0
+    assert _canonical_transition_rows(database) == []
+
+
+def test_unique_violation_without_loadable_transition_is_hard_failure():
+    database, service, primary = _strict_handoff_fixture()
+    database.force_transition_unique_without_row = True
+
+    with pytest.raises(AdmissionWriteBlocked, match="STATE_MISMATCH"):
+        _strict_handoff_request(service, primary)
+
+    assert database.handoff_mutation_count == 0
+
+
+def test_legacy_transition_row_is_not_accepted_as_an_idempotent_replay():
+    database, service, primary = _strict_handoff_fixture()
+    database.audit.append(
+        {
+            "session_id": primary.operational_session.operational_session_id,
+            "event": "PRIMARY_USER_TRANSITION",
+            "device_id": "PC-1",
+            "username": "usuario_b",
+            "generation": 2,
+            "details": json.dumps({"old_turn_id": 10, "new_turn_id": 20}),
+            "transition_id": HANDOFF_TRANSITION_ID,
+        }
+    )
+
+    with pytest.raises(AdmissionWriteBlocked, match="TRANSITION_ID_COLLISION"):
+        _strict_handoff_request(service, primary)
+
+    assert database.handoff_mutation_count == 0
+
+
+def test_requested_but_uncommitted_transition_is_not_reported_as_success():
+    database, service, primary = _strict_handoff_fixture()
+    _strict_handoff_request(service, primary)
+    canonical = _canonical_transition_rows(database)[0]
+    payload = json.loads(canonical["details"])
+    payload["status"] = "REQUESTED"
+    canonical["details"] = json.dumps(payload)
+
+    with pytest.raises(AdmissionWriteBlocked, match="NOT_COMMITTED"):
+        _strict_handoff_request(service, primary)
+
+    assert database.handoff_mutation_count == 1
+
+
+def test_replay_rejects_committed_payload_whose_central_state_does_not_match():
+    database, service, primary = _strict_handoff_fixture()
+    _strict_handoff_request(service, primary)
+    canonical = _canonical_transition_rows(database)[0]
+    payload = json.loads(canonical["details"])
+    payload["result"] = []
+    canonical["details"] = json.dumps(payload)
+
+    with pytest.raises(AdmissionWriteBlocked, match="HANDOFF_STATE_MISMATCH"):
+        _strict_handoff_request(service, primary)
+
+    assert database.handoff_mutation_count == 1
+
+
+def test_transition_fails_when_idempotency_ledger_cannot_be_committed():
+    database, service, primary = _strict_handoff_fixture()
+    database.audit_update_rowcount = 0
+
+    with pytest.raises(AdmissionWriteBlocked, match="ledger idempotente"):
+        _strict_handoff_request(service, primary)
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_message"),
+    [
+        ({"expected_operational_source_id": "other-source"}, "identidad operacional"),
+        ({"previous_turn_id": 99}, "turno cambió"),
+        ({"previous_generation": 99}, "sesión operativa cambió"),
+        ({"previous_revision": 99}, "revisión operacional"),
+        ({"current_representative_id": "99"}, "representante cambió"),
+    ],
+)
+def test_normal_handoff_rejects_each_stale_semantic_precondition(
+    override,
+    expected_message,
+):
+    database, service, primary = _strict_handoff_fixture()
+
+    with pytest.raises(AdmissionWriteBlocked, match=expected_message):
+        _strict_handoff_request(service, primary, **override)
+
+    assert database.handoff_mutation_count == 0
+
+
+def _admin_turn_override(service, primary, **override):
+    values = {
+        "actor_user": {"id": 7, "username": "admin", "role": "administrador"},
+        "operational_session_id": primary.operational_session.operational_session_id,
+        "primary_device_id": "PC-1",
+        "new_turn_id": 20,
+        "expected_generation": 1,
+        "expected_operational_revision": 1,
+        "expected_previous_turn_id": 10,
+        "expected_operational_source_id": primary.operational_session.operational_source_id,
+        "expected_current_representative_id": "7",
+        "transition_id": "99999999-9999-4999-8999-999999999999",
+        "administrative_override": True,
+    }
+    values.update(override)
+    return service.admin_set_admission_turn(**values)
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_message"),
+    [
+        ({"expected_operational_source_id": "other-source"}, "identidad operacional"),
+        ({"expected_previous_turn_id": 99}, "turno cambió"),
+        ({"expected_generation": 99}, "sesión operativa cambió"),
+        ({"expected_operational_revision": 99}, "revisión operacional"),
+        ({"expected_current_representative_id": "99"}, "representante cambió"),
+    ],
+)
+def test_admin_turn_override_rejects_each_stale_semantic_precondition(
+    override,
+    expected_message,
+):
+    database, service, primary = _strict_handoff_fixture()
+
+    with pytest.raises(AdmissionWriteBlocked, match=expected_message):
+        _admin_turn_override(service, primary, **override)
+
+    assert database.handoff_mutation_count == 0
+
+
+def test_admin_same_turn_override_is_a_noop_without_transition_reservation():
+    database, service, primary = _strict_handoff_fixture()
+
+    result = _admin_turn_override(service, primary, new_turn_id=10)
+
+    assert result.new_turn_id == 10
+    assert result.new_generation == 1
+    assert database.handoff_mutation_count == 0
+    assert _canonical_transition_rows(
+        database,
+        "99999999-9999-4999-8999-999999999999",
+    ) == []
+
+
+def test_admin_turn_override_commits_once_and_replays_idempotently():
+    database, service, primary = _strict_handoff_fixture()
+
+    first = _admin_turn_override(service, primary)
+    replay = _admin_turn_override(service, primary)
+
+    assert first.committed is True
+    assert first.new_turn_id == 20
+    assert first.new_generation == 2
+    assert replay.committed is True
+    assert replay.idempotent_replay is True
+    assert replay.new_turn_id == first.new_turn_id
+    assert replay.new_generation == first.new_generation
+    assert database.handoff_mutation_count == 1
+    assert len(
+        _canonical_transition_rows(
+            database,
+            "99999999-9999-4999-8999-999999999999",
+        )
+    ) == 1
 
 
 def test_same_user_handoff_is_rejected_and_keeps_turn_generation_and_secondary():

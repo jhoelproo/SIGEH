@@ -347,7 +347,13 @@ main_analysis = Analysis(
 main_analysis.datas = [
     entry
     for entry in main_analysis.datas
-    if not str(entry[0]).casefold().endswith(".log")
+    if not (
+        str(entry[0]).casefold().endswith((".log", ".pyc", ".pyo"))
+        or any(
+            part.casefold() == "__pycache__"
+            for part in Path(str(entry[0])).parts
+        )
+    )
 ]
 main_pyz = PYZ(main_analysis.pure)
 main_exe = EXE(
