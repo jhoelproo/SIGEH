@@ -285,6 +285,19 @@ def test_health_result_wait_rejects_missing_or_incomplete_json(tmp_path):
     assert updater._read_health_result_when_ready(result_path, timeout=0) is None
 
 
+def test_health_check_rejects_missing_packaged_result(tmp_path, monkeypatch):
+    install = tmp_path / "SIGEH"
+    _write_payload(install)
+    monkeypatch.setattr(
+        updater.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(updater, "_read_health_result_when_ready", lambda _path: None)
+
+    assert not updater.health_check_install(install)
+
+
 def test_health_check_rejects_incomplete_and_nontransient_install(
     tmp_path, monkeypatch
 ):
