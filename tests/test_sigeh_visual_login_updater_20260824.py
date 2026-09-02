@@ -257,6 +257,34 @@ def test_health_check_retries_only_transient_sqlite_cleanup(tmp_path, monkeypatc
     assert len([item for item in calls if item[0].endswith("CALCULOS_QT.exe")]) == 2
 
 
+def test_health_check_waits_for_delayed_pyinstaller_gui_result(tmp_path, monkeypatch):
+    install = tmp_path / "SIGEH"
+    _write_payload(install)
+    delayed_result = None
+
+    def fake_run(command, **_kwargs):
+        nonlocal delayed_result
+        if command[0].endswith("SIGEH.exe"):
+            return SimpleNamespace(returncode=0)
+        delayed_result = Path(command[-1])
+        return SimpleNamespace(returncode=0)
+
+    def finish_delayed_result(_seconds):
+        delayed_result.write_text(json.dumps({"status": "PASS"}), encoding="utf-8")
+
+    monkeypatch.setattr(updater.subprocess, "run", fake_run)
+    monkeypatch.setattr(updater.time, "sleep", finish_delayed_result)
+
+    assert updater.health_check_install(install)
+
+
+def test_health_result_wait_rejects_missing_or_incomplete_json(tmp_path):
+    result_path = tmp_path / "v15.json"
+    assert updater._read_health_result_when_ready(result_path, timeout=0) is None
+    result_path.write_text("{", encoding="utf-8")
+    assert updater._read_health_result_when_ready(result_path, timeout=0) is None
+
+
 def test_health_check_rejects_incomplete_and_nontransient_install(
     tmp_path, monkeypatch
 ):

@@ -17,6 +17,8 @@ from pathlib import Path
 from sigeh_product import PRODUCT_ID
 
 WAIT_SECONDS = 60
+HEALTH_RESULT_WAIT_SECONDS = 3.0
+HEALTH_RESULT_POLL_SECONDS = 0.05
 PRESERVE_NAMES = ("recibos", "reportes", "respaldos")
 PRESERVE_FILES = ("lanzador_log.txt", "pdf_performance.log")
 PRESERVE_RELATIVE_DIRECTORIES = (Path("_internal") / "data",)
@@ -148,6 +150,26 @@ def update_storage_root() -> Path:
     return base / PRODUCT_ID / "updates"
 
 
+def _read_health_result_when_ready(
+    result_path: Path,
+    *,
+    timeout: float = HEALTH_RESULT_WAIT_SECONDS,
+) -> dict | None:
+    """Wait briefly for the PyInstaller GUI child to finish its result file."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            if result_path.is_file():
+                return json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            # A GUI child may still be flushing the file after its bootstrap exits.
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(HEALTH_RESULT_POLL_SECONDS, remaining))
+
+
 def health_check_install(install_dir: Path) -> bool:
     """Verify the new launcher and the packaged Admisión bootstrap without login."""
     launcher = install_dir / "SIGEH.exe"
@@ -180,9 +202,9 @@ def health_check_install(install_dir: Path) -> bool:
                     check=False,
                     creationflags=flags,
                 )
-                if not result_path.is_file():
+                payload = _read_health_result_when_ready(result_path)
+                if payload is None:
                     return False
-                payload = json.loads(result_path.read_text(encoding="utf-8"))
                 if (
                     main_result.returncode == 0
                     and str(payload.get("status") or "").upper() == "PASS"
