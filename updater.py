@@ -17,7 +17,7 @@ from pathlib import Path
 from sigeh_product import PRODUCT_ID
 
 WAIT_SECONDS = 60
-HEALTH_RESULT_WAIT_SECONDS = 3.0
+HEALTH_RESULT_WAIT_SECONDS = 15.0
 HEALTH_RESULT_POLL_SECONDS = 0.05
 PRESERVE_NAMES = ("recibos", "reportes", "respaldos")
 PRESERVE_FILES = ("lanzador_log.txt", "pdf_performance.log")

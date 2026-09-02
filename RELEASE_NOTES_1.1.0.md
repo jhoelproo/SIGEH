@@ -1,4 +1,4 @@
-# SIGEH v1.1.0 — candidato de producción
+# SIGEH v1.1.0 — actualización oficial
 
 ## Edición de pacientes
 
@@ -71,6 +71,9 @@
 - La actualización conserva la réplica SQLite, pacientes, atenciones, outbox,
   turno vigente, representante, PRIMARY, configuración protegida y documentos
   locales.
+- El actualizador espera de forma acotada el resultado del health check del
+  ejecutable GUI empaquetado, evitando un rollback falso en equipos donde el
+  proceso hijo tarda algunos segundos en completar la validación.
 - No ejecuta reset de Admisión, baseline, SEED, MERGE ni cambio/cierre de turno.
 - No migra a otro proyecto Supabase y no contiene credenciales en el ZIP
   público.
