@@ -69,6 +69,7 @@ from emergency_core.io_utils import ConfigError, atomic_write_json, load_json_fi
 from emergency_core.paths import data_root, harden_windows_acl, migrate_legacy_files
 from emergency_core.security import AdminSecurity, SecurityError
 from emergency_core.session_context import (
+    CAP_EDIT_PATIENT,
     CAP_EDIT_RECORDS,
     CAP_INTERNAL_CONFIG,
     CAP_OPEN_EXCEL,
@@ -3038,16 +3039,23 @@ class DatabaseManager:
             patient = conn.execute("SELECT * FROM pacientes WHERE id=?", (patient_id,)).fetchone()
             if not patient:
                 return None
+            patient_master = dict(patient)
             if attention is None:
                 attention = conn.execute(
                     "SELECT * FROM atenciones WHERE paciente_id=? ORDER BY id DESC LIMIT 1",
                     (patient_id,),
                 ).fetchone()
-            data = dict(patient)
+            data = dict(patient_master)
             data["paciente_id"] = patient_id
             if attention:
                 data.update(dict(attention))
                 data["paciente_id"] = patient_id
+                for field in (
+                    "nombre", "cedula", "telefono", "direccion", "nacionalidad",
+                    "ars", "nss", "nss_clean", "cedula_clean", "telefono_clean",
+                    "global_patient_id", "server_revision",
+                ):
+                    data[field] = patient_master.get(field)
             return data
 
     def _resolver_paciente_para_eliminacion(self, conn, paciente_id: int):
@@ -3266,136 +3274,169 @@ class DatabaseManager:
         )
         return resumen
 
+    @staticmethod
+    def _patient_master_update_values(nuevos):
+        cedula = (nuevos.get("Cédula") or "").strip().replace("-", "")
+        telefono = (nuevos.get("Teléfono") or "").strip().replace("-", "")
+        nss = (nuevos.get("NSS") or "").strip().upper()
+        return {
+            "nombre": (nuevos.get("Nombre") or "").strip(),
+            "cedula": re.sub(r"\D", "", cedula),
+            "telefono": telefono if telefono.isdigit() and len(telefono) == 10 else None,
+            "telefono_clean": re.sub(r"\D", "", telefono) or None,
+            "direccion": (nuevos.get("Dirección") or "").strip(),
+            "nacionalidad": (nuevos.get("Nacionalidad") or "").strip(),
+            "nss": re.sub(r"\D", "", nss),
+            "ars": normalizar_seguro(nuevos.get("Aseguradora (ARS)", ""), nss),
+        }
+
+    @staticmethod
+    def _patient_edit_identifiers(values):
+        identifiers = []
+        if is_valid_nss_key(values["nss"]):
+            identifiers.append(("NSS", values["nss"]))
+        if is_valid_cedula_key(values["cedula"]):
+            identifiers.append(("CEDULA", values["cedula"]))
+        return identifiers
+
+    @staticmethod
+    def _resolve_patient_edit_target(cur, ident):
+        if ident.startswith("P:") and ident[2:].isdigit():
+            return int(ident[2:]), None
+        if ident.startswith("A:") and ident[2:].isdigit():
+            attention = cur.execute(
+                "SELECT * FROM atenciones WHERE id=? LIMIT 1",
+                (int(ident[2:]),),
+            ).fetchone()
+            patient_id = int(attention["paciente_id"]) if attention else None
+            return patient_id, attention
+        patient_row = cur.execute(
+            "SELECT paciente_id FROM paciente_identificadores "
+            "WHERE valor_normalizado=? AND activo=1 "
+            "ORDER BY conflicto,id DESC LIMIT 1",
+            (re.sub(r"\D", "", ident),),
+        ).fetchone()
+        return (int(patient_row[0]) if patient_row else None), None
+
+    @staticmethod
+    def _validate_patient_edit_identifiers(cur, patient_id, identifiers):
+        for kind, value in identifiers:
+            conflict = cur.execute(
+                "SELECT paciente_id FROM paciente_identificadores "
+                "WHERE tipo=? AND valor_normalizado=? AND activo=1 AND paciente_id<>? LIMIT 1",
+                (kind, value, patient_id),
+            ).fetchone()
+            if conflict:
+                raise ValueError(f"El {kind} indicado ya está asignado a otra ficha.")
+
+    @staticmethod
+    def _update_patient_master_conn(cur, patient_id, values, identifiers):
+        valid_nss = values["nss"] if is_valid_nss_key(values["nss"]) else None
+        valid_cedula = values["cedula"] if is_valid_cedula_key(values["cedula"]) else None
+        cur.execute(
+            """
+            UPDATE pacientes SET
+                cedula=?, nombre=?, telefono=?, direccion=?, nacionalidad=?, ars=?, nss=?,
+                nss_clean=?, cedula_clean=?, telefono_clean=?, provisional=?,
+                updated_at=datetime('now','localtime')
+            WHERE id=?
+            """,
+            (
+                valid_cedula,
+                values["nombre"],
+                values["telefono"],
+                values["direccion"],
+                values["nacionalidad"],
+                values["ars"],
+                valid_nss,
+                valid_nss,
+                valid_cedula,
+                values["telefono_clean"],
+                int(not identifiers),
+                patient_id,
+            ),
+        )
+        return cur.rowcount
+
+    @staticmethod
+    def _replace_patient_edit_identifiers(cur, patient_id, identifiers):
+        by_kind = dict(identifiers)
+        for kind in ("NSS", "CEDULA"):
+            cur.execute(
+                "DELETE FROM paciente_identificadores WHERE paciente_id=? AND tipo=?",
+                (patient_id, kind),
+            )
+            if kind in by_kind:
+                cur.execute(
+                    "INSERT INTO paciente_identificadores("
+                    "paciente_id,tipo,valor_normalizado,activo,conflicto) VALUES (?,?,?,1,0) "
+                    "ON CONFLICT(paciente_id,tipo,valor_normalizado) "
+                    "DO UPDATE SET activo=1,conflicto=0",
+                    (patient_id, kind, by_kind[kind]),
+                )
+
+    def _audit_patient_master_update(self, conn, attention, before, after):
+        if attention is None:
+            return
+        changed_fields = sorted(key for key in after if before.get(key) != after.get(key))
+        self._registrar_auditoria_conn(
+            conn,
+            int(attention["id"]),
+            "PATIENT_UPDATE",
+            "Campos modificados: " + ",".join(changed_fields),
+            self.session_context.audit_actor,
+            before,
+            after,
+            self.session_context.role,
+        )
+
     def actualizar_datos_paciente_por_identidad(self, identidad_original: str, nuevos: dict, actualizar_ficha=True):
+        """Actualiza únicamente la ficha maestra; nunca reescribe una atención."""
+        del actualizar_ficha
         ident = (identidad_original or "").strip().upper()
         if not ident:
             return 0, 0
 
-        nombre = (nuevos.get("Nombre") or "").strip()
-        cedula = (nuevos.get("Cédula") or "").strip().replace("-", "")
-        telefono = (nuevos.get("Teléfono") or "").strip().replace("-", "")
-        telefono_db = telefono if telefono.isdigit() and len(telefono) == 10 else None
-        direccion = (nuevos.get("Dirección") or "").strip()
-        nacionalidad = (nuevos.get("Nacionalidad") or "").strip()
-        nss = (nuevos.get("NSS") or "").strip().upper()
-        ars = normalizar_seguro(nuevos.get("Aseguradora (ARS)", ""), nss)
+        values = self._patient_master_update_values(nuevos)
 
         with closing(self._connect()) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
-            cur = conn.cursor()
-            objetivo = None
-            patient_id = None
-            if ident.startswith("P:") and ident[2:].isdigit():
-                patient_id = int(ident[2:])
-            elif ident.startswith("A:") and ident[2:].isdigit():
-                objetivo = cur.execute(
-                    "SELECT * FROM atenciones WHERE id=? LIMIT 1", (int(ident[2:]),)
+            try:
+                cur = conn.cursor()
+                patient_id, attention = self._resolve_patient_edit_target(cur, ident)
+                if patient_id is None:
+                    conn.rollback()
+                    return 0, 0
+                patient_before = cur.execute(
+                    "SELECT * FROM pacientes WHERE id=?", (patient_id,)
                 ).fetchone()
-            else:
-                clean_ident = re.sub(r"\D", "", ident)
-                patient_rows = cur.execute(
-                    "SELECT paciente_id FROM paciente_identificadores "
-                    "WHERE valor_normalizado=? AND activo=1 "
-                    "ORDER BY conflicto,id DESC LIMIT 1",
-                    (clean_ident,),
-                ).fetchall()
-                patient_id = int(patient_rows[0][0]) if patient_rows else None
-            if objetivo:
-                patient_id = int(objetivo["paciente_id"])
-            elif patient_id is not None:
-                objetivo = cur.execute('''
-                    SELECT * FROM atenciones
-                    WHERE paciente_id=?
-                    ORDER BY id DESC LIMIT 1
-                ''', (patient_id,)).fetchone()
-            if patient_id is None:
-                conn.rollback()
-                return 0, 0
-
-            nss_clean = re.sub(r"\D", "", nss)
-            cedula_clean = re.sub(r"\D", "", cedula)
-            nuevos_ids = []
-            if is_valid_nss_key(nss_clean):
-                nuevos_ids.append(("NSS", nss_clean))
-            if is_valid_cedula_key(cedula_clean):
-                nuevos_ids.append(("CEDULA", cedula_clean))
-            atenciones_actualizadas = 0
-            if objetivo:
-                objetivo_id = int(objetivo["id"])
-                cur.execute('''
-                    UPDATE atenciones
-                    SET nombre=?, cedula=?, telefono=?, direccion=?, nacionalidad=?, nss=?, ars=?,
-                        nss_clean=?, cedula_clean=?, telefono_clean=?, identidad_estado=?,
-                        requiere_revision=?, updated_at=datetime('now','localtime')
-                    WHERE id=?
-                ''', (
-                    nombre, cedula, telefono, direccion, nacionalidad, nss, ars,
-                    nss_clean or None, cedula_clean or None,
-                    re.sub(r"\D", "", telefono) or None, "VALIDADA", 0, objetivo_id,
-                ))
-                atenciones_actualizadas = cur.rowcount
-                after = dict(cur.execute("SELECT * FROM atenciones WHERE id=?", (objetivo_id,)).fetchone())
-                self._registrar_auditoria_conn(
-                    conn,
-                    objetivo_id,
-                    "MODIFICACION",
-                    "Edición de una atención y/o ficha del paciente",
-                    limpiar_nombre_representante((cargar_turno_config(permitir_vencido=True) or {}).get("representante", "")),
-                    dict(objetivo),
-                    after,
-                    "OPERADOR",
-                )
-
-            pacientes_actualizados = 0
-            if actualizar_ficha:
-                for kind, value in nuevos_ids:
-                    if kind != "CEDULA":
-                        continue
-                    conflict = cur.execute(
-                        "SELECT paciente_id FROM paciente_identificadores "
-                        "WHERE tipo=? AND valor_normalizado=? AND activo=1 AND paciente_id<>? LIMIT 1",
-                        (kind, value, patient_id),
+                if patient_before is None:
+                    conn.rollback()
+                    return 0, 0
+                if attention is None:
+                    attention = cur.execute(
+                        "SELECT * FROM atenciones WHERE paciente_id=? ORDER BY id DESC LIMIT 1",
+                        (patient_id,),
                     ).fetchone()
-                    if conflict:
-                        conn.rollback()
-                        raise ValueError(
-                            f"El {kind} indicado ya está asignado a otra ficha."
-                        )
-                cur.execute('''
-                    UPDATE pacientes SET
-                        cedula=?, nombre=?, telefono=?, direccion=?, nacionalidad=?, ars=?, nss=?,
-                        nss_clean=?, cedula_clean=?, telefono_clean=?, provisional=?,
-                        updated_at=datetime('now','localtime')
-                    WHERE id=?
-                ''', (
-                    cedula_clean if is_valid_cedula_key(cedula_clean) else None,
-                    nombre, telefono_db, direccion, nacionalidad, ars,
-                    nss_clean if is_valid_nss_key(nss_clean) else None,
-                    nss_clean if is_valid_nss_key(nss_clean) else None,
-                    cedula_clean if is_valid_cedula_key(cedula_clean) else None,
-                    re.sub(r"\D", "", telefono) or None,
-                    int(not nuevos_ids),
-                    patient_id,
-                ))
-                pacientes_actualizados = cur.rowcount
-                for kind in ("NSS", "CEDULA"):
-                    new_value = next((value for item_kind, value in nuevos_ids if item_kind == kind), None)
-                    cur.execute(
-                        "DELETE FROM paciente_identificadores WHERE paciente_id=? AND tipo=?",
-                        (patient_id, kind),
-                    )
-                    if new_value:
-                        cur.execute(
-                            "INSERT INTO paciente_identificadores(" 
-                            "paciente_id,tipo,valor_normalizado,activo,conflicto) VALUES (?,?,?,1,0) "
-                            "ON CONFLICT(paciente_id,tipo,valor_normalizado) "
-                            "DO UPDATE SET activo=1,conflicto=0",
-                            (patient_id, kind, new_value),
-                        )
 
-            conn.commit()
-            return atenciones_actualizadas, pacientes_actualizados
+                identifiers = self._patient_edit_identifiers(values)
+                self._validate_patient_edit_identifiers(cur, patient_id, identifiers)
+                pacientes_actualizados = self._update_patient_master_conn(
+                    cur, patient_id, values, identifiers
+                )
+                self._replace_patient_edit_identifiers(cur, patient_id, identifiers)
+                patient_after = cur.execute(
+                    "SELECT * FROM pacientes WHERE id=?", (patient_id,)
+                ).fetchone()
+                self._audit_patient_master_update(
+                    conn, attention, dict(patient_before), dict(patient_after)
+                )
+                conn.commit()
+                return 0, pacientes_actualizados
+            except Exception:
+                conn.rollback()
+                raise
 
     def listar_ars_conteo(self):
         conteo = {}
@@ -6453,7 +6494,7 @@ class App:
         if self._puede(CAP_OPEN_EXCEL):
             self.actions_menu.add_command(label="Listado de Excel", command=self._abrir_excel_actual)
         self.actions_menu.add_separator()
-        if self._puede(CAP_EDIT_RECORDS):
+        if self._puede(CAP_EDIT_PATIENT):
             self.actions_menu.add_command(label="Editar paciente", command=self._abrir_edicion_paciente)
         self.actions_menu.add_command(label="Impresiones y documentos pendientes", command=self.abrir_trabajos_salida_pendientes)
         if self._puede(CAP_INTERNAL_CONFIG):
@@ -9209,7 +9250,7 @@ class App:
         if self._puede(CAP_OPEN_EXCEL):
             add_action("Abrir Listado en Excel", self._abrir_excel_actual, SUCCESS)
         add_action("Ver Historial sin Seguro", self.abrir_historial_sin_seguros, WARNING)
-        if self._puede(CAP_EDIT_RECORDS):
+        if self._puede(CAP_EDIT_PATIENT):
             add_action("Editar paciente", self._abrir_edicion_paciente, PRIMARY)
         if self._puede(CAP_INTERNAL_CONFIG):
             add_action("Configuración interna", self._abrir_configuracion_interna, SECONDARY)
@@ -12880,7 +12921,9 @@ class App:
 
         if self._puede(CAP_EDIT_RECORDS):
             menu_historial.add_command(label="🖉 Editar atención", command=lambda: self._abrir_editor_atencion_desde_tree(tree, buscar))
+        if self._puede(CAP_EDIT_PATIENT):
             menu_historial.add_command(label="⚙ Editar datos del paciente", command=_editar_paciente_desde_historial)
+        if self._puede(CAP_EDIT_RECORDS) or self._puede(CAP_EDIT_PATIENT):
             menu_historial.add_separator()
         menu_historial.add_command(label="📄 Abrir hoja", command=lambda: self.ver_pdf_seleccionado(tree))
         if self._puede(CAP_VOID_RECORDS):
@@ -13218,6 +13261,7 @@ class App:
         tb.Button(frm_btn, text="📄  Abrir hoja", bootstyle=SUCCESS, command=lambda: self.ver_pdf_seleccionado(tree)).pack(side="left", padx=4, ipady=4)
         if self._puede(CAP_EDIT_RECORDS):
             tb.Button(frm_btn, text="🖉  Editar atención", bootstyle=SECONDARY, command=lambda: self._abrir_editor_atencion_desde_tree(tree, cargar)).pack(side="left", padx=4, ipady=4)
+        if self._puede(CAP_EDIT_PATIENT):
             tb.Button(frm_btn, text="⚙ Editar paciente", bootstyle=INFO, command=lambda: self._abrir_edicion_paciente(prefill_identidad=(tree.item(tree.selection()[0], "values")[6] or tree.item(tree.selection()[0], "values")[7]) if tree.selection() else "")).pack(side="left", padx=4, ipady=4)
         if self._puede(CAP_VOID_RECORDS):
             tb.Button(frm_btn, text="Anular seleccionado", bootstyle=DANGER, command=lambda: self.eliminar_atencion_seleccionada(tree, reordenar_ids=False, refrescar_callback=cargar)).pack(side="left", padx=4, ipady=4)
@@ -13248,7 +13292,9 @@ class App:
 
         if self._puede(CAP_EDIT_RECORDS):
             menu_sin_seguro.add_command(label="🖉 Editar atención", command=lambda: self._abrir_editor_atencion_desde_tree(tree, cargar))
+        if self._puede(CAP_EDIT_PATIENT):
             menu_sin_seguro.add_command(label="⚙ Editar datos del paciente", command=_editar_paciente_ss)
+        if self._puede(CAP_EDIT_RECORDS) or self._puede(CAP_EDIT_PATIENT):
             menu_sin_seguro.add_separator()
         menu_sin_seguro.add_command(label="📄 Abrir hoja", command=lambda: self.ver_pdf_seleccionado(tree))
         if self._puede(CAP_VOID_RECORDS):
@@ -13550,7 +13596,7 @@ class App:
         """
         Ventana independiente y ligera para editar pacientes.
         """
-        if not self._exigir_permiso(CAP_EDIT_RECORDS, "modificar los datos de un paciente"):
+        if not self._exigir_permiso(CAP_EDIT_PATIENT, "modificar los datos de un paciente"):
             return
         win = self._crear_toplevel_estable("Editar paciente", "1160x760", "edicion_paciente_win")
         if win is None:
@@ -13887,22 +13933,11 @@ class App:
                 return
 
             try:
-                alcance = messagebox.askyesnocancel(
-                    "Alcance de la modificación",
-                    "¿Desea actualizar también la ficha actual del paciente?\n\n"
-                    "Sí: esta atención y la ficha actual\n"
-                    "No: solamente esta atención\n"
-                    "Cancelar: no guardar",
-                    parent=win,
-                )
-                if alcance is None:
-                    return
-                actualizar_ficha = alcance is True
                 snapshot_paciente = self.db.buscar_paciente_para_edicion(original_identidad["valor"])
                 at_count, pac_count = self.db.actualizar_datos_paciente_por_identidad(
                     original_identidad["valor"],
                     nuevos,
-                    actualizar_ficha=actualizar_ficha,
+                    actualizar_ficha=True,
                 )
 
                 def _undo_edit_paciente():
@@ -13919,14 +13954,14 @@ class App:
                         "Aseguradora (ARS)": snapshot_paciente.get("ars", ""),
                     }
                     ident_undo = (
-                        snapshot_paciente.get("nss")
-                        or snapshot_paciente.get("cedula")
-                        or f"A:{snapshot_paciente.get('id')}"
+                        f"P:{snapshot_paciente.get('paciente_id')}"
+                        if snapshot_paciente.get("paciente_id")
+                        else f"A:{snapshot_paciente.get('id')}"
                     )
                     self.db.actualizar_datos_paciente_por_identidad(
                         str(ident_undo),
                         anteriores,
-                        actualizar_ficha=actualizar_ficha,
+                        actualizar_ficha=True,
                     )
                     self._reconstruir_excel_si_necesario("deshacer edición paciente", antes=nuevos, despues=anteriores, forzar=False)
                     self._invalidar_caches_datos()
@@ -13940,7 +13975,10 @@ class App:
                 self._ars_catalogo = self._obtener_catalogo_ars()
                 self._refrescar_resumen_en_vivo()
 
-                estado_var.set(f"Guardado: {at_count} atención(es) y {pac_count} ficha(s) actualizada(s).")
+                estado_var.set(
+                    f"Guardado: {pac_count} ficha(s) actualizada(s); "
+                    f"{at_count} atención(es) modificada(s)."
+                )
                 self.set_status("Datos del paciente actualizados", "ok")
                 self._mostrar_notificacion("Datos del paciente actualizados. Ctrl+Z para deshacer.", on_undo=_undo_edit_paciente, autohide_ms=5000)
                 messagebox.showinfo("Guardado", "Datos actualizados correctamente. No se generó una hoja nueva.")
@@ -16145,7 +16183,8 @@ class App:
                 "Se requiere conexión central para cambiar el turno.",
             )
         snapshot = dict(runtime.state() or {})
-        if not bool(snapshot.get("can_change_turn")):
+        policy_allowed = bool(runtime.can_change_admission_turn())
+        if not policy_allowed:
             is_primary = str(snapshot.get("role") or "").upper() == "PRIMARY"
             return (
                 False,

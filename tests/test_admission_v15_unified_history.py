@@ -306,7 +306,7 @@ def test_history_queries_postgresql_even_when_the_replica_is_available():
 
     rows = proxy.listar_atenciones(limite=200, offset=0)
 
-    assert [row["nombre"] for row in rows] == ["LOCAL PENDING", "CENTRAL"]
+    assert [row["nombre"] for row in rows] == ["CENTRAL", "LOCAL PENDING"]
 
 
 def test_this_turn_history_uses_central_source_and_turn_from_local_replica():
@@ -334,6 +334,8 @@ def test_this_turn_history_uses_central_source_and_turn_from_local_replica():
     assert "admission_attention_projection" in connection.query
     assert "p.operational_source_id::TEXT=%s" in connection.query
     assert "p.turn_id=%s" in connection.query
+    assert "COALESCE(p.device_local_sequence,0) ASC" in connection.query
+    assert "COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) ASC" in connection.query
     assert connection.params[:2] == ("central-source", 316)
 
 
@@ -425,7 +427,7 @@ def test_offline_history_never_opens_the_central_connection():
 
     rows = proxy.listar_atenciones(limite=200, offset=0)
 
-    assert [row["id"] for row in rows] == [100, 99]
+    assert [row["id"] for row in rows] == [99, 100]
 
 
 def test_projection_readthrough_has_an_explicit_offline_replica_path():
@@ -436,7 +438,7 @@ def test_projection_readthrough_has_an_explicit_offline_replica_path():
         "listar_atenciones", (), {"limite": 200, "offset": 0}
     )
 
-    assert [row["id"] for row in rows] == [100, 99]
+    assert [row["id"] for row in rows] == [99, 100]
 
 
 def test_background_lookup_executes_cedula_and_nss_queries():

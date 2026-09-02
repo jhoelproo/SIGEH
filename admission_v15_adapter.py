@@ -81,12 +81,14 @@ _V15_CAPABILITIES = frozenset(
     {
         "reports.view",
         "excel.open",
+        "patients.edit",
         "records.edit",
         "records.void",
         "configuration.manage",
     }
 )
 _V15_READ_CAPABILITIES = frozenset({"reports.view", "excel.open"})
+_V15_PATIENT_CAPABILITIES = frozenset({"patients.edit"})
 _V15_OPERATIONAL_CAPABILITIES = frozenset({"records.edit", "records.void"})
 
 
@@ -102,8 +104,12 @@ def v15_capabilities_for_role(user: Any) -> frozenset[str]:
     if role == ADMISSION_ROLE_ADMINISTRATOR:
         return _V15_CAPABILITIES
     if role == ADMISSION_ROLE_AUXILIARY:
-        return _V15_READ_CAPABILITIES | _V15_OPERATIONAL_CAPABILITIES
-    return _V15_READ_CAPABILITIES
+        return (
+            _V15_READ_CAPABILITIES
+            | _V15_PATIENT_CAPABILITIES
+            | _V15_OPERATIONAL_CAPABILITIES
+        )
+    return _V15_READ_CAPABILITIES | _V15_PATIENT_CAPABILITIES
 
 
 class AdmissionV15EventBus(QObject):
@@ -1110,6 +1116,28 @@ class _HybridAdmissionRuntime:
             return None
         return self.patient_directory.verify_with_cloud(
             cedula=cedula, nss=nss, timeout_ms=timeout_ms
+        )
+
+    def update_patient_directory(
+        self,
+        global_patient_id: str,
+        changes: Mapping[str, Any],
+        *,
+        expected_revision: int = 0,
+    ) -> dict[str, Any]:
+        """Update patient master data independently from the operational turn."""
+        if not self.username or not self.login_session_id:
+            raise PermissionError(
+                "La edición requiere una sesión autenticada válida de SIGEH."
+            )
+        if self.patient_directory is None:
+            raise RuntimeError("El directorio de pacientes no está disponible.")
+        return self.patient_directory.update_patient(
+            global_patient_id,
+            changes,
+            expected_revision=expected_revision,
+            actor_user=self.username,
+            actor_role=str(self.current_user.get("role") or ""),
         )
 
     def require_write(self, *, primary_only: bool = False):
@@ -2404,7 +2432,7 @@ class _HybridDatabaseProxy:
                     if str(row.get("hoja") or row.get("specialty") or "").upper()
                     == specialty
                 ]
-            rows = sorted(rows, key=self._history_sort_key, reverse=True)
+            rows = sorted(rows, key=self._history_sort_key)
             offset = max(0, int(values.get("offset") or 0))
             limit = max(1, min(int(values.get("limite") or 200), 500))
             return rows[offset:offset + limit]
@@ -2537,7 +2565,6 @@ class _HybridDatabaseProxy:
             return sorted(
                 local_method(*args, **kwargs) or [],
                 key=self._history_sort_key,
-                reverse=True,
             )
 
         values = dict(kwargs or {})
@@ -2616,10 +2643,10 @@ class _HybridDatabaseProxy:
                    ORDER BY COALESCE(
                                 p.created_at_effective_utc,
                                 NULLIF(p.synced_at,'')::TIMESTAMPTZ
-                            ) DESC,
-                            COALESCE(p.origin_device_id,'') DESC,
-                            COALESCE(p.device_local_sequence,0) DESC,
-                            COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) DESC
+                            ) ASC,
+                            COALESCE(p.origin_device_id,'') ASC,
+                            COALESCE(p.device_local_sequence,0) ASC,
+                            COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) ASC
                    LIMIT %s OFFSET %s"""
         params.extend((limit + offset, 0))
         with self._runtime.host.connection_factory() as con:
@@ -2687,7 +2714,7 @@ class _HybridDatabaseProxy:
             key = str(row.get("global_attention_id") or "").replace("-", "").lower()
             if key and key not in by_uuid:
                 by_uuid[key] = row
-        merged = sorted(by_uuid.values(), key=self._history_sort_key, reverse=True)
+        merged = sorted(by_uuid.values(), key=self._history_sort_key)
         result = merged[offset:offset + limit]
         if logger is not None:
             estimated_bytes = sum(
@@ -2759,7 +2786,6 @@ class _HybridDatabaseProxy:
         rows = sorted(
             self.list_history_cache_local(method_name, **values),
             key=self._history_sort_key,
-            reverse=True,
         )
         if logger is not None:
             logger.info(
@@ -3621,6 +3647,62 @@ class _HybridDatabaseProxy:
             return resolve_local_to_global
         if name == "get_attention_by_global_id":
             return self._runtime.get_attention_by_global_id
+        if name == "actualizar_datos_paciente_por_identidad" and callable(value):
+            def update_patient_master(
+                original_identity: str,
+                changes: Mapping[str, Any],
+                actualizar_ficha: bool = True,
+            ) -> tuple[int, int]:
+                del actualizar_ficha  # Patient edit never mutates an attention snapshot.
+                current = self._database.buscar_paciente_para_edicion(
+                    original_identity
+                )
+                if not current:
+                    raise ValueError("No se encontró el paciente seleccionado.")
+                global_patient_id = str(
+                    current.get("global_patient_id") or ""
+                ).strip()
+                verified = None
+                if not global_patient_id:
+                    cedula = str(current.get("cedula") or "").strip()
+                    nss = str(current.get("nss") or "").strip()
+                    if cedula:
+                        verified = self._runtime.verify_patient_with_cloud(
+                            cedula=cedula
+                        )
+                    if not verified and nss:
+                        verified = self._runtime.verify_patient_with_cloud(nss=nss)
+                    if verified:
+                        global_patient_id = str(
+                            verified.get("global_patient_id") or ""
+                        ).strip()
+                if not global_patient_id:
+                    raise ValueError(
+                        "El paciente no posee identidad global; no se guardó ningún cambio."
+                    )
+                normalized_changes = {
+                    "patient_name": str(changes.get("Nombre") or "").strip(),
+                    "cedula": str(changes.get("Cédula") or "").strip(),
+                    "phone": str(changes.get("Teléfono") or "").strip(),
+                    "nss": str(changes.get("NSS") or "").strip(),
+                    "address": str(changes.get("Dirección") or "").strip(),
+                    "nationality": str(
+                        changes.get("Nacionalidad") or ""
+                    ).strip(),
+                    "canonical_ars": str(
+                        changes.get("Aseguradora (ARS)") or ""
+                    ).strip(),
+                }
+                self._runtime.update_patient_directory(
+                    global_patient_id,
+                    normalized_changes,
+                    expected_revision=int(
+                        (verified or current).get("server_revision") or 0
+                    ),
+                )
+                return 0, 1
+
+            return update_patient_master
         if name == "borrar_atencion" and callable(value):
             def cancel_by_local_identity(
                 attention_id: int, *, motivo: str = "", usuario: str = ""

@@ -19,9 +19,11 @@ from admission_hybrid import (
     StationRole,
     SAME_USER_HANDOFF_MESSAGE,
     can_change_admission_turn,
+    evaluate_admission_access,
     is_primary_shift_handover,
 )
 from admission_v15_adapter import _HybridAdmissionRuntime
+from ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6 import App
 
 
 OLD_USER = {"id": 10, "username": "aux_anterior", "role": "auxiliar"}
@@ -51,6 +53,81 @@ def test_different_auxiliary_on_primary_can_only_start_explicit_handover():
     assert is_primary_shift_handover(NEW_USER, state, StationRole.PRIMARY)
     assert can_change_admission_turn(NEW_USER, state, StationRole.PRIMARY)
     assert not is_primary_shift_handover(OLD_USER, state, StationRole.PRIMARY)
+
+
+def test_access_snapshot_keeps_turn_identity_for_incoming_primary_operator():
+    now = datetime.now(timezone.utc)
+    state = OperationalState(
+        operational_session_id="op-access",
+        generation=7,
+        active_user_id="10",
+        active_username="aux_anterior",
+        active_user_display_name="AUXILIAR ANTERIOR",
+        turn_id=500,
+        primary_device_id="PC-PRIMARY",
+        primary_login_session_id="login-new",
+        local_device_id="PC-PRIMARY",
+        local_login_session_id="login-new",
+        device_role=StationRole.PRIMARY,
+        device_attached=True,
+        user_matches_operational=False,
+        write_allowed=False,
+        turn_code="8AM_8PM",
+        turn_started_at=now,
+        turn_ends_at=now + timedelta(hours=12),
+    )
+
+    decision = evaluate_admission_access(NEW_USER, state)
+
+    assert can_change_admission_turn(NEW_USER, state, StationRole.PRIMARY)
+    assert decision.write_allowed is False
+    assert decision.can_change_turn is True
+
+
+def test_turn_button_uses_live_runtime_policy_not_stale_snapshot_flag():
+    app = object.__new__(App)
+    app._turn_change_in_progress = False
+    app._turn_change_committing = False
+    runtime = SimpleNamespace(
+        offline=False,
+        device_id="PC-PRIMARY",
+        state=lambda: {
+            "role": "PRIMARY",
+            "can_change_turn": False,
+            "primary_device_id": "PC-PRIMARY",
+        },
+        can_change_admission_turn=lambda: True,
+        require_primary_turn_change=lambda: True,
+    )
+    app.db = SimpleNamespace(_runtime=runtime)
+
+    allowed, reason_code, message = app.can_change_admission_turn()
+
+    assert allowed is True
+    assert reason_code == "ALLOWED"
+    assert message == ""
+
+
+def test_turn_button_rejects_live_policy_denial_on_primary():
+    app = object.__new__(App)
+    app._turn_change_in_progress = False
+    app._turn_change_committing = False
+    runtime = SimpleNamespace(
+        offline=False,
+        device_id="PC-PRIMARY",
+        state=lambda: {
+            "role": "PRIMARY",
+            "can_change_turn": True,
+            "primary_device_id": "PC-PRIMARY",
+        },
+        can_change_admission_turn=lambda: False,
+    )
+    app.db = SimpleNamespace(_runtime=runtime)
+
+    allowed, reason_code, _message = app.can_change_admission_turn()
+
+    assert allowed is False
+    assert reason_code == "ROLE_NOT_ALLOWED"
 
 
 def test_turn_guard_allows_handover_even_though_patient_writes_remain_read_only():

@@ -28,6 +28,11 @@ from sqlite_write_coordinator import (
 PATIENT_DIRECTORY_SCHEMA_VERSION = 1
 PATIENT_ENTITY_TYPE = "patient"
 
+
+class PatientDirectoryConflict(RuntimeError):
+    """The patient changed elsewhere or a document belongs to another patient."""
+
+
 POSTGRES_PATIENT_DIRECTORY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS admission_patient_directory(
   global_patient_id UUID PRIMARY KEY,
@@ -219,8 +224,16 @@ class CentralPatientDirectoryRepository:
         )
 
     @staticmethod
-    def _insert_event(con: Any, row: Mapping[str, Any], operation: str) -> None:
+    def _insert_event(
+        con: Any,
+        row: Mapping[str, Any],
+        operation: str,
+        *,
+        audit: Mapping[str, Any] | None = None,
+    ) -> None:
         payload = CentralPatientDirectoryRepository._payload(row)
+        if audit:
+            payload["audit"] = dict(audit)
         con.execute(
             """INSERT INTO admission_patient_directory_events(
                    event_uuid,global_patient_id,operation,server_revision,payload_json
@@ -295,6 +308,155 @@ class CentralPatientDirectoryRepository:
                 )
             rows = self._find_by_document(con, nss=normalized)
         return self._payload(rows[0]) if len(rows) == 1 else None
+
+    def update_patient(
+        self,
+        global_patient_id: str,
+        changes: Mapping[str, Any],
+        *,
+        expected_revision: int = 0,
+        actor_user: str,
+        actor_role: str,
+    ) -> dict[str, Any]:
+        """Update one central patient without altering any attention identity."""
+        patient_id = _uuid_or_empty(global_patient_id)
+        if not patient_id:
+            raise ValueError("El paciente no posee una identidad global válida.")
+        requested = dict(changes or {})
+        with self.connection_factory() as con:
+            row = con.execute(
+                """SELECT * FROM admission_patient_directory
+                     WHERE global_patient_id=%s::UUID FOR UPDATE""",
+                (patient_id,),
+            ).fetchone()
+            if row is None or bool(_mapping(row).get("is_deleted")):
+                raise ValueError("El paciente ya no está disponible para edición.")
+            current = self._payload(_mapping(row))
+            desired = {
+                **current,
+                "nombre": str(
+                    requested.get(
+                        "patient_name", requested.get("nombre", current["nombre"])
+                    )
+                    or ""
+                ).strip(),
+                "cedula": str(requested.get("cedula", current["cedula"]) or "").strip(),
+                "nss": str(requested.get("nss", current["nss"]) or "").strip(),
+                "telefono": str(
+                    requested.get(
+                        "phone", requested.get("telefono", current["telefono"])
+                    )
+                    or ""
+                ).strip(),
+                "direccion": str(
+                    requested.get(
+                        "address", requested.get("direccion", current["direccion"])
+                    )
+                    or ""
+                ).strip(),
+                "nacionalidad": str(
+                    requested.get(
+                        "nationality",
+                        requested.get("nacionalidad", current["nacionalidad"]),
+                    )
+                    or ""
+                ).strip(),
+                "ars": str(
+                    requested.get("canonical_ars", requested.get("ars", current["ars"]))
+                    or ""
+                ).strip(),
+            }
+            if not desired["nombre"]:
+                raise ValueError("El nombre del paciente no puede quedar vacío.")
+            desired["cedula_normalized"] = normalize_patient_document(desired["cedula"])
+            desired["nss_normalized"] = normalize_patient_document(desired["nss"])
+            field_names = (
+                ("nombre", "patient_name"),
+                ("cedula", "cedula"),
+                ("nss", "nss"),
+                ("telefono", "phone"),
+                ("direccion", "address"),
+                ("nacionalidad", "nationality"),
+                ("ars", "canonical_ars"),
+            )
+            changed_fields = [
+                audit_name
+                for field, audit_name in field_names
+                if desired[field] != current[field]
+            ]
+            if not changed_fields:
+                return current
+            current_revision = int(current.get("server_revision") or 1)
+            if expected_revision and int(expected_revision) != current_revision:
+                raise PatientDirectoryConflict(
+                    "El paciente fue modificado en otra estación. Recargue los datos e intente de nuevo."
+                )
+            for document_key in sorted(
+                {
+                    value
+                    for value in (
+                        desired["cedula_normalized"],
+                        desired["nss_normalized"],
+                    )
+                    if value
+                }
+            ):
+                con.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"admission-patient-document:{document_key}",),
+                )
+            duplicate = con.execute(
+                """SELECT global_patient_id::TEXT
+                     FROM admission_patient_directory
+                    WHERE is_deleted=FALSE
+                      AND global_patient_id<>%s::UUID
+                      AND ((%s<>'' AND cedula_normalized=%s)
+                           OR (%s<>'' AND nss_normalized=%s))
+                    LIMIT 1""",
+                (
+                    patient_id,
+                    desired["cedula_normalized"],
+                    desired["cedula_normalized"],
+                    desired["nss_normalized"],
+                    desired["nss_normalized"],
+                ),
+            ).fetchone()
+            if duplicate:
+                raise PatientDirectoryConflict(
+                    "La cédula o el NSS indicado ya pertenece a otro paciente."
+                )
+            next_revision = current_revision + 1
+            updated = con.execute(
+                """UPDATE admission_patient_directory SET
+                       patient_name=%s,cedula=%s,cedula_normalized=%s,nss=%s,
+                       nss_normalized=%s,phone=%s,address=%s,nationality=%s,
+                       canonical_ars=%s,server_revision=%s,updated_at=NOW()
+                     WHERE global_patient_id=%s::UUID
+                     RETURNING *""",
+                (
+                    desired["nombre"],
+                    desired["cedula"],
+                    desired["cedula_normalized"],
+                    desired["nss"],
+                    desired["nss_normalized"],
+                    desired["telefono"],
+                    desired["direccion"],
+                    desired["nacionalidad"],
+                    desired["ars"],
+                    next_revision,
+                    patient_id,
+                ),
+            ).fetchone()
+            audit = {
+                "operation": "PATIENT_UPDATE",
+                "actor_user": str(actor_user or "").strip()[:160],
+                "actor_role": str(actor_role or "").strip()[:80],
+                "patient_id": patient_id,
+                "fields_changed": changed_fields,
+                "timestamp": _timestamp(),
+            }
+            self._insert_event(con, _mapping(updated), "PATIENT_UPDATED", audit=audit)
+        return self._payload(_mapping(updated))
 
     def upsert_patient(
         self,
@@ -632,7 +794,9 @@ class LocalPatientDirectory:
         """Avoid schema DDL in the patient lookup/save hot path when V15 prepared it."""
         try:
             with closing(
-                sqlite3.connect(f"file:{Path(self.database).resolve()}?mode=ro", uri=True)
+                sqlite3.connect(
+                    f"file:{Path(self.database).resolve()}?mode=ro", uri=True
+                )
             ) as con:
                 row = con.execute(
                     "SELECT valor FROM app_metadata "
@@ -667,7 +831,9 @@ class LocalPatientDirectory:
                     ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
                 ):
                     if name not in columns:
-                        con.execute(f"ALTER TABLE pacientes ADD COLUMN {name} {definition}")
+                        con.execute(
+                            f"ALTER TABLE pacientes ADD COLUMN {name} {definition}"
+                        )
                 con.execute(
                     "CREATE INDEX IF NOT EXISTS idx_pacientes_global_patient_id "
                     "ON pacientes(global_patient_id)"
@@ -764,6 +930,10 @@ class LocalPatientDirectory:
                 tuple(fields.values()),
             )
             patient_id = int(con.execute("SELECT last_insert_rowid()").fetchone()[0])
+        con.execute(
+            "DELETE FROM paciente_identificadores WHERE paciente_id=? AND tipo IN ('CEDULA','NSS')",
+            (patient_id,),
+        )
         for kind, value in (
             ("CEDULA", fields["cedula_clean"]),
             ("NSS", fields["nss_clean"]),
@@ -897,6 +1067,30 @@ class PatientDirectoryService:
         self.local.hydrate(central)
         return dict(central)
 
+    def update_patient(
+        self,
+        global_patient_id: str,
+        changes: Mapping[str, Any],
+        *,
+        expected_revision: int = 0,
+        actor_user: str,
+        actor_role: str,
+    ) -> dict[str, Any]:
+        """Commit centrally, then refresh the local cache with the same revision."""
+        if not self.is_online():
+            raise RuntimeError(
+                "La edición de pacientes requiere conexión central; no se guardó ningún cambio."
+            )
+        updated = self.central.update_patient(
+            global_patient_id,
+            changes,
+            expected_revision=expected_revision,
+            actor_user=actor_user,
+            actor_role=actor_role,
+        )
+        self.local.hydrate(updated)
+        return dict(updated)
+
     def search_patient(self, identifier: str) -> dict[str, Any] | None:
         normalized = normalize_patient_document(identifier)
         if not normalized:
@@ -1003,6 +1197,7 @@ __all__ = [
     "POSTGRES_PATIENT_DIRECTORY_SCHEMA",
     "CentralPatientDirectoryRepository",
     "LocalPatientDirectory",
+    "PatientDirectoryConflict",
     "PatientDirectoryService",
     "PatientSeedResult",
     "normalize_patient_document",

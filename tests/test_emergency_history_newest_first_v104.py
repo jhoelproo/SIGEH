@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from admission_v15_adapter import _HybridDatabaseProxy
 
 
-def test_current_turn_history_is_newest_first():
+def test_current_turn_history_is_oldest_first_with_stable_identity_order():
     proxy = object.__new__(_HybridDatabaseProxy)
     object.__setattr__(proxy, "_database", SimpleNamespace())
     object.__setattr__(proxy, "_runtime", SimpleNamespace(
@@ -27,6 +27,24 @@ def test_current_turn_history_is_newest_first():
             "created_at_effective_utc": "2026-08-27T07:11:00+00:00",
             "global_attention_id": "00000000-0000-4000-8000-000000000031",
         },
+        {
+            "id": 32,
+            "fecha": "2026-08-27",
+            "hora": "07:11:00",
+            "created_at_effective_utc": "2026-08-27T07:11:00+00:00",
+            "origin_device_id": "PC-1",
+            "device_local_sequence": 1,
+            "global_attention_id": "00000000-0000-4000-8000-000000000032",
+        },
+        {
+            "id": 33,
+            "fecha": "2026-08-27",
+            "hora": "07:11:00",
+            "created_at_effective_utc": "2026-08-27T07:11:00+00:00",
+            "origin_device_id": "PC-1",
+            "device_local_sequence": 2,
+            "global_attention_id": "00000000-0000-4000-8000-000000000033",
+        },
     ])
 
     rows = proxy.list_history_cache_local(
@@ -36,4 +54,4 @@ def test_current_turn_history_is_newest_first():
         offset=0,
     )
 
-    assert [row["id"] for row in rows] == [31, 30]
+    assert [row["id"] for row in rows] == [30, 31, 32, 33]
