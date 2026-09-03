@@ -45,7 +45,7 @@ python release_packaging.py `
   --dist dist/SIGEH `
   --updater dist/SIGEH_Updater.exe `
   --output release-internal `
-  --version 1.1.1 `
+  --version 1.1.2 `
   --internal-deployment `
   --backend-bundle C:\ruta-segura\database_url.bundle
 ```

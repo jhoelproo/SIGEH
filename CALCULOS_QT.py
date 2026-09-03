@@ -31447,6 +31447,93 @@ class ShiftClosureReportWorker(QThread):
         self.username = str(username or "Sistema")
         self.open_and_print = open_and_print
 
+    def _complete_generated_report(self, closure: dict, path: str) -> None:
+        try:
+            self.open_and_print(closure, path)
+        except Exception as open_error:
+            mark_shift_report_opened(closure, str(open_error))
+            write_runtime_log(
+                "Reporte automático de cierre generado; apertura pendiente: "
+                f"{type(open_error).__name__}"
+            )
+            self.completed.emit(
+                {
+                    "status": "GENERATED_OPEN_FAILED",
+                    "closure": closure,
+                    "path": path,
+                    "error_type": type(open_error).__name__,
+                }
+            )
+            return
+        mark_shift_report_opened(closure)
+        log_action(
+            self.username,
+            "Reporte automático de cierre de Facturación",
+            f"Turno {closure['turn_id']} · {os.path.basename(path)}",
+        )
+        self.completed.emit(
+            {"status": "GENERATED", "closure": closure, "path": path}
+        )
+
+    def _generate_report(self, closure: dict, data: dict) -> str:
+        source_tag = re.sub(
+            r"[^A-Za-z0-9_-]+", "", str(closure["source_instance_id"])
+        )[:10]
+        filename = (
+            f"cierre_turno_{closure['operational_date']}_"
+            f"{source_tag}_{int(closure['turn_id'])}.pdf"
+        )
+        generated_at = now_str()
+        document_context = {
+            "mode": "shift_closure",
+            "title": shift_closure_report_type(closure),
+            "subtitle": "Control de autorizaciones de Emergencias por turno",
+            "generated_by": str(
+                closure.get("closed_by")
+                or closure.get("actor")
+                or closure.get("representative")
+                or self.username
+            ),
+            "generated_at": generated_at,
+            "data": data,
+            "landscape": True,
+        }
+        save_shift_report_snapshot(
+            closure, data, document_context, generated_at
+        )
+        source_key_value = (
+            f"{closure['source_instance_id']}|{int(closure['turn_id'])}"
+        )
+        path = resolve_report_document(
+            "billing_shift_closures",
+            source_key_value,
+            "generate",
+            filename,
+            logo_path=LOGO_PATH,
+        )
+        mark_shift_report_generated(
+            closure,
+            filename,
+            data,
+            document_context,
+            generated_at,
+        )
+        return path
+
+    @staticmethod
+    def _record_generation_failure(
+        closure: dict | None, generated: bool, exc: Exception
+    ) -> None:
+        if not closure:
+            return
+        try:
+            if generated:
+                mark_shift_report_opened(closure, str(exc))
+            else:
+                mark_shift_report_error(closure, str(exc))
+        except Exception:
+            pass
+
     def run(self):
         closure = None
         generated = False
@@ -31468,66 +31555,11 @@ class ShiftClosureReportWorker(QThread):
                 mark_shift_report_skipped_empty(closure)
                 self.completed.emit({"status": "SKIPPED_EMPTY", "closure": closure})
                 return
-            source_tag = re.sub(
-                r"[^A-Za-z0-9_-]+", "", str(closure["source_instance_id"])
-            )[:10]
-            filename = (
-                f"cierre_turno_{closure['operational_date']}_"
-                f"{source_tag}_{int(closure['turn_id'])}.pdf"
-            )
-            generated_at = now_str()
-            document_context = {
-                "mode": "shift_closure",
-                "title": shift_closure_report_type(closure),
-                "subtitle": "Control de autorizaciones de Emergencias por turno",
-                "generated_by": str(
-                    closure.get("closed_by")
-                    or closure.get("actor")
-                    or closure.get("representative")
-                    or self.username
-                ),
-                "generated_at": generated_at,
-                "data": data,
-                "landscape": True,
-            }
-            save_shift_report_snapshot(
-                closure, data, document_context, generated_at
-            )
-            source_key_value = f"{closure['source_instance_id']}|{int(closure['turn_id'])}"
-            path = resolve_report_document(
-                "billing_shift_closures",
-                source_key_value,
-                "generate",
-                filename,
-                logo_path=LOGO_PATH,
-            )
-            mark_shift_report_generated(
-                closure,
-                filename,
-                data,
-                document_context,
-                generated_at,
-            )
+            path = self._generate_report(closure, data)
             generated = True
-            self.open_and_print(closure, path)
-            mark_shift_report_opened(closure)
-            log_action(
-                self.username,
-                "Reporte automático de cierre de Facturación",
-                f"Turno {closure['turn_id']} · {filename}",
-            )
-            self.completed.emit(
-                {"status": "GENERATED", "closure": closure, "path": path}
-            )
+            self._complete_generated_report(closure, path)
         except Exception as exc:
-            if closure:
-                try:
-                    if generated:
-                        mark_shift_report_opened(closure, str(exc))
-                    else:
-                        mark_shift_report_error(closure, str(exc))
-                except Exception:
-                    pass
+            self._record_generation_failure(closure, generated, exc)
             write_runtime_log(f"Reporte automático de cierre: {exc}")
             self.failed.emit(str(exc))
 
@@ -33692,6 +33724,10 @@ class MainWindow(QMainWindow):
         status = str(data.get("status") or "")
         if status == "GENERATED":
             FloatingToast("Reporte del turno abierto e impresión solicitada", self).show()
+        elif status == "GENERATED_OPEN_FAILED":
+            FloatingToast(
+                "Reporte de Facturación generado; apertura pendiente.", self
+            ).show()
         elif status == "SKIPPED_EMPTY":
             FloatingToast(
                 "Turno cerrado; no se generó reporte porque no contiene pacientes.",

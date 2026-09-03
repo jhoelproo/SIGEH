@@ -22,9 +22,9 @@ import ctypes
 import time as _time
 import threading
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
-V15_SOURCE_BUILD_ID = "20260830_V1010_REMOTE_PRIMARY_V1"
+V15_SOURCE_BUILD_ID = "20260903_V112_TURN_CLOSURE_REPORTS_V1"
 from logging.handlers import RotatingFileHandler
 
 # Preparación del entorno del proyecto antes de importar emergency_core.
@@ -99,6 +99,7 @@ from admission_statistical_reports import (  # noqa: E402 - PROJECT_ROOT bootstr
     COVERAGE_INSURED,
     COVERAGE_UNINSURED,
     SPECIALTY_ALL,
+    AdmissionReportDataset,
     AdmissionReportFilters,
     ReportSnapshotStore,
     SnapshotStaleError,
@@ -141,6 +142,59 @@ class AttentionOutputResult:
     flow_started_at: float
     should_open: bool
     should_print: bool
+
+
+@dataclass(frozen=True)
+class OutgoingTurnContext:
+    """Immutable operational identity captured before a confirmed handoff."""
+
+    operational_source_id: str
+    turn_id: int
+    generation: int
+    operational_revision: int
+    representative_id: str
+    representative_display_name: str
+    started_at: datetime
+    closed_at: datetime
+    turn_code: str
+    base_date: date
+    transition_id: str = ""
+    new_turn_id: int = 0
+    new_representative_id: str = ""
+
+    def as_turn_config(self) -> dict:
+        return {
+            "representante": self.representative_display_name,
+            "turno_codigo": self.turn_code,
+            "fecha_base": self.base_date,
+            "inicio_real": format_datetime_local(self.started_at),
+            "inicio_real_dt": self.started_at,
+        }
+
+
+@dataclass(frozen=True)
+class TurnClosureReportSnapshot:
+    """One immutable old-turn dataset shared by every admission artifact."""
+
+    context: OutgoingTurnContext
+    dataset: AdmissionReportDataset
+    dataset_revision: str
+    global_attention_ids: tuple[str, ...]
+    patient_count: int
+
+
+@dataclass(frozen=True)
+class TurnClosureReportFiles:
+    """Generation state; opening/printing is deliberately tracked separately."""
+
+    pdf_path: str
+    excel_path: str
+    patient_count: int
+    dataset_revision: str
+    pdf_generated: bool = False
+    excel_generated: bool = False
+    pdf_already_existed: bool = False
+    excel_already_existed: bool = False
 
 try:
     from .admission_context import AdmissionContext, create_standalone_context
@@ -440,6 +494,7 @@ RESUMEN_TURNO_PATH = app_data_path("resumen_turno.json")
 
 APP_LOG = logging.getLogger("emergencias")
 APP_LOG.setLevel(logging.INFO)
+_TURN_CLOSURE_REPORT_LOCK = threading.RLock()
 if not APP_LOG.handlers:
     _log_path = os.path.join(LOGS_DIR, "app.log")
     try:
@@ -5311,6 +5366,32 @@ def abrir_pdf(ruta_pdf, mostrar_error=True):
         return False
 
 
+def abrir_excel_generado(ruta_excel, mostrar_error=True):
+    """Open one generated workbook without acquiring or retaining a DB handle."""
+    try:
+        ruta_abs = os.path.abspath(str(ruta_excel or ""))
+        if not os.path.isfile(ruta_abs):
+            raise FileNotFoundError(ruta_abs)
+        sis = platform.system()
+        if sis == "Windows":
+            os.startfile(ruta_abs)
+        elif sis == "Darwin":
+            subprocess.run(["open", ruta_abs], check=False)
+        else:
+            subprocess.run(["xdg-open", ruta_abs], check=False)
+        return True
+    except Exception as exc:
+        APP_LOG.exception(
+            "EXCEL_OPEN_ERROR path=%s", os.path.basename(str(ruta_excel or ""))
+        )
+        if mostrar_error:
+            messagebox.showwarning(
+                "Listado Excel",
+                f"El archivo se generó, pero no se pudo abrir:\n{exc}",
+            )
+        return False
+
+
 def sanitize_filename(name: str) -> str:
     keep = "-_.() "
     return "".join(c for c in (name or "") if c.isalnum() or c in keep).strip().replace("  ", " ")
@@ -5855,6 +5936,216 @@ def construir_resumen_turno(
     )
 
 
+def _first_snapshot_value(snapshot: dict, *names: str):
+    for name in names:
+        value = snapshot.get(name)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def _parse_outgoing_identity(snapshot: dict) -> tuple[str, int, int, int]:
+    source_id = str(snapshot.get("operational_source_id") or "").strip()
+    try:
+        turn_id = int(snapshot.get("turn_id") or 0)
+        generation = int(snapshot.get("generation") or 0)
+        revision = int(snapshot.get("operational_revision") or 0)
+    except (TypeError, ValueError) as exc:
+        raise TurnoNoVigenteError("OUTGOING_TURN_IDENTITY_INVALID") from exc
+    if not source_id or turn_id <= 0:
+        raise TurnoNoVigenteError("OUTGOING_TURN_IDENTITY_UNAVAILABLE")
+    return source_id, turn_id, generation, revision
+
+
+def _parse_outgoing_period(
+    config: dict, closed_at: datetime
+) -> tuple[datetime, date]:
+    started_at = config.get("inicio_real_dt")
+    if not isinstance(started_at, datetime):
+        started_at = parse_datetime_local(str(config.get("inicio_real") or ""))
+    if not isinstance(started_at, datetime):
+        raise TurnoNoVigenteError("OUTGOING_TURN_START_UNAVAILABLE")
+    if not isinstance(closed_at, datetime) or closed_at <= started_at:
+        raise TurnoNoVigenteError("OUTGOING_TURN_END_INVALID")
+
+    base_date = config.get("fecha_base")
+    if isinstance(base_date, datetime):
+        base_date = base_date.date()
+    if not isinstance(base_date, date):
+        base_date = started_at.date()
+    return started_at, base_date
+
+
+def capture_outgoing_turn_context(
+    turno_cfg: dict,
+    operational_snapshot: dict,
+    closed_at: datetime,
+) -> OutgoingTurnContext:
+    """Freeze old-turn evidence before any central or local state can change."""
+    config = dict(turno_cfg or {})
+    snapshot = dict(operational_snapshot or {})
+    source_id, turn_id, generation, revision = _parse_outgoing_identity(snapshot)
+    started_at, base_date = _parse_outgoing_period(config, closed_at)
+    representative_id = str(
+        _first_snapshot_value(
+            snapshot, "representative_user_id", "active_user_id"
+        )
+    ).strip()
+    representative_name = limpiar_nombre_representante(
+        _first_snapshot_value(
+            snapshot,
+            "representative_display_name",
+            "active_user_display_name",
+            "active_username",
+        )
+        or config.get("representante")
+    )
+    return OutgoingTurnContext(
+        operational_source_id=source_id,
+        turn_id=turn_id,
+        generation=generation,
+        operational_revision=revision,
+        representative_id=representative_id,
+        representative_display_name=representative_name,
+        started_at=started_at,
+        closed_at=closed_at,
+        turn_code=normalizar_turno_codigo(config.get("turno_codigo", "8AM_8AM")),
+        base_date=base_date,
+    )
+
+
+def bind_outgoing_turn_transition(
+    context: OutgoingTurnContext,
+    transition,
+) -> OutgoingTurnContext:
+    """Attach the committed transition without replacing captured old identity."""
+    old_turn_id = int(getattr(transition, "old_turn_id", 0) or 0)
+    if old_turn_id != context.turn_id:
+        raise RuntimeError(
+            "La transición confirmada no corresponde al turno saliente capturado."
+        )
+    transition_id = str(getattr(transition, "transition_id", "") or "").strip()
+    session = getattr(transition, "operational_session", None)
+    new_turn_id = int(
+        getattr(transition, "new_turn_id", 0)
+        or getattr(session, "turn_id", 0)
+        or 0
+    )
+    if not transition_id or new_turn_id <= 0:
+        raise RuntimeError("La transición confirmada no devolvió identidad completa.")
+    return replace(
+        context,
+        transition_id=transition_id,
+        new_turn_id=new_turn_id,
+        new_representative_id=str(
+            getattr(transition, "new_user_id", "")
+            or getattr(session, "active_user_id", "")
+            or ""
+        ).strip(),
+    )
+
+
+def schedule_turn_closure_post_commit(
+    root,
+    runner,
+    context: OutgoingTurnContext | None,
+    new_turn_config,
+    warnings: list[str],
+) -> bool:
+    """Schedule only report delivery; this helper can never repeat a handoff."""
+    if context is None:
+        warnings.append("POST_COMMIT_REPORT_CONTEXT")
+        return False
+    root.after(
+        0,
+        lambda: runner(context, new_turn_config),
+    )
+    return True
+
+
+def build_turn_closure_report_snapshot(
+    db,
+    context: OutgoingTurnContext,
+) -> TurnClosureReportSnapshot:
+    """Read PostgreSQL once for the exact old identity and freeze the result."""
+    if not context.transition_id:
+        raise ValueError("El cierre requiere el transition_id confirmado.")
+    central_dataset = _dataset_turno_central(
+        db,
+        turn_id=context.turn_id,
+        operational_source_id=context.operational_source_id,
+    )
+    if central_dataset is None:
+        raise RuntimeError("El cierre de turno requiere el dataset central canónico.")
+    rows, effective_turn_id, effective_source_id = central_dataset
+    if (
+        effective_turn_id != context.turn_id
+        or effective_source_id != context.operational_source_id
+    ):
+        raise RuntimeError("La consulta central devolvió otra identidad operacional.")
+    turn_label = obtener_datos_turno_visual(
+        context.base_date, context.turn_code
+    )["turno_resumen"]
+    period_label = (
+        f"{context.started_at.strftime('%d/%m/%Y %I:%M %p')} a "
+        f"{context.closed_at.strftime('%d/%m/%Y %I:%M %p')}"
+    )
+    filters = AdmissionReportFilters(
+        start_at=context.started_at,
+        end_at=context.closed_at,
+        period_label=period_label,
+        turn_label=turn_label,
+        operational_source_id=context.operational_source_id,
+        turn_id=context.turn_id,
+    )
+    representatives = ()
+    if context.representative_display_name:
+        representatives = (
+            {
+                "user_id": context.representative_id,
+                "display_name": context.representative_display_name,
+                "event_at": context.started_at.isoformat(timespec="seconds"),
+            },
+        )
+    dataset = build_admission_report_dataset(
+        rows,
+        filters,
+        generated_at=context.closed_at,
+        turns=(
+            {
+                "turn_id": context.turn_id,
+                "started_at": context.started_at,
+                "ended_at": context.closed_at,
+                "representatives": representatives,
+            },
+        ),
+    )
+    revision = _admission_dataset_revision(dataset.records)
+    global_ids = tuple(
+        str(row.get("global_attention_id") or "") for row in dataset.records
+    )
+    APP_LOG.info(
+        "TURN_CLOSURE_SNAPSHOT transition_id=%s old_source=%s old_turn_id=%s "
+        "old_generation=%s old_revision=%s new_turn_id=%s patient_count=%s "
+        "dataset_revision=%s",
+        context.transition_id,
+        context.operational_source_id,
+        context.turn_id,
+        context.generation,
+        context.operational_revision,
+        context.new_turn_id,
+        len(dataset.records),
+        revision,
+    )
+    return TurnClosureReportSnapshot(
+        context=context,
+        dataset=dataset,
+        dataset_revision=revision,
+        global_attention_ids=global_ids,
+        patient_count=len(dataset.records),
+    )
+
+
 def crear_pdf_reporte(resumen, destino=None):
     if reportable_patient_count(resumen) == 0:
         raise EmptyAdmissionReportError(
@@ -6178,6 +6469,155 @@ def crear_excel_reporte_estadistico(resumen, destino=None):
     ):
         raise RuntimeError("No se pudo guardar el reporte estadístico en Excel.")
     return xlsx_path
+
+
+def crear_excel_listado_turno_cerrado(
+    snapshot: TurnClosureReportSnapshot,
+    destino: str,
+) -> str:
+    """Render the official operational listing from the frozen old-turn rows."""
+    if snapshot.patient_count <= 0:
+        raise EmptyAdmissionReportError(
+            "El turno saliente no contiene pacientes para el listado."
+        )
+    destination = os.path.abspath(os.fspath(destino))
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "LISTADO DE PACIENTES"
+    summary = snapshot.dataset.summary
+    construir_hoja_listado_pacientes(
+        sheet,
+        snapshot.dataset.records,
+        encabezado_linea_3=(
+            f"{snapshot.context.representative_display_name} "
+            f"{snapshot.context.base_date.strftime('%d/%m/%Y')}"
+        ).strip(),
+        encabezado_linea_4=str(summary.get("turn_label") or ""),
+        revision=snapshot.dataset_revision,
+    )
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".turn-closure-",
+        suffix=".xlsx",
+        dir=os.path.dirname(destination),
+    )
+    os.close(file_descriptor)
+    try:
+        workbook.save(temporary_path)
+        workbook.close()
+        os.replace(temporary_path, destination)
+    except Exception:
+        try:
+            workbook.close()
+        finally:
+            try:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+            except OSError:
+                pass
+        raise
+    return destination
+
+
+def _turn_closure_artifact_paths(
+    snapshot: TurnClosureReportSnapshot,
+    output_directory,
+    generate_pdf: bool,
+    generate_excel: bool,
+) -> tuple[str, str]:
+    context = snapshot.context
+    transition_tag = limpiar_nombre_archivo(context.transition_id)
+    if not transition_tag:
+        raise ValueError("El cierre requiere un transition_id válido.")
+    directory = os.path.abspath(
+        os.fspath(output_directory or carpeta_archivo_turno(context.as_turn_config()))
+    )
+    os.makedirs(directory, exist_ok=True)
+    turn_label = limpiar_nombre_archivo(
+        etiqueta_turno_archivo(context.as_turn_config())
+    )
+    artifact_tag = f"{turn_label} - turno {context.turn_id} - {transition_tag}"
+    pdf_path = (
+        os.path.join(directory, f"Reporte - {artifact_tag}.pdf")
+        if generate_pdf
+        else ""
+    )
+    excel_path = (
+        os.path.join(directory, f"Listado de pacientes - {artifact_tag}.xlsx")
+        if generate_excel
+        else ""
+    )
+    return pdf_path, excel_path
+
+
+def _generate_missing_turn_closure_artifacts(
+    snapshot: TurnClosureReportSnapshot,
+    pdf_path: str,
+    excel_path: str,
+) -> tuple[bool, bool, bool, bool]:
+    with _TURN_CLOSURE_REPORT_LOCK:
+        pdf_existed = bool(pdf_path and os.path.isfile(pdf_path))
+        excel_existed = bool(excel_path and os.path.isfile(excel_path))
+        pdf_generated = False
+        excel_generated = False
+        if pdf_path and not pdf_existed:
+            crear_pdf_reporte(snapshot.dataset.summary, destino=pdf_path)
+            pdf_generated = True
+        if excel_path and not excel_existed:
+            crear_excel_listado_turno_cerrado(snapshot, excel_path)
+            excel_generated = True
+    return pdf_generated, excel_generated, pdf_existed, excel_existed
+
+
+def generate_turn_closure_report_files(
+    snapshot: TurnClosureReportSnapshot,
+    *,
+    output_directory=None,
+    generate_pdf=True,
+    generate_excel=True,
+) -> TurnClosureReportFiles:
+    """Generate missing old-turn artifacts once; never mutates operational state."""
+    if snapshot.patient_count <= 0:
+        return TurnClosureReportFiles(
+            pdf_path="",
+            excel_path="",
+            patient_count=0,
+            dataset_revision=snapshot.dataset_revision,
+        )
+    context = snapshot.context
+    pdf_path, excel_path = _turn_closure_artifact_paths(
+        snapshot, output_directory, bool(generate_pdf), bool(generate_excel)
+    )
+    (
+        pdf_generated,
+        excel_generated,
+        pdf_existed,
+        excel_existed,
+    ) = _generate_missing_turn_closure_artifacts(snapshot, pdf_path, excel_path)
+    APP_LOG.info(
+        "TURN_CLOSURE_FILES transition_id=%s old_turn_id=%s new_turn_id=%s "
+        "patient_count=%s dataset_revision=%s pdf_generated=%s "
+        "pdf_already_existed=%s excel_generated=%s excel_already_existed=%s",
+        context.transition_id,
+        context.turn_id,
+        context.new_turn_id,
+        snapshot.patient_count,
+        snapshot.dataset_revision,
+        pdf_generated,
+        pdf_existed,
+        excel_generated,
+        excel_existed,
+    )
+    return TurnClosureReportFiles(
+        pdf_path=pdf_path,
+        excel_path=excel_path,
+        patient_count=snapshot.patient_count,
+        dataset_revision=snapshot.dataset_revision,
+        pdf_generated=pdf_generated,
+        excel_generated=excel_generated,
+        pdf_already_existed=pdf_existed,
+        excel_already_existed=excel_existed,
+    )
 
 
 def _report_excel_datetime(value):
@@ -8642,91 +9082,179 @@ class App:
         )
 
     def _run_turn_post_commit_effects(
-        self, turno_saliente, turno_cfg_nuevo, momento_cambio
+        self,
+        outgoing_context: OutgoingTurnContext,
+        turno_cfg_nuevo=None,
+        retry_attempt=0,
     ):
-        """Efectos derivados. Ninguno modifica el resultado del cambio central."""
-        warnings = []
-        outgoing_has_patients = True
-        transition = getattr(self.db, "last_transition_result", None)
-        outgoing_turn_id = getattr(transition, "old_turn_id", None)
-        outgoing_source_id = self._snapshot_operacional_integrado().get(
-            "operational_source_id"
+        """Generate old-turn artifacts in background after the central COMMIT."""
+        generate_pdf = bool(
+            self.app_settings.get("turnos_generate_report", True)
         )
-        if turno_saliente:
-            try:
-                outgoing_summary = construir_resumen_turno(
-                    self.db,
-                    turno_saliente,
-                    fin_override=momento_cambio,
-                    turn_id=outgoing_turn_id,
-                    operational_source_id=outgoing_source_id,
+        generate_excel = bool(
+            self.app_settings.get("turnos_save_excel_copy", True)
+        )
+
+        def generate_files():
+            snapshot = build_turn_closure_report_snapshot(
+                self.db, outgoing_context
+            )
+            files = generate_turn_closure_report_files(
+                snapshot,
+                generate_pdf=generate_pdf,
+                generate_excel=generate_excel,
+            )
+            return snapshot, files
+
+        def finish(payload):
+            snapshot, files = payload
+            warnings = []
+            pdf_opened = False
+            excel_opened = False
+            if files.patient_count <= 0:
+                self.set_status(
+                    "Relevo aplicado; el turno saliente no contiene pacientes.",
+                    "ok",
                 )
-                outgoing_has_patients = (
-                    reportable_patient_count(outgoing_summary) > 0
-                )
-            except Exception:
-                outgoing_has_patients = True
-                APP_LOG.exception(
-                    "No se pudo verificar si el turno saliente contiene pacientes"
-                )
-        if turno_saliente and bool(self.app_settings.get("turnos_generate_report", True)):
-            try:
-                self._generar_y_abrir_reporte_turno(
-                    turno_saliente,
-                    fin_corte=momento_cambio,
-                    turn_id=outgoing_turn_id,
-                    operational_source_id=outgoing_source_id,
-                )
-            except Exception as exc:
-                warnings.append("REPORTE_TURNO")
-                APP_LOG.exception("Efecto post-commit: reporte de turno")
-        if (
-            turno_saliente
-            and outgoing_has_patients
-            and bool(self.app_settings.get("turnos_save_excel_copy", True))
-        ):
-            try:
-                guardar_copia_excel_turno(turno_saliente, EXCEL_PATH)
-            except Exception:
-                warnings.append("COPIA_EXCEL_SALIENTE")
-                APP_LOG.exception("Efecto post-commit: copia del Excel saliente")
-        if (
-            outgoing_has_patients
-            and
-            self.app_settings.get("auto_print", True)
-            and bool(self.app_settings.get("print_auto_excel_turno", True))
-        ):
-            try:
-                if excel_canonical_in_use(EXCEL_PATH):
-                    warnings.append("IMPRESION_EXCEL_ARCHIVO_EN_USO")
-                elif not imprimir_excel(
-                    EXCEL_PATH,
-                    copias=max(
-                        1, int(self.app_settings.get("print_copies_excel", 2) or 2)
+            else:
+                if files.pdf_path:
+                    pdf_opened = abrir_pdf(files.pdf_path, mostrar_error=False)
+                    if not pdf_opened:
+                        warnings.append("PDF_OPEN_FAILED")
+                    if (
+                        self.app_settings.get("auto_print", True)
+                        and bool(
+                            self.app_settings.get(
+                                "print_auto_reporte_turno", True
+                            )
+                        )
+                    ):
+                        copies = max(
+                            1,
+                            int(
+                                self.app_settings.get(
+                                    "print_copies_reporte", 2
+                                )
+                                or 2
+                            ),
+                        )
+                        if not imprimir_pdf(
+                            files.pdf_path,
+                            copias=copies,
+                            mostrar_error=False,
+                        ):
+                            warnings.append("PDF_PRINT_FAILED")
+                if files.excel_path:
+                    excel_opened = abrir_excel_generado(
+                        files.excel_path, mostrar_error=False
+                    )
+                    if not excel_opened:
+                        warnings.append("EXCEL_OPEN_FAILED")
+                    if (
+                        self.app_settings.get("auto_print", True)
+                        and bool(
+                            self.app_settings.get(
+                                "print_auto_excel_turno", True
+                            )
+                        )
+                        and not imprimir_excel(
+                            files.excel_path,
+                            copias=max(
+                                1,
+                                int(
+                                    self.app_settings.get(
+                                        "print_copies_excel", 2
+                                    )
+                                    or 2
+                                ),
+                            ),
+                            permitir_reintento=False,
+                        )
+                    ):
+                        warnings.append("EXCEL_PRINT_FAILED")
+                self.set_status(
+                    (
+                        "Relevo aplicado; documentos del turno saliente generados."
+                        if not warnings
+                        else "Relevo aplicado; documentos generados con apertura pendiente."
                     ),
-                    permitir_reintento=False,
-                ):
-                    warnings.append("IMPRESION_EXCEL")
-            except Exception:
-                warnings.append("IMPRESION_EXCEL")
-                APP_LOG.exception("Efecto post-commit: impresión del Excel")
-        if bool(self.app_settings.get("turnos_open_archive_folder", False)):
-            try:
-                carpeta = (
-                    carpeta_archivo_turno(turno_saliente)
-                    if turno_saliente else ARCHIVO_DIARIO_DIR
+                    "ok" if not warnings else "warning",
                 )
-                if platform.system() == "Windows":
-                    os.startfile(carpeta)
-                elif platform.system() == "Darwin":
-                    subprocess.run(["open", carpeta], check=False)
-                else:
-                    subprocess.run(["xdg-open", carpeta], check=False)
-            except Exception:
-                warnings.append("OPEN_ARCHIVE_FOLDER")
-                APP_LOG.exception("Efecto post-commit: abrir carpeta de archivo")
-        self._post_to_ui(lambda: self._retry_excel_export_jobs())
-        return tuple(warnings)
+            APP_LOG.info(
+                "TURN_CLOSURE_DELIVERY transition_id=%s old_source=%s "
+                "old_turn_id=%s new_turn_id=%s old_representative=%s "
+                "new_representative=%s patient_count=%s dataset_revision=%s "
+                "pdf_generated=%s pdf_opened=%s excel_generated=%s "
+                "excel_opened=%s billing_report=DISPATCHED_BY_SHIFT_CLOSED_EVENT "
+                "warnings=%s",
+                outgoing_context.transition_id,
+                outgoing_context.operational_source_id,
+                outgoing_context.turn_id,
+                outgoing_context.new_turn_id,
+                outgoing_context.representative_id,
+                outgoing_context.new_representative_id,
+                snapshot.patient_count,
+                snapshot.dataset_revision,
+                files.pdf_generated,
+                pdf_opened,
+                files.excel_generated,
+                excel_opened,
+                ",".join(warnings) or "NONE",
+            )
+            if bool(self.app_settings.get("turnos_open_archive_folder", False)):
+                folder = os.path.dirname(files.pdf_path or files.excel_path or "")
+                if folder:
+                    try:
+                        if platform.system() == "Windows":
+                            os.startfile(folder)
+                        elif platform.system() == "Darwin":
+                            subprocess.run(["open", folder], check=False)
+                        else:
+                            subprocess.run(["xdg-open", folder], check=False)
+                    except Exception:
+                        APP_LOG.exception(
+                            "Efecto post-commit: abrir carpeta de archivo"
+                        )
+            self._retry_excel_export_jobs()
+
+        def fail(exc):
+            APP_LOG.error(
+                "TURN_CLOSURE_REPORT_PENDING transition_id=%s old_source=%s "
+                "old_turn_id=%s new_turn_id=%s error_type=%s retry_attempt=%s",
+                outgoing_context.transition_id,
+                outgoing_context.operational_source_id,
+                outgoing_context.turn_id,
+                outgoing_context.new_turn_id,
+                type(exc).__name__,
+                int(retry_attempt),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            self.set_status(
+                "Relevo aplicado; los documentos del turno saliente quedaron pendientes.",
+                "warning",
+            )
+            if int(retry_attempt) < 1:
+                try:
+                    self.root.after(
+                        30000,
+                        lambda: self._run_turn_post_commit_effects(
+                            outgoing_context,
+                            turno_cfg_nuevo,
+                            retry_attempt=1,
+                        ),
+                    )
+                except Exception:
+                    APP_LOG.exception(
+                        "No se pudo programar el reintento exclusivo de reportes"
+                    )
+            self._retry_excel_export_jobs()
+
+        return self._ejecutar_en_segundo_plano(
+            "Generando cierre del turno saliente...",
+            generate_files,
+            al_terminar=finish,
+            al_error=fail,
+        )
 
     def _actor_actual(self):
         if self.session_context.audit_actor:
@@ -16521,6 +17049,34 @@ class App:
                 candidato["administrative_override"] = True
                 candidato["override_reason"] = override_reason
 
+            outgoing_context = None
+            if not administrative_override:
+                if not turno_saliente:
+                    messagebox.showerror(
+                        "Cambio de turno",
+                        "No se pudo capturar el turno saliente. El relevo no se ejecutó.",
+                        parent=win,
+                    )
+                    return
+                try:
+                    outgoing_context = capture_outgoing_turn_context(
+                        turno_saliente,
+                        snapshot_actual,
+                        momento_cambio,
+                    )
+                except Exception as exc:
+                    APP_LOG.exception(
+                        "TURN_CLOSURE_CONTEXT_CAPTURE_FAILED error_type=%s",
+                        type(exc).__name__,
+                    )
+                    messagebox.showerror(
+                        "Cambio de turno",
+                        "No se pudo fijar la identidad del turno saliente. "
+                        "El relevo no se ejecutó.",
+                        parent=win,
+                    )
+                    return
+
             try:
                 self.db.backup_manager.create(
                     "cierre_turno",
@@ -16559,6 +17115,38 @@ class App:
             post_commit_warnings = []
             turno_cfg_nuevo = None
             nuevo_turno_local_id = None
+            if outgoing_context is not None:
+                try:
+                    outgoing_context = bind_outgoing_turn_transition(
+                        outgoing_context, transition
+                    )
+                except Exception:
+                    post_commit_warnings.append("OUTGOING_CONTEXT")
+                    outgoing_context = None
+                    APP_LOG.exception(
+                        "Turno central confirmado; contexto de cierre pendiente "
+                        "transition=%s turn_id=%s",
+                        transition_id,
+                        central_turn_id,
+                    )
+
+            if turno_saliente and not administrative_override:
+                try:
+                    self.db.cerrar_turno_existente(
+                        turno_saliente,
+                        momento_cambio,
+                        actor=self.session_context.username,
+                        actor_role=self.session_context.role,
+                        session_id=self.session_context.session_id,
+                    )
+                except Exception:
+                    post_commit_warnings.append("BILLING_SHIFT_CLOSURE")
+                    APP_LOG.exception(
+                        "Turno central confirmado; cierre de Facturación pendiente "
+                        "transition=%s old_turn_id=%s",
+                        transition_id,
+                        getattr(transition, "old_turn_id", None),
+                    )
             try:
                 saved = guardar_turno_config(
                     representante,
@@ -16570,14 +17158,6 @@ class App:
                 )
                 if not saved:
                     raise RuntimeError("No se pudo guardar el espejo de configuración.")
-                if turno_saliente and not administrative_override:
-                    self.db.cerrar_turno_existente(
-                        turno_saliente,
-                        momento_cambio,
-                        actor=self.session_context.username,
-                        actor_role=self.session_context.role,
-                        session_id=self.session_context.session_id,
-                    )
                 guardar_representante_catalogo(representante, self.db)
                 turno_cfg_nuevo = cargar_turno_config(
                     permitir_vencido=administrative_override
@@ -16635,13 +17215,13 @@ class App:
                 )
             else:
                 try:
-                    if turno_cfg_nuevo:
-                        self.root.after(
-                            0,
-                            lambda saliente=turno_saliente, nuevo=turno_cfg_nuevo, momento=momento_cambio: (
-                                self._run_turn_post_commit_effects(saliente, nuevo, momento)
-                            ),
-                        )
+                    schedule_turn_closure_post_commit(
+                        self.root,
+                        self._run_turn_post_commit_effects,
+                        outgoing_context,
+                        turno_cfg_nuevo,
+                        post_commit_warnings,
+                    )
                 except Exception:
                     post_commit_warnings.append("POST_COMMIT_SCHEDULE")
                     APP_LOG.exception("Turno confirmado; efectos post-commit pendientes")
