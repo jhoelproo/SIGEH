@@ -171,6 +171,7 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
     def test_final_save_validates_pc_source_against_shared_operational_source(self):
         connection = SequentialConnection(
             [
+                {"operational_source_id": "SHARED-OPERATIONAL-SOURCE", "turn_id": 3942},
                 None,
                 None,
                 {

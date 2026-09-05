@@ -1322,6 +1322,12 @@ def obtener_rango_turno_efectivo(turno_cfg: dict, fin_override: datetime = None)
 
 
 def turno_config_es_vigente(turno_cfg: dict, momento: datetime = None) -> bool:
+    from admission_sheet_state import ConfirmedTurnConfig
+
+    if isinstance(turno_cfg, ConfirmedTurnConfig):
+        # Only the integrated write guard creates this in-memory configuration.
+        # A scheduled end is not a centrally committed handoff.
+        return True
     if not turno_cfg:
         return False
     try:
@@ -12647,6 +12653,70 @@ class App:
         tree.bind("<Double-1>", lambda _event: reintentar_seleccion())
         cargar()
 
+    def _begin_sheet_operational_validation(self):
+        runtime = getattr(self.db, "_runtime", None)
+        if runtime is None:
+            return False
+        if getattr(self, "_sheet_validation_running", False):
+            return True
+        if getattr(self, "_sheet_validation_ready", False):
+            self._sheet_validation_ready = False
+            return False
+        self._sheet_validation_running = True
+
+        def fetch():
+            if not runtime.offline:
+                runtime.refresh_operational_state(force_remote=True)
+            runtime.require_write()
+            return runtime.state()
+
+        def finish(state):
+            from admission_sheet_state import SheetOperationalError, validate_sheet_snapshot_identity
+
+            self._sheet_validation_running = False
+            try:
+                validate_sheet_snapshot_identity(state, runtime.state())
+            except SheetOperationalError as exc:
+                fail(exc)
+                return
+            self.apply_operational_snapshot(state)
+            self._sheet_validation_ready = True
+            self.generar_pdf()
+
+        def fail(exc):
+            self._sheet_validation_running = False
+            self.boton_generar_pdf.config(state=tk.NORMAL)
+            APP_LOG.warning(
+                "OPERATIONAL_VALIDATION decision=BLOCK reason=%s",
+                getattr(exc, "code", type(exc).__name__),
+            )
+            self.set_status("No se pudo validar la sesión operacional; no se guardó la atención.", "warning")
+
+        self._ejecutar_en_segundo_plano(
+            "Verificando turno central...", fetch, al_terminar=finish, al_error=fail,
+        )
+        return True
+
+    def _generation_turn_config(self):
+        from admission_sheet_state import SheetOperationalError, confirmed_turn_config
+
+        if not callable(getattr(self.db, "get_operational_station_snapshot", None)):
+            return cargar_turno_config()
+        snapshot = self._snapshot_operacional_integrado()
+        try:
+            config = confirmed_turn_config(snapshot)
+        except SheetOperationalError as exc:
+            APP_LOG.warning("OPERATIONAL_VALIDATION decision=BLOCK reason=%s", exc.code)
+            raise
+        self.apply_operational_snapshot(snapshot)
+        APP_LOG.info(
+            "OPERATIONAL_VALIDATION source=%s turn=%s generation=%s "
+            "representative_id=%s role=%s decision=ALLOW reason=CONFIRMED_SNAPSHOT",
+            snapshot.get("operational_source_id"), snapshot.get("turn_id"),
+            snapshot.get("generation"), snapshot.get("active_user_id"), snapshot.get("role"),
+        )
+        return config
+
     def generar_pdf(self):
         salida_iniciada = False
         flow_started_at = _time.perf_counter()
@@ -12680,7 +12750,9 @@ class App:
 
             datos['Aseguradora (ARS)'] = ars_canon
 
-            turno_cfg = cargar_turno_config()
+            if self._begin_sheet_operational_validation():
+                return
+            turno_cfg = self._generation_turn_config()
             if not turno_cfg:
                 self.set_status("Debe abrir el turno operativo actual", "warning")
                 messagebox.showwarning(
@@ -12690,7 +12762,8 @@ class App:
                 )
                 self._dialogo_turno()
                 return
-            if not self._turno_pertenece_a_sesion(turno_cfg):
+            if (not callable(getattr(self.db, "get_operational_station_snapshot", None))
+                    and not self._turno_pertenece_a_sesion(turno_cfg)):
                 self.set_status("El turno pertenece a otro usuario", "warning")
                 self._asegurar_turno_de_sesion()
                 return
@@ -12788,7 +12861,8 @@ class App:
             self.set_status(f"Error: {str(e)}", "error")
             messagebox.showerror("Error", str(e))
         finally:
-            if not salida_iniciada and not self._final_revalidation_in_progress:
+            if (not salida_iniciada and not self._final_revalidation_in_progress
+                    and not getattr(self, "_sheet_validation_running", False)):
                 self.boton_generar_pdf.config(state=tk.NORMAL)
 
     # ─── HISTORIALES ───────────────────────────────────────────────────────

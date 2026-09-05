@@ -12,6 +12,9 @@ class _Cursor:
     def fetchone(self):
         return self._row
 
+    def fetchall(self):
+        return [self._row] if self._row else []
+
 
 class _Connection:
     def __init__(self, row=None):
@@ -39,7 +42,7 @@ def test_medication_markup_uses_central_cache_without_repricing_history():
     app.update_medication_markup_cache(35.0, 3)
 
 
-def test_claim_uses_in_memory_operational_context(monkeypatch):
+def test_failed_claim_has_bounded_central_diagnosis(monkeypatch):
     connection = _Connection(None)
     monkeypatch.setattr(app, "db_connect", lambda: connection)
     monkeypatch.setattr(
@@ -61,7 +64,10 @@ def test_claim_uses_in_memory_operational_context(monkeypatch):
         },
     )
     assert result is None
-    assert len(connection.calls) == 1
+    assert len(connection.calls) == 3  # reservation, diagnostic timeout, diagnostic SELECT
+    assert "INSERT INTO admission_billing_claims" in connection.calls[0][0]
+    assert "ELIGIBILITY" not in connection.calls[2][0]  # SQL, not a second mutation
+    assert connection.calls[2][0].lstrip().startswith("SELECT p.*")
 
 
 def test_ars_change_callback_has_no_database_reads():

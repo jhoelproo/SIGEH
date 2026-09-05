@@ -92,10 +92,12 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
                             turn_filter=turn_filter,
                             session_id="session-v15",
                         )
-                    sql, params = connection.calls[-1]
+                    sql, params = next(
+                        call for call in connection.calls if "AS processing_turn_id" in call[0]
+                    )
                     self.assertIn(turn_filter, params)
                     self.assertIn(expected, params)
-                    self.assertIn("p.patient_name ILIKE", sql)
+                    self.assertIn("REGEXP_REPLACE(TRIM(COALESCE(p.patient_name", sql)
                     self.assertIn("p.nss_snapshot", sql)
                     self.assertIn("p.cedula_snapshot", sql)
                     self.assertNotIn("turn_rank", sql)
@@ -144,7 +146,7 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
             readiness_index = params.index(app.READINESS_READY)
             self.assertEqual(params[readiness_index + 1], allowed)
 
-    def test_admin_and_auditor_can_recover_unprocessed_claims(self):
+    def test_privileged_roles_cannot_skip_live_claim_check(self):
         for role, allowed in (
             (app.ROLE_ADMIN, True),
             (app.ROLE_AUDIT, True),
@@ -164,11 +166,11 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
                     )
                 queue_sql, queue_params = connection.calls[-1]
                 self.assertIn(
-                    "AND ( %s OR NOT EXISTS ( SELECT 1 FROM admission_billing_claims",
+                    "AND ( NOT EXISTS ( SELECT 1 FROM admission_billing_claims",
                     queue_sql,
                 )
                 coverage_index = queue_params.index(app.COVERAGE_UNINSURED_DECLARED)
-                self.assertEqual(queue_params[coverage_index + 1], allowed)
+                self.assertEqual(queue_params[coverage_index + 1], f"session-{role}")
 
     def test_final_claim_revalidates_all_billing_rules(self):
         connection = _Connection()
@@ -181,7 +183,7 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
                 current_user={"role": app.ROLE_AUDIT},
             )
         self.assertIsNone(result)
-        sql, params = connection.calls[-1]
+        sql, params = next(call for call in connection.calls if "INSERT INTO admission_billing_claims" in call[0])
         self.assertIn("p.attention_id=%s AND p.source_instance_id=%s", sql)
         self.assertIn("r.admission_atencion_id=p.attention_id", sql)
         self.assertIn("admission_quick_list_dismissals", sql)
@@ -197,7 +199,7 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
             sql,
         )
         self.assertIn("admission_billing_claims.receipt_id IS NULL", sql)
-        self.assertIs(params[-1], True)
+        self.assertNotIn("OR ( %s AND", sql)
 
     def test_auxiliary_cannot_take_over_another_active_claim(self):
         connection = _Connection()
@@ -209,14 +211,11 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
                 session_id="session-aux",
                 current_user={"role": app.ROLE_AUX},
             )
-        sql, params = connection.calls[-1]
-        self.assertIn(
-            "( %s AND admission_billing_claims.receipt_id IS NULL",
-            sql,
-        )
-        self.assertIs(params[-1], False)
+        sql, params = next(call for call in connection.calls if "INSERT INTO admission_billing_claims" in call[0])
+        self.assertNotIn("OR ( %s AND", sql)
+        self.assertIn("admission_billing_claims.expires_at<=NOW()", sql)
 
-    def test_history_recheck_ignores_claim_only_for_privileged_roles(self):
+    def test_history_recheck_keeps_claim_guard_for_all_roles(self):
         for role, allowed in (
             (app.ROLE_ADMIN, True),
             (app.ROLE_AUDIT, True),
@@ -245,10 +244,11 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
                         session_id=f"session-{role}",
                     )
                 sql, params = connection.calls[-1]
-                self.assertIn("AND NOT %s ) AS claimed_elsewhere", sql)
-                self.assertIs(params[1], allowed)
+                self.assertIn("claim.expires_at>NOW()", sql)
+                self.assertIn("COALESCE(claim.station_id,'')=%s", sql)
+                self.assertEqual(params[0], f"session-{role}")
 
-    def test_billing_history_matches_active_v15_universe_and_left_joins_billing(self):
+    def test_billing_history_preserves_non_tombstoned_states_and_receipts(self):
         connection = _Connection()
         with patch.object(app, "db_connect", return_value=connection):
             app.list_admission_history(
@@ -258,7 +258,10 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
             )
         sql, params = connection.calls[-1]
         self.assertIn("LEFT JOIN LATERAL", sql)
-        self.assertIn(
+        self.assertIn("COALESCE(p.is_deleted,FALSE)=FALSE", sql)
+        self.assertIn("p.source_status", sql)
+        # Contract test 45: annulled history is not an eligible pending queue.
+        self.assertNotIn(
             "p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')", sql
         )
         self.assertNotIn("p.readiness=", sql)

@@ -113,7 +113,7 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
                 " 001-02 ", turn_filter="HEREDADO", allow_uninsured=False
             )
         self.assertEqual(result, [])
-        sql, params = connection.calls[-1]
+        sql, params = next(call for call in connection.calls if "AS processing_turn_id" in call[0])
         self.assertIn("admission_quick_list_dismissals", sql)
         self.assertIn("BANCOCENTRAL", sql)
         self.assertIn("UNIVERSAL", sql)

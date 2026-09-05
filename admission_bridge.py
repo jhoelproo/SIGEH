@@ -94,6 +94,7 @@ class AdmissionAttention:
     generation: int = 0
     origin_device_id: str = ""
     version: int = 1
+    billing_claim_acquired_at: str = ""
 
     def snapshot(self) -> dict:
         return asdict(self)

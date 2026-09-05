@@ -3847,6 +3847,14 @@ class _HybridDatabaseProxy:
                     self._runtime.require_primary_transition()
             else:
                 self._runtime.require_write()
+            if name == "guardar_atencion":
+                from admission_sheet_state import (
+                    ConfirmedTurnConfig, validate_sheet_snapshot_identity,
+                )
+
+                config = kwargs.get("turno_cfg", args[2] if len(args) > 2 else None)
+                if isinstance(config, ConfirmedTurnConfig):
+                    validate_sheet_snapshot_identity(config, self._runtime.state())
             result = value(*args, **kwargs)
             return result
 
