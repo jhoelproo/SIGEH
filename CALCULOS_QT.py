@@ -20,6 +20,11 @@ import unicodedata
 from dataclasses import dataclass, field
 from contextlib import contextmanager, nullcontext, suppress
 from types import SimpleNamespace
+from receipt_uuid import (
+    receipt_admission_uuid,
+    receipt_persistence_diagnostics,
+    receipt_save_error_message,
+)
 try:
     import requests  # type: ignore
 except ImportError:
@@ -4924,13 +4929,16 @@ def get_next_recibo_number() -> int:
 
 def _admission_values(attention) -> tuple:
     if not attention:
+        global_id = receipt_admission_uuid(None, write_runtime_log)
         return (
-            None, None, "", "", "", None, None, "", "", "", "", "", "EMERGENCIA", "", "", "",
+            None, None, "", "", "", None, None, "", None, "", "", "", "EMERGENCIA", "", "", global_id,
         )
     if isinstance(attention, AdmissionAttention):
         data = attention.snapshot()
     else:
         data = dict(attention)
+    global_id = receipt_admission_uuid(data.get("global_attention_id"), write_runtime_log)
+    data["global_attention_id"] = global_id
     snapshot_hash = str(data.get("snapshot_hash") or "").strip()
     if not snapshot_hash:
         snapshot_hash = stable_snapshot_hash(data)
@@ -4943,14 +4951,14 @@ def _admission_values(attention) -> tuple:
         now_str(),
         str(data.get("linked_by") or ""),
         str(data.get("source_updated_at") or ""),
-        str(data.get("source_instance_id") or "LEGACY"),
+        str(data.get("source_instance_id") or "").strip() or None,
         snapshot_hash,
         str(data.get("coverage_status") or ""),
         str(data.get("billing_readiness") or ""),
         str(data.get("attention_type") or data.get("service_type") or "EMERGENCIA"),
         str(data.get("specialty") or ""),
         str(data.get("admission_username") or ""),
-        str(data.get("global_attention_id") or ""),
+        global_id,
     )
 
 
@@ -10863,7 +10871,10 @@ def save_receipt_with_items(
         service_type = "EMERGENCIA"
     if admission_attention:
         admission_values[6] = str(username or "Sistema")
-    with db_connect() as con:
+    with receipt_persistence_diagnostics(
+        write_runtime_log, bypass=bypass_data,
+        global_id=admission_values[15], source_id=admission_values[8],
+    ), db_connect() as con:
         admission_processing = _lock_and_validate_admission_processing(
             con,
             admission_attention,
@@ -10951,7 +10962,7 @@ def save_receipt_with_items(
                        admission_source_instance_id=COALESCE(
                            NULLIF(%s,''), admission_source_instance_id),
                        admission_global_attention_id=COALESCE(
-                           NULLIF(%s,'')::UUID, admission_global_attention_id),
+                           %s::UUID, admission_global_attention_id),
                        admission_snapshot_hash=COALESCE(
                            NULLIF(%s,''), admission_snapshot_hash),
                        admission_coverage_status=COALESCE(
@@ -16782,10 +16793,12 @@ class PDFDatabaseWorker(threading.Thread):
             )
         except Exception as exc:
             write_runtime_log(
-                "Error guardando recibo SNAPSHOT "
-                f"| error={type(exc).__name__}: {str(exc)[:500]}"
+                "RECEIPT_WORKER_FAILED operation=SAVE_RECEIPT "
+                f"exception_type={type(exc).__name__}"
             )
-            self.signals.finished_signal.emit(False, str(exc), "", 0)
+            self.signals.finished_signal.emit(
+                False, receipt_save_error_message(exc), "", 0
+            )
 
 
 def number_to_text(num: int) -> str:
