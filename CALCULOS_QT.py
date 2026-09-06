@@ -5060,6 +5060,8 @@ def evaluate_attention_billing_eligibility(
     source_instance_id: str = "",
     global_attention_id: str = "",
     session_id: str = "",
+    receipt_id: int | None = None,
+    connection=None,
 ) -> dict:
     """Reconsulta la proyección central y aplica la regla canónica única.
 
@@ -5078,6 +5080,9 @@ def evaluate_attention_billing_eligibility(
                       receipt.id AS linked_receipt_id,
                       receipt.estado_facturacion AS linked_billing_status,
                       receipt.estado_documento AS linked_document_status,
+                      receipt.turno_origen_id AS receipt_origin_turn,
+                      receipt.turno_procesamiento_id AS receipt_processing_turn,
+                      receipt.herencia_estado AS receipt_inheritance_state,
                       ars_match.billing_enabled AS ars_billing_enabled,
                       active.operational_source_id AS active_operational_source_id,
                       active.turn_id AS active_turn_id,
@@ -5102,13 +5107,15 @@ def evaluate_attention_billing_eligibility(
                        ) AS dismissed_from_quick_list
                FROM admission_attention_projection p
                LEFT JOIN LATERAL (
-                   SELECT id,estado_facturacion,estado_documento
+                   SELECT id,estado_facturacion,estado_documento,
+                          turno_origen_id,turno_procesamiento_id,herencia_estado
                    FROM recibos receipt
                    WHERE """,
             receipt_identity,
             f"""
                      AND receipt.is_deleted=0
-                   ORDER BY receipt.id DESC LIMIT 1
+                   ORDER BY CASE WHEN receipt.id=%s THEN 1 ELSE 0 END,
+                            receipt.id DESC LIMIT 1
                ) receipt ON TRUE
                LEFT JOIN LATERAL (
                    SELECT billing_enabled FROM ars
@@ -5125,23 +5132,29 @@ def evaluate_attention_billing_eligibility(
                )
                ORDER BY p.synced_at DESC LIMIT 1""",
     ))
-    rows, _timings = CentralAdmissionReader().fetch_all(
-            eligibility_sql,
-            (
+    params = (
                 str(session_id or ""),
                 str(os.environ.get("COMPUTERNAME") or "ESTACION"),
                 str(dict(user_context or {}).get("username") or ""),
+                receipt_id,
                 global_id, global_id, global_id,
                 identity, source, source,
-            ),
+    )
+    if connection is not None:
+        rows = connection.execute(eligibility_sql, params).fetchall()
+    else:
+        rows, _timings = CentralAdmissionReader().fetch_all(
+            eligibility_sql, params,
             operation="evaluate_attention_billing_eligibility",
             sql_stage="ELIGIBILITY_REVALIDATION_QUERY",
             current_user=user_context,
             statement_timeout_ms=10000,
-    )
+        )
     if not rows:
         return _evaluate_hybrid_eligibility(None, dict(user_context or {}))
-    row = dict(rows[0])
+    from billing_admission_edit import apply_owned_receipt_context
+
+    row = apply_owned_receipt_context(dict(rows[0]), receipt_id)
     if not row.get("active_operational_source_id") or not row.get("active_turn_id"):
         raise AdmissionBridgeError("No se pudo resolver la identidad operacional central vigente.")
     access = evaluate_admission_billing_access(
@@ -5187,7 +5200,8 @@ def evaluate_attention_billing_eligibility(
         result.update(eligible=False, reason_code="TOMBSTONED",
                       reason="La atención fue anulada centralmente.")
     write_runtime_log(
-        "BILLING_CANDIDATE_EVALUATED "
+        "BILLING_CANDIDATE_EVALUATED BILLING_FINAL_ELIGIBILITY "
+        f"editing_receipt_id={receipt_id} own_receipt={row.get('editing_own_receipt', False)} "
         f"global_attention_id={_billing_admission_log_token(row.get('global_attention_id'))} "
         f"source={_billing_admission_log_token(row.get('operational_source_id'))} "
         f"turn={_projection_int(row.get('turn_id'))} "
@@ -6647,52 +6661,30 @@ def get_projected_billable_attention(
     *,
     current_user=None,
     global_attention_id: str = "",
+    session_id: str = "",
+    receipt_id: int | None = None,
+    connection=None,
+    expected_snapshot=None,
+    explain_denial=False,
 ):
-    ars_exclusion = admission_ars_sql_exclusion("p.canonical_ars")
-    allow_uninsured = can_view_uninsured_patients(dict(current_user or {}))
-    with db_connect() as con:
-        row = con.execute(
-            f"""WITH current_shift AS (
-                   {CURRENT_OPERATIONAL_SHIFT_SQL}
-               )
-               SELECT p.*,
-                      CASE WHEN p.turn_id=cs.turn_id THEN 'TURNO ACTUAL'
-                           WHEN inheritance.attention_id IS NOT NULL THEN 'HEREDADA'
-                           ELSE 'HISTÓRICO' END AS turn_scope,
-                      cs.turn_id AS processing_turn_id
-               FROM admission_attention_projection p
-               JOIN current_shift cs
-                 ON p.operational_source_id=cs.operational_source_id
-               LEFT JOIN admission_shift_inheritances inheritance
-                 ON inheritance.source_instance_id=p.source_instance_id
-                AND inheritance.attention_id=p.attention_id
-                AND inheritance.turno_origen_id=p.turn_id
-                AND inheritance.estado='PENDIENTE'
-               WHERE ((%s<>'' AND p.global_attention_id::TEXT=%s)
-                      OR (%s='' AND p.attention_id=%s AND p.source_instance_id=%s))
-                 AND p.readiness=%s
-                 AND {ars_exclusion}
-                 AND {ars_enabled_sql()}
-                 AND UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
-                 AND (%s OR p.coverage_status<>%s)
-                 AND (p.turn_id=cs.turn_id
-                      OR inheritance.attention_id IS NOT NULL)
-                 AND COALESCE(p.is_deleted,FALSE)=FALSE
-                 AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')
-               LIMIT 1""",
-            (
-                str(global_attention_id or ""),
-                str(global_attention_id or ""),
-                str(global_attention_id or ""),
-                int(attention_id),
-                str(source_instance_id or "LEGACY"),
-                READINESS_READY,
-                bool(allow_uninsured),
-                COVERAGE_UNINSURED_DECLARED,
-            ),
-        ).fetchone()
-    return _attention_from_projection(row) if row else None
-
+    result = evaluate_attention_billing_eligibility(
+        attention_id, current_user, source_instance_id=source_instance_id,
+        global_attention_id=global_attention_id, session_id=session_id,
+        receipt_id=receipt_id, connection=connection,
+    )
+    if not result.get("eligible"):
+        if explain_denial:
+            raise AdmissionAttentionUnavailableError(result.get("reason_code"), result.get("reason"))
+        return None
+    row = dict(result["_projection"])
+    if expected_snapshot is not None:
+        from billing_admission_edit import validate_admission_snapshot
+        validate_admission_snapshot(expected_snapshot, row)
+    row["turn_scope"] = (
+        "TURNO ACTUAL" if result["turn_scope"] == "CURRENT" else "HEREDADA"
+    )
+    row["processing_turn_id"] = row["active_turn_id"]
+    return _attention_from_projection(row)
 
 class DocumentIdentityMismatch(RuntimeError):
     pass
@@ -8923,6 +8915,7 @@ def create_uninsured_admission_receipt(
             con,
             attention,
             session_id=str(session_id or ""),
+            user_context=user,
         )
         row = con.execute(
                 """INSERT INTO recibos(
@@ -10499,21 +10492,18 @@ class DuplicateReceiptError(ValueError):
 
 
 class AdmissionAttentionUnavailableError(ValueError):
-    def __init__(self):
+    def __init__(self, reason_code="ATTENTION_UNAVAILABLE", reason=None):
+        self.reason_code = reason_code
         super().__init__(
-            "La atención o su reserva ya no están disponibles. "
+            reason or "La atención o su reserva ya no están disponibles. "
             "Actualiza su estado central antes de continuar."
         )
 
 
 def _lock_and_validate_admission_processing(
-    con,
-    admission_attention,
-    *,
-    session_id: str,
-    receipt_id=None,
+    con, admission_attention, *, session_id: str, receipt_id=None, user_context=None,
 ):
-    """Revalida y bloquea brevemente la atención antes de guardar el recibo."""
+    """Lock the canonical projection, then revalidate within the receipt transaction."""
     if not admission_attention:
         return None
     data = (
@@ -10521,120 +10511,68 @@ def _lock_and_validate_admission_processing(
         if isinstance(admission_attention, AdmissionAttention)
         else dict(admission_attention)
     )
-    attention_id = int(
-        data.get("attention_id") or data.get("admission_atencion_id") or 0
-    )
-    source_instance_id = str(
-        data.get("source_instance_id")
-        or data.get("admission_source_instance_id")
-        or "LEGACY"
-    )
-    if not attention_id:
-        raise AdmissionAttentionUnavailableError()
-
-    # Same transaction as the receipt/claim validation; no second connection.
-    shift = con.execute(CURRENT_OPERATIONAL_SHIFT_SQL).fetchone()
-    if not shift:
-        raise AdmissionAttentionUnavailableError()
-
+    attention_id = int(data.get("attention_id") or data.get("admission_atencion_id") or 0)
+    source = str(data.get("source_instance_id") or data.get("admission_source_instance_id") or "LEGACY")
+    global_id = str(data.get("global_attention_id") or "")
     con.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
-        (f"admission-billing:{source_instance_id}:{attention_id}",),
+        (f"admission-billing:{source}:{attention_id}",),
     )
-    existing = con.execute(
-        """SELECT id,turno_origen_id,turno_procesamiento_id,herencia_estado
-           FROM recibos
-           WHERE admission_atencion_id=%s
-             AND COALESCE(admission_source_instance_id,'LEGACY')=%s
-             AND is_deleted=0
-           ORDER BY id LIMIT 1""",
-        (attention_id, source_instance_id),
+    locked = con.execute(
+        """SELECT p.attention_id,p.source_instance_id
+           FROM admission_attention_projection p
+           WHERE ((%s<>'' AND p.global_attention_id::TEXT=%s)
+              OR (%s='' AND p.attention_id=%s AND p.source_instance_id=%s))
+           FOR UPDATE OF p""",
+        (global_id, global_id, global_id, attention_id, source),
     ).fetchone()
-    if existing:
-        if receipt_id is not None and int(existing["id"]) == int(receipt_id):
-            return {
-                "turno_origen_id": existing["turno_origen_id"],
-                "turno_procesamiento_id": existing["turno_procesamiento_id"],
-                "herencia_estado": existing["herencia_estado"],
-                "already_linked": True,
-            }
-        raise AdmissionAttentionUnavailableError()
-
-    eligible = con.execute(
-        f"""WITH current_shift AS (
-               SELECT %s::TEXT AS operational_source_id,
-                       %s::BIGINT AS turn_id
-           )
-           SELECT p.turn_id AS turno_origen_id,
-                  cs.turn_id AS turno_procesamiento_id,
-                  (p.turn_id<>cs.turn_id) AS is_inherited
-            FROM admission_attention_projection p
-            JOIN current_shift cs
-              ON p.operational_source_id::TEXT=cs.operational_source_id
-           LEFT JOIN admission_shift_inheritances inheritance
-             ON inheritance.source_instance_id=p.source_instance_id
-            AND inheritance.attention_id=p.attention_id
-            AND inheritance.turno_origen_id=p.turn_id
-            AND inheritance.estado='PENDIENTE'
-           WHERE p.attention_id=%s AND p.source_instance_id=%s
-             AND p.readiness=%s
-             AND {admission_ars_sql_exclusion('p.canonical_ars')}
-             AND {ars_enabled_sql()}
-             AND NOT EXISTS (
-                 SELECT 1 FROM admission_quick_list_dismissals d
-                 WHERE d.source_instance_id=p.source_instance_id
-                   AND d.attention_id=p.attention_id AND d.is_active=TRUE
-             )
-             AND (
-                   p.turn_id=cs.turn_id
-                   OR inheritance.attention_id IS NOT NULL
-             )
-             AND UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
-             AND COALESCE(p.is_deleted,FALSE)=FALSE
-             AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
-                 IN ('ACTIVA','PENDIENTE')
-           LIMIT 1 FOR SHARE OF p""",
-        (
-            str(
-                shift.get("operational_source_id")
-                or ""
-            ),
-            int(shift["turn_id"]),
-            attention_id, source_instance_id, READINESS_READY,
-        ),
-    ).fetchone()
-    if not eligible:
-        raise AdmissionAttentionUnavailableError()
-
+    if not locked:
+        raise AdmissionAttentionUnavailableError("ATTENTION_NOT_FOUND")
+    attention_id, source = int(locked["attention_id"]), str(locked["source_instance_id"])
+    # A fresh statement after acquiring the lock sees a preceding writer's commit.
+    result = evaluate_attention_billing_eligibility(
+        attention_id, user_context, source_instance_id=source,
+        global_attention_id=global_id, session_id=session_id,
+        receipt_id=receipt_id, connection=con,
+    )
+    if not result.get("eligible"):
+        raise AdmissionAttentionUnavailableError(
+            result.get("reason_code"), result.get("reason"),
+        )
+    row = result["_projection"]
+    from billing_admission_edit import validate_admission_snapshot
+    validate_admission_snapshot(data, row)
+    if row.get("editing_own_receipt"):
+        return {
+            "turno_origen_id": row["receipt_origin_turn"],
+            "turno_procesamiento_id": row["receipt_processing_turn"],
+            "herencia_estado": row["receipt_inheritance_state"],
+            "already_linked": True,
+        }
     claim = con.execute(
         """SELECT session_id,expires_at
            FROM admission_billing_claims
            WHERE source_instance_id=%s AND attention_id=%s
              AND session_id=%s AND receipt_id IS NULL AND processed_at IS NULL
            FOR UPDATE""",
-        (source_instance_id, attention_id, str(session_id or "")),
+        (source, attention_id, str(session_id or "")),
     ).fetchone()
     if not claim:
-        raise AdmissionAttentionUnavailableError()
-    # An expired reservation still owned by this login is safe to resume under
-    # its row lock. A concurrent claimant changes session_id and is rejected.
+        raise AdmissionAttentionUnavailableError("CLAIM_NOT_OWNED", "Debe validar nuevamente la reserva de la atención.")
     con.execute(
         """UPDATE admission_billing_claims SET expires_at=NOW()+INTERVAL '20 minutes'
            WHERE source_instance_id=%s AND attention_id=%s AND session_id=%s""",
-        (source_instance_id, attention_id, str(session_id or "")),
+        (source, attention_id, str(session_id or "")),
     )
-
     return {
-        "turno_origen_id": int(eligible["turno_origen_id"]),
-        "turno_procesamiento_id": int(eligible["turno_procesamiento_id"]),
+        "turno_origen_id": int(row["turn_id"]),
+        "turno_procesamiento_id": int(row["active_turn_id"]),
         "herencia_estado": (
-            "HEREDADA_PROCESADA"
-            if bool(eligible["is_inherited"])
+            "HEREDADA_PROCESADA" if result["turn_scope"] == "INHERITED"
             else "TURNO_ACTUAL_PROCESADA"
         ),
         "already_linked": False,
     }
-
 
 def normalize_receipt_identity(value) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).upper()
@@ -10772,11 +10710,15 @@ def save_receipt_with_items(
     """Guarda cabecera, ítems, historial y snapshot con un solo commit."""
     if str(ars or "").strip() and not medication_ars_is_selectable(ars):
         raise ValueError("SENASA SUBSIDIADO no se factura en este módulo.")
+    from billing_field_policy import room_price
+    room_price(sala)
+    admission_values = list(_admission_values(admission_attention))
     bypass_data = dict(verification_bypass or {})
     actor_user = {
         "username": str(username or ""),
         "role": str(bypass_data.get("role") or ""),
     }
+    actor_user = get_user(str(username or "")) or {"username": str(username or ""), "role": ""}
     if bypass_data and not admission_attention:
         actor_user = get_user(str(username or "")) or actor_user
         bypass_reason = str(bypass_data.get("reason") or "").strip()
@@ -10861,7 +10803,6 @@ def save_receipt_with_items(
         review_status, review_reason = AUTH_REVIEW_NOT_APPLICABLE, ""
     authorization_changed_at = now_str() if authorization_number else None
     authorization_actor = (username or "Sistema") if authorization_number else None
-    admission_values = list(_admission_values(admission_attention))
     service_type = str(
         (admission_attention or {}).get("attention_type", "")
         if isinstance(admission_attention, dict)
@@ -10880,10 +10821,35 @@ def save_receipt_with_items(
             admission_attention,
             session_id=str(admission_session_id or ""),
             receipt_id=recibo_id,
+            user_context=actor_user,
         )
+        if admission_attention:
+            from billing_admission_edit import validate_admission_snapshot
+            validate_admission_snapshot(
+                {"service_date": fecha}, {"service_date": attention_data.get("service_date") or attention_data.get("fecha")},
+            )
+        if not is_administrator(actor_user):
+            from billing_field_policy import require_room_price
+            old_price = None
+            if editing:
+                existing_price = con.execute(
+                    "SELECT sala FROM recibos WHERE id=%s FOR UPDATE", (int(recibo_id),),
+                ).fetchone()
+                old_price = existing_price["sala"] if existing_price else None
+            tariff = con.execute(
+                "SELECT sala_emergencia,consulta_price FROM ars WHERE nombre=%s AND is_active=1 FOR SHARE",
+                (ars,),
+            ).fetchone()
+            if ars and tariff is None and old_price is None:
+                raise ValueError("No se pudo resolver la tarifa vigente de la ARS. Solicite revisión a ADMIN.")
+            catalog_price = (
+                tariff["consulta_price" if service_type == "CONSULTA" else "sala_emergencia"]
+                if tariff else 0
+            )
+            require_room_price(admin=False, supplied=sala, catalog=catalog_price or 0, existing=old_price)
         if editing:
             current = con.execute(
-                """SELECT estado_facturacion, revision_version, total, sala, ars,
+                """SELECT estado_facturacion, revision_version, total, sala, ars, nombre, fecha, dx,
                           tipo_cobertura, numero_autorizacion, estado_documento,
                           admission_atencion_id, admission_nss_snapshot,
                           admission_cedula_snapshot, admission_source_instance_id,
@@ -10898,6 +10864,13 @@ def save_receipt_with_items(
             ).fetchone()
             if not current:
                 raise ValueError("El recibo que intentas editar ya no existe.")
+            from billing_field_policy import require_validated_header_edit
+            require_validated_header_edit(
+                auxiliary=normalize_role(actor_user.get("role")) == ROLE_AUX,
+                validated=bool(admission_attention),
+                supplied={"nombre": nombre, "dx": dx, "fecha": fecha, "ars": ars, "sala": sala},
+                previous=dict(current),
+            )
             if bool(current.get("verification_bypassed")) and not admission_attention:
                 document_state, review_status, review_reason = (
                     classify_privileged_bypass_authorization(authorization_number)
@@ -13200,6 +13173,8 @@ def change_receipt_billing_status(
                             or "LEGACY"
                         ),
                         current_user=user,
+                        receipt_id=int(recibo_id),
+                        connection=con,
                     )
                 except Exception as exc:
                     raise ValueError(
@@ -14536,6 +14511,8 @@ def evaluate_admission_billing_access(
     current_operational_state: dict | None = None,
 ) -> dict:
     """Matriz canónica de alcance de turno para Facturación."""
+    from billing_history_handoff import has_inherited_receipt
+
     data = dict(attention or {})
     state = dict(current_operational_state or {})
     role = normalize_role((current_user or {}).get("role"))
@@ -14558,6 +14535,7 @@ def evaluate_admission_billing_access(
         is_current = str(data.get("turn_scope") or "").upper() in {"CURRENT", "TURNO ACTUAL"}
     inherited = same_source and (
         bool(data.get("explicitly_inherited"))
+        or has_inherited_receipt(data)
         or str(data.get("turn_scope") or "").upper()
         in {"INHERITED", "HEREDADA", "HEREDADA DEL TURNO ANTERIOR"}
     )
@@ -19954,6 +19932,8 @@ class ARSManagerDialog(QDialog):
         self.btn_edit_hono.clicked.connect(lambda: self.open_category_editor('Honorarios'))
         up.clicked.connect(lambda: self.sala_spin.setValue(self.sala_spin.value()+SALA_STEP))
         dn.clicked.connect(lambda: self.sala_spin.setValue(max(0.0, self.sala_spin.value()-SALA_STEP)))
+        for control in (self.sala_spin, up, dn, self.btn_save):
+            control.setEnabled(is_administrator(self.current_user))
         if self.ars_combo.count() > 0:
             self.on_ars_change(self.ars_combo.currentText())
         dbtns = QDialogButtonBox(QDialogButtonBox.Close)
@@ -20254,6 +20234,9 @@ class ARSManagerDialog(QDialog):
         FloatingToast("✅ ARS eliminada", self).show()
 
     def save_price(self):
+        if not is_administrator(self.current_user):
+            QMessageBox.warning(self, "Tarifa de sala", "Sólo ADMIN puede modificar la tarifa de sala.")
+            return
         name = self.ars_combo.currentText()
         if not name: return
         if not medication_ars_is_selectable(name):
@@ -29488,6 +29471,7 @@ class EmergencyWorkspacePage(QWidget):
     """Admisión V15 dentro de la aplicación y sesión principales."""
 
     attention_selected = Signal(object)
+    billing_requested = Signal(object)
     projection_changed = Signal(object)
     shift_changed = Signal(object)
     shift_closure_ready = Signal(str, int)
@@ -29555,6 +29539,9 @@ class EmergencyWorkspacePage(QWidget):
                 force_logout_callback=self._force_logout_from_hybrid,
             )
             self.admission_controller = None
+            self.admission_context.event_bus.billing_requested.connect(
+                self.billing_requested.emit
+            )
             self._v15_factory = AdmissionV15Factory(
                 self.admission_context,
                 # SessionHealthWorker owns the central heartbeat. V15 only
@@ -30252,6 +30239,8 @@ class AdmissionValidationDialog(QDialog):
         worker.start()
 
     def _apply_attentions(self, attentions):
+        from billing_history_handoff import exclude_current_draft
+
         self.table.setRowCount(0)
         loaded = list(attentions or [])
         worker = self._load_worker
@@ -30261,7 +30250,10 @@ class AdmissionValidationDialog(QDialog):
             f"fase=cola ms={elapsed_ms:.1f} filas={len(loaded)} consultas=1"
         )
         self._has_next_page = len(loaded) > self._page_size
-        self.attentions = loaded[:self._page_size]
+        self.attentions = exclude_current_draft(
+            loaded[:self._page_size],
+            getattr(self.parent(), "current_admission_attention", None) or {},
+        )
         self.page_label.setText(f"Página {self._page + 1}")
         self.previous_page_button.setEnabled(self._page > 0)
         self.next_page_button.setEnabled(self._has_next_page)
@@ -32861,6 +32853,9 @@ class MainWindow(QMainWindow):
             )
             self.admission_page = self.emergency_workspace.queue_page
             self.full_admission_page = self.emergency_workspace.full_page
+            self.emergency_workspace.billing_requested.connect(
+                self._send_emergency_history_to_billing
+            )
             self.emergency_workspace.attention_selected.connect(
                 self._use_admission_attention_from_module
             )
@@ -33603,6 +33598,19 @@ class MainWindow(QMainWindow):
             self._restore_validation_button()
 
     def _complete_verified_admission(self, verified):
+        from billing_admission_edit import can_refresh_patient_in_draft
+
+        refreshed = verified.snapshot()
+        if can_refresh_patient_in_draft(
+            dict(self.current_admission_attention or {}), refreshed
+        ):
+            self.current_admission_attention = refreshed
+            self.name_edit.setText(verified.name)
+            FloatingToast(
+                "Datos del paciente revalidados. Cargos y autorización conservados.",
+                self,
+            ).show()
+            return
         if self.editing_recibo_id is not None:
             answer = QMessageBox.question(
                 self,
@@ -34843,6 +34851,9 @@ class MainWindow(QMainWindow):
 
     def save_sala(self):
         self.mark_activity()
+        if not is_administrator(self.current_user):
+            QMessageBox.warning(self, "Precio de sala", "Sólo ADMIN puede modificar el precio de sala.")
+            return
         if not self.current_ars:
             FloatingToast("Seleccione una ARS primero", self, is_error=True).show()
             return
@@ -34923,7 +34934,23 @@ class MainWindow(QMainWindow):
 
         self.search_and_maybe_switch_tab()
 
+    def _apply_billing_field_policy(self):
+        from billing_field_policy import editable_billing_fields
+        policy = editable_billing_fields(
+            admin=is_administrator(self.current_user),
+            auxiliary=normalize_role(self.current_user.get("role")) == ROLE_AUX,
+            validated=bool(self.current_admission_attention),
+            read_only=bool(getattr(self, "receipt_read_only", False)),
+        )
+        if getattr(self, "service_type", "EMERGENCIA") == "CONSULTA":
+            policy["sala_spin"] = False
+        for name, editable in policy.items():
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(editable)
+
     def _update_document_flow_ui(self):
+        MainWindow._apply_billing_field_policy(self)
         low_height = bool(getattr(self, "_low_height_mode", False))
         patient_validated = bool(self.current_admission_attention)
         privileged_unlinked = (
@@ -35178,6 +35205,7 @@ class MainWindow(QMainWindow):
                 editor = self.cart_table.cellWidget(row, column)
                 if editor is not None:
                     editor.setEnabled(editable)
+        MainWindow._apply_billing_field_policy(self)
 
     def open_receipt_in_billing(self, recibo_id: int):
         """Punto canónico para cargar un recibo existente en Facturación."""
@@ -35258,6 +35286,7 @@ class MainWindow(QMainWindow):
                     "source_instance_id": data.get(
                         "admission_source_instance_id"
                     ),
+                    "global_attention_id": data.get("admission_global_attention_id"),
                     "snapshot_hash": data.get("admission_snapshot_hash"),
                     "coverage_status": data.get(
                         "admission_coverage_status"
@@ -35395,7 +35424,18 @@ class MainWindow(QMainWindow):
                     global_attention_id=str(
                         self.current_admission_attention.get("global_attention_id") or ""
                     ),
+                    session_id=self.session_id,
+                    receipt_id=self.editing_recibo_id,
+                    expected_snapshot=self.current_admission_attention,
+                    explain_denial=True,
                 )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Verificar Admisión", str(exc))
+                write_runtime_log(
+                    "BILLING_FINAL_ELIGIBILITY rejected "
+                    f"reason={getattr(exc, 'reason_code', 'ADMISSION_DATA_CHANGED')}"
+                )
+                return
             except Exception as exc:
                 QMessageBox.critical(
                     self,
@@ -35403,7 +35443,7 @@ class MainWindow(QMainWindow):
                     "No se pudo verificar la atención central. "
                     "El recibo permanece pendiente y no se guardó.",
                 )
-                write_runtime_log(f"Verificación central de Admisión: {exc}")
+                write_runtime_log(f"BILLING_FINAL_ELIGIBILITY query_failed exception_type={type(exc).__name__}")
                 return
             if not live_attention:
                 schedule_admission_claim_release(
@@ -35846,7 +35886,7 @@ class MainWindow(QMainWindow):
         if quick_list is not None and hasattr(quick_list, "refresh_data"):
             quick_list.refresh_data()
 
-    def _use_admission_attention_from_module(self, attention):
+    def _use_admission_attention_from_module(self, attention, *, from_history=False):
         """Revalida la atención antes de usarla y evita recibos duplicados."""
         self.mark_activity()
         attention_ars = str(
@@ -35879,10 +35919,68 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self._validation_claim_worker = worker
-        worker.completed.connect(self._on_admission_claim_completed)
+        worker.completed.connect(
+            self._on_history_billing_claim_completed
+            if from_history else self._on_admission_claim_completed
+        )
         worker.failed.connect(self._on_admission_claim_failed)
         worker.finished.connect(worker.deleteLater)
         worker.start()
+
+    def _send_emergency_history_to_billing(self, identity):
+        if not can_access_billing_admission_history(self.current_user):
+            QMessageBox.warning(self, "Facturación", "Tu rol no permite esta operación.")
+            return
+        if self._validation_claim_worker is not None:
+            return
+        self._validation_flow_started_at = perf_counter()
+        self.btn_validate_admission.setEnabled(False)
+        worker = AdmissionHistoryEligibilityWorker(
+            identity, self.current_user, self.session_id, self
+        )
+        self._validation_claim_worker = worker
+        worker.resolved.connect(self._on_history_billing_resolved)
+        worker.failed.connect(self._on_admission_claim_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_history_billing_resolved(self, result, _elapsed_ms):
+        from billing_history_handoff import billing_destination
+
+        self._validation_claim_worker = None
+        self._restore_validation_button()
+        destination = billing_destination(result)
+        if destination == "claim":
+            self._use_admission_attention_from_module(
+                _attention_from_projection(result["_projection"]), from_history=True
+            )
+        elif destination == "receipt":
+            if self.cart_table.rowCount() or self.name_edit.text().strip() or self.editing_recibo_id is not None:
+                answer = QMessageBox.question(
+                    self, "Abrir facturación existente",
+                    "Se abrirá el recibo vinculado y se reemplazará el borrador visible. "
+                    "¿Deseas continuar?", QMessageBox.Yes | QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+            if self.open_receipt_in_billing(int(result["receipt_id"])):
+                self._show_billing_from_history()
+        else:
+            QMessageBox.information(
+                self, "Atención no disponible",
+                result.get("reason") or "Actualiza el Historial para consultar su estado central.",
+            )
+
+    def _show_billing_from_history(self):
+        if self.billing_module_index is not None:
+            self.module_tabs.setCurrentIndex(self.billing_module_index)
+        self._refresh_admission_billing_views()
+
+    def _on_history_billing_claim_completed(self, verified, elapsed_ms):
+        self._on_admission_claim_completed(verified, elapsed_ms)
+        current = self.current_admission_attention or {}
+        if verified and current.get("global_attention_id") == verified.global_attention_id:
+            self._show_billing_from_history()
 
     def open_audit_workspace(self):
         self.mark_activity()

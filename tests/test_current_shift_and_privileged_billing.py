@@ -48,44 +48,50 @@ class _SummaryConnection:
     def execute(self, sql, params=()):
         self.calls.append((sql, params))
         if "SELECT p.* FROM admission_attention_projection" in sql:
-            return _Result(rows=[
-                {
-                    "source_instance_id": "PC1-LOCAL",
-                    "operational_source_id": "OPERATIONAL-SOURCE",
-                    "attention_id": 11,
-                    "patient_id": 1011,
-                    "turn_id": 33,
-                    "patient_name": "PACIENTE 11",
-                    "service_date": "2026-08-08",
-                    "service_time": "08:00:00",
-                    "canonical_ars": "APS",
-                    "coverage_status": "ASEGURADO_VALIDADO",
-                    "service_type": "EMERGENCIA",
-                    "readiness": app.READINESS_READY,
-                    "readiness_reasons": "[]",
-                },
-                {
-                    "source_instance_id": "PC2-LOCAL",
-                    "operational_source_id": "OPERATIONAL-SOURCE",
-                    "attention_id": 12,
-                    "patient_id": 1012,
-                    "turn_id": 33,
-                    "patient_name": "PACIENTE 12",
-                    "service_date": "2026-08-08",
-                    "service_time": "08:01:00",
-                    "canonical_ars": "FUTURO",
-                    "coverage_status": "ASEGURADO_VALIDADO",
-                    "service_type": "EMERGENCIA",
-                    "readiness": "PENDIENTE_CORRECCION",
-                    "readiness_reasons": "[]",
-                },
-            ])
+            return _Result(
+                rows=[
+                    {
+                        "source_instance_id": "PC1-LOCAL",
+                        "operational_source_id": "OPERATIONAL-SOURCE",
+                        "attention_id": 11,
+                        "patient_id": 1011,
+                        "turn_id": 33,
+                        "patient_name": "PACIENTE 11",
+                        "service_date": "2026-08-08",
+                        "service_time": "08:00:00",
+                        "canonical_ars": "APS",
+                        "coverage_status": "ASEGURADO_VALIDADO",
+                        "service_type": "EMERGENCIA",
+                        "readiness": app.READINESS_READY,
+                        "readiness_reasons": "[]",
+                    },
+                    {
+                        "source_instance_id": "PC2-LOCAL",
+                        "operational_source_id": "OPERATIONAL-SOURCE",
+                        "attention_id": 12,
+                        "patient_id": 1012,
+                        "turn_id": 33,
+                        "patient_name": "PACIENTE 12",
+                        "service_date": "2026-08-08",
+                        "service_time": "08:01:00",
+                        "canonical_ars": "FUTURO",
+                        "coverage_status": "ASEGURADO_VALIDADO",
+                        "service_type": "EMERGENCIA",
+                        "readiness": "PENDIENTE_CORRECCION",
+                        "readiness_reasons": "[]",
+                    },
+                ]
+            )
         if "DISTINCT ON (admission_atencion_id)" in sql:
-            return _Result(rows=[{
-                "source_instance_id": "PC1-LOCAL",
-                "admission_atencion_id": 11,
-                "estado_facturacion": "FACTURADO",
-            }])
+            return _Result(
+                rows=[
+                    {
+                        "source_instance_id": "PC1-LOCAL",
+                        "admission_atencion_id": 11,
+                        "estado_facturacion": "FACTURADO",
+                    }
+                ]
+            )
         if "COUNT(*) AS patients" in sql:
             return _Result(row={"patients": 2, "total": 1250.0})
         return _Result(row={"inherited_pending": 1, "inherited_processed": 0})
@@ -180,9 +186,14 @@ def test_privileged_roles_cannot_select_uninherited_historical_attention():
         )
 
     assert result is None
-    assert "ELSE 'HISTÓRICO' END AS turn_scope" in connection.sql
-    assert "AND (p.turn_id=cs.turn_id" in connection.sql
-    assert "(%s OR p.turn_id=cs.turn_id" not in connection.sql
+    assert "AS explicitly_inherited" in connection.sql
+    assert "inheritance.estado='PENDIENTE'" in connection.sql
+    decision = app.evaluate_admission_billing_access(
+        {"turn_id": 1, "operational_source_id": "SOURCE"},
+        {"role": app.ROLE_AUDIT},
+        {"turn_id": 33, "operational_source_id": "SOURCE"},
+    )
+    assert not decision["can_use_for_billing"]
 
 
 def test_regular_roles_keep_current_or_inherited_turn_restriction():
@@ -200,8 +211,18 @@ def test_regular_roles_keep_current_or_inherited_turn_restriction():
             "V15-REAL",
             current_user={"role": app.ROLE_AUX},
         )
-    assert "AND (p.turn_id=cs.turn_id" in connection.sql
-    assert "(%s OR p.turn_id=cs.turn_id" not in connection.sql
+    assert "inheritance.estado='PENDIENTE'" in connection.sql
+    for inherited in (False, True):
+        decision = app.evaluate_admission_billing_access(
+            {
+                "turn_id": 1,
+                "operational_source_id": "SOURCE",
+                "explicitly_inherited": inherited,
+            },
+            {"role": app.ROLE_AUX},
+            {"turn_id": 33, "operational_source_id": "SOURCE"},
+        )
+        assert decision["can_use_for_billing"] is inherited
 
 
 def test_yellow_theme_icons_remain_visible_for_moon_and_sun():

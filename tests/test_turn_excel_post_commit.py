@@ -1356,8 +1356,14 @@ def test_real_windows_file_lock_does_not_get_closed_by_exporter(tmp_path):
     v15 = _v15_module()
     source = tmp_path / "versionado.xlsx"
     canonical = tmp_path / "LISTADO DE PACIENTES EN EMERGENCIA.xlsx"
-    source.write_bytes(b"nuevo")
-    canonical.write_bytes(b"anterior")
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    workbook.active["A1"] = "nuevo"
+    workbook.save(source)
+    workbook.active["A1"] = "anterior"
+    workbook.save(canonical)
+    workbook.close()
 
     create_file = ctypes.windll.kernel32.CreateFileW
     create_file.restype = ctypes.c_void_p
@@ -1382,4 +1388,4 @@ def test_real_windows_file_lock_does_not_get_closed_by_exporter(tmp_path):
         assert ctypes.windll.kernel32.CloseHandle(handle)
 
     v15._update_canonical_excel(str(source), str(canonical))
-    assert canonical.read_bytes() == b"nuevo"
+    assert canonical.read_bytes() == source.read_bytes()

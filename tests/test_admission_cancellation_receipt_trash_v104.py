@@ -58,8 +58,13 @@ def test_all_billing_admission_entry_points_reject_tombstones():
     claim = inspect.getsource(app.claim_projected_billable_attention)
     receipt_link = inspect.getsource(app._lock_and_validate_admission_processing)
 
-    for source in (candidates, history, projected, claim, receipt_link):
+    for source in (candidates, history, claim):
         assert "COALESCE(p.is_deleted,FALSE)=FALSE" in source
+    for source in (projected, receipt_link):
+        assert "evaluate_attention_billing_eligibility(" in source
+    evaluator = inspect.getsource(app.evaluate_attention_billing_eligibility)
+    assert 'row.get("is_deleted")' in evaluator
+    assert 'reason_code="TOMBSTONED"' in evaluator
 
 
 def test_schema_initialization_installs_cancellation_trigger_after_columns():
@@ -67,9 +72,7 @@ def test_schema_initialization_installs_cancellation_trigger_after_columns():
 
     billing_columns = source.index("billing_columns =")
     projection_columns = source.index("projection_definitions =")
-    trigger_migration = source.index(
-        "_apply_admission_data_lifecycle_migrations(con)"
-    )
+    trigger_migration = source.index("_apply_admission_data_lifecycle_migrations(con)")
     assert billing_columns < projection_columns < trigger_migration
 
 

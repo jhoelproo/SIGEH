@@ -127,6 +127,19 @@ def test_auxiliary_can_create_an_idempotent_local_attention_tombstone(tmp_path):
             (attention_id,),
         )
 
+    # Initialization/restart must not turn a live attention into an annulment.
+    admission_hybrid.OfflineAdmissionStore(database_path).initialize()
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT estado,is_deleted FROM atenciones WHERE id=1"
+        ).fetchone() == ("ACTIVA", 0)
+    with pytest.raises(ValueError):
+        store.cancel_attention_local(
+            attention_id,
+            current_user={"id": 9, "username": "aux.test", "role": "Auxiliar"},
+            reason="",
+        )
+
     cancelled = store.cancel_attention_local(
         attention_id,
         current_user={"id": 9, "username": "aux.test", "role": "Auxiliar"},

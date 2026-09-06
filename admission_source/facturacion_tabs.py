@@ -3795,9 +3795,11 @@ class DatabaseManager:
 # EXCEL
 # -------------------------------
 def guardar_excel_seguro(wb, ruta_excel=EXCEL_PATH, accion="guardar el Excel", interactivo=True):
+    from excel_artifact import save_workbook
+
     while True:
         try:
-            wb.save(ruta_excel)
+            save_workbook(wb, ruta_excel)
             return True
         except PermissionError:
             if not interactivo:
@@ -3889,44 +3891,8 @@ def es_error_excel_corrupto(exc) -> bool:
 
 
 def recrear_excel_basico_por_corrupcion():
-    try:
-        if os.path.exists(EXCEL_PATH):
-            corrupt_name = os.path.join(
-                os.path.dirname(EXCEL_PATH),
-                f"LISTADO_CORRUPTO_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
-            try:
-                shutil.move(EXCEL_PATH, corrupt_name)
-            except Exception:
-                try:
-                    os.remove(EXCEL_PATH)
-                except Exception:
-                    pass
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Pacientes"
-
-        ws.merge_cells('A1:D1')
-        ws.merge_cells('A2:D2')
-        ws.merge_cells('A3:D3')
-        ws.merge_cells('A4:D4')
-
-        ws['A1'] = "ASISTENCIA DE PACIENTES A EMERGENCIA"
-        ws['A2'] = "ASEGURADOS Y NO ASEGURADOS"
-        ws['A3'] = ""
-        ws['A4'] = ""
-
-        ws['A5'] = "NO."
-        ws['B5'] = "NOMBRE"
-        ws['C5'] = "ESPECIALIDAD"
-        ws['D5'] = "ARS"
-
-        aplicar_formato_excel(ws)
-        guardar_excel_seguro(wb, EXCEL_PATH, "recrear el listado de Excel")
-        return True
-    except Exception:
-        return False
+    """Compatibility entry point: never replace or delete corruption evidence."""
+    return False
 
 
 def abrir_excel_workbook_seguro(ruta_excel=None, mostrar_error=True, **kwargs):
@@ -3942,10 +3908,10 @@ def abrir_excel_workbook_seguro(ruta_excel=None, mostrar_error=True, **kwargs):
             messagebox.showwarning(
                 "Excel dañado",
                 "El listado de Excel presentó un error de compresión o corrupción.\n\n"
-                "Se creará un Excel nuevo y se intentará reconstruir con los datos del turno actual."
+                "El archivo se conservará sin cambios para su diagnóstico. "
+                "No se reemplazará automáticamente por un listado vacío."
             )
-            recrear_excel_basico_por_corrupcion()
-            return openpyxl.load_workbook(ruta_excel, **kwargs)
+            raise
         raise
 
 def verificar_o_crear_excel():

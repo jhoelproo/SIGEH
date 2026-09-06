@@ -18,11 +18,13 @@ def test_every_billing_current_turn_query_uses_product_epoch():
     for function in (
         app.BillingAdmissionQueryService.get_operational_candidates,
         app.BillingAdmissionQueryService.load_admission_history_batch,
-        app.get_projected_billable_attention,
         app.claim_projected_billable_attention,
         app.evaluate_attention_billing_eligibility,
     ):
         assert "CURRENT_OPERATIONAL_SHIFT_SQL" in inspect.getsource(function)
+    assert "evaluate_attention_billing_eligibility(" in inspect.getsource(
+        app.get_projected_billable_attention
+    )
     assert (
         "production_epoch_id=session.production_epoch_id"
         in CURRENT_OPERATIONAL_SHIFT_SQL
@@ -30,9 +32,16 @@ def test_every_billing_current_turn_query_uses_product_epoch():
 
 
 def test_revalidation_rejects_urgency_before_mapping():
-    source = inspect.getsource(app.get_projected_billable_attention)
-    assert "service_type" in source
-    assert "EMERGENCIA" in source
+    with (
+        patch.object(
+            app,
+            "evaluate_attention_billing_eligibility",
+            return_value={"eligible": False, "reason_code": "URGENCY_EXCLUDED"},
+        ),
+        patch.object(app, "_attention_from_projection") as mapper,
+    ):
+        assert app.get_projected_billable_attention(1, "SOURCE") is None
+        mapper.assert_not_called()
 
 
 def test_cancel_has_owned_claim_release():
@@ -157,7 +166,7 @@ def test_cancel_form_expires_claim_but_reselect_same_attention_preserves_it(
 @pytest.mark.parametrize("editing", [None, 17])
 def test_refuse_replace_patient_releases_new_claim(monkeypatch, editing):
     attention = selected_attention()
-    window = Mock(editing_recibo_id=editing, session_id="A")
+    window = Mock(editing_recibo_id=editing, session_id="A", current_admission_attention=None)
     window.cart_table.rowCount.return_value = 1
     release = Mock()
     monkeypatch.setattr(app, "schedule_admission_claim_release", release)
@@ -171,7 +180,7 @@ def test_refuse_replace_patient_releases_new_claim(monkeypatch, editing):
 
 def test_accept_patient_preserves_new_claim_through_form_reset(monkeypatch):
     attention = selected_attention()
-    window = Mock(editing_recibo_id=None, session_id="A")
+    window = Mock(editing_recibo_id=None, session_id="A", current_admission_attention=None)
     window.cart_table.rowCount.return_value = 0
     window.name_edit.text.return_value = ""
     monkeypatch.setattr(app, "FloatingToast", Mock())

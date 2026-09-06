@@ -4123,9 +4123,11 @@ class DatabaseManager:
 # EXCEL
 # -------------------------------
 def guardar_excel_seguro(wb, ruta_excel=EXCEL_PATH, accion="guardar el Excel", interactivo=True):
+    from excel_artifact import save_workbook
+
     while True:
         try:
-            wb.save(ruta_excel)
+            save_workbook(wb, ruta_excel)
             return True
         except PermissionError:
             if not interactivo:
@@ -4217,44 +4219,8 @@ def es_error_excel_corrupto(exc) -> bool:
 
 
 def recrear_excel_basico_por_corrupcion():
-    try:
-        if os.path.exists(EXCEL_PATH):
-            corrupt_name = os.path.join(
-                os.path.dirname(EXCEL_PATH),
-                f"LISTADO_CORRUPTO_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
-            try:
-                shutil.move(EXCEL_PATH, corrupt_name)
-            except Exception:
-                try:
-                    os.remove(EXCEL_PATH)
-                except Exception:
-                    pass
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Pacientes"
-
-        ws.merge_cells('A1:D1')
-        ws.merge_cells('A2:D2')
-        ws.merge_cells('A3:D3')
-        ws.merge_cells('A4:D4')
-
-        ws['A1'] = "ASISTENCIA DE PACIENTES A EMERGENCIA"
-        ws['A2'] = "ASEGURADOS Y NO ASEGURADOS"
-        ws['A3'] = ""
-        ws['A4'] = ""
-
-        ws['A5'] = "NO."
-        ws['B5'] = "NOMBRE"
-        ws['C5'] = "ESPECIALIDAD"
-        ws['D5'] = "ARS"
-
-        aplicar_formato_excel(ws)
-        guardar_excel_seguro(wb, EXCEL_PATH, "recrear el listado de Excel")
-        return True
-    except Exception:
-        return False
+    """Compatibility entry point: never replace or delete corruption evidence."""
+    return False
 
 
 def abrir_excel_workbook_seguro(ruta_excel=None, mostrar_error=True, **kwargs):
@@ -4270,10 +4236,10 @@ def abrir_excel_workbook_seguro(ruta_excel=None, mostrar_error=True, **kwargs):
             messagebox.showwarning(
                 "Excel dañado",
                 "El listado de Excel presentó un error de compresión o corrupción.\n\n"
-                "Se creará un Excel nuevo y se intentará reconstruir con los datos del turno actual."
+                "El archivo se conservará sin cambios para su diagnóstico. "
+                "No se reemplazará automáticamente por un listado vacío."
             )
-            recrear_excel_basico_por_corrupcion()
-            return openpyxl.load_workbook(ruta_excel, **kwargs)
+            raise
         raise
 
 def verificar_o_crear_excel():
@@ -4487,6 +4453,8 @@ def _construir_workbook_turno(db: DatabaseManager, turno_cfg: dict):
 
 
 def reconstruir_excel_turno(db: DatabaseManager, turno_cfg: dict):
+    from excel_artifact import save_workbook
+
     wb, total = _construir_workbook_turno(db, turno_cfg)
     if total == 0:
         revision = str(wb.active['F1'].value or "")
@@ -4514,22 +4482,10 @@ def reconstruir_excel_turno(db: DatabaseManager, turno_cfg: dict):
     ):
         wb.close()
         return total
-    temp_excel = EXCEL_LATEST_PATH + ".tmp.xlsx"
     try:
-        wb.save(temp_excel)
+        save_workbook(wb, EXCEL_LATEST_PATH)
+    finally:
         wb.close()
-        os.replace(temp_excel, EXCEL_LATEST_PATH)
-    except Exception:
-        try:
-            wb.close()
-        except Exception:
-            pass
-        try:
-            if os.path.exists(temp_excel):
-                os.remove(temp_excel)
-        except OSError:
-            pass
-        raise
     try:
         _update_canonical_excel(EXCEL_LATEST_PATH, EXCEL_PATH)
     except Exception as exc:
@@ -4764,8 +4720,11 @@ def _generate_versioned_excel(
     turn_id: int,
     transition_id: str,
 ) -> tuple[str, int]:
+    from excel_artifact import save_workbook, validate_xlsx
+
     target = _versioned_excel_path(turn_id, transition_id)
     if os.path.isfile(target):
+        validate_xlsx(target)
         return target, 1 if excel_tiene_registros(target) else 0
     wb, total = _construir_workbook_turno(db, turno_cfg)
     if total == 0:
@@ -4775,37 +4734,17 @@ def _generate_versioned_excel(
             int(turn_id or 0),
         )
         return "", 0
-    temp_target = target + ".tmp.xlsx"
     try:
-        wb.save(temp_target)
+        save_workbook(wb, target)
+    finally:
         wb.close()
-        os.replace(temp_target, target)
-    except Exception:
-        try:
-            wb.close()
-        except Exception:
-            pass
-        try:
-            if os.path.exists(temp_target):
-                os.remove(temp_target)
-        except OSError:
-            pass
-        raise
     return target, total
 
 
 def _update_canonical_excel(source_file: str, canonical_target: str = EXCEL_PATH) -> None:
-    temp_target = canonical_target + ".pending.xlsx"
-    try:
-        shutil.copy2(source_file, temp_target)
-        os.replace(temp_target, canonical_target)
-    except Exception:
-        try:
-            if os.path.exists(temp_target):
-                os.remove(temp_target)
-        except OSError:
-            pass
-        raise
+    from excel_artifact import copy_workbook
+
+    copy_workbook(source_file, canonical_target)
 
 
 def synchronize_latest_excel() -> str:
@@ -4851,6 +4790,8 @@ def pending_excel_export_jobs() -> int:
 
 def process_excel_export_jobs(db: DatabaseManager, *, limit: int = 3) -> dict:
     """Procesa efectos post-commit; nunca cambia ni revierte un turno."""
+    from excel_artifact import validate_xlsx
+
     _ensure_excel_export_queue()
     resultado = {
         "completed": 0,
@@ -4900,6 +4841,8 @@ def process_excel_export_jobs(db: DatabaseManager, *, limit: int = 3) -> dict:
                         "UPDATE excel_export_jobs SET source_file=?,updated_at=? WHERE job_id=?",
                         (source_file, ahora, job_id),
                     )
+            if source_file:
+                validate_xlsx(source_file)
             if total == 0 or (
                 source_file
                 and os.path.isfile(source_file)
@@ -13163,6 +13106,7 @@ class App:
             "rows": [],
             "fingerprint": (),
         }
+        billing_rows = {}
 
         def _insertar_mensaje_tabla(mensaje):
             for i in tree.get_children():
@@ -13233,12 +13177,13 @@ class App:
                 new_fingerprint = history_rows_fingerprint(combined_rows)
                 changed = new_fingerprint != page_state["fingerprint"]
                 if reset and changed:
+                    billing_rows.clear()
                     for i in tree.get_children():
                         tree.delete(i)
                 rows_to_insert = filas if (not reset or changed) else ()
                 for f in rows_to_insert:
                     seguro_canon = normalizar_seguro(f.get("ars", ""), f.get("nss", ""))
-                    tree.insert(
+                    item_id = tree.insert(
                         "",
                         "end",
                         values=(
@@ -13253,6 +13198,7 @@ class App:
                             (f.get("tipo_atencion") or "EMERGENCIA")
                         )
                     )
+                    billing_rows[item_id] = dict(f)
                 if selected_attention_id and changed:
                     for item in tree.get_children():
                         values = tree.item(item, "values")
@@ -13490,6 +13436,33 @@ class App:
                 pass
 
         menu_historial = tk.Menu(win, tearoff=0)
+
+        def enviar_a_facturacion():
+            from billing_history_handoff import history_identity
+
+            selected = tree.selection()
+            row = billing_rows.get(selected[0]) if selected else None
+            if row is None:
+                self._mostrar_dialogo_modal_unico(
+                    "Facturación", "Seleccione una atención del Historial."
+                )
+                return
+            try:
+                identity = history_identity(row)
+            except ValueError as exc:
+                self._mostrar_dialogo_modal_unico("Facturación", str(exc))
+                return
+            self.event_bus.billing_requested.emit(identity)
+            win.destroy()
+
+        if getattr(self.event_bus, "billing_requested", None) is not None:
+            tb.Button(
+                cont, text="Enviar a Facturación", bootstyle=SUCCESS,
+                command=enviar_a_facturacion,
+            ).pack(side="bottom", anchor="e", pady=(0, 8))
+            menu_historial.add_command(
+                label="Enviar a Facturación", command=enviar_a_facturacion
+            )
 
         def _seleccionar_fila_click_derecho(event):
             item = tree.identify_row(event.y)
@@ -14337,7 +14310,9 @@ class App:
         original_identidad = {"valor": "", "paciente_id": None}
 
         def _llenar_formulario_paciente(data, ident):
-            original_identidad["valor"] = ident
+            original_identidad["valor"] = (
+                f"P:{int(data['paciente_id'])}" if data.get("paciente_id") else ident
+            )
             original_identidad["paciente_id"] = data.get("paciente_id")
             valores = {
                 "Nombre": data.get("nombre", ""),
@@ -14389,6 +14364,7 @@ class App:
                         resultados_tree.insert(
                             "",
                             "end",
+                            iid=f"P:{int(r['paciente_id'])}",
                             values=(
                                 r.get("id", ""),
                                 r.get("fecha", ""),
@@ -14400,11 +14376,12 @@ class App:
                         )
 
                     primero = resultados[0]
-                    ident_carga = (
-                        f"A:{primero.get('id')}" if primero.get("id")
-                        else str(primero.get("nss") or primero.get("cedula") or ident)
-                    )
-                    _llenar_formulario_paciente(primero, ident_carga)
+                    ident_carga = f"P:{int(primero['paciente_id'])}"
+                    ficha_actual = self.db.buscar_paciente_para_edicion(ident_carga)
+                    if not ficha_actual:
+                        estado_var.set("La ficha del paciente ya no está disponible. Vuelva a buscar.")
+                        return
+                    _llenar_formulario_paciente(ficha_actual, ident_carga)
                     estado_var.set(f"{len(resultados)} coincidencia(s). Seleccione una fila para cargar otra.")
                 except Exception as e:
                     estado_var.set("Error al buscar paciente.")
@@ -14419,8 +14396,9 @@ class App:
             sel = resultados_tree.selection()
             if not sel:
                 return
-            vals = resultados_tree.item(sel[0], "values")
-            ident = f"A:{vals[0]}" if vals[0] else (vals[3] or vals[4])
+            ident = str(sel[0])
+            if not ident.startswith("P:"):
+                return
             data = self.db.buscar_paciente_para_edicion(str(ident))
             if data:
                 _llenar_formulario_paciente(data, str(ident))
@@ -16872,7 +16850,7 @@ class App:
             self._turn_change_in_progress = False
             return
 
-        win = self._crear_toplevel_estable("Configurar turno", "680x460", "turno_win")
+        win = self._crear_toplevel_estable("Configurar turno", "680x510", "turno_win")
         if win is None:
             self._turn_change_in_progress = False
             self._set_turn_change_controls_enabled(True)
@@ -16902,11 +16880,12 @@ class App:
             getattr(self.session_context, "display_name", "")
             or getattr(self.session_context, "username", "")
         )
-        subtitulo_turno = (
-            "Confirma el horario. El usuario autenticado asumirá el nuevo turno."
-            if relevo_formal
-            else "Selecciona el horario. El representante operacional actual se conserva."
+        subtitulo_turno = "Selecciona la operación y confirma el horario del turno."
+        administrative_var = tk.BooleanVar(value=False)
+        responsable_var = tk.StringVar(
+            value=usuario_autenticado if relevo_formal else "Relevo no disponible"
         )
+        operacion_detalle_var = tk.StringVar(value="")
         self._crear_header_ventana(
             cont,
             "Configurar turno",
@@ -16932,20 +16911,15 @@ class App:
         ).pack(anchor="w")
         tb.Label(
             rep_box,
-            text=(usuario_autenticado if relevo_formal else usuario_sesion)
-            or "Representante no configurado",
+            textvariable=responsable_var,
             font=("Arial", 13, "bold"),
             foreground="#FFFFFF",
             background="#0E1B2B",
         ).pack(anchor="w", pady=(3, 2))
         tb.Label(
             rep_box,
-            text=(
-                "Relevo formal: al confirmar, este usuario será el responsable del "
-                "nuevo turno y se cerrará la sesión secundaria del responsable saliente."
-                if relevo_formal
-                else "El cambio de horario no modifica al representante operacional actual."
-            ),
+            textvariable=operacion_detalle_var,
+            height=3,
             wraplength=560,
             justify="left",
             foreground="#BDD6F4",
@@ -17007,6 +16981,19 @@ class App:
             return mapa.get(texto_combo, "8AM_8AM")
 
         def actualizar_vista_previa():
+            correccion = bool(administrative_var.get())
+            responsable_var.set(
+                usuario_sesion if correccion else (
+                    usuario_autenticado if relevo_formal else "Relevo no disponible"
+                )
+            )
+            operacion_detalle_var.set(
+                "Corrección administrativa: conserva representante y PRIMARY; "
+                "puede asignar una nueva identidad de turno. Requiere confirmación y razón."
+                if correccion else
+                "Relevo formal: el usuario autenticado recibirá el nuevo turno. "
+                "Debe ser diferente del representante actual."
+            )
             turno_codigo = normalizar_turno_desde_combo(combo_turno.get())
             datos_turno = obtener_datos_turno_visual(fecha_base, turno_codigo)
             vista_turno_var.set(datos_turno["turno_label"])
@@ -17020,15 +17007,18 @@ class App:
                 "8:00 PM → 8:00 AM",
             ])
             aviso_var.set(
-                (
-                    "El nuevo conteo quedará separado y el usuario autenticado asumirá "
-                    "el nuevo turno. Los tres turnos canónicos están disponibles todos los días."
-                    if relevo_formal
-                    else "El nuevo conteo quedará separado y conservará al representante "
-                    "operacional actual. Los tres turnos canónicos están disponibles todos los días."
-                )
+                "El horario no elige la operación. "
+                "Los tres turnos canónicos están disponibles todos los días."
             )
             actualizar_vista_previa()
+
+        if normalize_role(self.session_context.role) == ROLE_ADMIN:
+            tb.Checkbutton(
+                form_card,
+                text="Aplicar como corrección administrativa (conservar representante)",
+                variable=administrative_var,
+                command=actualizar_vista_previa,
+            ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 8))
 
         combo_turno.bind("<<ComboboxSelected>>", lambda e: actualizar_vista_previa())
         refrescar_turnos()
@@ -17060,9 +17050,7 @@ class App:
                 "inicio_real": format_datetime_local(momento_cambio),
                 "inicio_real_dt": momento_cambio,
             }
-            administrative_override = not turno_config_es_vigente(
-                candidato, momento=momento_cambio
-            )
+            administrative_override = bool(administrative_var.get())
             relevo_formal_actual = bool(
                 runtime_actual is not None
                 and runtime_actual.is_primary_shift_handover()
@@ -17096,14 +17084,14 @@ class App:
                 if normalize_role(self.session_context.role) != ROLE_ADMIN:
                     messagebox.showwarning(
                         "Cambio de turno",
-                        "Solo un Administrador puede aplicar una corrección de turno fuera de horario.",
+                        "Solo un Administrador puede aplicar una corrección de turno.",
                         parent=win,
                     )
                     return
                 if not messagebox.askyesno(
                     "Corrección administrativa de turno",
-                    "Este turno no coincide con el horario que correspondería "
-                    "automáticamente en este momento.\n\n"
+                    "Ha seleccionado una corrección administrativa. "
+                    "Esta operación puede crear una nueva identidad de turno.\n\n"
                     "El representante y PRIMARY no cambiarán.\n\n"
                     "¿Desea aplicarlo como corrección administrativa?",
                     parent=win,
@@ -17233,8 +17221,10 @@ class App:
                 if not saved:
                     raise RuntimeError("No se pudo guardar el espejo de configuración.")
                 guardar_representante_catalogo(representante, self.db)
-                turno_cfg_nuevo = cargar_turno_config(
-                    permitir_vencido=administrative_override
+                turno_cfg_nuevo = (
+                    self._generation_turn_config()
+                    if runtime_actual is not None and not administrative_override
+                    else cargar_turno_config(permitir_vencido=administrative_override)
                 )
                 if not turno_cfg_nuevo:
                     raise TurnoNoVigenteError("El espejo del turno no quedó disponible.")
@@ -17380,8 +17370,8 @@ class App:
         aplicar_btn = tb.Button(
             form_card, text="Aplicar", bootstyle=SUCCESS, command=aplicar_una_vez
         )
-        aplicar_btn.grid(row=6, column=0, pady=12)
-        tb.Button(form_card, text="Cancelar", bootstyle=SECONDARY, command=win.destroy).grid(row=6, column=1, sticky="w", pady=12)
+        aplicar_btn.grid(row=7, column=0, pady=12)
+        tb.Button(form_card, text="Cancelar", bootstyle=SECONDARY, command=win.destroy).grid(row=7, column=1, sticky="w", pady=12)
 
     def run(self):
         if not self._standalone:

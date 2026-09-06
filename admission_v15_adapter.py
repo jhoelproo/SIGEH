@@ -122,6 +122,7 @@ class AdmissionV15EventBus(QObject):
     shift_changed = Signal(object)
     shift_closed = Signal(object)
     history_refresh_requested = Signal()
+    billing_requested = Signal(object)
 
 
 class AdmissionV15IntegrationError(RuntimeError):

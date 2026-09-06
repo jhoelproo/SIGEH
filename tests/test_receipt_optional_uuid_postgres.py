@@ -184,6 +184,7 @@ def test_legacy_and_valid_uuid_persistence_boundary(receipts, monkeypatch, ident
         "ars": "FUTURO",
         "source_instance_id": "   ",
         "global_attention_id": identifier,
+        "service_date": "2026-09-05",
     }
     receipt_id = save(admission_attention=attention, verification_bypass=None)
     with app.db_connect() as con:

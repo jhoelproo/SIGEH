@@ -85,15 +85,24 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
             "herencia_estado": "HEREDADA_PROCESADA",
             "already_linked": False,
         }
-        with patch.object(app, "db_connect", return_value=connection), patch.object(
-            app,
-            "_lock_and_validate_admission_processing",
-            return_value=processing,
-        ), patch.object(
-            app,
-            "save_receipt_document_snapshot",
-            return_value={"version": 1},
-        ) as save_snapshot:
+        with (
+            patch.object(
+                app,
+                "get_user",
+                return_value={"username": "facturador", "role": app.ROLE_ADMIN},
+            ),
+            patch.object(app, "db_connect", return_value=connection),
+            patch.object(
+                app,
+                "_lock_and_validate_admission_processing",
+                return_value=processing,
+            ),
+            patch.object(
+                app,
+                "save_receipt_document_snapshot",
+                return_value={"version": 1},
+            ) as save_snapshot,
+        ):
             receipt_id = app.save_receipt_with_items(
                 None,
                 55,
@@ -123,7 +132,9 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
             target_storage_mode="SNAPSHOT",
         )
         receipt_insert = next(
-            call for call in connection.calls if call[0].startswith("INSERT INTO recibos(")
+            call
+            for call in connection.calls
+            if call[0].startswith("INSERT INTO recibos(")
         )
         self.assertIn("admission_atencion_id", receipt_insert[0])
         self.assertIn("admission_source_instance_id", receipt_insert[0])
@@ -134,7 +145,7 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
         self.assertIn("123456789", receipt_insert[1])
         source_position = receipt_insert[1].index("source-e2e")
         self.assertEqual(
-            receipt_insert[1][source_position:source_position + 5],
+            receipt_insert[1][source_position : source_position + 5],
             (
                 "source-e2e",
                 "a" * 64,
@@ -171,14 +182,8 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
     def test_final_save_validates_pc_source_against_shared_operational_source(self):
         connection = SequentialConnection(
             [
-                {"operational_source_id": "SHARED-OPERATIONAL-SOURCE", "turn_id": 3942},
                 None,
-                None,
-                {
-                    "turno_origen_id": 3942,
-                    "turno_procesamiento_id": 3942,
-                    "is_inherited": False,
-                },
+                {"attention_id": 1, "source_instance_id": "PC-PRIVATE-SOURCE"},
                 {"session_id": "login-session", "expires_at": "future"},
             ]
         )
@@ -186,17 +191,22 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
             "attention_id": 1,
             "source_instance_id": "PC-PRIVATE-SOURCE",
         }
-        central_shift = {
+        central_projection = {
             "operational_source_id": "SHARED-OPERATIONAL-SOURCE",
             "source_instance_id": "SHARED-OPERATIONAL-SOURCE",
             "turn_id": 3942,
+            "active_turn_id": 3942,
         }
 
         with patch.object(
-            app.BillingAdmissionQueryService,
-            "current_shift",
-            return_value=central_shift,
-        ):
+            app,
+            "evaluate_attention_billing_eligibility",
+            return_value={
+                "eligible": True,
+                "turn_scope": "CURRENT",
+                "_projection": central_projection,
+            },
+        ) as evaluate:
             result = app._lock_and_validate_admission_processing(
                 connection,
                 attention,
@@ -208,12 +218,12 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
             for call in connection.calls
             if "FROM admission_attention_projection p" in call[0]
         )
-        self.assertIn(
-            "p.operational_source_id::TEXT=cs.operational_source_id",
-            eligible_sql,
+        self.assertIn("FOR UPDATE OF p", eligible_sql)
+        self.assertEqual(eligible_params[-1], "PC-PRIVATE-SOURCE")
+        self.assertIs(evaluate.call_args.kwargs["connection"], connection)
+        self.assertEqual(
+            evaluate.call_args.kwargs["source_instance_id"], "PC-PRIVATE-SOURCE"
         )
-        self.assertNotIn("cs.source_instance_id=p.source_instance_id", eligible_sql)
-        self.assertEqual(eligible_params[0], "SHARED-OPERATIONAL-SOURCE")
         self.assertEqual(result["turno_origen_id"], 3942)
         self.assertEqual(result["turno_procesamiento_id"], 3942)
 

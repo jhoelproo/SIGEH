@@ -55,6 +55,8 @@ class _SaveConnection(_Connection):
         self.calls.append((compact, params))
         if compact.startswith("INSERT INTO recibos("):
             return _Cursor([(77,)])
+        if compact.startswith("SELECT sala_emergencia,consulta_price FROM ars"):
+            return _Cursor([{"sala_emergencia": 0, "consulta_price": 0}])
         return _Cursor()
 
 
@@ -271,6 +273,8 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
 
         connection = EditingConnection()
         with patch.object(
+            app, "get_user", return_value={"username": "audit", "role": app.ROLE_AUDIT}
+        ), patch.object(
             app, "db_connect", return_value=connection
         ), patch.object(
             app, "save_receipt_document_snapshot", return_value={"version": 2}
