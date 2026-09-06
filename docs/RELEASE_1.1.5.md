@@ -18,6 +18,10 @@ Módulo de handoff: cobertura real 100 % de líneas y ramas, complejidad máxima
 
 ## Alcance de publicación
 
+Build limpio de aplicación/lanzador y updater: PASS, salida 0. ZIP extraído: CRC y SHA-256 verificados, 1800 archivos contrastados contra el manifiesto, metadatos 1.1.5 y bytecode de ocho módulos comparado con fuentes actuales: PASS. Smoke desde el ZIP extraído: Admisión/Historial/Configuración, PDF y reportes, las tres invocaciones PASS (salida 0).
+
+Artefacto: `SIGEH-1.1.5-windows-x64.zip`, 304415051 bytes. SHA-256: `20f2a176adb6364323e0574a8e1208f292e061bed7f684a3c0cf08f28b712278`. Evidencias locales: `D:/SIGEH_RELEASE_115/package-verification.json`, `smoke.json`, `release-tests.xml`, `build.log` y `updater-build.log`.
+
 El usuario autorizó compilar y publicar la siguiente versión, y retiró el caso 399 como bloqueo. No se afirma que la diferencia entre Historial y selector sea imposible: el acceso conserva las reglas centrales de elegibilidad y requiere una atención sincronizada.
 
 La publicación no ejecuta cambios manuales sobre datos hospitalarios ni demuestra QA física entre estaciones. Persisten las limitaciones generales documentadas. La autorización de publicación no convierte controles no ejecutados en PASS.
