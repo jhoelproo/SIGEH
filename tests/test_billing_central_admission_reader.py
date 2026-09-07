@@ -206,16 +206,216 @@ def test_queue_diagnostic_reports_every_stage_and_exclusion_reason():
     assert write_log.call_args.args == ("BILLING_ADMISSION_QUEUE_STAGES",)
 
 
-def test_full_history_role_still_cannot_bill_uninherited_historical_attention():
+@pytest.mark.parametrize("role", [app.ROLE_ADMIN, app.ROLE_AUDIT])
+def test_privileged_roles_can_bill_uninherited_historical_attention_at_any_age(role):
     access = app.evaluate_admission_billing_access(
-        {"turn_id": 12, "explicitly_inherited": False},
-        {"role": app.ROLE_ADMIN},
-        {"turn_id": 13},
+        {
+            "turn_id": 12,
+            "operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+            "explicitly_inherited": False,
+            "within_history_billing_window": False,
+        },
+        {"role": role},
+        {**CENTRAL_CONTEXT, "turn_id": 13},
     )
 
     assert access["turn_scope"] == "HISTORICAL"
+    assert access["can_use_for_billing"] is True
+    assert access["reason_code"] == "HISTORICAL_PENDING_ALLOWED"
+
+
+@pytest.mark.parametrize(
+    "role",
+    [app.ROLE_AUX, app.ROLE_MEDICAL_AUDIT, app.ROLE_ADMIN, app.ROLE_AUDIT],
+)
+def test_every_role_can_bill_uninherited_emergency_within_two_days(role):
+    access = app.evaluate_admission_billing_access(
+        {
+            "turn_id": 12,
+            "operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+            "service_type": "EMERGENCIA",
+            "within_history_billing_window": True,
+        },
+        {"role": role},
+        {**CENTRAL_CONTEXT, "turn_id": 13},
+    )
+
+    assert access["turn_scope"] == "HISTORICAL"
+    assert access["can_use_for_billing"] is True
+    assert access["reason_code"] == "HISTORICAL_PENDING_ALLOWED"
+
+
+@pytest.mark.parametrize("role", [app.ROLE_AUX, app.ROLE_MEDICAL_AUDIT])
+def test_non_privileged_roles_cannot_bill_emergency_at_exact_or_over_two_days(role):
+    access = app.evaluate_admission_billing_access(
+        {
+            "turn_id": 12,
+            "operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+            "service_type": "EMERGENCIA",
+            "within_history_billing_window": False,
+        },
+        {"role": role},
+        {**CENTRAL_CONTEXT, "turn_id": 13},
+    )
+
     assert access["can_use_for_billing"] is False
-    assert access["reason_code"] == "HISTORICAL_ROLE_DENIED"
+    assert access["reason_code"] == "HISTORICAL_TIME_DENIED"
+
+
+def test_history_and_revalidation_use_strict_postgres_two_day_window():
+    history_connection = _Connection()
+    with (
+        patch.object(app, "get_central_operational_context", return_value=CENTRAL_CONTEXT),
+        patch.object(app, "db_connect", return_value=history_connection),
+    ):
+        app.list_admission_history(current_user={"role": app.ROLE_AUX})
+
+    history_sql, _params = history_connection.calls[-1]
+    assert "p.created_at_effective_utc > CURRENT_TIMESTAMP - INTERVAL '2 days'" in history_sql
+
+    row = {
+        "attention_id": 12,
+        "global_attention_id": "11111111-1111-1111-1111-111111111111",
+        "active_operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+        "active_turn_id": CENTRAL_CONTEXT["turn_id"],
+        "operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+        "turn_id": CENTRAL_CONTEXT["turn_id"] - 1,
+    }
+    eligibility_connection = _Connection([row])
+    with patch.object(app, "db_connect", return_value=eligibility_connection):
+        app.evaluate_attention_billing_eligibility(
+            12,
+            {"role": app.ROLE_AUX},
+            global_attention_id=row["global_attention_id"],
+        )
+
+    eligibility_sql, _params = eligibility_connection.calls[-1]
+    assert (
+        "p.created_at_effective_utc > CURRENT_TIMESTAMP - INTERVAL '2 days' "
+        "AS within_history_billing_window"
+    ) in eligibility_sql
+
+
+def test_all_configured_roles_can_access_billing_admission_history():
+    for role in (app.ROLE_AUX, app.ROLE_ADMIN, app.ROLE_AUDIT, app.ROLE_MEDICAL_AUDIT):
+        assert app.can_access_billing_admission_history({"role": role}) is True
+
+
+def test_invalid_turn_value_is_historical_without_crashing_policy():
+    access = app.evaluate_admission_billing_access(
+        {
+            "turn_id": "invalid",
+            "operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+            "within_history_billing_window": True,
+        },
+        {"role": app.ROLE_AUX},
+        CENTRAL_CONTEXT,
+    )
+
+    assert access["turn_scope"] == "HISTORICAL"
+    assert access["can_use_for_billing"] is True
+
+
+def test_invalid_history_filters_are_normalized_before_query():
+    connection = _Connection()
+    with (
+        patch.object(app, "get_central_operational_context", return_value=CENTRAL_CONTEXT),
+        patch.object(app, "db_connect", return_value=connection),
+    ):
+        result = app.list_admission_history(
+            current_user={"role": app.ROLE_ADMIN},
+            turn_filter="invalid",
+            coverage_filter="invalid",
+        )
+
+    assert result["rows"] == []
+    _sql, params = connection.calls[-1]
+    assert params.count("TODOS") >= 2
+
+
+def test_revalidation_connection_override_handles_empty_and_invalid_central_state():
+    empty = app.evaluate_attention_billing_eligibility(
+        12,
+        {"role": app.ROLE_AUX},
+        connection=_Connection(),
+    )
+    assert empty["reason_code"] == "INVALID_ATTENTION"
+
+    with pytest.raises(app.AdmissionBridgeError):
+        app.evaluate_attention_billing_eligibility(
+            12,
+            {"role": app.ROLE_AUX},
+            connection=_Connection([{"attention_id": 12}]),
+        )
+
+
+def test_revalidation_connection_override_preserves_existing_receipt():
+    row = {
+        "attention_id": 12,
+        "global_attention_id": "11111111-1111-1111-1111-111111111111",
+        "active_operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+        "active_turn_id": CENTRAL_CONTEXT["turn_id"],
+        "operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+        "turn_id": CENTRAL_CONTEXT["turn_id"],
+        "source_status": "ACTIVA",
+        "service_type": "EMERGENCIA",
+        "readiness": app.READINESS_READY,
+        "coverage_status": "ASEGURADO_VALIDADO",
+        "canonical_ars": "FUTURO",
+        "ars_billing_enabled": True,
+        "linked_receipt_id": 71,
+        "linked_billing_status": "PENDIENTE",
+        "linked_document_status": "PRELIMINAR",
+    }
+
+    result = app.evaluate_attention_billing_eligibility(
+        12,
+        {"role": app.ROLE_AUX},
+        global_attention_id=row["global_attention_id"],
+        connection=_Connection([row]),
+    )
+
+    assert result["receipt_id"] == 71
+    assert result["reason_code"] == "RECEIPT_PENDING"
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason_code"),
+    (
+        ({"source_status": "ANULADA"}, "CANCELLED"),
+        ({"is_deleted": True}, "TOMBSTONED"),
+        ({"service_type": "URGENCIA"}, "INVALID_ATTENTION"),
+        ({"claimed_elsewhere": True}, "CLAIMED_OTHER_SESSION"),
+    ),
+)
+def test_recent_history_never_bypasses_existing_clinical_guards(changes, reason_code):
+    row = {
+        "attention_id": 12,
+        "global_attention_id": "11111111-1111-1111-1111-111111111111",
+        "patient_id": 120,
+        "active_operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+        "active_turn_id": CENTRAL_CONTEXT["turn_id"],
+        "operational_source_id": CENTRAL_CONTEXT["operational_source_id"],
+        "turn_id": CENTRAL_CONTEXT["turn_id"] - 1,
+        "within_history_billing_window": True,
+        "source_status": "ACTIVA",
+        "service_type": "EMERGENCIA",
+        "readiness": app.READINESS_READY,
+        "coverage_status": "ASEGURADO_VALIDADO",
+        "canonical_ars": "FUTURO",
+        "ars_billing_enabled": True,
+        **changes,
+    }
+    connection = _Connection([row])
+    with patch.object(app, "db_connect", return_value=connection):
+        result = app.evaluate_attention_billing_eligibility(
+            12,
+            {"role": app.ROLE_AUX},
+            global_attention_id=row["global_attention_id"],
+        )
+
+    assert result["eligible"] is False
+    assert result["reason_code"] == reason_code
 
 
 def test_matching_turn_from_another_operational_source_is_not_current():
@@ -230,6 +430,7 @@ def test_matching_turn_from_another_operational_source_is_not_current():
 
     assert access["turn_scope"] == "HISTORICAL"
     assert access["can_use_for_billing"] is False
+    assert access["reason_code"] == "HISTORICAL_SOURCE_DENIED"
 
 
 def test_inheritance_from_another_operational_source_is_not_billable():
@@ -245,6 +446,7 @@ def test_inheritance_from_another_operational_source_is_not_billable():
 
     assert access["turn_scope"] == "HISTORICAL"
     assert access["can_use_for_billing"] is False
+    assert access["reason_code"] == "HISTORICAL_SOURCE_DENIED"
 
 
 def test_final_eligibility_rejects_not_ready_and_dismissed_rows():
@@ -361,6 +563,18 @@ def test_receipt_matching_prefers_global_attention_identity_with_legacy_fallback
             {"role": app.ROLE_ADMIN},
             {"reason_code": "HISTORICAL_ROLE_DENIED"},
             "HISTORICAL_ROLE_DENIED",
+        ),
+        (
+            {"readiness": app.READINESS_READY, "canonical_ars": "FUTURO"},
+            {"role": app.ROLE_AUX},
+            {"reason_code": "HISTORICAL_TIME_DENIED"},
+            "HISTORICAL_TIME_DENIED",
+        ),
+        (
+            {"readiness": app.READINESS_READY, "canonical_ars": "FUTURO"},
+            {"role": app.ROLE_ADMIN},
+            {"reason_code": "HISTORICAL_SOURCE_DENIED"},
+            "HISTORICAL_SOURCE_DENIED",
         ),
         (
             {"readiness": "PENDIENTE", "canonical_ars": "FUTURO"},

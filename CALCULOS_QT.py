@@ -465,6 +465,10 @@ ROLE_AUX = "auxiliar"
 ROLE_ADMIN = "administrador"
 ROLE_AUDIT = "facturador de auditoria"
 ROLE_MEDICAL_AUDIT = "auditoria medica y cuentas"
+BILLING_HISTORY_ROLES = frozenset(
+    {ROLE_AUX, ROLE_ADMIN, ROLE_AUDIT, ROLE_MEDICAL_AUDIT}
+)
+UNLIMITED_HISTORY_BILLING_ROLES = frozenset({ROLE_ADMIN, ROLE_AUDIT})
 
 BILLING_PENDING = "PENDIENTE"
 BILLING_INVOICED = "FACTURADO"
@@ -4996,11 +5000,18 @@ def get_receipt_for_admission_attention(
 
 
 def _billing_projection_denial(row: dict, user: dict, access: dict):
-    if access["reason_code"] == "HISTORICAL_ROLE_DENIED":
-        return (
-            "HISTORICAL_ROLE_DENIED",
-            "Tu rol no puede facturar atenciones históricas no heredadas.",
-        )
+    historical_denials = {
+        "HISTORICAL_SOURCE_DENIED": "La atención no pertenece a la operación central vigente.",
+        "HISTORICAL_TIME_DENIED": (
+            "Tu rol solo puede enviar a Facturación emergencias de menos de 2 días."
+        ),
+        "HISTORICAL_ROLE_DENIED": (
+            "Tu rol no puede facturar atenciones históricas no heredadas."
+        ),
+    }
+    historical_reason = historical_denials.get(access["reason_code"])
+    if historical_reason:
+        return access["reason_code"], historical_reason
     if str(row.get("readiness") or "") != READINESS_READY:
         return "NOT_READY", "La atención todavía no está lista para facturación."
     if not admission_ars_is_visible(row.get("canonical_ars")):
@@ -5077,6 +5088,9 @@ def evaluate_attention_billing_eligibility(
     receipt_identity = admission_receipt_identity_sql("receipt", "p")
     eligibility_sql = "".join((
             f"""SELECT p.*,
+                      p.created_at_effective_utc >
+                          CURRENT_TIMESTAMP - INTERVAL '2 days'
+                          AS within_history_billing_window,
                       receipt.id AS linked_receipt_id,
                       receipt.estado_facturacion AS linked_billing_status,
                       receipt.estado_documento AS linked_document_status,
@@ -6088,7 +6102,18 @@ class BillingAdmissionQueryService:
                    WHERE (%s OR {ars_exclusion})
                      AND COALESCE(p.is_deleted,FALSE)=FALSE
                      AND (
-                           (%s AND %s='TODOS')
+                           (%s='TODOS' AND (
+                                %s
+                                OR p.created_at_effective_utc >
+                                   CURRENT_TIMESTAMP - INTERVAL '2 days'
+                                OR (
+                                    p.operational_source_id::TEXT=cs.operational_source_id
+                                    AND (
+                                         p.turn_id=cs.turn_id
+                                         OR inheritance.attention_id IS NOT NULL
+                                    )
+                                )
+                           ))
                         OR (
                             p.operational_source_id::TEXT=cs.operational_source_id
                             AND (
@@ -6148,8 +6173,8 @@ class BillingAdmissionQueryService:
                     str(shift["source_instance_id"]),
                     int(shift["turn_id"]),
                     bool(full_history),
-                    bool(full_history),
-                    turn_filter, turn_filter, turn_filter, turn_filter,
+                    turn_filter, bool(full_history),
+                    turn_filter, turn_filter, turn_filter,
                     str(date_from or ""), str(date_from or ""),
                     str(date_to or ""), str(date_to or ""),
                     ars_text, ars_key,
@@ -14490,7 +14515,7 @@ def user_is_admin(user: dict) -> bool:
 
 
 def _is_privileged_billing_role(user: dict) -> bool:
-    return normalize_role((user or {}).get("role")) in {ROLE_ADMIN, ROLE_AUDIT}
+    return normalize_role((user or {}).get("role")) in UNLIMITED_HISTORY_BILLING_ROLES
 
 
 def can_override_admission_billing_claim(user: dict) -> bool:
@@ -14500,8 +14525,109 @@ def can_override_admission_billing_claim(user: dict) -> bool:
 
 def can_access_billing_admission_history(user: dict) -> bool:
     """El historial localiza atenciones; la matriz decide si se pueden usar."""
-    return normalize_role((user or {}).get("role")) in {
-        ROLE_AUX, ROLE_AUDIT, ROLE_ADMIN,
+    return normalize_role((user or {}).get("role")) in BILLING_HISTORY_ROLES
+
+
+def _same_operational_source(attention: dict, state: dict, has_state: bool) -> bool:
+    if not has_state:
+        return True
+    current_source = str(state.get("operational_source_id") or "").strip()
+    attention_source = str(attention.get("operational_source_id") or "").strip()
+    return bool(
+        current_source
+        and attention_source
+        and attention_source == current_source
+    )
+
+
+def _is_current_admission_attention(attention: dict, state: dict, same_source: bool) -> bool:
+    current_turn = state.get("turn_id")
+    if current_turn is None:
+        return str(attention.get("turn_scope") or "").upper() in {
+            "CURRENT",
+            "TURNO ACTUAL",
+        }
+    try:
+        return same_source and int(attention.get("turn_id") or 0) == int(current_turn)
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_inherited_admission_attention(attention: dict, same_source: bool) -> bool:
+    from billing_history_handoff import has_inherited_receipt
+
+    inherited_scope = str(attention.get("turn_scope") or "").upper() in {
+        "INHERITED",
+        "HEREDADA",
+        "HEREDADA DEL TURNO ANTERIOR",
+    }
+    return same_source and (
+        bool(attention.get("explicitly_inherited"))
+        or has_inherited_receipt(attention)
+        or inherited_scope
+    )
+
+
+def _admission_turn_scope(attention: dict, state: dict, has_state: bool) -> tuple[str, bool]:
+    same_source = _same_operational_source(attention, state, has_state)
+    if _is_current_admission_attention(attention, state, same_source):
+        return "CURRENT", same_source
+    if _is_inherited_admission_attention(attention, same_source):
+        return "INHERITED", same_source
+    return "HISTORICAL", same_source
+
+
+def _admission_receipt_state(attention: dict) -> tuple[object, str, bool]:
+    receipt_id = attention.get("linked_receipt_id") or attention.get("receipt_id")
+    billing_status = str(
+        attention.get("linked_billing_status")
+        or attention.get("estado_facturacion")
+        or "SIN_RECIBO"
+    ).upper()
+    document_status = str(
+        attention.get("linked_document_status")
+        or attention.get("estado_documento")
+        or ""
+    ).upper()
+    completed = billing_status in {"COMPLETO", "FACTURADO", "FINAL"} or bool(
+        receipt_id and document_status == "FINAL"
+    )
+    return receipt_id, billing_status, completed
+
+
+def _admission_scope_decision(
+    scope: str,
+    role: str,
+    *,
+    same_source: bool,
+    within_two_days: bool,
+) -> tuple[bool, str]:
+    if scope in {"CURRENT", "INHERITED"}:
+        return True, f"{scope}_PENDING_ALLOWED"
+    if not same_source:
+        return False, "HISTORICAL_SOURCE_DENIED"
+    if role not in BILLING_HISTORY_ROLES:
+        return False, "HISTORICAL_ROLE_DENIED"
+    if role in UNLIMITED_HISTORY_BILLING_ROLES or within_two_days:
+        return True, "HISTORICAL_PENDING_ALLOWED"
+    return False, "HISTORICAL_TIME_DENIED"
+
+
+def _admission_access_flags(
+    scope_allowed: bool,
+    completed: bool,
+    receipt_id,
+    role: str,
+) -> dict:
+    pending = scope_allowed and not completed
+    existing = bool(receipt_id)
+    return {
+        "can_use_for_billing": bool(pending and not existing),
+        "can_continue_receipt": bool(pending and existing),
+        "can_open_receipt": bool(scope_allowed and completed and existing),
+        "can_reopen_completed": bool(
+            scope_allowed and completed and role == ROLE_ADMIN and existing
+        ),
     }
 
 
@@ -14511,60 +14637,29 @@ def evaluate_admission_billing_access(
     current_operational_state: dict | None = None,
 ) -> dict:
     """Matriz canónica de alcance de turno para Facturación."""
-    from billing_history_handoff import has_inherited_receipt
-
     data = dict(attention or {})
     state = dict(current_operational_state or {})
     role = normalize_role((current_user or {}).get("role"))
-    current_turn = state.get("turn_id")
-    current_source = str(state.get("operational_source_id") or "").strip()
-    attention_source = str(data.get("operational_source_id") or "").strip()
-    same_source = (
-        bool(current_source and attention_source and attention_source == current_source)
-        if current_operational_state is not None else True
+    scope, same_source = _admission_turn_scope(
+        data,
+        state,
+        current_operational_state is not None,
     )
-    try:
-        is_current = (
-            same_source
-            and current_turn is not None
-            and int(data.get("turn_id") or 0) == int(current_turn)
-        )
-    except (TypeError, ValueError):
-        is_current = False
-    if current_turn is None:
-        is_current = str(data.get("turn_scope") or "").upper() in {"CURRENT", "TURNO ACTUAL"}
-    inherited = same_source and (
-        bool(data.get("explicitly_inherited"))
-        or has_inherited_receipt(data)
-        or str(data.get("turn_scope") or "").upper()
-        in {"INHERITED", "HEREDADA", "HEREDADA DEL TURNO ANTERIOR"}
+    receipt_id, billing_status, completed = _admission_receipt_state(data)
+    scope_allowed, pending_reason = _admission_scope_decision(
+        scope,
+        role,
+        same_source=same_source,
+        within_two_days=bool(data.get("within_history_billing_window")),
     )
-    scope = "CURRENT" if is_current else "INHERITED" if inherited else "HISTORICAL"
-    receipt_id = data.get("linked_receipt_id") or data.get("receipt_id")
-    billing_status = str(
-        data.get("linked_billing_status") or data.get("estado_facturacion") or "SIN_RECIBO"
-    ).upper()
-    completed = billing_status in {"COMPLETO", "FACTURADO", "FINAL"} or bool(
-        receipt_id and str(
-            data.get("linked_document_status") or data.get("estado_documento") or ""
-        ).upper() == "FINAL"
-    )
-    scope_allowed = scope in {"CURRENT", "INHERITED"}
-    reason_code = (
-        f"{scope}_PENDING_ALLOWED" if scope_allowed and not completed
-        else "ALREADY_BILLED" if completed
-        else "HISTORICAL_ROLE_DENIED"
-    )
-    return {
+    result = {
         "turn_scope": scope,
         "billing_status": billing_status,
         "receipt_id": receipt_id,
-        "can_use_for_billing": bool(scope_allowed and not completed and not receipt_id),
-        "can_continue_receipt": bool(scope_allowed and not completed and receipt_id),
-        "can_open_receipt": bool(scope_allowed and completed and receipt_id),
-        "can_reopen_completed": bool(scope_allowed and completed and role == ROLE_ADMIN and receipt_id),
-        "reason_code": reason_code,
+        "reason_code": "ALREADY_BILLED" if completed else pending_reason,
     }
+    result.update(_admission_access_flags(scope_allowed, completed, receipt_id, role))
+    return result
 
 
 def can_bypass_patient_verification(user: dict) -> bool:
@@ -30634,7 +30729,7 @@ class AdmissionHistoryDialog(QDialog):
             + (
                 "Tu rol puede consultar el historial completo."
                 if self._full_history
-                else "Tu rol ve el turno actual y las atenciones heredadas."
+                else "Tu rol puede enviar emergencias de los últimos 2 días."
             )
         )
         subtitle.setWordWrap(True)
@@ -30662,7 +30757,7 @@ class AdmissionHistoryDialog(QDialog):
         if self._full_history:
             self.turn_combo.addItem("Todo el historial", "TODOS")
         else:
-            self.turn_combo.addItem("Turno actual + heredadas", "TODOS")
+            self.turn_combo.addItem("Últimos 2 días + turno vigente", "TODOS")
         self.turn_combo.addItem("Turno actual", "ACTUAL")
         self.turn_combo.addItem("Atenciones heredadas", "HEREDADO")
         self.ars_edit = QLineEdit()

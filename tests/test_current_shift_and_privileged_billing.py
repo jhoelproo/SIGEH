@@ -169,7 +169,7 @@ class _SelectionConnection:
         return _Result(row=None)
 
 
-def test_privileged_roles_cannot_select_uninherited_historical_attention():
+def test_quick_list_stays_turn_scoped_but_auditor_can_use_history_without_age_limit():
     connection = _SelectionConnection()
     with (
         patch.object(
@@ -193,7 +193,7 @@ def test_privileged_roles_cannot_select_uninherited_historical_attention():
         {"role": app.ROLE_AUDIT},
         {"turn_id": 33, "operational_source_id": "SOURCE"},
     )
-    assert not decision["can_use_for_billing"]
+    assert decision["can_use_for_billing"]
 
 
 def test_regular_roles_keep_current_or_inherited_turn_restriction():

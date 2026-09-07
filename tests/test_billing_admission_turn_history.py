@@ -230,7 +230,12 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
         self.assertEqual(len(connection.calls), 1)
 
     def test_history_is_visible_to_billing_roles_but_access_matrix_decides_use(self):
-        for role in (app.ROLE_AUX, app.ROLE_ADMIN, app.ROLE_AUDIT):
+        for role in (
+            app.ROLE_AUX,
+            app.ROLE_ADMIN,
+            app.ROLE_AUDIT,
+            app.ROLE_MEDICAL_AUDIT,
+        ):
             connection = _Connection()
             service = app.BillingAdmissionQueryService(_Repository())
             with patch.object(app, "db_connect", return_value=connection):
@@ -268,6 +273,24 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
             self.assertEqual(dialog.table.item(1, 11).text(), "PENDIENTE")
         finally:
             dialog.close()
+
+    def test_medical_audit_history_explains_the_two_day_window(self):
+        with patch.object(app.QTimer, "singleShot", return_value=None):
+            dialog = app.AdmissionHistoryDialog(
+                current_user={"role": app.ROLE_MEDICAL_AUDIT}
+            )
+        try:
+            labels = [
+                dialog.turn_combo.itemText(index)
+                for index in range(dialog.turn_combo.count())
+            ]
+            self.assertIn("Últimos 2 días + turno vigente", labels)
+        finally:
+            dialog.close()
+
+    def test_unknown_role_cannot_construct_admission_history(self):
+        with self.assertRaises(PermissionError):
+            app.AdmissionHistoryDialog(current_user={"role": "invitado"})
 
     def test_old_generation_cannot_contaminate_new_search(self):
         with patch.object(app.QTimer, "singleShot", return_value=None):
