@@ -481,6 +481,7 @@ EXCEL_LATEST_PATH = app_data_path("LISTADO.latest.xlsx")
 EXCEL_EXPORT_STATE_PATH = app_data_path("excel_export_state.json")
 EXCEL_VERSIONED_DIR = app_data_path("EXCEL_POR_TURNO")
 EXCEL_EXPORT_QUEUE_PATH = app_data_path("excel_export_jobs.sqlite3")
+EXCEL_PRINT_QUEUE_PATH = app_data_path("turn_excel_delivery.sqlite3")
 APP_SETTINGS_PATH = app_data_path("app_settings.json")
 ARS_CATALOGO_PATH = app_data_path("ars_catalogo.json")
 NSS_FORMATOS_PATH = app_data_path("nss_formatos_ars.json")
@@ -5258,7 +5259,7 @@ def reintentar_si_excel_abierto(accion):
             messagebox.showwarning("Aviso", f"No se pudo completar la acción:\n{str(e)}")
             return False
 
-def imprimir_excel(ruta_excel=None, copias=1, *, permitir_reintento=True):
+def imprimir_excel(ruta_excel=None, copias=1, *, permitir_reintento=True, mostrar_error=True):
     if ruta_excel is None:
         ruta_excel = EXCEL_PATH
 
@@ -5273,10 +5274,13 @@ def imprimir_excel(ruta_excel=None, copias=1, *, permitir_reintento=True):
         sis = platform.system()
         copias = max(1, int(copias or 1))
 
+        if sis == "Windows":
+            from excel_printing import print_patient_workbook
+
+            print_patient_workbook(ruta_abs, copies=copias)
+            return True
         for _ in range(copias):
-            if sis == "Windows":
-                os.startfile(ruta_abs, "print")
-            elif sis == "Darwin":
+            if sis == "Darwin":
                 subprocess.run(["lp", ruta_abs], check=False)
             elif sis == "Linux":
                 subprocess.run(["lpr", ruta_abs], check=False)
@@ -5292,10 +5296,12 @@ def imprimir_excel(ruta_excel=None, copias=1, *, permitir_reintento=True):
             )
         return False
     except Exception as e:
-        messagebox.showwarning(
-            "Aviso",
-            f"No se pudo imprimir automáticamente el listado de Excel:\n{str(e)}"
-        )
+        APP_LOG.error("EXCEL_PRINT_FAILED type=%s", type(e).__name__)
+        if mostrar_error:
+            messagebox.showwarning(
+                "Aviso",
+                f"No se pudo imprimir automáticamente el listado de Excel:\n{str(e)}"
+            )
         return False
 
 def abrir_pdf(ruta_pdf, mostrar_error=True):
@@ -6010,6 +6016,23 @@ def schedule_turn_closure_post_commit(
         lambda: runner(context, new_turn_config),
     )
     return True
+
+
+def enqueue_turn_excel_delivery(app, context):
+    from dataclasses import asdict
+    from turn_excel_delivery import enqueue
+
+    settings = getattr(app, "app_settings", {})
+    if context is not None and settings.get("auto_print", True) and settings.get("print_auto_excel_turno", False):
+        enqueue(EXCEL_PRINT_QUEUE_PATH, asdict(context), settings.get("print_copies_excel", 2))
+
+
+def restore_turn_delivery_context(data):
+    values = dict(data)
+    for key in ("started_at", "closed_at"):
+        values[key] = datetime.fromisoformat(values[key])
+    values["base_date"] = date.fromisoformat(values["base_date"])
+    return OutgoingTurnContext(**values)
 
 
 def build_turn_closure_report_snapshot(
@@ -9037,12 +9060,15 @@ class App:
         retry_attempt=0,
     ):
         """Generate old-turn artifacts in background after the central COMMIT."""
+        from turn_excel_delivery import deliver
+
+        enqueue_turn_excel_delivery(self, outgoing_context)
         generate_pdf = bool(
             self.app_settings.get("turnos_generate_report", True)
         )
         generate_excel = bool(
             self.app_settings.get("turnos_save_excel_copy", True)
-        )
+        ) or bool(self.app_settings.get("auto_print", True) and self.app_settings.get("print_auto_excel_turno", False))
 
         def generate_files():
             snapshot = build_turn_closure_report_snapshot(
@@ -9053,11 +9079,24 @@ class App:
                 generate_pdf=generate_pdf,
                 generate_excel=generate_excel,
             )
+            if self.app_settings.get("auto_print", True) and self.app_settings.get("print_auto_excel_turno", False):
+                deliver(
+                    EXCEL_PRINT_QUEUE_PATH, outgoing_context.transition_id,
+                    lambda _context: files.excel_path if files.patient_count else "",
+                    lambda path, copies: imprimir_excel(
+                        path, copies, permitir_reintento=False, mostrar_error=False
+                    ),
+                )
             return snapshot, files
 
         def finish(payload):
             snapshot, files = payload
             warnings = []
+            from turn_excel_delivery import jobs
+
+            if any(job["transition_id"] == outgoing_context.transition_id
+                   for job in jobs(EXCEL_PRINT_QUEUE_PATH, "SUBMITTING")):
+                warnings.append("EXCEL_PRINT_UNCONFIRMED")
             pdf_opened = False
             excel_opened = False
             if files.patient_count <= 0:
@@ -9099,33 +9138,11 @@ class App:
                     )
                     if not excel_opened:
                         warnings.append("EXCEL_OPEN_FAILED")
-                    if (
-                        self.app_settings.get("auto_print", True)
-                        and bool(
-                            self.app_settings.get(
-                                "print_auto_excel_turno", True
-                            )
-                        )
-                        and not imprimir_excel(
-                            files.excel_path,
-                            copias=max(
-                                1,
-                                int(
-                                    self.app_settings.get(
-                                        "print_copies_excel", 2
-                                    )
-                                    or 2
-                                ),
-                            ),
-                            permitir_reintento=False,
-                        )
-                    ):
-                        warnings.append("EXCEL_PRINT_FAILED")
                 self.set_status(
                     (
                         "Relevo aplicado; documentos del turno saliente generados."
                         if not warnings
-                        else "Relevo aplicado; documentos generados con apertura pendiente."
+                        else "Relevo aplicado; documentos generados con apertura o impresión pendiente."
                     ),
                     "ok" if not warnings else "warning",
                 )
@@ -10995,6 +11012,24 @@ class App:
             self._date_after_id = self.root.after(0, self._actualizar_fecha_actual)
             self._summary_after_id = self.root.after(0, self._programar_refresco_resumen_en_vivo)
         self._retry_excel_export_jobs()
+        if not getattr(self, "_turn_print_recovery_started", False):
+            self._turn_print_recovery_started = True
+            self._resume_turn_excel_delivery()
+
+    def _resume_turn_excel_delivery(self):
+        from turn_excel_delivery import jobs
+
+        for job in jobs(EXCEL_PRINT_QUEUE_PATH):
+            self._run_turn_post_commit_effects(restore_turn_delivery_context(job["context"]))
+        uncertain = jobs(EXCEL_PRINT_QUEUE_PATH, "SUBMITTING")
+        if uncertain:
+            messagebox.showwarning(
+                "Impresión de turno pendiente de verificar",
+                "Hay listados cuyo envío a la impresora no pudo confirmarse. "
+                "Revise la cola de impresión antes de imprimirlos manualmente:\n\n"
+                + "\n".join(job["file_path"] for job in uncertain),
+                parent=self.root,
+            )
 
     def deactivate(self):
         """Pause presentation timers without ending session or application."""
@@ -17240,6 +17275,12 @@ class App:
                     central_turn_id,
                 )
 
+            try:
+                if not administrative_override:
+                    enqueue_turn_excel_delivery(self, outgoing_context)
+            except Exception:
+                post_commit_warnings.append("EXCEL_PRINT_QUEUE")
+                APP_LOG.exception("Turno confirmado; solicitud de impresión pendiente de registrar")
             try:
                 if turno_cfg_nuevo:
                     enqueue_excel_export_job(

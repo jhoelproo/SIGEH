@@ -7,6 +7,8 @@ las dependencias que ya pertenecen a la aplicación principal.
 
 from __future__ import annotations
 
+from admission_specialty import with_resolved_specialty
+
 import importlib
 import importlib.util
 import logging
@@ -2355,12 +2357,9 @@ class _HybridDatabaseProxy:
             elif attention_type == "CONSULTA":
                 counts["CONSULTAS"] += 1
             else:
-                specialty = str(
-                    row.get("hoja_normalizada")
-                    or row.get("specialty")
-                    or row.get("hoja")
-                    or "GENERAL"
-                ).upper()
+                from admission_specialty import resolve_specialty
+
+                specialty = resolve_specialty(row)
                 key = (
                     "PEDIATRIA" if "PED" in specialty
                     else "GINECOLOGIA" if "GINE" in specialty
@@ -2521,7 +2520,23 @@ class _HybridDatabaseProxy:
             )
         )
         kwargs = {key: values[key] for key in accepted_names if key in values}
-        return [dict(row) for row in (local_method(**kwargs) or [])]
+        rows = [dict(row) for row in (local_method(**kwargs) or [])]
+        self._attach_local_history_identity(rows)
+        return rows
+
+    def _attach_local_history_identity(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        identities = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in identities)
+        with self._database._connect() as con:
+            metadata = con.execute(
+                f"SELECT id,global_attention_id FROM atenciones WHERE id IN ({placeholders})",
+                identities,
+            ).fetchall()
+        by_id = {int(item[0]): str(item[1] or "") for item in metadata}
+        for row in rows:
+            row["global_attention_id"] = by_id.get(int(row["id"]), "")
 
     def _local_pending_history(self, rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
         local_rows = [dict(row) for row in rows]
@@ -2694,7 +2709,7 @@ class _HybridDatabaseProxy:
         sql = f"""SELECT p.*,p.attention_id AS origin_attention_id,
                           p.attention_id AS id,p.service_date AS fecha,
                           p.service_time AS hora,p.patient_name AS nombre,
-                          CASE WHEN p.has_detail_sheet THEN COALESCE(NULLIF(p.specialty,''),'GENERAL')
+                          CASE WHEN p.has_detail_sheet THEN COALESCE(p.specialty,'')
                                ELSE '' END AS hoja,
                           p.canonical_ars AS ars,p.nss_snapshot AS nss,
                           p.cedula_snapshot AS cedula,'' AS edad_num,'' AS unidad,
@@ -2724,7 +2739,7 @@ class _HybridDatabaseProxy:
                    LIMIT %s OFFSET %s"""
         params.extend((limit + offset, 0))
         with self._runtime.host.connection_factory() as con:
-            cloud_rows = [dict(row) for row in con.execute(sql, tuple(params)).fetchall()]
+            cloud_rows = [with_resolved_specialty(row) for row in con.execute(sql, tuple(params)).fetchall()]
         if logger is not None:
             logger.info(
                 "HISTORY_CENTRAL_READ method=%s rows=%s source=CENTRAL",
@@ -2979,7 +2994,7 @@ class _HybridDatabaseProxy:
                         p.attention_id AS id,p.service_date AS fecha,
                         p.service_time AS hora,p.patient_name AS nombre,
                         CASE WHEN p.has_detail_sheet
-                             THEN COALESCE(NULLIF(p.specialty,''),'GENERAL')
+                             THEN COALESCE(p.specialty,'')
                              ELSE '' END AS hoja,
                         p.specialty AS hoja_normalizada,
                         p.canonical_ars AS ars,p.canonical_ars AS ars_display,
@@ -3001,7 +3016,7 @@ class _HybridDatabaseProxy:
                            COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT)"""
         with self._runtime.host.connection_factory() as connection:
             return [
-                dict(row)
+                with_resolved_specialty(row)
                 for row in connection.execute(
                     sql, (str(operational_source_id), int(turn_id))
                 ).fetchall()

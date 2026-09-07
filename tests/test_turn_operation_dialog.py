@@ -202,6 +202,7 @@ def test_confirmed_handoff_after_nominal_end_uses_central_configuration():
         guardar_turno_config=Mock(return_value=True),
         guardar_representante_catalogo=Mock(),
         enqueue_excel_export_job=enqueue,
+        enqueue_turn_excel_delivery=Mock(),
         schedule_turn_closure_post_commit=schedule,
         messagebox=Mock(),
         APP_LOG=Mock(),

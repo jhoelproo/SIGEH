@@ -7,6 +7,8 @@ usados por las dos interfaces de Admisi\u00f3n y probados sin una ventana abiert
 
 from __future__ import annotations
 
+from admission_specialty import resolve_specialty
+
 import hashlib
 import json
 import logging
@@ -7211,8 +7213,8 @@ class AdmissionCloudRepository:
             "service_date": str(data.get("service_date") or ""),
             "service_time": str(data.get("service_time") or ""),
             "service_type": str(data.get("service_type") or "EMERGENCIA"),
-            "specialty": str(data.get("specialty") or ""),
-            "detail_sheet": "GENERADA" if data.get("has_detail_sheet") else "",
+            "specialty": resolve_specialty(data),
+            "detail_sheet": (resolve_specialty(data) or "GENERADA") if data.get("has_detail_sheet") else "",
             "source_status": str(data.get("source_status") or "ACTIVA"),
             "created_at_device": str(data.get("created_at_device") or effective_at),
             "created_at_effective_utc": effective_at,
@@ -7503,8 +7505,8 @@ class AdmissionCloudRepository:
                     "service_date": str(data.get("service_date") or ""),
                     "service_time": str(data.get("service_time") or ""),
                     "service_type": str(data.get("service_type") or "EMERGENCIA"),
-                    "specialty": str(data.get("specialty") or ""),
-                    "detail_sheet": "GENERADA" if data.get("has_detail_sheet") else "",
+                    "specialty": resolve_specialty(data),
+                    "detail_sheet": (resolve_specialty(data) or "GENERADA") if data.get("has_detail_sheet") else "",
                     "source_status": str(data.get("source_status") or "ACTIVA"),
                     "is_deleted": is_deleted,
                     "deleted_at": str(data.get("deleted_at") or ""),
@@ -7779,7 +7781,7 @@ class AdmissionCloudRepository:
             nss,
             cedula,
             service_type,
-            str(payload.get("specialty") or ""),
+            resolve_specialty(payload),
             str(payload.get("admission_username") or ""),
             status,
             bool(sheet),
@@ -7898,7 +7900,7 @@ class AdmissionCloudRepository:
                 nss,
                 cedula,
                 service_type,
-                str(payload.get("specialty") or ""),
+                resolve_specialty(payload),
                 str(payload.get("admission_username") or ""),
                 status,
                 bool(sheet),
@@ -8226,7 +8228,7 @@ class AdmissionCloudRepository:
             nss,
             cedula,
             service_type,
-            str(payload.get("specialty") or ""),
+            resolve_specialty(payload),
             str(payload.get("admission_username") or event.origin_username or ""),
             status,
             bool(str(payload.get("detail_sheet") or "").strip()),

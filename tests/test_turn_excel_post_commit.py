@@ -17,6 +17,11 @@ from admission_hybrid import build_admission_order_key
 from admission_v15_adapter import DEFAULT_V15_ROOT, _load_v15_modules
 
 
+@pytest.fixture(autouse=True)
+def isolated_turn_print_queue(monkeypatch, tmp_path):
+    monkeypatch.setattr(_v15_module(), "EXCEL_PRINT_QUEUE_PATH", str(tmp_path / "print.sqlite3"))
+
+
 class _TurnDatabase:
     def __init__(self, rows=None):
         self.rows = (

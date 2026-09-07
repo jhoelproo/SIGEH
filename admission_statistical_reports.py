@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
+from admission_specialty import resolve_specialty
 import unicodedata
 
 
@@ -353,7 +354,7 @@ def _normalize_record(row: Mapping[str, Any]) -> dict[str, Any] | None:
     if uninsured:
         ars = "SIN SEGURO"
     specialty = _normalize_specialty(
-        _first_truthy(row, "hoja_normalizada", "specialty", "hoja")
+        resolve_specialty(row)
     )
     attention_id = _coerce_int(
         _first_truthy(row, "attention_id", "id", default=0), default=0
