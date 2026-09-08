@@ -25,6 +25,7 @@ Se preservan los filtros legítimos, los recibos, el historial clínico y los ci
 | Suite relacionada inicial | PASS: 120 pruebas |
 | Validación integral de UUID y arrastre entre cierres | PASS: SQL real, migración, captura, recibo de otra estación, pendiente → autorizada |
 | Suite completa final, coverage con ramas | **PASS: 1435 passed, 0 failed, 1 skipped; 60 subtests passed** |
+| Regresión posterior al renombrado local para lint | PASS: 45 pruebas; sin cambio de lógica |
 | Microsoft Excel real, exportación del área de impresión | **PASS: 137 pacientes, 7 páginas, ninguno omitido** |
 | Revisión visual de primera y última página renderizadas | PASS: tablas legibles, encabezados repetidos, última fila 137 presente |
 | Ejecutable: `--check-v15-package` | PASS, exit 0; abre Admisión/Historial/configuración |
@@ -60,7 +61,7 @@ python release_packaging.py --dist D:/SIGEH_RELEASE_117/dist/SIGEH --updater D:/
 
 Los tres comandos finalizaron correctamente. SHA256 del ZIP:
 
-`6a572cf50d59d279cdf9e1dc9bc5703b15d4363a58db2304c1d65fbb033eda72`
+`7f569e6b5565cf5093f1569dbea5216f1c33e8a36a99a51a55fd33fe1b729356`
 
 ## QA final y quality gates
 

@@ -8384,9 +8384,9 @@ def _legacy_shift_receipt_matches(row, candidate):
         return False
     if normalize_key(candidate.get("ars")) != normalize_key(row.get("ars")):
         return False
-    for field in ("nss_snapshot", "cedula_snapshot"):
-        identity = _shift_receipt_digits(row, field)
-        candidate_identity = _shift_receipt_digits(candidate, "admission_" + field)
+    for identity_field in ("nss_snapshot", "cedula_snapshot"):
+        identity = _shift_receipt_digits(row, identity_field)
+        candidate_identity = _shift_receipt_digits(candidate, "admission_" + identity_field)
         if identity and identity == candidate_identity:
             return True
     return False
