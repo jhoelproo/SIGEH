@@ -73,3 +73,17 @@ def deliver(path, identity, generate, printer):
             return False
         _set_state(path, identity, "SUBMITTED", file_path)
         return True
+
+
+def repair_unconfirmed_artifacts(path, generate, is_valid):
+    """Recover missing artifacts without repeating an uncertain printer submission."""
+    repaired = 0
+    with artifact_lock(str(path) + ".delivery"):
+        for job in jobs(path, "SUBMITTING"):
+            if is_valid(job["file_path"]):
+                continue
+            file_path = generate(job["context"])
+            if file_path and is_valid(file_path):
+                _set_state(path, job["transition_id"], "SUBMITTING", file_path)
+                repaired += 1
+    return repaired

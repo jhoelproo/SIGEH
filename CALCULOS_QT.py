@@ -1566,6 +1566,7 @@ CREATE TABLE IF NOT EXISTS billing_shift_closures(
   CHECK(status IN ('PENDING','GENERATING','GENERATED','PRINT_REQUESTED','COMPLETED','PRINT_ERROR','ERROR'))
 );
 CREATE TABLE IF NOT EXISTS billing_shift_closure_details(
+  global_attention_id UUID,
   closure_source_instance_id TEXT NOT NULL,
   closure_turn_id BIGINT NOT NULL,
   attention_source_instance_id TEXT NOT NULL,
@@ -2735,6 +2736,7 @@ def _apply_billing_shift_closure_snapshot_migration(con):
           );
         ALTER TABLE billing_shift_closure_details ADD COLUMN IF NOT EXISTS nss_snapshot TEXT;
         ALTER TABLE billing_shift_closure_details ADD COLUMN IF NOT EXISTS cedula_snapshot TEXT;
+        ALTER TABLE billing_shift_closure_details ADD COLUMN IF NOT EXISTS global_attention_id UUID;
         """
     )
 
@@ -7957,9 +7959,15 @@ def load_current_shift_billing_summary(repository=None) -> dict:
                       AND SUBSTRING(COALESCE(r.estado_facturacion_at,''),1,10)=%s""",
                 (operational_source_id, source_instance_id, turn_id, shift_date),
             ).fetchone()
+        from billing_historical_cancellation import inherited_attention_is_active_sql
+
+        active_inheritance = inherited_attention_is_active_sql(
+            "admission_shift_inheritances.source_instance_id",
+            "admission_shift_inheritances.attention_id",
+        )
         inheritance = con.execute(
-            """SELECT
-                    COUNT(*) FILTER (WHERE estado='PENDIENTE') AS inherited_pending,
+            f"""SELECT
+                    COUNT(*) FILTER (WHERE estado='PENDIENTE' AND {active_inheritance}) AS inherited_pending,
                     COUNT(*) FILTER (
                         WHERE estado='COMPLETADA'
                           AND turno_procesamiento_id=%s
@@ -8299,20 +8307,21 @@ def _receipt_candidates_for_shift(
             "source_id": str(row["source_instance_id"]),
             "attention_id": int(row["attention_id"]),
             "service_date": str(row.get("service_date") or ""),
+            "global_id": str(row.get("global_attention_id") or ""),
         }
         for row in records
     ]
     rows = con.execute(
         """WITH targets AS (
                SELECT * FROM jsonb_to_recordset(%s::jsonb)
-                 AS t(source_id TEXT,attention_id BIGINT,service_date TEXT)
+                 AS t(source_id TEXT,attention_id BIGINT,service_date TEXT,global_id TEXT)
            )
            SELECT DISTINCT r.id,r.numero,
                   CASE WHEN COALESCE(NULLIF(r.autorizacion_at,''),r.created_at)<=%s
                        THEN r.numero_autorizacion ELSE NULL END AS numero_autorizacion,
                   r.autorizacion_at,
                   r.autorizacion_por,r.username,r.created_at,r.fecha,r.ars,
-                  r.admission_atencion_id,
+                  r.admission_atencion_id,r.admission_global_attention_id,
                   COALESCE(r.admission_source_instance_id,'LEGACY') AS source_id,
                   r.admission_nss_snapshot,r.admission_cedula_snapshot
            FROM recibos r
@@ -8320,8 +8329,13 @@ def _receipt_candidates_for_shift(
              AND COALESCE(NULLIF(r.created_at,''),r.fecha||' 23:59:59')<=%s
              AND (
              EXISTS(SELECT 1 FROM targets t
-                    WHERE r.admission_atencion_id=t.attention_id
-                      AND COALESCE(r.admission_source_instance_id,'LEGACY')=t.source_id)
+                    WHERE (NULLIF(t.global_id,'') IS NOT NULL
+                           AND r.admission_global_attention_id::TEXT=t.global_id)
+                       OR (r.admission_atencion_id=t.attention_id
+                           AND COALESCE(r.admission_source_instance_id,'LEGACY')=t.source_id
+                           AND (r.admission_global_attention_id IS NULL
+                                OR NULLIF(t.global_id,'') IS NULL
+                                OR r.admission_global_attention_id::TEXT=t.global_id)))
              OR (r.admission_atencion_id IS NULL
                  AND r.fecha IN (SELECT service_date FROM targets WHERE service_date<>''))
            )
@@ -8331,37 +8345,63 @@ def _receipt_candidates_for_shift(
     return [dict(row) for row in rows]
 
 
-def _link_shift_receipts(records: list[dict], receipts: list[dict]) -> dict:
+def _shift_receipt_indexes(receipts):
     direct = {}
+    central = {}
     for receipt in receipts:
+        global_id = str(receipt.get("admission_global_attention_id") or "")
+        if global_id:
+            central.setdefault(global_id, receipt)
         attention_id = receipt.get("admission_atencion_id")
         if attention_id is not None:
             direct.setdefault(
                 (str(receipt.get("source_id") or "LEGACY"), int(attention_id)),
                 receipt,
             )
+    return direct, central
+
+
+def _direct_shift_receipt(row, direct, central):
+    global_id = str(row.get("global_attention_id") or "")
+    if global_id in central:
+        return central[global_id]
+    key = (str(row["source_instance_id"]), int(row["attention_id"]))
+    candidate = direct.get(key)
+    candidate_id = str((candidate or {}).get("admission_global_attention_id") or "")
+    if global_id and candidate_id and global_id != candidate_id:
+        return None
+    return candidate
+
+
+def _shift_receipt_digits(row, field):
+    return re.sub(r"\D", "", str(row.get(field) or ""))
+
+
+def _legacy_shift_receipt_matches(row, candidate):
+    if candidate.get("admission_atencion_id") is not None or candidate.get("admission_global_attention_id"):
+        return False
+    if str(candidate.get("fecha") or "") != str(row.get("service_date") or ""):
+        return False
+    if normalize_key(candidate.get("ars")) != normalize_key(row.get("ars")):
+        return False
+    for field in ("nss_snapshot", "cedula_snapshot"):
+        identity = _shift_receipt_digits(row, field)
+        candidate_identity = _shift_receipt_digits(candidate, "admission_" + field)
+        if identity and identity == candidate_identity:
+            return True
+    return False
+
+
+def _link_shift_receipts(records: list[dict], receipts: list[dict]) -> dict:
+    direct, central = _shift_receipt_indexes(receipts)
     linked = {}
     for row in records:
         key = (str(row["source_instance_id"]), int(row["attention_id"]))
-        receipt = direct.get(key)
+        receipt = _direct_shift_receipt(row, direct, central)
         if receipt is None:
-            nss = re.sub(r"\D", "", str(row.get("nss_snapshot") or ""))
-            cedula = re.sub(r"\D", "", str(row.get("cedula_snapshot") or ""))
-            if nss or cedula:
-                matches = []
-                for candidate in receipts:
-                    if candidate.get("admission_atencion_id") is not None:
-                        continue
-                    if str(candidate.get("fecha") or "") != str(row.get("service_date") or ""):
-                        continue
-                    if normalize_key(candidate.get("ars")) != normalize_key(row.get("ars")):
-                        continue
-                    candidate_nss = re.sub(r"\D", "", str(candidate.get("admission_nss_snapshot") or ""))
-                    candidate_cedula = re.sub(r"\D", "", str(candidate.get("admission_cedula_snapshot") or ""))
-                    if (nss and candidate_nss == nss) or (cedula and candidate_cedula == cedula):
-                        matches.append(candidate)
-                if len(matches) == 1:
-                    receipt = matches[0]
+            matches = [candidate for candidate in receipts if _legacy_shift_receipt_matches(row, candidate)]
+            if len(matches) == 1:
+                receipt = matches[0]
         linked[key] = receipt
     return linked
 
@@ -8376,6 +8416,7 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
         current.append({
             "source_instance_id": str(data.get("source_instance_id") or event.source_instance_id),
             "attention_id": int(data["attention_id"]),
+            "global_attention_id": str(data.get("global_attention_id") or ""),
             "original_turn_id": int(data.get("turn_id") or event.turn_id),
             "service_date": str(data.get("service_date") or ""),
             "service_time": str(data.get("service_time") or ""),
@@ -8409,21 +8450,33 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
         ).fetchone()
         inherited = []
         if previous:
+            from billing_historical_cancellation import inherited_attention_is_active_sql
+
+            active_inheritance = inherited_attention_is_active_sql(
+                "billing_shift_closure_details.attention_source_instance_id",
+                "billing_shift_closure_details.attention_id",
+            )
             inherited_rows = con.execute(
-                """SELECT attention_source_instance_id,attention_id,original_turn_id,
+                f"""SELECT attention_source_instance_id,attention_id,original_turn_id,
                           service_date,service_time,patient_name,ars,nss_snapshot,
-                          cedula_snapshot,responsible_username,source_updated_at
+                          cedula_snapshot,responsible_username,source_updated_at,
+                          COALESCE(global_attention_id::TEXT, (SELECT p.global_attention_id::TEXT
+                             FROM admission_attention_projection p
+                            WHERE p.source_instance_id=attention_source_instance_id
+                              AND p.attention_id=billing_shift_closure_details.attention_id
+                            LIMIT 1)) AS global_attention_id
                    FROM billing_shift_closure_details
                    WHERE closure_source_instance_id=%s AND closure_turn_id=%s
                      AND classification IN (
                        'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE'
-                     )""",
+                     ) AND {active_inheritance}""",
                 (previous["source_instance_id"], int(previous["turn_id"])),
             ).fetchall()
             inherited = [
                 {
                     "source_instance_id": str(row["attention_source_instance_id"]),
                     "attention_id": int(row["attention_id"]),
+                    "global_attention_id": str(row["global_attention_id"] or ""),
                     "original_turn_id": int(row["original_turn_id"]),
                     "service_date": str(row["service_date"] or ""),
                     "service_time": str(row["service_time"] or ""),
@@ -8477,7 +8530,7 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
                 int(receipt["numero"]) if receipt else None,
                 authorization or None, classification,
                 responsible or record["admission_username"], updated_at,
-                int(inherited_flag), now_str(),
+                int(inherited_flag), now_str(), record.get("global_attention_id") or None,
             ))
 
         counts = {
@@ -8504,7 +8557,7 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
                        service_date,service_time,patient_name,ars,nss_snapshot,
                        cedula_snapshot,receipt_id,receipt_number,authorization_number,
                        classification,responsible_username,source_updated_at,
-                       inherited,created_at
+                       inherited,created_at,global_attention_id
                    ) VALUES %s ON CONFLICT DO NOTHING""",
                 details,
                 page_size=500,
@@ -30000,6 +30053,89 @@ class EmergencyWorkspacePage(QWidget):
         )
 
 
+class HistoricalAdmissionCancellationWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, runtime, global_id, reason, parent=None):
+        super().__init__(parent)
+        self.runtime = runtime
+        self.global_id = global_id
+        self.reason = reason
+
+    def run(self):
+        from billing_historical_cancellation import cancel_pending_inheritance
+
+        try:
+            result = cancel_pending_inheritance(self.runtime, self.global_id, self.reason)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        try:
+            event = dict(result.get("event") or {})
+            if event and self.runtime.store is not None:
+                self.runtime.store.hydrate_remote_events([event])
+        except Exception:
+            result["replica_refresh_pending"] = True
+        self.completed.emit(result)
+
+
+def _historical_cancellation_context(dialog):
+    owner = dialog
+    while owner is not None:
+        workspace = getattr(owner, "emergency_workspace", None)
+        runtime = getattr(getattr(workspace, "full_page", None), "_hybrid_runtime", None)
+        if runtime is not None:
+            return workspace, runtime
+        owner = owner.parent()
+    return None, None
+
+
+def _cancel_historical_admission_from_dialog(dialog, attention, refresh):
+    if not is_administrator(dialog.current_user) or attention is None:
+        return
+    if getattr(dialog, "_cancellation_worker", None) is not None:
+        return
+    global_id = (
+        attention.global_attention_id if isinstance(attention, AdmissionAttention)
+        else attention.get("global_attention_id")
+    )
+    workspace, runtime = _historical_cancellation_context(dialog)
+    if runtime is None or not global_id:
+        QMessageBox.warning(dialog, "Anular heredada", "No hay sesión central o identidad de atención disponible. Actualice Admisión.")
+        return
+    reason, accepted = QInputDialog.getText(dialog, "Anular heredada pendiente", "Motivo de anulación (mínimo 8 caracteres):")
+    if not accepted:
+        return
+    if len(reason.strip()) < 8:
+        QMessageBox.warning(dialog, "Motivo requerido", "Escriba al menos 8 caracteres.")
+        return
+    if QMessageBox.question(
+        dialog, "Confirmar anulación",
+        "Se anulará la atención en Admisión y dejará de estar pendiente en Facturación. "
+        "Se conservará su historial y el motivo. Solo se permite si no tiene recibos ni reservas activas. ¿Continuar?",
+        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+    ) != QMessageBox.Yes:
+        return
+    worker = HistoricalAdmissionCancellationWorker(runtime, str(global_id), reason, dialog)
+    dialog._cancellation_worker = worker
+
+    def completed(result):
+        invalidate_admission_validation_cache()
+        workspace.admission_context.event_bus.history_refresh_requested.emit()
+        refresh()
+        text = "Atención anulada y retirada de pendientes."
+        if result.get("replica_refresh_pending"):
+            text += " La réplica local se actualizará en la siguiente sincronización."
+        QMessageBox.information(dialog, "Anulación confirmada", text)
+
+    worker.completed.connect(completed)
+    worker.failed.connect(lambda message: QMessageBox.warning(dialog, "No se pudo anular", message))
+    worker.finished.connect(lambda: setattr(dialog, "_cancellation_worker", None))
+    worker.finished.connect(worker.deleteLater)
+    worker.start()
+
+
 class AdmissionValidationLoadWorker(QThread):
     loaded = Signal(object)
     failed = Signal(str)
@@ -30110,6 +30246,10 @@ class AdmissionValidationClaimWorker(QThread):
 
 
 class AdmissionValidationDialog(QDialog):
+    def done(self, result):
+        if getattr(self, "_cancellation_worker", None) is None:
+            super().done(result)
+
     """Búsqueda central: la información solo se aplica al confirmar."""
 
     def __init__(self, current_user=None, session_id="", parent=None):
@@ -30229,6 +30369,13 @@ class AdmissionValidationDialog(QDialog):
         self.dismiss_button.setEnabled(False)
         set_button_role(self.dismiss_button, "danger")
         buttons.addWidget(self.dismiss_button)
+        self.cancel_inherited_button = QPushButton("Anular heredada pendiente")
+        self.cancel_inherited_button.setVisible(is_administrator(self.current_user))
+        set_button_role(self.cancel_inherited_button, "danger")
+        self.cancel_inherited_button.clicked.connect(
+            lambda: _cancel_historical_admission_from_dialog(self, self.selected_attention(), self.refresh)
+        )
+        buttons.addWidget(self.cancel_inherited_button)
         buttons.addStretch(1)
         cancel = QPushButton("Cancelar")
         self.confirm_button = QPushButton("Confirmar paciente")
@@ -30582,6 +30729,9 @@ class AdmissionValidationDialog(QDialog):
         }
 
     def closeEvent(self, event):
+        if getattr(self, "_cancellation_worker", None) is not None:
+            event.ignore()
+            return
         self._closing = True
         self._pending_identifier = None
         self.refresh_timer.stop()
@@ -30692,6 +30842,10 @@ class AdmissionHistoryDialog(QDialog):
         "Turno", "Tipo", "ARS", "Usuario Admisión", "Hoja", "Recibo",
         "Estado facturación", "Origen",
     )
+
+    def done(self, result):
+        if getattr(self, "_cancellation_worker", None) is None:
+            super().done(result)
 
     def __init__(self, current_user=None, parent=None):
         requested_user = dict(current_user or {})
@@ -30837,6 +30991,12 @@ class AdmissionHistoryDialog(QDialog):
         self.open_receipt_button = QPushButton("Abrir recibo")
         self.refresh_button = QPushButton("Actualizar")
         self.close_button = QPushButton("Cerrar")
+        self.cancel_inherited_button = QPushButton("Anular heredada pendiente")
+        self.cancel_inherited_button.setVisible(is_administrator(self.current_user))
+        set_button_role(self.cancel_inherited_button, "danger")
+        self.cancel_inherited_button.clicked.connect(
+            lambda: _cancel_historical_admission_from_dialog(self, self._selected_row_data(), self.search)
+        )
         set_button_role(self.use_button, "success")
         set_button_role(self.open_sheet_button, "info")
         set_button_role(self.open_receipt_button, "info")
@@ -30855,6 +31015,7 @@ class AdmissionHistoryDialog(QDialog):
         footer.addWidget(self.use_button)
         footer.addWidget(self.open_sheet_button)
         footer.addWidget(self.open_receipt_button)
+        footer.addWidget(self.cancel_inherited_button)
         footer.addWidget(self.refresh_button)
         footer.addWidget(self.close_button)
         root.addLayout(footer)
@@ -31362,6 +31523,9 @@ class AdmissionHistoryDialog(QDialog):
         self.search()
 
     def closeEvent(self, event):
+        if getattr(self, "_cancellation_worker", None) is not None:
+            event.ignore()
+            return
         self._closing = True
         for worker in tuple(self._workers):
             if worker.isRunning():

@@ -7,6 +7,11 @@ import pytest
 from excel_printing import print_patient_workbook
 
 
+@pytest.fixture(autouse=True)
+def prepared_workbook(monkeypatch):
+    monkeypatch.setattr('excel_printing.prepare_excel_delivery', lambda path: str(path))
+
+
 @pytest.mark.parametrize("failure", [None, "open", "print", "close", "quit"])
 def test_prints_patient_sheet_and_releases_private_excel(
     monkeypatch, tmp_path, failure

@@ -896,36 +896,8 @@ def test_turn_closure_excel_cleans_temporary_file_on_publish_error(
     with pytest.raises(OSError, match="publish failed"):
         v15.crear_excel_listado_turno_cerrado(snapshot, tmp_path / "failed.xlsx")
 
-    assert not list(tmp_path.glob(".turn-closure-*.xlsx"))
-    real_remove = v15.os.remove
-
-    def fail_turn_closure_cleanup(path):
-        if Path(path).name.startswith(".turn-closure-"):
-            raise OSError("cleanup failed")
-        return real_remove(path)
-
-    monkeypatch.setattr(v15.os, "remove", fail_turn_closure_cleanup)
-    with pytest.raises(OSError, match="publish failed"):
-        v15.crear_excel_listado_turno_cerrado(snapshot, tmp_path / "failed-again.xlsx")
-    temporary_files = list(tmp_path.glob(".turn-closure-*.xlsx"))
-    assert temporary_files
-    for temporary_file in temporary_files:
-        temporary_file.unlink()
-    monkeypatch.setattr(v15.os, "remove", real_remove)
-    real_exists = v15.os.path.exists
-    monkeypatch.setattr(
-        v15.os.path,
-        "exists",
-        lambda path: (
-            False if Path(path).name.startswith(".turn-closure-") else real_exists(path)
-        ),
-    )
-    with pytest.raises(OSError, match="publish failed"):
-        v15.crear_excel_listado_turno_cerrado(
-            snapshot, tmp_path / "failed-hidden-temp.xlsx"
-        )
-    for temporary_file in tmp_path.glob(".turn-closure-*.xlsx"):
-        temporary_file.unlink()
+    assert not list(tmp_path.glob("*.pending.xlsx"))
+    assert not (tmp_path / "failed.xlsx").exists()
 
 
 def test_nonempty_turn_closure_requires_transition_identifier(tmp_path):
@@ -944,11 +916,13 @@ def test_nonempty_turn_closure_requires_transition_identifier(tmp_path):
 def test_generated_excel_open_uses_the_platform_launcher(tmp_path, monkeypatch, system):
     v15 = _v15_module()
     workbook = tmp_path / "turn.xlsx"
-    workbook.write_bytes(b"xlsx")
+    from openpyxl import Workbook
+
+    Workbook().save(workbook)
     launched = []
     monkeypatch.setattr(v15.platform, "system", lambda: system)
     monkeypatch.setattr(
-        v15.os, "startfile", lambda path: launched.append(("windows", path))
+        v15.os, "startfile", lambda path, *args, **kwargs: launched.append(("windows", path))
     )
     monkeypatch.setattr(
         v15.subprocess,
@@ -1352,6 +1326,35 @@ def test_empty_excel_dataset_is_recorded_only_once(tmp_path, monkeypatch):
 
     assert sum("ADMISSION_EXCEL_SKIPPED_EMPTY" in value for value in messages) == 1
     assert v15._read_excel_export_state()["excel_status"] == "SKIPPED_EMPTY"
+
+
+def test_canonical_history_edits_and_last_cancellation_replace_excel(tmp_path, monkeypatch):
+    v15 = _v15_module()
+    paths = {
+        "EXCEL_PATH": "listado.xlsx",
+        "EXCEL_LATEST_PATH": "latest.xlsx",
+        "EXCEL_EXPORT_STATE_PATH": "state.json",
+    }
+    for key, name in paths.items():
+        monkeypatch.setattr(v15, key, str(tmp_path / name))
+    row = {"id": 1, "nombre": "PACIENTE SINTETICO", "tipo_atencion": "EMERGENCIA", "hoja": "GENERAL"}
+    database = _CanonicalTurnDatabase([row])
+    for kind in ("EMERGENCIA", "URGENCIA", "CONSULTA", "EMERGENCIA"):
+        row["tipo_atencion"] = kind
+        assert v15.reconstruir_excel_turno(database, _turn_config()) == 1
+        with open(v15.EXCEL_PATH, "rb") as stream:
+            book = load_workbook(stream)
+            assert book.active["C6"].value == ("GENERAL" if kind == "EMERGENCIA" else kind)
+            book.close()
+        summary = v15.resumen_excel_actual_simple()
+        assert summary["URGENCIAS"] == int(kind == "URGENCIA")
+        assert summary["CONSULTAS"] == int(kind == "CONSULTA")
+    database.rows.clear()
+    assert v15.reconstruir_excel_turno(database, _turn_config()) == 0
+    book = load_workbook(v15.EXCEL_PATH)
+    assert book.active["B6"].value is None
+    book.close()
+    assert v15._read_excel_export_state()["patient_count"] == 0
 
 
 @pytest.mark.skipif(

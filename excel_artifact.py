@@ -6,10 +6,13 @@ import sys
 import tempfile
 import threading
 import zipfile
+import uuid
+from xml.etree.ElementTree import ParseError
 from contextlib import contextmanager
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 
 _LOCKS = tuple(threading.RLock() for _ in range(64))
@@ -74,10 +77,32 @@ def _temporary_xlsx(target):
         temporary.unlink(missing_ok=True)
 
 
-def _retain_previous(target):
+def xlsx_is_valid(path):
+    try:
+        validate_xlsx(path)
+        return True
+    except (
+        FileNotFoundError,
+        zipfile.BadZipFile,
+        ParseError,
+        KeyError,
+        ValueError,
+        InvalidFileException,
+        EOFError,
+    ):
+        return False
+
+
+def _retain_previous(target, recover_corrupt=False):
     if not target.exists():
         return
     # A corrupt artifact is evidence: refuse to replace it automatically.
+    if recover_corrupt and not xlsx_is_valid(target):
+        evidence = target.with_name(
+            target.stem + ".corrupt-" + uuid.uuid4().hex + ".xlsx"
+        )
+        shutil.copy2(target, evidence)
+        return
     validate_xlsx(target)
     backup = target.with_name(target.stem + ".last-valid.xlsx")
     with _temporary_xlsx(backup) as temporary:
@@ -85,22 +110,24 @@ def _retain_previous(target):
         os.replace(temporary, backup)
 
 
-def _replace_validated(target, writer):
+def _replace_validated(target, writer, recover_corrupt=False):
     with artifact_lock(target) as destination:
         with _temporary_xlsx(destination) as temporary:
             writer(temporary)
             validate_xlsx(temporary)
             with open(temporary, "r+b") as stream:
                 os.fsync(stream.fileno())
-            _retain_previous(destination)
+            _retain_previous(destination, recover_corrupt)
             os.replace(temporary, destination)
 
 
-def save_workbook(workbook, target):
+def save_workbook(workbook, target, *, recover_corrupt=False):
     """Keep workbook ownership with the caller, including after a failed save."""
-    _replace_validated(target, workbook.save)
+    _replace_validated(target, workbook.save, recover_corrupt)
 
 
-def copy_workbook(source, target):
+def copy_workbook(source, target, *, recover_corrupt=False):
     """Copy bytes without reserializing official formatting or embedded images."""
-    _replace_validated(target, lambda temporary: shutil.copy2(source, temporary))
+    _replace_validated(
+        target, lambda temporary: shutil.copy2(source, temporary), recover_corrupt
+    )

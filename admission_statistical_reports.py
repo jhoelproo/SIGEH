@@ -101,6 +101,10 @@ def _parse_datetime(value: Any) -> datetime | None:
                 "%Y-%m-%d %H:%M",
                 "%d/%m/%Y %H:%M:%S",
                 "%d/%m/%Y %H:%M",
+                "%Y-%m-%d %I:%M %p",
+                "%Y-%m-%d %I:%M:%S %p",
+                "%d/%m/%Y %I:%M %p",
+                "%d/%m/%Y %I:%M:%S %p",
             ):
                 try:
                     result = datetime.strptime(text_value, pattern)

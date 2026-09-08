@@ -2338,6 +2338,8 @@ class _HybridDatabaseProxy:
 
     @staticmethod
     def _calculate_turn_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+        from admission_listing import attention_type
+
         counts = {
             "total": 0,
             "sin_seguro": 0,
@@ -2349,12 +2351,10 @@ class _HybridDatabaseProxy:
         }
         for row in rows:
             counts["total"] += 1
-            attention_type = str(
-                row.get("tipo_atencion") or row.get("service_type") or "EMERGENCIA"
-            ).upper()
-            if attention_type == "URGENCIA":
+            kind = attention_type(row)
+            if kind == "URGENCIA":
                 counts["URGENCIAS"] += 1
-            elif attention_type == "CONSULTA":
+            elif kind == "CONSULTA":
                 counts["CONSULTAS"] += 1
             else:
                 from admission_specialty import resolve_specialty
@@ -5316,12 +5316,7 @@ class AdmissionV15Factory:
                                 "Aviso", "No se pudo anular. Intente nuevamente."
                             )
                             return
-                        attention_type = str(
-                            attention.get("tipo_atencion") or "EMERGENCIA"
-                        ).strip().upper()
-                        if affects_excel and attention_type not in {
-                            "URGENCIA", "CONSULTA"
-                        }:
+                        if affects_excel:
                             excel_refresh.request() if excel_refresh is not None else None
                         if refrescar_callback:
                             try:
@@ -5546,6 +5541,8 @@ class AdmissionV15Factory:
                         refresh_controller.request_summary("history_dataset_changed")
 
                 history_signal.connect(refresh_summary_after_history_event)
+                if excel_refresh is not None:
+                    history_signal.connect(excel_refresh.request)
 
             def refresh_after_sync(result: Mapping[str, Any]) -> None:
                 if refresh_controller is not None:

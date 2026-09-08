@@ -3964,8 +3964,6 @@ class DatabaseManager:
         if not contexto:
             excel = resumen_excel_actual_simple(turno_cfg=turno_cfg)
             if int(excel.get("total", 0) or 0):
-                excel["URGENCIAS"] = 0
-                excel["CONSULTAS"] = 0
                 excel["_fuente"] = "EXCEL_RECUPERADO"
                 return excel
             return base
@@ -4200,6 +4198,8 @@ def aplicar_formato_excel(ws):
         ws.page_setup.orientation = "landscape" if orientacion_excel.startswith("h") else "portrait"
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
+        ws.page_setup.scale = None
+        ws.print_title_rows = '1:5'
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.print_area = f"A1:D{max(ws.max_row, 6)}"
         ws.freeze_panes = "A6"
@@ -4385,6 +4385,8 @@ def construir_hoja_listado_pacientes(
     revision=None,
 ):
     """Build the single official operational patient-listing format."""
+    from admission_listing import listing_classification
+
     filas = list(filas or [])
     for rng in ('A1:D1', 'A2:D2', 'A3:D3', 'A4:D4'):
         try:
@@ -4410,7 +4412,7 @@ def construir_hoja_listado_pacientes(
         ws.append([
             numero,
             str(fila.get("nombre") or fila.get("patient_name") or "SIN NOMBRE").upper(),
-            fila.get("hoja_normalizada", fila.get("specialty", fila.get("hoja", ""))),
+            listing_classification(fila),
             fila.get("ars_display", fila.get("canonical_ars", fila.get("ars", "SIN SEGURO"))),
             str(fila.get("global_attention_id") or ""),
         ])
@@ -4454,10 +4456,10 @@ def _construir_workbook_turno(db: DatabaseManager, turno_cfg: dict):
 
 
 def reconstruir_excel_turno(db: DatabaseManager, turno_cfg: dict):
-    from excel_artifact import save_workbook
+    from excel_artifact import save_workbook, xlsx_is_valid
 
     wb, total = _construir_workbook_turno(db, turno_cfg)
-    if total == 0:
+    if total == 0 and not callable(getattr(db, "build_turn_dataset", None)):
         revision = str(wb.active['F1'].value or "")
         wb.close()
         export_state = _read_excel_export_state()
@@ -4480,11 +4482,12 @@ def reconstruir_excel_turno(db: DatabaseManager, turno_cfg: dict):
         export_state.get("excel_dataset_revision") == revision
         and export_state.get("excel_status") == "SYNCED"
         and os.path.isfile(EXCEL_PATH)
+        and xlsx_is_valid(EXCEL_PATH)
     ):
         wb.close()
         return total
     try:
-        save_workbook(wb, EXCEL_LATEST_PATH)
+        save_workbook(wb, EXCEL_LATEST_PATH, recover_corrupt=True)
     finally:
         wb.close()
     try:
@@ -4519,11 +4522,14 @@ def _excel_file_in_use(exc: BaseException) -> bool:
 
 def _admission_dataset_revision(rows) -> str:
     """Hash estable del contenido/orden; no depende de metadatos binarios XLSX."""
+    from admission_listing import attention_type
+
     normalized = []
     for position, raw in enumerate(rows, start=1):
         row = dict(raw or {})
         normalized.append({
             "position": position,
+            "attention_type": attention_type(row),
             "global_attention_id": str(row.get("global_attention_id") or ""),
             "attention_id": int(row.get("attention_id") or row.get("id") or 0),
             "name": str(row.get("nombre") or row.get("patient_name") or "").strip().upper(),
@@ -4745,7 +4751,7 @@ def _generate_versioned_excel(
 def _update_canonical_excel(source_file: str, canonical_target: str = EXCEL_PATH) -> None:
     from excel_artifact import copy_workbook
 
-    copy_workbook(source_file, canonical_target)
+    copy_workbook(source_file, canonical_target, recover_corrupt=True)
 
 
 def synchronize_latest_excel() -> str:
@@ -5167,6 +5173,8 @@ def resumen_excel_actual_simple(turno_cfg=None):
         "GENERAL": 0,
         "PEDIATRIA": 0,
         "GINECOLOGIA": 0,
+        "URGENCIAS": 0,
+        "CONSULTAS": 0,
     }
     try:
         if not os.path.exists(EXCEL_PATH):
@@ -5200,8 +5208,9 @@ def resumen_excel_actual_simple(turno_cfg=None):
             ars = str(ws.cell(row=fila, column=4).value or "").strip()
 
             resumen["total"] += 1
-            if esp in resumen:
-                resumen[esp] += 1
+            category = {"URGENCIA": "URGENCIAS", "CONSULTA": "CONSULTAS"}.get(esp, esp)
+            if category in resumen:
+                resumen[category] += 1
 
             if normalizar_seguro(ars, "") == "SIN SEGURO":
                 resumen["sin_seguro"] += 1
@@ -5329,7 +5338,9 @@ def abrir_excel_generado(ruta_excel, mostrar_error=True):
             raise FileNotFoundError(ruta_abs)
         sis = platform.system()
         if sis == "Windows":
-            os.startfile(ruta_abs)
+            from excel_delivery_path import prepare_excel_delivery
+
+            os.startfile(prepare_excel_delivery(ruta_abs), "open", show_cmd=3)
         elif sis == "Darwin":
             subprocess.run(["open", ruta_abs], check=False)
         else:
@@ -6035,6 +6046,18 @@ def restore_turn_delivery_context(data):
     return OutgoingTurnContext(**values)
 
 
+def repair_unconfirmed_turn_listings(db):
+    from excel_artifact import xlsx_is_valid
+    from turn_excel_delivery import repair_unconfirmed_artifacts
+
+    def regenerate(data):
+        context = restore_turn_delivery_context(data)
+        snapshot = build_turn_closure_report_snapshot(db, context)
+        return generate_turn_closure_report_files(snapshot, generate_pdf=False).excel_path
+
+    return repair_unconfirmed_artifacts(EXCEL_PRINT_QUEUE_PATH, regenerate, xlsx_is_valid)
+
+
 def build_turn_closure_report_snapshot(
     db,
     context: OutgoingTurnContext,
@@ -6092,6 +6115,11 @@ def build_turn_closure_report_snapshot(
             },
         ),
     )
+    if len(dataset.records) != len(rows):
+        raise RuntimeError(
+            "El listado del turno contiene registros que el reporte no pudo interpretar. "
+            "Se conservan los datos; actualice Admisión antes de reintentar el reporte."
+        )
     revision = _admission_dataset_revision(dataset.records)
     global_ids = tuple(
         str(row.get("global_attention_id") or "") for row in dataset.records
@@ -6468,26 +6496,12 @@ def crear_excel_listado_turno_cerrado(
         encabezado_linea_4=str(summary.get("turn_label") or ""),
         revision=snapshot.dataset_revision,
     )
-    file_descriptor, temporary_path = tempfile.mkstemp(
-        prefix=".turn-closure-",
-        suffix=".xlsx",
-        dir=os.path.dirname(destination),
-    )
-    os.close(file_descriptor)
+    from excel_artifact import save_workbook
+
     try:
-        workbook.save(temporary_path)
+        save_workbook(workbook, destination, recover_corrupt=True)
+    finally:
         workbook.close()
-        os.replace(temporary_path, destination)
-    except Exception:
-        try:
-            workbook.close()
-        finally:
-            try:
-                if os.path.exists(temporary_path):
-                    os.remove(temporary_path)
-            except OSError:
-                pass
-        raise
     return destination
 
 
@@ -6505,17 +6519,14 @@ def _turn_closure_artifact_paths(
         os.fspath(output_directory or carpeta_archivo_turno(context.as_turn_config()))
     )
     os.makedirs(directory, exist_ok=True)
-    turn_label = limpiar_nombre_archivo(
-        etiqueta_turno_archivo(context.as_turn_config())
-    )
-    artifact_tag = f"{turn_label} - turno {context.turn_id} - {transition_tag}"
+    artifact_tag = f"T{context.turn_id}-{transition_tag}-{snapshot.dataset_revision[:12]}"
     pdf_path = (
         os.path.join(directory, f"Reporte - {artifact_tag}.pdf")
         if generate_pdf
         else ""
     )
     excel_path = (
-        os.path.join(directory, f"Listado de pacientes - {artifact_tag}.xlsx")
+        os.path.join(directory, f"Listado-{artifact_tag}.xlsx")
         if generate_excel
         else ""
     )
@@ -6529,7 +6540,9 @@ def _generate_missing_turn_closure_artifacts(
 ) -> tuple[bool, bool, bool, bool]:
     with _TURN_CLOSURE_REPORT_LOCK:
         pdf_existed = bool(pdf_path and os.path.isfile(pdf_path))
-        excel_existed = bool(excel_path and os.path.isfile(excel_path))
+        from excel_artifact import xlsx_is_valid
+
+        excel_existed = bool(excel_path and xlsx_is_valid(excel_path))
         pdf_generated = False
         excel_generated = False
         if pdf_path and not pdf_existed:
@@ -9857,12 +9870,11 @@ class App:
                 total_texto = ""
                 texto = "Resumen oculto por preferencias."
             else:
-                # Total = solo EMERGENCIAS. Urgencias y consultas son conteos aparte.
-                total_emergencias = sum(
+                total_atenciones = sum(
                     int(r.get(categoria, 0) or 0)
-                    for categoria in ("GENERAL", "PEDIATRIA", "GINECOLOGIA")
+                    for categoria in ("GENERAL", "PEDIATRIA", "GINECOLOGIA", "URGENCIAS", "CONSULTAS")
                 )
-                total_texto = f"Total pacientes: {total_emergencias}"
+                total_texto = f"Total atenciones: {total_atenciones}"
                 texto = (
                     f"Sin seguro: {r.get('sin_seguro', 0)}\n"
                     f"General: {r.get('GENERAL', 0)}\n"
@@ -11019,16 +11031,32 @@ class App:
     def _resume_turn_excel_delivery(self):
         from turn_excel_delivery import jobs
 
-        for job in jobs(EXCEL_PRINT_QUEUE_PATH):
-            self._run_turn_post_commit_effects(restore_turn_delivery_context(job["context"]))
-        uncertain = jobs(EXCEL_PRINT_QUEUE_PATH, "SUBMITTING")
+        try:
+            pending = jobs(EXCEL_PRINT_QUEUE_PATH)
+            uncertain = jobs(EXCEL_PRINT_QUEUE_PATH, "SUBMITTING")
+        except Exception:
+            APP_LOG.exception("EXCEL_QUEUE_RECOVERY_FAILED")
+            self.set_status("No se pudo leer la cola de impresión. Puede continuar trabajando.", "warning")
+            return
+        for job in pending:
+            try:
+                self._run_turn_post_commit_effects(restore_turn_delivery_context(job["context"]))
+            except Exception:
+                APP_LOG.exception("EXCEL_JOB_RECOVERY_FAILED")
         if uncertain:
-            messagebox.showwarning(
-                "Impresión de turno pendiente de verificar",
-                "Hay listados cuyo envío a la impresora no pudo confirmarse. "
-                "Revise la cola de impresión antes de imprimirlos manualmente:\n\n"
-                + "\n".join(job["file_path"] for job in uncertain),
-                parent=self.root,
+            self.set_status(
+                "Hay impresiones sin confirmar. Revise la cola de la impresora antes de repetirlas.",
+                "warning",
+            )
+            self._ejecutar_en_segundo_plano(
+                "Recuperar listados de turnos anteriores",
+                lambda: repair_unconfirmed_turn_listings(self.db),
+                on_success=lambda count: self.set_status(
+                    f"Listados recuperados: {count}. Revise la cola antes de imprimir otra vez.", "warning"
+                ),
+                on_error=lambda error: self.set_status(
+                    "La recuperación del listado sigue pendiente; puede continuar trabajando.", "warning"
+                ),
             )
 
     def deactivate(self):
@@ -11280,8 +11308,6 @@ class App:
     def _registro_afecta_excel_turno(self, atencion):
         if not atencion:
             return False
-        if (atencion.get("tipo_atencion") or "EMERGENCIA").strip().upper() in ("URGENCIA", "CONSULTA"):
-            return False
         return self._registro_esta_en_turno_actual(atencion)
 
     def _cambio_requiere_reconstruir_excel(self, antes: dict, despues: dict) -> bool:
@@ -11289,7 +11315,7 @@ class App:
         FASE 8: Reconstruir Excel SOLO si cambia un campo crítico.
         Campos críticos: nombre, hoja, ARS, tipo_atencion, fecha.
         Campos NO críticos: telefono, direccion, sexo, nacionalidad, cedula, edad, nss, hora.
-        URGENCIA nunca reconstruye.
+        Los cambios de tipo también invalidan el listado.
         """
         if not antes and not despues:
             return False
@@ -11301,9 +11327,6 @@ class App:
             despues.get("TipoAtencion", despues.get("tipo_atencion",
             antes.get("tipo_atencion", "EMERGENCIA"))) or "EMERGENCIA"
         ).strip().upper()
-
-        if tipo_despues in ("URGENCIA", "CONSULTA"):
-            return False
 
         campos_clave = [
             ("nombre", "Nombre"),

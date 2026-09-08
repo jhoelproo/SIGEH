@@ -168,6 +168,63 @@ def test_total_counts_general_urgency_and_consultation_once_each():
     assert summary["CONSULTAS"] == 1
 
 
+@pytest.mark.parametrize("kind", ["URGENCIA", "CONSULTA"])
+def test_attention_type_change_invalidates_excel_and_is_visible(kind):
+    from openpyxl import Workbook
+
+    v15 = _v15_module()
+    before = _row(1)
+    after = dict(before, tipo_atencion=kind, service_type=kind)
+    assert v15._admission_dataset_revision([before]) != v15._admission_dataset_revision([after])
+    workbook = Workbook()
+    try:
+        v15.construir_hoja_listado_pacientes(workbook.active, [after])
+        assert workbook.active["C6"].value == kind
+    finally:
+        workbook.close()
+
+
+@pytest.mark.parametrize("kind,key", [(" urgencia ", "URGENCIAS"), (" consulta ", "CONSULTAS")])
+def test_summary_normalizes_attention_type(kind, key):
+    counts = _HybridDatabaseProxy._calculate_turn_counts([_row(1, kind)])
+    assert counts[key] == 1
+    assert counts["GENERAL"] == 0
+
+
+def test_central_history_type_edit_overrides_old_local_copy():
+    proxy, connection = _proxy([_row(1)])
+    assert proxy.refresh_turn_summary()["GENERAL"] == 1
+    for kind, key in (("URGENCIA", "URGENCIAS"), ("CONSULTA", "CONSULTAS")):
+        connection.rows = [_row(1, kind)]
+        counts = proxy.refresh_turn_summary()
+        assert counts[key] == 1
+        assert counts["GENERAL"] == 0
+        assert proxy.build_turn_dataset(turn_id=CURRENT_TURN, operational_source_id=SOURCE)[0]["tipo_atencion"] == kind
+
+
+def test_sidebar_total_includes_urgencies_and_consultations():
+    v15 = _v15_module()
+    total, detail = [], []
+    view = SimpleNamespace(
+        app_settings={}, turno_total_var=SimpleNamespace(set=total.append),
+        turno_resumen_var=SimpleNamespace(set=detail.append),
+        root=SimpleNamespace(update_idletasks=lambda: None),
+    )
+    v15.App._actualizar_resumen_turno_panel(view, resumen={"GENERAL": 4, "URGENCIAS": 1, "CONSULTAS": 2})
+    assert total == ["Total atenciones: 7"]
+    assert "Urgencias: 1" in detail[0]
+    assert "Consultas: 2" in detail[0]
+
+
+@pytest.mark.parametrize("kind", ["URGENCIA", "CONSULTA"])
+def test_history_type_edits_request_excel_rebuild(kind):
+    v15 = _v15_module()
+    controller = SimpleNamespace(_registro_afecta_excel_turno=lambda _row: True)
+    assert v15.App._cambio_requiere_reconstruir_excel(
+        controller, _row(1), {"TipoAtencion": kind}
+    )
+
+
 def test_previous_turn_identity_cannot_enter_current_dataset():
     proxy, connection = _proxy([])
 

@@ -1589,7 +1589,11 @@ class Toplevel(QDialog, _WidgetMixin):
         if target.isVisible():
             target.exec()
     def withdraw(self): self.hide()
-    def deiconify(self): self.show()
+    def deiconify(self):
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
 
 class Frame(QWidget, _WidgetMixin):
