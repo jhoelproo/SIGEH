@@ -1724,6 +1724,11 @@ def install_central_hybrid_schema(connection: Any) -> None:
         for statement in (part.strip() for part in POSTGRES_HYBRID_SCHEMA.split(";") if part.strip()):
             connection.execute(statement)
     ensure_admission_import_progress_schema(connection)
+    from admission_urgency_repair import repair_urgency_projection
+    from admission_authorship import repair_admission_authorship
+
+    repair_urgency_projection(connection)
+    repair_admission_authorship(connection)
 
 
 class OfflineAdmissionStore:
@@ -1824,6 +1829,7 @@ class OfflineAdmissionStore:
             self._add_column(con, "atenciones", "device_local_sequence", "INTEGER")
             self._add_column(con, "atenciones", "captured_by_user_id", "TEXT")
             self._add_column(con, "atenciones", "captured_by_username", "TEXT")
+            self._add_column(con, "atenciones", "admission_username", "TEXT")
             self._add_column(con, "atenciones", "is_deleted", "INTEGER NOT NULL DEFAULT 0")
             self._add_column(con, "atenciones", "deleted_at", "TEXT")
             self._add_column(con, "atenciones", "deleted_by_user_id", "TEXT")
@@ -1892,6 +1898,19 @@ class OfflineAdmissionStore:
                     "FROM pacientes p WHERE p.id=atenciones.paciente_id) "
                     "WHERE global_patient_id IS NULL OR TRIM(global_patient_id)=''"
                 )
+                con.execute("""UPDATE atenciones SET admission_username=(
+                    SELECT json_extract(o.payload_json,'$.admission_username')
+                    FROM sync_outbox o
+                    WHERE o.entity_uuid=atenciones.global_attention_id
+                      AND o.operation='CREATE'
+                    ORDER BY o.rowid LIMIT 1
+                ) WHERE NULLIF(admission_username,'') IS NULL""")
+                if "atenciones_auditoria" in tables:
+                    con.execute("""UPDATE atenciones SET admission_username=(
+                        SELECT usuario FROM atenciones_auditoria audit
+                        WHERE audit.atencion_id=atenciones.id AND audit.accion='CREACION'
+                        ORDER BY audit.id LIMIT 1
+                    ) WHERE NULLIF(admission_username,'') IS NULL""")
                 self._install_attention_outbox_triggers(con)
             con.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_atenciones_global_attention "
@@ -2000,6 +2019,7 @@ class OfflineAdmissionStore:
                      device_local_sequence=(SELECT last_sequence FROM sync_device_sequence WHERE singleton=1),
                      captured_by_user_id=COALESCE(NULLIF((SELECT actor_user_id FROM sync_runtime_context WHERE singleton=1),''),(SELECT active_user_id FROM sync_runtime_context WHERE singleton=1)),
                      captured_by_username=COALESCE(NULLIF((SELECT actor_username FROM sync_runtime_context WHERE singleton=1),''),(SELECT active_username FROM sync_runtime_context WHERE singleton=1)),
+                     admission_username=(SELECT active_username FROM sync_runtime_context WHERE singleton=1),
                      reconciliation_status='DIRECT',
                      is_deleted=0,
                      sync_state='LOCAL_NEW',
@@ -2031,6 +2051,7 @@ class OfflineAdmissionStore:
                               'origin_device_id',a.origin_device_id,
                               'admission_username',c.active_username,
                               'operational_representative_user_id',c.active_user_id,
+                              'operational_username',c.active_username,
                               'captured_by_username',COALESCE(NULLIF(c.actor_username,''),c.active_username),
                               'origin_user_id',COALESCE(NULLIF(c.actor_user_id,''),c.active_user_id),
                               'created_at_device',a.created_at_device,
@@ -2062,8 +2083,6 @@ class OfflineAdmissionStore:
                  SET last_sequence=last_sequence+1 WHERE singleton=1;
               UPDATE atenciones SET
                   version=COALESCE(version,1)+1,
-                  origin_device_id=(SELECT device_id FROM sync_runtime_context WHERE singleton=1),
-                  operational_source_id=(SELECT operational_source_id FROM sync_runtime_context WHERE singleton=1),
                   operational_session_id=(SELECT operational_session_id FROM sync_runtime_context WHERE singleton=1),
                   generation=(SELECT generation FROM sync_runtime_context WHERE singleton=1),
                   base_server_revision=COALESCE(server_revision,0),
@@ -2112,7 +2131,7 @@ class OfflineAdmissionStore:
                                       THEN 'ATTENTION_VOIDED'
                                   ELSE 'ATTENTION_RECTIFIED' END,
                               'patient_id',a.paciente_id,'global_patient_id',a.global_patient_id,
-                              'turn_id',COALESCE(c.operational_turn_id,a.turno_id),
+                              'turn_id',COALESCE(a.operational_turn_id,a.turno_id),
                               'local_turn_id',a.turno_id,'name',a.nombre,'sex',a.sexo,
                               'age',a.edad_num,'age_unit',a.unidad,
                               'cedula',a.cedula,'phone',a.telefono,
@@ -2126,16 +2145,13 @@ class OfflineAdmissionStore:
                                    WHERE clave='integration.source_instance_id'),''),
                               'operational_source_id',a.operational_source_id,
                               'origin_device_id',a.origin_device_id,
-                              'admission_username',c.active_username,
+                              'admission_username',COALESCE(a.admission_username,''),
                               'operational_representative_user_id',c.active_user_id,
-                              'captured_by_username',COALESCE(NULLIF(c.actor_username,''),c.active_username),
-                              'origin_user_id',COALESCE(NULLIF(c.actor_user_id,''),c.active_user_id),
-                              'created_at_device',strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                              'created_at_effective_utc',strftime(
-                                '%Y-%m-%dT%H:%M:%fZ','now',
-                                printf('%+.3f seconds',COALESCE((
-                                  SELECT CAST(valor AS REAL)/1000.0 FROM app_metadata
-                                  WHERE clave='sync.server_time_offset_ms'),0))),
+                              'operational_username',c.active_username,
+                              'captured_by_username',COALESCE(a.captured_by_username,''),
+                              'origin_user_id',COALESCE(a.captured_by_user_id,''),
+                              'created_at_device',a.created_at_device,
+                              'created_at_effective_utc',a.created_at_effective_utc,
                               'device_local_sequence',(SELECT last_sequence FROM sync_device_sequence WHERE singleton=1),
                               'is_deleted',a.is_deleted,'deleted_at',a.deleted_at,
                               'deleted_by_user_id',a.deleted_by_user_id,
@@ -3360,6 +3376,7 @@ class OfflineAdmissionStore:
                 if existing:
                     updates = {
                         "nombre": str(payload.get("name") or "SIN NOMBRE"),
+                        "admission_username": str(payload.get("admission_username") or ""),
                         "sexo": str(payload.get("sex") or ""),
                         "edad_num": _as_int_or_none(payload.get("age")),
                         "unidad": str(payload.get("age_unit") or "Años"),
@@ -3395,19 +3412,20 @@ class OfflineAdmissionStore:
                         ),
                         "generation": _as_int_or_none(event.get("generation")),
                         "operational_turn_id": _as_int_or_none(
-                            event.get("turn_id") or payload.get("turn_id")
+                            payload.get("turn_id") or event.get("turn_id")
                         ),
                         "created_at_device": created_at_device,
                         "created_at_effective_utc": created_at_effective,
                         "device_local_sequence": local_sequence,
                         "captured_by_user_id": str(
-                            event.get("origin_user_id")
-                            or payload.get("origin_user_id")
+                            payload.get("origin_user_id")
+                            or event.get("origin_user_id")
                             or ""
                         ),
                         "captured_by_username": str(
-                            event.get("origin_username")
+                            payload.get("captured_by_username")
                             or payload.get("admission_username")
+                            or event.get("origin_username")
                             or ""
                         ),
                         "reconciliation_status": reconciliation_status,
@@ -3440,6 +3458,7 @@ class OfflineAdmissionStore:
                             "turno_id": int(turn[0]),
                             "nss": str(payload.get("nss") or ""),
                             "nombre": str(payload.get("name") or "SIN NOMBRE"),
+                            "admission_username": str(payload.get("admission_username") or ""),
                             "sexo": str(payload.get("sex") or ""),
                             "edad_num": _as_int_or_none(payload.get("age")),
                             "unidad": str(payload.get("age_unit") or "Años"),
@@ -3469,19 +3488,20 @@ class OfflineAdmissionStore:
                             ),
                             "generation": _as_int_or_none(event.get("generation")),
                             "operational_turn_id": _as_int_or_none(
-                                event.get("turn_id") or payload.get("turn_id")
+                                payload.get("turn_id") or event.get("turn_id")
                             ),
                             "created_at_device": created_at_device,
                             "created_at_effective_utc": created_at_effective,
                             "device_local_sequence": local_sequence,
                             "captured_by_user_id": str(
-                                event.get("origin_user_id")
-                                or payload.get("origin_user_id")
+                                payload.get("origin_user_id")
+                                or event.get("origin_user_id")
                                 or ""
                             ),
                             "captured_by_username": str(
-                                event.get("origin_username")
+                                payload.get("captured_by_username")
                                 or payload.get("admission_username")
+                                or event.get("origin_username")
                                 or ""
                             ),
                             "reconciliation_status": reconciliation_status,
@@ -7956,7 +7976,10 @@ class AdmissionCloudRepository:
             ).fetchone()
             if not device:
                 raise AdmissionWriteBlocked("El equipo no pertenece a la sesión operativa.")
-            actor = str(event.payload.get("admission_username") or "").strip()
+            actor = str(
+                event.payload.get("operational_username")
+                or event.payload.get("admission_username") or ""
+            ).strip()
             if actor and actor.casefold() != str(session[0] or "").strip().casefold():
                 raise AdmissionWriteBlocked(
                     "El usuario del evento no coincide con el usuario operativo principal."
@@ -8038,7 +8061,10 @@ class AdmissionCloudRepository:
             ).fetchone()
             if not device:
                 raise AdmissionWriteBlocked("El equipo no pertenece a la sesión operativa.")
-            actor = str(event.payload.get("admission_username") or "").strip()
+            actor = str(
+                event.payload.get("operational_username")
+                or event.payload.get("admission_username") or ""
+            ).strip()
             if (
                 not stale_generation
                 and actor

@@ -19,6 +19,7 @@ from typing import Any
 CONTRACT_VERSION = 2
 
 SERVICE_EMERGENCY = "EMERGENCIA"
+SERVICE_URGENCY = "URGENCIA"
 SERVICE_CONSULTATION = "CONSULTA"
 SUPPORTED_SERVICE_TYPES = {SERVICE_EMERGENCY, SERVICE_CONSULTATION}
 
@@ -138,6 +139,8 @@ def canonicalize_ars(value: Any) -> str:
 
 def normalize_service_type(value: Any) -> str:
     key = normalize_key(value)
+    if key in {"URGENCIA", "URGENCIAS"}:
+        return SERVICE_URGENCY
     if key in {"CONSULTA", "CONSULTAS", "AMBULATORIA", "AMBULATORIO"}:
         return SERVICE_CONSULTATION
     return SERVICE_EMERGENCY

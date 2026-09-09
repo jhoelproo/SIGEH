@@ -29758,6 +29758,10 @@ class EmergencyWorkspacePage(QWidget):
                 "CONSTRUCCION_OK AdmissionWidget V15 insertado en Emergencias"
             )
         layout.addWidget(self.full_page, 1)
+        self._closure_recovery_timer = QTimer(self)
+        self._closure_recovery_timer.timeout.connect(self._recover_committed_closures)
+        self._closure_recovery_timer.start(30000)
+
 
     def _prime_bridge_cursor(self):
         try:
@@ -29790,80 +29794,54 @@ class EmergencyWorkspacePage(QWidget):
         except Exception as exc:
             write_runtime_log(f"Admisión nativa · cierre de turno: {exc}")
 
+    def _recover_committed_closures(self):
+        from billing_closure_recovery import can_recover_closures
+
+        page = getattr(self, "full_page", None)
+        runtime = getattr(page, "_hybrid_runtime", None)
+        state = dict(runtime.state() if runtime is not None else {})
+        if (getattr(self, "_closure_recovery_busy", False)
+                or not can_recover_closures(state)):
+            return
+        coordinator = getattr(page, "_hybrid_coordinator", None)
+        if coordinator is None:
+            return
+        self._closure_recovery_busy = True
+        coordinator.submit_background(
+            self._prepare_committed_closures,
+            self._finish_committed_closures,
+            self._failed_committed_closures,
+        )
+
+    def _prepare_committed_closures(self):
+        from billing_closure_recovery import (
+            pending_central_closures, closure_from_interval, closed_turn_attentions,
+        )
+        with db_connect() as connection:
+            pending = pending_central_closures(connection)
+        results = []
+        for row in pending:
+            event = closure_from_interval(dict(row))
+            with db_connect() as connection:
+                attentions = closed_turn_attentions(connection, event)
+            capture_shift_closure_snapshot(event, attentions)
+            results.append((event.source_instance_id, event.turn_id))
+        return results
+
+    def _finish_committed_closures(self, results):
+        self._closure_recovery_busy = False
+        for source, turn in results:
+            self.shift_closure_ready.emit(source, turn)
+        if results:
+            self.projection_changed.emit({"event_type": "closures_recovered"})
+
+    def _failed_committed_closures(self, code):
+        self._closure_recovery_busy = False
+        write_runtime_log(f"Recuperación del cierre pendiente: {code}")
+
     @Slot(str, int)
     def _handle_v15_shift_closed(self, source_instance_id: str, turn_id: int):
-        """Encola el snapshot post-commit sin bloquear el hilo de la interfaz."""
-        state = dict(
-            (self.admission_context.configuration or {}).get("admission_hybrid")
-            or {}
-        )
-        if not state:
-            runtime = getattr(self.full_page, "_hybrid_runtime", None)
-            state = dict(runtime.state() if runtime is not None else {})
-        if (
-            str(state.get("role") or "").upper() != "PRIMARY"
-            or str(state.get("local_device_id") or "")
-            != str(state.get("primary_device_id") or "")
-        ):
-            return
-        coordinator = getattr(self.full_page, "_hybrid_coordinator", None)
-        if coordinator is None:
-            write_runtime_log(
-                "Cierre V15 post-commit pendiente: coordinador background no disponible"
-            )
-            return
-        coordinator.submit_background(
-            lambda: self._prepare_v15_shift_closure(source_instance_id, turn_id),
-            self._finish_v15_shift_closure,
-            lambda code: write_runtime_log(
-                f"Contrato Admisión V15 · cierre {turn_id}: {code}"
-            ),
-        )
-
-    def _prepare_v15_shift_closure(self, source_instance_id: str, turn_id: int):
-        try:
-            closure = self.bridge_repository.get_shift_closure_by_identity(
-                source_instance_id,
-                int(turn_id),
-            )
-            if closure is None:
-                raise LookupError("No se encontró el cierre durable emitido por V15.")
-            if str(closure.session_id or "") != self.current_session_id:
-                return {"status": "IGNORED_SESSION"}
-            existing = get_shift_closure(
-                closure.source_instance_id,
-                int(closure.turn_id),
-            )
-            if existing and existing.get("snapshot_created_at"):
-                return {"status": "ALREADY_CAPTURED"}
-            attentions = self.bridge_repository.list_turn_attentions(
-                int(closure.turn_id)
-            )
-            sync_admission_projection(attentions)
-            snapshot = capture_shift_closure_snapshot(closure, attentions)
-            return {
-                "status": "CAPTURED" if snapshot.get("snapshot_created") else "UNCHANGED",
-                "source_instance_id": closure.source_instance_id,
-                "turn_id": int(closure.turn_id),
-            }
-        except Exception as exc:
-            raise RuntimeError(
-                f"No se pudo materializar el cierre {int(turn_id)}: {exc}"
-            ) from exc
-
-    @Slot(object)
-    def _finish_v15_shift_closure(self, result):
-        data = dict(result or {})
-        if data.get("status") != "CAPTURED":
-            return
-        source_instance_id = str(data.get("source_instance_id") or "")
-        turn_id = int(data.get("turn_id") or 0)
-        self.shift_closure_ready.emit(source_instance_id, turn_id)
-        self.shift_changed.emit({
-            "source_instance_id": source_instance_id,
-            "turn_id": turn_id,
-            "event_type": "shift_closed",
-        })
+        self._recover_committed_closures()
 
     def refresh_current(self):
         """Schedules non-visual work after the destination page has painted."""
@@ -34075,9 +34053,15 @@ class MainWindow(QMainWindow):
 
     def process_shift_closure_report(self, source_instance_id="", turn_id=0):
         """Solicita el efecto post-commit solo desde la estación PRIMARY."""
+        if self.cierre_facturacion_en_progreso:
+            pending = getattr(self, "_pending_closure_reports", [])
+            identity = (str(source_instance_id), int(turn_id or 0))
+            if identity not in pending:
+                pending.append(identity)
+            self._pending_closure_reports = pending
+            return
         if (
-            self.cierre_facturacion_en_progreso
-            or normalize_role(self.current_user.get("role")) == ROLE_AUDIT
+            normalize_role(self.current_user.get("role")) == ROLE_AUDIT
             or not source_instance_id
             or not int(turn_id or 0)
             or not self._is_primary_admission_station()
@@ -34100,11 +34084,11 @@ class MainWindow(QMainWindow):
     def _is_primary_admission_station(self) -> bool:
         context = getattr(self.emergency_workspace, "admission_context", None)
         configuration = getattr(context, "configuration", {}) or {}
-        state = dict(configuration.get("admission_hybrid") or {})
+        page = getattr(self.emergency_workspace, "full_page", None)
+        runtime = getattr(page, "_hybrid_runtime", None)
+        state = dict(runtime.state() if runtime is not None else {})
         if not state:
-            page = getattr(self.emergency_workspace, "full_page", None)
-            runtime = getattr(page, "_hybrid_runtime", None)
-            state = dict(runtime.state() if runtime is not None else {})
+            state = dict(configuration.get("admission_hybrid") or {})
         local_device = str(state.get("local_device_id") or "")
         primary_device = str(state.get("primary_device_id") or "")
         return bool(
@@ -34147,6 +34131,10 @@ class MainWindow(QMainWindow):
         self._shift_report_worker = None
         if worker is not None:
             worker.deleteLater()
+        pending = getattr(self, "_pending_closure_reports", [])
+        if pending:
+            source, turn = pending.pop(0)
+            QTimer.singleShot(0, lambda: self.process_shift_closure_report(source, turn))
 
     def _open_and_print_shift_report(self, closure: dict, pdf_path: str) -> None:
         """Abre siempre el cierre y solicita una sola impresión por SumatraPDF."""

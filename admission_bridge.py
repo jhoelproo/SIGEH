@@ -917,7 +917,10 @@ class AdmissionReadOnlyRepository:
             SELECT a.id,a.paciente_id,a.turno_id,a.nombre,a.fecha,a.hora,
                    a.nss,a.nss_clean,a.cedula,a.cedula_clean,a.ars,
                    a.tipo_atencion,a.updated_at,a.created_at,a.hoja,
-                   a.numero_autorizacion,
+                   a.numero_autorizacion,a.global_attention_id,
+                   a.global_patient_id,a.operational_source_id,
+                   a.operational_session_id,a.generation,
+                   a.origin_device_id,a.version,
                    COALESCE((SELECT aa.usuario FROM atenciones_auditoria aa WHERE aa.atencion_id=a.id AND aa.accion='CREACION' ORDER BY aa.id LIMIT 1),'') AS admission_username
             FROM atenciones a
             WHERE a.turno_id=? AND a.estado='ACTIVA'

@@ -167,6 +167,18 @@ def test_online_v15_history_reads_postgresql_and_keeps_only_local_pending_rows()
     assert {row["nombre"] for row in rows} == {"CENTRAL", "LOCAL PENDING"}
 
 
+def test_online_history_keeps_local_sync_conflict_visible():
+    database = _LocalDatabase()
+    database.connection.execute("UPDATE sync_outbox SET sync_status='CONFLICT'")
+    runtime = SimpleNamespace(
+        offline=False,
+        host=SimpleNamespace(connection_factory=lambda: _CloudConnection()),
+        operational_session=None,
+    )
+    rows = _HybridDatabaseProxy(database, runtime).listar_atenciones(limite=200)
+    assert {row["id"] for row in rows} == {100, 200}
+
+
 def test_excel_dataset_reads_the_same_central_current_turn_view():
     database = _LocalDatabase()
     runtime = SimpleNamespace(

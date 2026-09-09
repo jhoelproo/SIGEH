@@ -165,6 +165,18 @@ class AdmissionBridgeTests(unittest.TestCase):
         self.assertEqual(closures[0].representative, "aux.01")
         self.assertEqual([row.attention_id for row in attentions], [1, 4, 5])
 
+    def test_closed_turn_retains_central_uuid_and_operational_identity(self):
+        path = self.root / "pacientes.db"
+        build_admission_db(path)
+        with sqlite3.connect(path) as connection:
+            connection.execute("ALTER TABLE atenciones ADD COLUMN global_attention_id TEXT")
+            connection.execute("ALTER TABLE atenciones ADD COLUMN operational_source_id TEXT")
+            connection.execute("UPDATE atenciones SET global_attention_id='central-uuid', operational_source_id='central-source' WHERE id=1")
+        connection.close()
+        rows = AdmissionReadOnlyRepository(path).list_turn_attentions(1)
+        self.assertEqual(rows[0].global_attention_id, "central-uuid")
+        self.assertEqual(rows[0].operational_source_id, "central-source")
+
     def test_search_only_returns_active_valid_emergency(self):
         path = self.root / "pacientes.db"
         build_admission_db(path)

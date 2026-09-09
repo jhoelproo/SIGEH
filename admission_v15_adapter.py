@@ -2547,14 +2547,19 @@ class _HybridDatabaseProxy:
         with self._database._connect() as con:
             pending = con.execute(
                 f"""SELECT a.id,a.global_attention_id,a.origin_device_id,
-                           a.device_local_sequence,a.created_at_effective_utc
+                           a.device_local_sequence,a.created_at_effective_utc,
+                           CASE WHEN EXISTS(
+                               SELECT 1 FROM sync_outbox conflict
+                               WHERE conflict.entity_uuid=a.global_attention_id
+                                 AND conflict.sync_status='CONFLICT'
+                           ) THEN 'CONFLICT' ELSE 'PENDING' END
                     FROM atenciones a
                     WHERE a.id IN ({placeholders})
                       AND EXISTS(
                           SELECT 1 FROM sync_outbox o
                           WHERE o.entity_type='attention'
                             AND o.entity_uuid=a.global_attention_id
-                            AND o.sync_status IN ('PENDING','RETRY')
+                            AND o.sync_status IN ('PENDING','RETRY','CONFLICT')
                       )""",
                 identities,
             ).fetchall()
@@ -2564,6 +2569,7 @@ class _HybridDatabaseProxy:
                 "origin_device_id": str(item[2] or ""),
                 "device_local_sequence": int(item[3] or 0),
                 "created_at_effective_utc": str(item[4] or ""),
+                "sync_state": str(item[5]),
             }
             for item in pending
         }
@@ -2573,7 +2579,6 @@ class _HybridDatabaseProxy:
             if not metadata:
                 continue
             row.update(metadata)
-            row["sync_state"] = "PENDING"
             result.append(row)
         return result
 
