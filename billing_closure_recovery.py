@@ -11,12 +11,13 @@ PENDING_RESTART_AT = datetime(2026, 9, 7, tzinfo=HOSPITAL_TIMEZONE)
 
 
 def can_recover_closures(state):
+    """Allow either synchronized station to restore durable closure data."""
+    role = str(state.get("role") or "").upper()
     return (
         not state.get("offline")
         and int(state.get("pending_sync_count") or 0) == 0
-        and str(state.get("role") or "").upper() == "PRIMARY"
+        and role in {"PRIMARY", "SECONDARY"}
         and bool(state.get("local_device_id"))
-        and state.get("local_device_id") == state.get("primary_device_id")
     )
 
 

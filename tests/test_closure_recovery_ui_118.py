@@ -9,14 +9,13 @@ import CALCULOS_QT as app
 @pytest.mark.parametrize(
     "change",
     [
-        {"role": "SECONDARY"},
         {"offline": True},
         {"pending_sync_count": 1},
         {"local_device_id": ""},
-        {"primary_device_id": "OTHER"},
+        {"role": ""},
     ],
 )
-def test_recovery_requires_synchronized_primary(change):
+def test_recovery_requires_synchronized_station(change):
     state = dict(role="PRIMARY", local_device_id="PC", primary_device_id="PC", **{})
     state.update(change)
     coordinator = Mock()
@@ -28,6 +27,40 @@ def test_recovery_requires_synchronized_primary(change):
     )
     app.EmergencyWorkspacePage._recover_committed_closures(workspace)
     coordinator.submit_background.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        dict(
+            role="PRIMARY",
+            local_device_id="PC",
+            primary_device_id="PC",
+            pending_sync_count=0,
+        ),
+        dict(
+            role="SECONDARY",
+            local_device_id="BILLING-PC",
+            primary_device_id="ADMISSION-PC",
+            pending_sync_count=0,
+        ),
+    ],
+)
+def test_any_synchronized_station_recovers_committed_closure_data(state):
+    coordinator = Mock()
+    workspace = SimpleNamespace(
+        full_page=SimpleNamespace(
+            _hybrid_runtime=SimpleNamespace(state=lambda: state),
+            _hybrid_coordinator=coordinator,
+        ),
+        _prepare_committed_closures=Mock(),
+        _finish_committed_closures=Mock(),
+        _failed_committed_closures=Mock(),
+    )
+
+    app.EmergencyWorkspacePage._recover_committed_closures(workspace)
+
+    coordinator.submit_background.assert_called_once()
 
 
 def test_recovery_queues_once_and_emits_all_committed_results():

@@ -164,5 +164,11 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
                 ).fetchone()[0]
                 == 1
             )
+        inherited = app.BillingAdmissionQueryService().get_operational_candidates(
+            turn_filter="HEREDADO",
+            current_user={"username": "billing", "role": app.ROLE_ADMIN},
+        )
+        assert len(inherited) == 1
+        assert inherited[0].attention_id == 1
     finally:
         fixture.tearDown()
