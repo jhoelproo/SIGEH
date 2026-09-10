@@ -2913,12 +2913,12 @@ class _HybridDatabaseProxy:
             metadata = con.execute(
                 f"""SELECT a.id,a.global_attention_id,a.origin_device_id,
                            a.device_local_sequence,a.created_at_effective_utc,
-                           CASE WHEN EXISTS(
-                               SELECT 1 FROM sync_outbox o
+                           (SELECT o.sync_status FROM sync_outbox o
                                WHERE o.entity_type='attention'
                                  AND o.entity_uuid=a.global_attention_id
-                                 AND o.sync_status IN ('PENDING','RETRY')
-                           ) THEN 1 ELSE 0 END AS pending_sync
+                                 AND o.sync_status IN ('PENDING','RETRY','CONFLICT')
+                               ORDER BY o.rowid DESC LIMIT 1
+                           ) AS supplemental_sync_status
                     FROM atenciones a WHERE a.id IN ({placeholders})""",
                 identities,
             ).fetchall()
@@ -2928,7 +2928,8 @@ class _HybridDatabaseProxy:
                 "origin_device_id": str(item[2] or ""),
                 "device_local_sequence": int(item[3] or 0),
                 "created_at_effective_utc": str(item[4] or ""),
-                "pending_sync": bool(item[5]),
+                "pending_sync": self._is_supplemental_sync_status(item[5]),
+                "supplemental_sync_status": self._supplemental_sync_status(item[5]),
             }
             for item in metadata
         }
@@ -2952,6 +2953,30 @@ class _HybridDatabaseProxy:
     def _list_identity(row: Mapping[str, Any]) -> str:
         global_id = str(row.get("global_attention_id") or "").replace("-", "").lower()
         return global_id or f"legacy:{row.get('source_instance_id') or ''}:{row.get('attention_id') or row.get('id')}"
+
+    @staticmethod
+    def _is_supplemental_sync_status(value: Any) -> bool:
+        return _HybridDatabaseProxy._supplemental_sync_status(value) in {
+            "PENDING", "RETRY", "CONFLICT",
+        }
+
+    @staticmethod
+    def _supplemental_sync_status(value: Any) -> str:
+        return str(value or "")
+
+    @staticmethod
+    def _supplemental_turn_rows(
+        central_rows: Iterable[Mapping[str, Any]],
+        local_rows: Iterable[Mapping[str, Any]],
+    ) -> list[Mapping[str, Any]]:
+        central_identities = {
+            _HybridDatabaseProxy._list_identity(row) for row in central_rows
+        }
+        return [
+            row for row in local_rows
+            if row.get("supplemental_sync_status") != "CONFLICT"
+            or _HybridDatabaseProxy._list_identity(row) not in central_identities
+        ]
 
     @staticmethod
     def _merge_turn_rows(
@@ -3116,7 +3141,8 @@ class _HybridDatabaseProxy:
             )
             return result
 
-        merged = self._merge_turn_rows(central_rows, pending_rows, deleted)
+        supplemental_rows = self._supplemental_turn_rows(central_rows, pending_rows)
+        merged = self._merge_turn_rows(central_rows, supplemental_rows, deleted)
         status = "VALID_EMPTY" if not merged else "VALID"
         source = "CENTRAL_PLUS_PENDING" if pending_rows else "CENTRAL"
         result = TurnDatasetResult(
