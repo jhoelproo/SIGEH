@@ -28,9 +28,11 @@ def inherited(receipts):
         con.execute(
             """INSERT INTO admission_attention_projection(source_instance_id,attention_id,patient_id,turn_id,
             service_date,patient_name,coverage_status,canonical_ars,source_status,service_type,readiness,snapshot_hash,
-            contract_version,synced_at,operational_source_id,global_attention_id)
+            contract_version,synced_at,operational_source_id,global_attention_id,
+            created_at_effective_utc)
             VALUES('ORIGIN',372,1,566,'2026-09-05','PACIENTE SINTETICO','ASEGURADO_VALIDADO','FUTURO',
-            'ACTIVA','EMERGENCIA','LISTA','test',1,'2026-09-05',%s,%s)""",
+            'ACTIVA','EMERGENCIA','LISTA','test',1,'2026-09-05',%s,%s,
+            '2026-09-08 10:00:00-04')""",
             (SOURCE, GLOBAL),
         )
         con.execute("""INSERT INTO admission_shift_inheritances(source_instance_id,attention_id,turno_origen_id,estado)

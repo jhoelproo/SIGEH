@@ -18,11 +18,13 @@ from tests.test_billing_consistency_postgres import (
 def runtime(database):
     with database() as con:
         con.execute(
-            "ALTER TABLE admission_shift_inheritances ADD COLUMN receipt_id BIGINT"
+            "ALTER TABLE admission_shift_inheritances ADD COLUMN IF NOT EXISTS receipt_id BIGINT"
         )
         con.execute("UPDATE admission_attention_projection SET turn_id=3948")
         con.execute(
-            "INSERT INTO admission_shift_inheritances VALUES('ORIGIN',329,3948,'PENDIENTE',NULL)"
+            """INSERT INTO admission_shift_inheritances(
+                   source_instance_id,attention_id,turno_origen_id,estado,receipt_id)
+               VALUES('ORIGIN',329,3948,'PENDIENTE',NULL)"""
         )
     return SimpleNamespace(
         current_user={"role": "administrador", "username": "admin.test", "id": 7},

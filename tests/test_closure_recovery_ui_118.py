@@ -178,6 +178,12 @@ def test_finished_report_with_no_queue_does_not_schedule(monkeypatch):
 
 def test_workspace_starts_recovery_timer_without_database_access(monkeypatch):
     application = app.QApplication.instance() or app.QApplication([])
+    scheduled = []
+    monkeypatch.setattr(
+        app.QTimer,
+        "singleShot",
+        lambda delay, callback: scheduled.append((delay, callback)),
+    )
     monkeypatch.setattr(app, "AdmissionReadOnlyRepository", Mock())
     monkeypatch.setattr(app, "_local_device_identity", lambda: ("PC", "Synthetic"))
     monkeypatch.setattr(
@@ -193,6 +199,13 @@ def test_workspace_starts_recovery_timer_without_database_access(monkeypatch):
     try:
         assert workspace._closure_recovery_timer.isActive()
         assert workspace._closure_recovery_timer.interval() == 30000
+        immediate = [
+            callback
+            for delay, callback in scheduled
+            if delay == 0 and callback == workspace._recover_committed_closures
+        ]
+        assert len(immediate) == 1
+        immediate[0]()
         workspace._closure_recovery_timer.timeout.emit()
         assert not getattr(workspace, "_closure_recovery_busy", False)
     finally:

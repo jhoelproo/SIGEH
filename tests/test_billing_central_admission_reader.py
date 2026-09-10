@@ -100,7 +100,8 @@ def test_privileged_selector_does_not_treat_every_previous_turn_as_inherited():
 
     sql, _params = connection.calls[-1]
     assert "OR (%s AND p.turn_id<>cs.turn_id)" not in sql
-    assert "p.turn_id=cs.turn_id OR inheritance.attention_id IS NOT NULL" in sql
+    assert "PRIMARY_USER_HANDOFF" in sql
+    assert "inheritance.attention_id IS NOT NULL" in sql
 
 
 def test_optional_distributed_ids_never_become_literal_none():

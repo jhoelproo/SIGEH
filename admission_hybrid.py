@@ -1231,6 +1231,9 @@ CREATE TABLE IF NOT EXISTS admission_operational_turn_intervals(
 );
 CREATE INDEX IF NOT EXISTS idx_admission_turn_intervals_effective
   ON admission_operational_turn_intervals(operational_session_id,started_at,ended_at);
+CREATE INDEX IF NOT EXISTS idx_admission_turn_intervals_closed_turn
+  ON admission_operational_turn_intervals(production_epoch_id,turn_id,ended_at)
+  WHERE ended_at IS NOT NULL AND turn_id IS NOT NULL;
 ALTER TABLE admission_operational_turn_intervals
   ADD COLUMN IF NOT EXISTS nominal_ends_at TIMESTAMPTZ;
 ALTER TABLE admission_operational_turn_intervals

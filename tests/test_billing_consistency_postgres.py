@@ -26,6 +26,11 @@ CREATE TABLE admission_operational_sessions(
  active_user_display_name TEXT DEFAULT 'OPERATOR', primary_device_id TEXT DEFAULT 'A',
  turn_id BIGINT,generation INT DEFAULT 1,status TEXT DEFAULT 'ACTIVE',
  updated_at TIMESTAMPTZ DEFAULT NOW(),production_epoch_id UUID);
+CREATE TABLE admission_operational_turn_intervals(
+ operational_session_id TEXT,generation INT,turn_id BIGINT,
+ started_at TIMESTAMPTZ,ended_at TIMESTAMPTZ,production_epoch_id UUID);
+CREATE TABLE admission_operational_audit(
+ operational_session_id TEXT,event_type TEXT,details_json JSONB);
 CREATE TABLE admission_attention_projection(
  source_instance_id TEXT DEFAULT 'ORIGIN',attention_id BIGINT PRIMARY KEY,patient_id BIGINT DEFAULT 1,
  turn_id BIGINT DEFAULT 3949,service_date TEXT DEFAULT '2026-09-04',service_time TEXT DEFAULT '02:10 PM',
@@ -38,7 +43,11 @@ CREATE TABLE admission_attention_projection(
  global_attention_id UUID UNIQUE,global_patient_id UUID,operational_source_id UUID,version INT DEFAULT 1,
  origin_device_id TEXT DEFAULT 'ORIGIN',device_local_sequence BIGINT DEFAULT 1,operational_session_id TEXT DEFAULT 'test',
  generation INT DEFAULT 1,is_deleted BOOLEAN DEFAULT FALSE,created_at_effective_utc TIMESTAMPTZ DEFAULT NOW());
-CREATE TABLE admission_shift_inheritances(source_instance_id TEXT,attention_id BIGINT,turno_origen_id BIGINT,estado TEXT);
+CREATE TABLE admission_shift_inheritances(
+ source_instance_id TEXT,attention_id BIGINT,turno_origen_id BIGINT,estado TEXT,
+ turno_procesamiento_id BIGINT,processed_at TIMESTAMPTZ,processed_by TEXT,
+ receipt_id BIGINT,updated_at TIMESTAMPTZ DEFAULT NOW(),
+ PRIMARY KEY(source_instance_id,attention_id));
 CREATE TABLE admission_billing_claims(
  source_instance_id TEXT,attention_id BIGINT,claimed_by TEXT,session_id TEXT,station_id TEXT,
  turno_origen_id BIGINT,turno_procesamiento_id BIGINT,estado_herencia TEXT,
@@ -301,12 +310,72 @@ def test_explicit_inheritance_only(database, monkeypatch):
     assert candidates(turn_filter="TODOS") == []
     with database() as con:
         con.execute(
-            "INSERT INTO admission_shift_inheritances VALUES('ORIGIN',329,3948,'PENDIENTE')"
+            """INSERT INTO admission_shift_inheritances(
+                   source_instance_id,attention_id,turno_origen_id,estado)
+               VALUES('ORIGIN',329,3948,'PENDIENTE')"""
         )
     assert len(candidates(turn_filter="HEREDADO")) == 1
     with database() as con:
         con.execute("UPDATE admission_attention_projection SET service_type='URGENCIA'")
     assert candidates(turn_filter="HEREDADO") == []
+
+
+def test_confirmed_handoff_is_inherited_before_closure_snapshot(database):
+    with database() as con:
+        con.execute(
+            "UPDATE admission_attention_projection SET turn_id=3948,created_at_effective_utc='2026-09-08 07:30:00-04'"
+        )
+        con.execute(
+            """INSERT INTO admission_operational_turn_intervals(
+                   operational_session_id,generation,turn_id,started_at,ended_at,
+                   production_epoch_id
+               ) VALUES('test',1,3948,'2026-09-07 20:00:00-04',
+                        '2026-09-08 08:00:00-04',%s)""",
+            (EPOCH,),
+        )
+        con.execute(
+            """INSERT INTO admission_operational_audit(
+                   operational_session_id,event_type,details_json
+               ) VALUES('test','TURN_HANDOFF_TRANSITION',%s::jsonb)""",
+            (
+                '{"status":"COMMITTED","request":{"transition_type":'
+                '"PRIMARY_USER_HANDOFF"},"result":{"old_turn_id":3948}}',
+            ),
+        )
+
+    inherited = candidates(turn_filter="HEREDADO")
+    assert len(inherited) == 1
+    assert inherited[0].attention_id == 329
+    assert claim("A") is not None
+
+
+@pytest.mark.parametrize(
+    ("created_at", "expected_count"),
+    (
+        ("2026-09-06 23:59:59-04", 0),
+        ("2026-09-07 00:00:00-04", 1),
+    ),
+)
+def test_explicit_inheritance_respects_restart_boundary(
+    database, created_at, expected_count
+):
+    with database() as con:
+        con.execute(
+            "UPDATE admission_attention_projection SET turn_id=3948,created_at_effective_utc=%s",
+            (created_at,),
+        )
+        con.execute(
+            """INSERT INTO admission_shift_inheritances(
+                   source_instance_id,attention_id,turno_origen_id,estado)
+               VALUES('ORIGIN',329,3948,'PENDIENTE')"""
+        )
+
+    assert len(candidates(turn_filter="HEREDADO")) == expected_count
+    history = app.BillingAdmissionQueryService().load_admission_history_batch(
+        current_user=USER,
+        turn_filter="HEREDADO",
+    )
+    assert len(history["rows"]) == expected_count
 
 
 def test_late_release_cannot_expire_reacquired_claim(database):

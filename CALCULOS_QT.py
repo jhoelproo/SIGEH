@@ -43,6 +43,7 @@ from admission_billing_consistency import (
     foreign_claim_sql,
     normalized_name_sql,
 )
+from billing_inheritance_scope import inherited_attention_sql
 from database_capacity import (
     DEFAULT_DATABASE_LIMIT_BYTES,
     DatabaseCapacityAnalyzer,
@@ -5088,6 +5089,7 @@ def evaluate_attention_billing_eligibility(
     source = str(source_instance_id or "").strip()
     global_id = str(global_attention_id or "").strip()
     receipt_identity = admission_receipt_identity_sql("receipt", "p")
+    inherited_scope = inherited_attention_sql("p", "active", "inheritance")
     eligibility_sql = "".join((
             f"""SELECT p.*,
                       p.created_at_effective_utc >
@@ -5102,13 +5104,7 @@ def evaluate_attention_billing_eligibility(
                       ars_match.billing_enabled AS ars_billing_enabled,
                       active.operational_source_id AS active_operational_source_id,
                       active.turn_id AS active_turn_id,
-                      EXISTS(
-                          SELECT 1 FROM admission_shift_inheritances inheritance
-                          WHERE inheritance.source_instance_id=p.source_instance_id
-                            AND inheritance.attention_id=p.attention_id
-                            AND inheritance.turno_origen_id=p.turn_id
-                            AND inheritance.estado='PENDIENTE'
-                      ) AS explicitly_inherited,
+                      {inherited_scope} AS explicitly_inherited,
                       EXISTS(
                           SELECT 1 FROM admission_billing_claims claim
                           WHERE claim.source_instance_id=p.source_instance_id
@@ -5141,6 +5137,11 @@ def evaluate_attention_billing_eligibility(
                LEFT JOIN LATERAL (
                    {CURRENT_OPERATIONAL_SHIFT_SQL}
                ) active ON TRUE
+               LEFT JOIN admission_shift_inheritances inheritance
+                 ON inheritance.source_instance_id=p.source_instance_id
+                AND inheritance.attention_id=p.attention_id
+                AND inheritance.turno_origen_id=p.turn_id
+                AND inheritance.estado='PENDIENTE'
                WHERE (
                        (%s<>'' AND p.global_attention_id::TEXT=%s)
                     OR (%s='' AND p.attention_id=%s
@@ -5864,6 +5865,7 @@ class BillingAdmissionQueryService:
             turn_filter = "ACTUAL"
         ars_exclusion = admission_ars_sql_exclusion("p.canonical_ars")
         receipt_identity = admission_receipt_identity_sql("r", "p")
+        inherited_scope = inherited_attention_sql("p", "cs", "inheritance")
         started = perf_counter()
         rows, timings = self.central_reader.fetch_all(
                 f"""WITH current_shift AS (
@@ -5881,7 +5883,8 @@ class BillingAdmissionQueryService:
                           p.origin_device_id,p.device_local_sequence,
                           p.operational_session_id,p.generation,
                           CASE WHEN p.turn_id=cs.turn_id THEN 'TURNO ACTUAL'
-                               ELSE 'HEREDADA' END AS turn_scope,
+                               WHEN {inherited_scope} THEN 'HEREDADA'
+                               ELSE 'HISTÓRICO' END AS turn_scope,
                           cs.turn_id AS processing_turn_id
                    FROM admission_attention_projection p
                    JOIN current_shift cs
@@ -5894,15 +5897,14 @@ class BillingAdmissionQueryService:
                    WHERE (
                            (%s='TODOS' AND (
                                p.turn_id=cs.turn_id
-                               OR inheritance.attention_id IS NOT NULL
+                               OR {inherited_scope}
                            ))
                         OR (%s='ACTUAL' AND p.turn_id=cs.turn_id)
-                        OR (%s='HEREDADO' AND p.turn_id<>cs.turn_id
-                            AND inheritance.attention_id IS NOT NULL)
+                        OR (%s='HEREDADO' AND {inherited_scope})
                      )
                      AND (
                           p.turn_id=cs.turn_id
-                          OR inheritance.attention_id IS NOT NULL
+                          OR {inherited_scope}
                      )
                      AND p.readiness=%s
                      AND {ars_exclusion}
@@ -6043,7 +6045,25 @@ class BillingAdmissionQueryService:
         ars_exclusion = admission_ars_sql_exclusion(
             "p.canonical_ars", history=True
         )
+        queue_ars_exclusion = admission_ars_sql_exclusion("p.canonical_ars")
         receipt_identity = admission_receipt_identity_sql("receipt", "p")
+        inherited_scope = inherited_attention_sql("p", "cs", "inheritance")
+        active_inherited_scope = f"""(
+            {inherited_scope}
+            AND p.readiness='{READINESS_READY}'
+            AND {queue_ars_exclusion}
+            AND {ars_enabled_sql()}
+            AND UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
+            AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
+                IN ('ACTIVA','PENDIENTE')
+            AND r.id IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM admission_quick_list_dismissals history_dismissal
+                 WHERE history_dismissal.source_instance_id=p.source_instance_id
+                   AND history_dismissal.attention_id=p.attention_id
+                   AND history_dismissal.is_active=TRUE
+            )
+        )"""
         batch_size = max(1, min(int(limit), 100))
         cursor_data = dict(cursor or {})
         cursor_attention = _projection_int(cursor_data.get("attention_id"))
@@ -6077,7 +6097,7 @@ class BillingAdmissionQueryService:
                                THEN 'TURNO ACTUAL'
                                WHEN p.operational_source_id::TEXT=
                                          cs.operational_source_id
-                                    AND inheritance.attention_id IS NOT NULL
+                                    AND {active_inherited_scope}
                                THEN 'HEREDADA'
                                ELSE 'HISTÓRICO' END AS turn_scope,
                           p.service_type,p.canonical_ars,p.source_status,
@@ -6120,11 +6140,10 @@ class BillingAdmissionQueryService:
                             p.operational_source_id::TEXT=cs.operational_source_id
                             AND (
                                  (%s='ACTUAL' AND p.turn_id=cs.turn_id)
-                              OR (%s='HEREDADO' AND p.turn_id<>cs.turn_id
-                                  AND inheritance.attention_id IS NOT NULL)
+                              OR (%s='HEREDADO' AND {active_inherited_scope})
                               OR (%s='TODOS' AND (
                                      p.turn_id=cs.turn_id
-                                     OR inheritance.attention_id IS NOT NULL
+                                     OR {active_inherited_scope}
                               ))
                             )
                         )
@@ -6282,6 +6301,7 @@ def diagnose_billing_admission_queue(
     ars_visible = admission_ars_sql_exclusion("p.canonical_ars")
     ars_visible = f"({ars_visible}) AND {ars_enabled_sql()}"
     receipt_identity = admission_receipt_identity_sql("receipt", "p")
+    inherited_scope = inherited_attention_sql("p", "shift", "inheritance")
     diagnostic_sql = "".join((
         """WITH current_shift AS (
                SELECT operational_source_id,
@@ -6300,17 +6320,9 @@ def diagnose_billing_admission_queue(
                      IN ('ACTIVA','PENDIENTE') AS active,
                    p.operational_source_id=shift.operational_source_id
                      AS same_source,
-                   (
-                       p.turn_id=shift.turn_id
-                       OR EXISTS (
-                           SELECT 1
-                           FROM admission_shift_inheritances inheritance
-                           WHERE inheritance.source_instance_id=p.source_instance_id
-                             AND inheritance.attention_id=p.attention_id
-                             AND inheritance.turno_origen_id=p.turn_id
-                             AND inheritance.estado='PENDIENTE'
-                       )
-                   ) AS turn_scoped,
+                   (p.turn_id=shift.turn_id OR """,
+        inherited_scope,
+        """) AS turn_scoped,
                    p.readiness=%s AS ready,
                    (""",
         ars_visible,
@@ -6343,6 +6355,11 @@ def diagnose_billing_admission_queue(
                    ) AS not_dismissed
                FROM admission_attention_projection p
                CROSS JOIN current_shift shift
+               LEFT JOIN admission_shift_inheritances inheritance
+                 ON inheritance.source_instance_id=p.source_instance_id
+                AND inheritance.attention_id=p.attention_id
+                AND inheritance.turno_origen_id=p.turn_id
+                AND inheritance.estado='PENDIENTE'
            )
            SELECT
                COUNT(*) FILTER (WHERE central_record) AS stage_0_central,
@@ -7764,6 +7781,7 @@ def claim_projected_billable_attention(
     receipt_identity = admission_receipt_identity_sql("r", "p")
     allow_uninsured = can_view_uninsured_patients(dict(current_user or {}))
     global_id = str(global_attention_id or "").strip()
+    inherited_scope = inherited_attention_sql("p", "cs", "inheritance")
     if global_id:
         identity_sql = "p.global_attention_id=%s::UUID"
         identity_params = (global_id,)
@@ -7777,7 +7795,7 @@ def claim_projected_billable_attention(
                ), eligible AS (
                    SELECT p.*,
                           CASE WHEN p.turn_id=cs.turn_id THEN 'TURNO ACTUAL'
-                               WHEN inheritance.attention_id IS NOT NULL THEN 'HEREDADA'
+                               WHEN {inherited_scope} THEN 'HEREDADA'
                                ELSE 'HISTÓRICO' END AS turn_scope,
                           cs.turn_id AS turno_procesamiento_id
                    FROM admission_attention_projection p
@@ -7793,8 +7811,7 @@ def claim_projected_billable_attention(
                       AND {ars_exclusion}
                       AND {ars_enabled_sql()}
                       AND (%s OR p.coverage_status<>%s)
-                     AND (p.turn_id=cs.turn_id
-                          OR inheritance.attention_id IS NOT NULL)
+                     AND (p.turn_id=cs.turn_id OR {inherited_scope})
                      AND UPPER(TRIM(COALESCE(p.service_type,'')))='EMERGENCIA'
                      AND COALESCE(p.is_deleted,FALSE)=FALSE
                      AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')
@@ -29761,6 +29778,7 @@ class EmergencyWorkspacePage(QWidget):
         self._closure_recovery_timer = QTimer(self)
         self._closure_recovery_timer.timeout.connect(self._recover_committed_closures)
         self._closure_recovery_timer.start(30000)
+        QTimer.singleShot(0, self._recover_committed_closures)
 
 
     def _prime_bridge_cursor(self):

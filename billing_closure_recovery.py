@@ -1,13 +1,9 @@
 """Recover effects of committed relays; never initiate or expire a turn."""
 
-from datetime import datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, uuid5
 
 from admission_bridge import AdmissionShiftClosure
-
-HOSPITAL_TIMEZONE = timezone(timedelta(hours=-4))
-# The user-authorized restart is a fixed boundary, not a rolling daily filter.
-PENDING_RESTART_AT = datetime(2026, 9, 7, tzinfo=HOSPITAL_TIMEZONE)
+from billing_inheritance_scope import HOSPITAL_TIMEZONE, PENDING_RESTART_AT
 
 
 def can_recover_closures(state):

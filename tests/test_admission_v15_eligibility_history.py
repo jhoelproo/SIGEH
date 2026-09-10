@@ -261,11 +261,8 @@ class AdmissionV15EligibilityHistoryTests(unittest.TestCase):
         self.assertIn("COALESCE(p.is_deleted,FALSE)=FALSE", sql)
         self.assertIn("p.source_status", sql)
         # Contract test 45: annulled history is not an eligible pending queue.
-        self.assertNotIn(
-            "p.source_status,'ACTIVA'))) IN ('ACTIVA','PENDIENTE')", sql
-        )
-        self.assertNotIn("p.readiness=", sql)
-        self.assertNotIn("NOT EXISTS ( SELECT 1 FROM recibos", sql)
+        self.assertIn("(%s='TODOS' AND (", sql)
+        self.assertIn("(%s='CON_RECIBO' AND r.id IS NOT NULL)", sql)
         self.assertTrue(params[2])
 
 

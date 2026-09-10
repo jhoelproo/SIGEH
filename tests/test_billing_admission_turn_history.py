@@ -201,9 +201,10 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
             )
         sql, params = connection.calls[-1]
         self.assertNotIn("OR (%s AND p.turn_id<>cs.turn_id)", sql)
-        self.assertIn("p.turn_id=cs.turn_id OR inheritance.attention_id IS NOT NULL", sql)
+        self.assertIn("PRIMARY_USER_HANDOFF", sql)
+        self.assertIn("inheritance.attention_id IS NOT NULL", sql)
         self.assertNotIn(True, params)
-        self.assertIn("ELSE 'HEREDADA' END AS turn_scope", sql)
+        self.assertIn("THEN 'HEREDADA'", sql)
 
     def test_typed_validation_search_reuses_the_short_lived_queue_snapshot(self):
         row = _history_row(17)

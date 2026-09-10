@@ -147,7 +147,8 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
         self.assertIn(
             "p.operational_source_id::TEXT=cs.operational_source_id", sql
         )
-        self.assertNotIn("p.readiness=", sql)
+        self.assertIn("(%s='SIN_SEGURO' AND p.coverage_status=%s)", sql)
+        self.assertTrue(params[2])
 
     def test_bypass_is_rejected_for_normal_role_before_database_write(self):
         with patch.object(

@@ -2940,6 +2940,8 @@ class _HybridDatabaseProxy:
             if pending_only and not row.get("pending_sync"):
                 continue
             row["attention_id"] = int(row.get("id") or 0)
+            row["turn_id"] = int(turn_id)
+            row["operational_source_id"] = str(operational_source_id)
             row["specialty"] = str(
                 row.get("hoja_normalizada") or row.get("hoja") or "GENERAL"
             ).strip().upper()
@@ -3538,9 +3540,33 @@ class _HybridDatabaseProxy:
                 start_at=start_at,
                 end_at=end_at,
             )
+        records = self._merge_statistical_report_pending(
+            records,
+            operational_source_id=source_id,
+            turn_id=turn_id,
+        )
         return self._statistical_report_source_result(
             turns=turns, selected_turn=selected, records=records
         )
+
+    def _merge_statistical_report_pending(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        *,
+        operational_source_id: str,
+        turn_id: int | None,
+    ) -> list[dict[str, Any]]:
+        """Include durable local outbox evidence in an exact-turn report."""
+        central_rows = [dict(row) for row in records]
+        if turn_id is None:
+            return central_rows
+        _local_rows, pending_rows, deleted, _local_error = (
+            self._load_local_turn_evidence(
+                (str(operational_source_id), int(turn_id), 0, 0)
+            )
+        )
+        supplemental = self._supplemental_turn_rows(central_rows, pending_rows)
+        return self._merge_turn_rows(central_rows, supplemental, deleted)
 
     def _load_offline_statistical_report_source(
         self,
@@ -3647,6 +3673,11 @@ class _HybridDatabaseProxy:
                 start_at=start_at,
                 end_at=end_at,
             )
+        rows = self._merge_statistical_report_pending(
+            rows,
+            operational_source_id=source_id,
+            turn_id=turn_id,
+        )
         if logger is not None:
             logger.info(
                 "ADMISSION_STATISTICAL_REPORT_READ source=postgresql turn_id=%s "
