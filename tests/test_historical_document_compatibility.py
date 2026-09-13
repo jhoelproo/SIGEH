@@ -81,7 +81,7 @@ def test_history_pending_uses_server_identity_and_complete_opens_linked_receipt(
                 self.callback(*args)
 
     class _EligibilityWorker:
-        def __init__(self, row_data, _user, _session_id, _parent):
+        def __init__(self, row_data, _user, _session_id, _parent, **_kwargs):
             self.row_data = dict(row_data)
             self.resolved = _Signal()
             self.failed = _Signal()

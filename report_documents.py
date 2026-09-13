@@ -17,6 +17,7 @@ import psycopg2.extras
 
 from historical_documents import parse_shift_closure_source_key
 from report_engine import ReportHTMLRenderer
+from report_pdf_integrity import is_readable_report_pdf
 
 STORAGE_LEGACY = "LEGACY_PDF"
 STORAGE_HYBRID = "HYBRID"
@@ -756,7 +757,7 @@ def render_report_snapshot_pdf(
     short_hash = str(document_record.get("snapshot_hash") or "")[:12]
     output_path = report_cache_root() / f"{source}_v{version}_{short_hash}.pdf"
     with _render_lock:
-        if output_path.is_file() and output_path.stat().st_size > 0:
+        if is_readable_report_pdf(output_path):
             return str(output_path)
         temporary = output_path.with_name(
             f".{output_path.stem}_{os.getpid()}_{threading.get_ident()}.tmp.pdf"
@@ -767,7 +768,7 @@ def render_report_snapshot_pdf(
                 str(temporary),
                 landscape=bool(context.get("landscape", False)),
             )
-            if not temporary.is_file() or temporary.stat().st_size <= 0:
+            if not is_readable_report_pdf(temporary):
                 raise ReportDocumentError(
                     "El motor documental no generó un reporte válido."
                 )

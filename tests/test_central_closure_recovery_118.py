@@ -158,6 +158,16 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
                 "snapshot_created"
             ]
         with app.db_connect() as con:
+            con.execute("SAVEPOINT delivery_states")
+            con.execute(
+                "UPDATE billing_shift_closures SET pdf_status='GENERADO', print_requested_at=NULL"
+            )
+            assert len(pending_central_closures(con)) == 3
+            con.execute("UPDATE billing_shift_closures SET print_requested_at=NOW()")
+            assert pending_central_closures(con) == []
+            con.execute("UPDATE billing_shift_closures SET pdf_status='OMITIDO_VACIO'")
+            assert len(pending_central_closures(con)) == 3
+            con.execute("ROLLBACK TO SAVEPOINT delivery_states")
             assert (
                 con.execute(
                     "SELECT COUNT(*) FROM admission_shift_inheritances WHERE estado='PENDIENTE'"
@@ -170,5 +180,12 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
         )
         assert len(inherited) == 1
         assert inherited[0].attention_id == 1
+        with app.db_connect() as con:
+            con.execute(
+                "UPDATE billing_shift_closures SET status='COMPLETED', pdf_status='OMITIDO_VACIO'"
+            )
+        recovered = app.claim_shift_closure("SYNTHETIC", source, 101)
+        assert recovered["status"] == "GENERATING"
+        assert app.claim_shift_closure("SYNTHETIC", source, 101) is None
     finally:
         fixture.tearDown()

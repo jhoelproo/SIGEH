@@ -2156,6 +2156,13 @@ class _HybridAdmissionRuntime:
             daemon=True,
         ).start()
 
+    def repair_admission_attention_projection(self, global_attention_id: str) -> bool:
+        """Verify one local attention exists in the central read projection."""
+        if self.offline or self.sync_service is None:
+            return False
+        return self.sync_service.ensure_attention_projected(global_attention_id)
+
+
 
 class _HybridDatabaseProxy:
     # V15 uses an integer SQLite turn identifier in its legacy dialogs. It is

@@ -13,6 +13,12 @@ from openpyxl import Workbook, load_workbook
 import CALCULOS_QT as app
 from admission_bridge import AdmissionReadOnlyRepository
 from admission_contract import READINESS_INCOMPLETE, READINESS_READY
+from admission_hybrid import (
+    AdmissionCloudRepository,
+    AdmissionSyncService,
+    OperationalSession,
+    SyncEvent,
+)
 from private_insurance_exporter import create_private_ars_workbook
 
 
@@ -148,6 +154,142 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
             admin.close()
         finally:
             self.temp_dir.cleanup()
+
+    def test_missing_projection_is_rebuilt_before_billing_and_cancellation(self):
+        operational_session_id = str(uuid.uuid4())
+        operational_source_id = str(uuid.uuid4())
+        global_attention_id = str(uuid.uuid4())
+        global_patient_id = str(uuid.uuid4())
+        device_id = "PC-PROJECTION-QA"
+        with app.db_connect() as connection:
+            connection.execute(
+                """INSERT INTO admission_operational_sessions(
+                       operational_session_id,active_username,active_user_id,
+                       active_user_display_name,primary_device_id,
+                       primary_login_session_id,turn_id,turn_started_at,
+                       operational_source_id,status,generation
+                   ) VALUES(%s,'ADMIN','7','Administrador',%s,'projection-login',
+                            77,'2026-09-11 08:00:00',%s,'ACTIVE',1)""",
+                (operational_session_id, device_id, operational_source_id),
+            )
+            connection.execute(
+                """INSERT INTO admission_operational_devices(
+                       operational_session_id,device_id,login_session_id,
+                       device_name,station_role
+                   ) VALUES(%s,%s,'projection-login','QA','PRIMARY')""",
+                (operational_session_id, device_id),
+            )
+        event = SyncEvent(
+            event_uuid=str(uuid.uuid4()),
+            entity_type="attention",
+            entity_uuid=global_attention_id,
+            operation="RECONCILE",
+            payload={
+                "event_type": "ATTENTION_RECONCILED",
+                "attention_id": 468,
+                "global_attention_id": global_attention_id,
+                "patient_id": 2468,
+                "global_patient_id": global_patient_id,
+                "turn_id": 77,
+                "name": "PACIENTE PROYECCION QA",
+                "ars": "SENASA CONTRIBUTIVO",
+                "nss": "090673433",
+                "cedula": "40200000000",
+                "detail_sheet": "GENERAL",
+                "service_date": "2026-09-11",
+                "service_time": "10:28:00",
+                "service_type": "EMERGENCIA",
+                "source_status": "ACTIVA",
+                "source_instance_id": "source-projection-qa",
+                "operational_source_id": operational_source_id,
+                "operational_session_id": operational_session_id,
+                "generation": 1,
+                "origin_device_id": device_id,
+                "admission_username": "ADMIN",
+                "captured_by_username": "ADMIN",
+                "origin_user_id": "7",
+                "created_at_device": "2026-09-11T10:28:00+00:00",
+                "created_at_effective_utc": "2026-09-11T10:28:00+00:00",
+                "device_local_sequence": 1,
+                "version": 1,
+                "reconciliation_status": "LEGACY_RECOVERY",
+            },
+            operational_session_id=operational_session_id,
+            generation=1,
+            device_id=device_id,
+            created_at="2026-09-11T10:28:00+00:00",
+            operational_source_id=operational_source_id,
+            turn_id=77,
+            origin_user_id="7",
+            origin_username="ADMIN",
+            created_at_device="2026-09-11T10:28:00+00:00",
+            created_at_effective_utc="2026-09-11T10:28:00+00:00",
+            device_local_sequence=1,
+        )
+        repository = AdmissionCloudRepository(app.db_connect)
+        self.assertIn(event.event_uuid, repository.push_events([event]))
+
+        class LocalReplica:
+            def __init__(self):
+                self.deleted = False
+
+            @staticmethod
+            def last_cloud_cursor():
+                return 0
+
+            def hydrate_remote_events(self, events):
+                self.deleted = bool(events and events[-1]["payload_json"]["is_deleted"])
+
+            def get_attention_by_global_id(self, *_args, **_kwargs):
+                return {
+                    "global_attention_id": global_attention_id,
+                    "is_deleted": self.deleted,
+                }
+
+        replica = LocalReplica()
+        service = AdmissionSyncService(replica, repository)
+        with app.db_connect() as connection:
+            connection.execute(
+                "DELETE FROM admission_attention_projection WHERE global_attention_id=%s",
+                (global_attention_id,),
+            )
+        self.assertEqual(
+            repository.missing_projection_entity_ids([global_attention_id]),
+            [global_attention_id],
+        )
+        self.assertTrue(service.ensure_attention_projected(global_attention_id))
+        self.assertTrue(repository.projection_has_attention(global_attention_id))
+
+        with app.db_connect() as connection:
+            connection.execute(
+                "DELETE FROM admission_attention_projection WHERE global_attention_id=%s",
+                (global_attention_id,),
+            )
+        session = OperationalSession(
+            operational_session_id=operational_session_id,
+            active_username="ADMIN",
+            active_user_id="7",
+            active_user_display_name="Administrador",
+            primary_device_id=device_id,
+            primary_login_session_id="projection-login",
+            turn_id=77,
+            operational_source_id=operational_source_id,
+            status="ACTIVE",
+            generation=1,
+        )
+        cancelled = service.cancel_attention(
+            global_attention_id,
+            current_user={"id": 7, "username": "ADMIN", "role": app.ROLE_ADMIN},
+            reason="Registro duplicado de prueba",
+            operational_session=session,
+            device_id=device_id,
+            online=True,
+        )
+        self.assertTrue(cancelled["is_deleted"])
+        central = repository.get_attention_by_global_id(
+            global_attention_id, include_deleted=True
+        )
+        self.assertTrue(central["is_deleted"])
 
     def test_emergency_to_audit_to_monthly_ars_list(self):
         repository = AdmissionReadOnlyRepository(self.sqlite_path)

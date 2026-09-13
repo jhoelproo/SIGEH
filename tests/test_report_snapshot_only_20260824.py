@@ -9,6 +9,8 @@ import pytest
 
 import CALCULOS_QT as app
 import report_documents as documents
+from io import BytesIO
+from PyPDF2 import PdfWriter
 
 
 def _snapshot(*, mode="standard", dataset=None, context=None):
@@ -103,7 +105,9 @@ def _save_snapshot(connection, **overrides):
     return documents.save_report_document_snapshot(connection, **args)
 
 
-def test_v2_snapshot_keeps_one_dataset_and_rebuilds_standard_render_context(tmp_path, monkeypatch):
+def test_v2_snapshot_keeps_one_dataset_and_rebuilds_standard_render_context(
+    tmp_path, monkeypatch
+):
     snapshot = _snapshot(
         context={
             "totals": {"should": "not persist here"},
@@ -123,7 +127,7 @@ def test_v2_snapshot_keeps_one_dataset_and_rebuilds_standard_render_context(tmp_
     def render_pdf(_self, context, output_path, **_kwargs):
         rendered.update(context)
         with open(output_path, "wb") as target:
-            target.write(b"%PDF-test")
+            target.write(_pdf_bytes())
         return output_path
 
     monkeypatch.setattr(documents, "report_cache_root", lambda: tmp_path)
@@ -247,7 +251,9 @@ def test_snapshot_loader_checks_hash_template_and_supported_contract():
         )
 
 
-def test_snapshot_json_normalizes_values_and_reuses_cached_render(tmp_path, monkeypatch):
+def test_snapshot_json_normalizes_values_and_reuses_cached_render(
+    tmp_path, monkeypatch
+):
     payload = {
         "money": Decimal("12.50"),
         "date": date(2026, 8, 24),
@@ -265,7 +271,7 @@ def test_snapshot_json_normalizes_values_and_reuses_cached_render(tmp_path, monk
     def render_pdf(_self, _context, output_path, **_kwargs):
         calls.append(output_path)
         with open(output_path, "wb") as target:
-            target.write(b"%PDF-cache")
+            target.write(_pdf_bytes())
         return output_path
 
     snapshot = _snapshot()
@@ -277,13 +283,15 @@ def test_snapshot_json_normalizes_values_and_reuses_cached_render(tmp_path, monk
     assert len(calls) == 1
 
 
-def test_deleted_snapshot_cache_is_rebuilt_from_the_same_immutable_data(tmp_path, monkeypatch):
+def test_deleted_snapshot_cache_is_rebuilt_from_the_same_immutable_data(
+    tmp_path, monkeypatch
+):
     calls = []
 
     def render_pdf(_self, _context, output_path, **_kwargs):
         calls.append(output_path)
         with open(output_path, "wb") as target:
-            target.write(b"%PDF-rebuild")
+            target.write(_pdf_bytes())
         return output_path
 
     snapshot = _snapshot()
@@ -478,16 +486,25 @@ def test_shift_closure_snapshot_has_its_own_immutable_source(monkeypatch):
     assert captured["created_from_module"] == "cierre_turno"
 
 
-def test_offline_history_open_uses_only_a_valid_existing_snapshot_cache(tmp_path, monkeypatch):
+def test_offline_history_open_uses_only_a_valid_existing_snapshot_cache(
+    tmp_path, monkeypatch
+):
     @contextmanager
     def unavailable_connection():
         raise ConnectionError("offline")
         yield  # pragma: no cover
 
     cache = tmp_path / "report_history_71_v1_deadbeefcafe.pdf"
-    cache.write_bytes(b"%PDF-offline-cache")
+    cache.write_bytes(_pdf_bytes())
     monkeypatch.setattr(app, "db_connect", unavailable_connection)
     monkeypatch.setattr(app, "report_cache_root", lambda: tmp_path)
     assert app.resolve_report_document("report_history", "71", "open") == str(cache)
     with pytest.raises(documents.ReportDocumentError, match="No hay conexión"):
         app.resolve_report_document("report_history", "72", "open")
+
+def _pdf_bytes():
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    stream = BytesIO()
+    writer.write(stream)
+    return stream.getvalue()

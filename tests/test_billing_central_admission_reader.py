@@ -851,3 +851,20 @@ def test_billing_workers_emit_safe_categories_on_failures():
         )
         worker.run()
     assert eligibility_failures == ["QUERY_ERROR"]
+
+def test_history_eligibility_repairs_selected_projection_before_query(monkeypatch):
+    repaired = []
+    evaluated = []
+    monkeypatch.setattr(
+        app,
+        "evaluate_attention_billing_eligibility",
+        lambda *args, **kwargs: evaluated.append((args, kwargs)) or {"eligible": True},
+    )
+    worker = app.AdmissionHistoryEligibilityWorker(
+        {"attention_id": 468, "global_attention_id": "global-468"},
+        {"role": app.ROLE_AUX},
+        projection_repair=lambda value: repaired.append(value) or True,
+    )
+    worker.run()
+    assert repaired == ["global-468"]
+    assert len(evaluated) == 1

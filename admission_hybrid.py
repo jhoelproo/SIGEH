@@ -2516,28 +2516,10 @@ class OfflineAdmissionStore:
             rows = con.execute(
                 """SELECT * FROM sync_outbox WHERE sync_status IN ('PENDING','RETRY')
                    ORDER BY created_at_effective_utc,device_local_sequence,event_uuid
-                   LIMIT ?""", (max(1, min(int(limit), 500)),)
+                   LIMIT ?""",
+                (max(1, min(int(limit), 500)),),
             ).fetchall()
-        return [
-            SyncEvent(
-                event_uuid=str(row["event_uuid"]), entity_type=str(row["entity_type"]),
-                entity_uuid=str(row["entity_uuid"]), operation=str(row["operation"]),
-                payload=json.loads(row["payload_json"]),
-                operational_session_id=str(row["operational_session_id"]),
-                generation=int(row["generation"]), device_id=str(row["device_id"]),
-                created_at=str(row["created_at"]), base_version=int(row["base_version"] or 0),
-                operational_source_id=str(row["operational_source_id"] or ""),
-                turn_id=_as_int_or_none(row["turn_id"]),
-                origin_user_id=str(row["origin_user_id"] or ""),
-                origin_username=str(row["origin_username"] or ""),
-                created_at_device=str(row["created_at_device"] or row["created_at"]),
-                created_at_effective_utc=str(
-                    row["created_at_effective_utc"] or row["created_at"]
-                ),
-                device_local_sequence=int(row["device_local_sequence"] or 0),
-                server_time_offset_ms=int(row["server_time_offset_ms"] or 0),
-            ) for row in rows
-        ]
+        return [self._sync_event_from_outbox_row(row) for row in rows]
 
     def pending_count(self) -> int:
         self.initialize()
@@ -2595,11 +2577,13 @@ class OfflineAdmissionStore:
         *,
         limit: int = 100,
         central_seed_id: str = "",
+        global_attention_id: str = "",
     ) -> int:
         """Recupera atenciones legacy sin outbox, en lotes acotados e idempotentes."""
         self.initialize()
         queued = 0
         seed_id = str(central_seed_id or "").strip()
+        target_id = self._normalize_repair_attention_id(global_attention_id)
         with self.connection() as con:
             runtime = con.execute(
                 "SELECT * FROM sync_runtime_context WHERE singleton=1"
@@ -2623,7 +2607,19 @@ class OfflineAdmissionStore:
                 if "representante" in turn_columns
                 else ""
             )
-            if seed_id:
+            if target_id:
+                rows = con.execute(
+                    f"""SELECT a.*,p.global_patient_id AS patient_global_id,
+                               {legacy_representative} AS legacy_turn_representative
+                       FROM atenciones a
+                       LEFT JOIN pacientes p ON p.id=a.paciente_id
+                       {turn_join}
+                       WHERE REPLACE(LOWER(a.global_attention_id),'-','')=
+                             REPLACE(LOWER(?),'-','')
+                       ORDER BY a.id DESC LIMIT 1""",
+                    (target_id,),
+                ).fetchall()
+            elif seed_id:
                 rows = con.execute(
                     f"""SELECT a.*,p.global_patient_id AS patient_global_id,
                                {legacy_representative} AS legacy_turn_representative
@@ -2681,12 +2677,14 @@ class OfflineAdmissionStore:
                 created_at_effective = str(
                     data.get("created_at_effective_utc") or created_at_device
                 )
-                event_identity = (
-                    f"hospital-admission-seed:{seed_id}:{entity_uuid}"
-                    if seed_id
-                    else f"hospital-admission-reconcile:{entity_uuid}:{version}"
+                event_uuid = self._recovery_event_uuid(
+                    seed_id=seed_id,
+                    target_id=target_id,
+                    entity_uuid=entity_uuid,
+                    version=version,
+                    operational_session_id=str(runtime["operational_session_id"]),
+                    generation=int(runtime["generation"]),
                 )
-                event_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, event_identity))
                 is_deleted = bool(data.get("is_deleted"))
                 payload = {
                     "event_type": (
@@ -2700,7 +2698,7 @@ class OfflineAdmissionStore:
                         or data.get("patient_global_id")
                         or ""
                     ),
-                    "turn_id": int(data.get("turno_id") or runtime["operational_turn_id"] or 0),
+                    "turn_id": self._recovery_projection_turn_id(data, runtime),
                     "local_turn_id": int(data.get("turno_id") or 0),
                     "name": str(data.get("nombre") or ""),
                     "sex": str(data.get("sexo") or ""),
@@ -2721,12 +2719,16 @@ class OfflineAdmissionStore:
                         data.get("is_deleted")
                         or str(data.get("estado") or "").upper() == "ANULADA"
                     ),
-                    "deleted_at": str(data.get("deleted_at") or data.get("anulada_at") or ""),
+                    "deleted_at": str(
+                        data.get("deleted_at") or data.get("anulada_at") or ""
+                    ),
                     "deleted_by_user_id": str(
                         data.get("deleted_by_user_id") or data.get("anulada_por") or ""
                     ),
                     "delete_event_uuid": str(data.get("delete_event_uuid") or ""),
-                    "delete_reason": str(data.get("delete_reason") or data.get("anulada_motivo") or ""),
+                    "delete_reason": str(
+                        data.get("delete_reason") or data.get("anulada_motivo") or ""
+                    ),
                     "version": version,
                     "source_instance_id": source_instance_id,
                     "operational_source_id": str(
@@ -2745,18 +2747,22 @@ class OfflineAdmissionStore:
                     "origin_device_id": str(
                         data.get("origin_device_id") or runtime["device_id"] or ""
                     ),
-                    "admission_username": str(runtime["active_username"] or ""),
+                    "admission_username": self._recovery_admission_username(
+                        data, runtime
+                    ),
                     "captured_by_username": str(
                         data.get("captured_by_username")
                         or data.get("legacy_turn_representative")
                         or runtime["active_username"]
                         or ""
                     ),
-                    "origin_user_id": str(runtime["active_user_id"] or ""),
+                    "origin_user_id": self._recovery_origin_user_id(data, runtime),
                     "created_at_device": created_at_device,
                     "created_at_effective_utc": created_at_effective,
                     "device_local_sequence": local_sequence,
-                    "updated_at": str(data.get("updated_at") or data.get("created_at") or ""),
+                    "updated_at": str(
+                        data.get("updated_at") or data.get("created_at") or ""
+                    ),
                     "reconciliation_status": (
                         "CENTRAL_SEED" if seed_id else "LEGACY_RECOVERY"
                     ),
@@ -2778,36 +2784,38 @@ class OfflineAdmissionStore:
                         str(runtime["operational_session_id"]),
                         str(runtime["operational_source_id"]),
                         int(runtime["generation"]),
-                        int(data.get("operational_turn_id") or data.get("turno_id") or 0),
+                        int(
+                            data.get("operational_turn_id") or data.get("turno_id") or 0
+                        ),
                         str(runtime["device_id"]),
                         str(runtime["active_user_id"] or ""),
                         str(runtime["active_username"] or ""),
                         created_at_device,
                         created_at_effective,
                         local_sequence,
-                        int((con.execute(
-                            "SELECT valor FROM app_metadata "
-                            "WHERE clave='sync.server_time_offset_ms'"
-                        ).fetchone() or [0])[0] or 0),
+                        int(
+                            (
+                                con.execute(
+                                    "SELECT valor FROM app_metadata "
+                                    "WHERE clave='sync.server_time_offset_ms'"
+                                ).fetchone()
+                                or [0]
+                            )[0]
+                            or 0
+                        ),
                         0,
                         _timestamp(),
                     ),
                 )
                 inserted = int(con.execute("SELECT changes()").fetchone()[0] or 0)
-                if seed_id:
-                    con.execute(
-                        """UPDATE sync_outbox
-                              SET sync_status='PENDING',sent_at=NULL,last_error=NULL
-                            WHERE event_uuid=?""",
-                        (event_uuid,),
-                    )
-                    con.execute(
-                        """INSERT OR IGNORE INTO sync_seed_entities(
-                               central_seed_id,entity_uuid,event_uuid,queued_at
-                           ) VALUES(?,?,?,?)""",
-                        (seed_id, entity_uuid, event_uuid, _timestamp()),
-                    )
-                queued += inserted
+                queued += self._finalize_recovery_outbox(
+                    con,
+                    seed_id=seed_id,
+                    target_id=target_id,
+                    entity_uuid=entity_uuid,
+                    event_uuid=event_uuid,
+                    inserted=inserted,
+                )
         return queued
 
     def recent_attention_entity_ids(self, *, limit: int = 100) -> list[str]:
@@ -3867,6 +3875,141 @@ class OfflineAdmissionStore:
             username,
         )
         return dict(current) if current else None
+
+    @staticmethod
+    def _sync_event_from_outbox_row(row: Mapping[str, Any]) -> SyncEvent:
+        return SyncEvent(
+            event_uuid=str(row["event_uuid"]),
+            entity_type=str(row["entity_type"]),
+            entity_uuid=str(row["entity_uuid"]),
+            operation=str(row["operation"]),
+            payload=json.loads(row["payload_json"]),
+            operational_session_id=str(row["operational_session_id"]),
+            generation=int(row["generation"]),
+            device_id=str(row["device_id"]),
+            created_at=str(row["created_at"]),
+            base_version=int(row["base_version"] or 0),
+            operational_source_id=str(row["operational_source_id"] or ""),
+            turn_id=_as_int_or_none(row["turn_id"]),
+            origin_user_id=str(row["origin_user_id"] or ""),
+            origin_username=str(row["origin_username"] or ""),
+            created_at_device=str(row["created_at_device"] or row["created_at"]),
+            created_at_effective_utc=str(
+                row["created_at_effective_utc"] or row["created_at"]
+            ),
+            device_local_sequence=int(row["device_local_sequence"] or 0),
+            server_time_offset_ms=int(row["server_time_offset_ms"] or 0),
+        )
+
+    @staticmethod
+    def _normalize_repair_attention_id(value: Any) -> str:
+        if not value:
+            return ""
+        try:
+            return str(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("global_attention_id no es válido.") from exc
+
+    @staticmethod
+    def _recovery_event_uuid(
+        *,
+        seed_id: str,
+        target_id: str,
+        entity_uuid: str,
+        version: int,
+        operational_session_id: str,
+        generation: int,
+    ) -> str:
+        if seed_id:
+            identity = f"hospital-admission-seed:{seed_id}:{entity_uuid}"
+        elif target_id:
+            identity = (
+                "hospital-admission-selected-repair:"
+                f"{entity_uuid}:{version}:{operational_session_id}:{generation}"
+            )
+        else:
+            identity = f"hospital-admission-reconcile:{entity_uuid}:{version}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
+
+    @staticmethod
+    def _recovery_projection_turn_id(
+        data: Mapping[str, Any], runtime: Mapping[str, Any]
+    ) -> int:
+        return int(
+            data.get("operational_turn_id")
+            or data.get("turno_id")
+            or runtime["operational_turn_id"]
+            or 0
+        )
+
+    @staticmethod
+    def _recovery_admission_username(
+        data: Mapping[str, Any], runtime: Mapping[str, Any]
+    ) -> str:
+        return str(
+            data.get("admission_username")
+            or data.get("captured_by_username")
+            or data.get("legacy_turn_representative")
+            or runtime["active_username"]
+            or ""
+        )
+
+    @staticmethod
+    def _recovery_origin_user_id(
+        data: Mapping[str, Any], runtime: Mapping[str, Any]
+    ) -> str:
+        return str(
+            data.get("captured_by_user_id") or runtime["active_user_id"] or ""
+        )
+
+    @staticmethod
+    def _finalize_recovery_outbox(
+        con: sqlite3.Connection,
+        *,
+        seed_id: str,
+        target_id: str,
+        entity_uuid: str,
+        event_uuid: str,
+        inserted: int,
+    ) -> int:
+        if target_id or seed_id:
+            con.execute(
+                """UPDATE sync_outbox
+                      SET sync_status='PENDING',sent_at=NULL,last_error=NULL
+                    WHERE event_uuid=?""",
+                (event_uuid,),
+            )
+        if target_id:
+            return 1
+        if seed_id:
+            con.execute(
+                """INSERT OR IGNORE INTO sync_seed_entities(
+                       central_seed_id,entity_uuid,event_uuid,queued_at
+                   ) VALUES(?,?,?,?)""",
+                (seed_id, entity_uuid, event_uuid, _timestamp()),
+            )
+        return inserted
+
+    def pending_attention_event(self, global_attention_id: str) -> SyncEvent | None:
+        """Return the newest queued repair for one exact attention identity."""
+        try:
+            normalized = str(uuid.UUID(str(global_attention_id)))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        self.initialize()
+        with self.connection() as con:
+            row = con.execute(
+                """SELECT * FROM sync_outbox
+                   WHERE entity_type='attention'
+                     AND REPLACE(LOWER(entity_uuid),'-','')=
+                         REPLACE(LOWER(?),'-','')
+                     AND sync_status IN ('PENDING','RETRY')
+                   ORDER BY rowid DESC LIMIT 1""",
+                (normalized,),
+            ).fetchone()
+        return self._sync_event_from_outbox_row(row) if row else None
+
+
 
 
 class OperationalSessionService:
@@ -8740,6 +8883,29 @@ class AdmissionCloudRepository:
                 repaired += 1
         return repaired
 
+    def missing_projection_entity_ids(self, entity_uuids: list[str]) -> list[str]:
+        """Return valid requested UUIDs that lack a central projection row."""
+        normalized = []
+        for value in entity_uuids:
+            try:
+                normalized.append(str(uuid.UUID(str(value))))
+            except (ValueError, TypeError, AttributeError):
+                continue
+        normalized = list(dict.fromkeys(normalized))
+        if not normalized:
+            return []
+        with self.connection_factory() as con:
+            rows = con.execute(
+                """SELECT requested.entity_uuid::TEXT
+                   FROM UNNEST(%s::uuid[]) requested(entity_uuid)
+                   LEFT JOIN admission_attention_projection projection
+                     ON projection.global_attention_id=requested.entity_uuid
+                   WHERE projection.global_attention_id IS NULL""",
+                (normalized,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+
 
 class AdmissionSyncService:
     """Push/pull incremental; la aplicaci\u00f3n concreta decide c\u00f3mo aplicar cada evento."""
@@ -8753,6 +8919,7 @@ class AdmissionSyncService:
         self._stalled_event: dict[str, Any] | None = None
         self._expired_event_window: dict[str, Any] | None = None
         self._last_recovery_queries = 0
+        self._recent_projection_repair_complete = False
         cursor_reader = getattr(self.store, "last_cloud_cursor", None)
         initial_cursor = int(cursor_reader()) if callable(cursor_reader) else 0
         self._last_pull_metrics: dict[str, Any] = {
@@ -9275,6 +9442,8 @@ class AdmissionSyncService:
     ) -> dict[str, Any] | None:
         """Canonical online-central/offline-outbox cancellation workflow."""
         if online:
+            if not self.ensure_attention_projected(global_attention_id):
+                return None
             central = self.cloud.cancel_attention(
                 global_attention_id,
                 current_user=current_user,
@@ -9350,6 +9519,7 @@ class AdmissionSyncService:
             self._local_recovery_complete = recovered < max(1, int(push_limit))
         push_started = perf_counter()
         pushed = self.push_outbox(limit=push_limit)
+        replayed = self.repair_recent_projections_once(limit=500)
         push_ms = (perf_counter() - push_started) * 1000.0
         cursor_after = self.store.last_cloud_cursor()
         total_ms = (perf_counter() - cycle_started) * 1000.0
@@ -9357,7 +9527,7 @@ class AdmissionSyncService:
             **pushed,
             "pulled": pulled,
             "recovered": recovered,
-            "replayed": 0,
+            "replayed": replayed,
             "backfilled": 0,
             "checkpoint_recovered": checkpoint_recovered,
             "server_time_offset_ms": int(clock["server_time_offset_ms"]),
@@ -9401,6 +9571,73 @@ class AdmissionSyncService:
             str(bool(self._last_pull_metrics.get("guarded"))).lower(),
         )
         return result
+
+    def _missing_projection_ids(self, entity_uuids: list[str]) -> list[str]:
+        checker = getattr(self.cloud, "missing_projection_entity_ids", None)
+        if callable(checker):
+            return list(checker(entity_uuids) or [])
+        single_checker = getattr(self.cloud, "projection_has_attention", None)
+        if not callable(single_checker):
+            return []
+        return [value for value in entity_uuids if not single_checker(value)]
+
+    def repair_projection_entities(self, entity_uuids: list[str]) -> int:
+        """Restore missing central projections from events or the exact local row."""
+        missing = self._missing_projection_ids(entity_uuids)
+        if not missing:
+            return 0
+        rematerialize = getattr(self.cloud, "rematerialize_attention_events", None)
+        repaired = int(rematerialize(missing) or 0) if callable(rematerialize) else 0
+        remaining = self._missing_projection_ids(missing)
+        queued_events = []
+        for entity_uuid in remaining:
+            self.store.queue_missing_attention_events(
+                limit=1,
+                global_attention_id=entity_uuid,
+            )
+            event = self.store.pending_attention_event(entity_uuid)
+            if event is not None:
+                queued_events.append(event)
+        if queued_events:
+            uploaded = self.cloud.push_events(queued_events)
+            acknowledged = [
+                event.event_uuid
+                for event in queued_events
+                if str(uuid.UUID(event.event_uuid)) in uploaded
+            ]
+            self.store.mark_uploaded_batch(acknowledged)
+            repaired += len(acknowledged)
+        unresolved = self._missing_projection_ids(remaining)
+        if unresolved:
+            raise SyncConflict(
+                "No fue posible reconstruir la proyección central de la atención."
+            )
+        return repaired
+
+    def repair_recent_projections_once(self, *, limit: int = 500) -> int:
+        if self._recent_projection_repair_complete:
+            return 0
+        loader = getattr(self.store, "recent_attention_entity_ids", None)
+        if not callable(loader):
+            self._recent_projection_repair_complete = True
+            return 0
+        entity_uuids = loader(limit=limit)
+        repaired = self.repair_projection_entities(entity_uuids)
+        self._recent_projection_repair_complete = True
+        return repaired
+
+    def ensure_attention_projected(self, global_attention_id: str) -> bool:
+        """Repair and verify one selected attention before a central operation."""
+        try:
+            normalized = str(uuid.UUID(str(global_attention_id)))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        self.repair_projection_entities([normalized])
+        return not self._missing_projection_ids([normalized])
+
+
+
+
 
 
 class AdmissionSeedService:

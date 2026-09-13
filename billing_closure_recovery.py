@@ -66,7 +66,9 @@ def pending_central_closures(connection):
              ON c.source_instance_id=s.operational_source_id::TEXT AND c.turn_id=i.turn_id
            WHERE i.ended_at IS NOT NULL AND i.ended_at>=%s
              AND i.turn_id IS NOT NULL
-             AND (c.snapshot_created_at IS NULL OR c.pdf_status IN ('PENDIENTE','ERROR'))
+             AND (c.snapshot_created_at IS NULL
+                  OR c.pdf_status IN ('PENDIENTE','ERROR','OMITIDO_VACIO')
+                  OR (c.pdf_status='GENERADO' AND c.print_requested_at IS NULL))
            ORDER BY i.ended_at,i.turn_id LIMIT 50""",
         (PENDING_RESTART_AT,),
     ).fetchall()

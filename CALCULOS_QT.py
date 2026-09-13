@@ -8712,7 +8712,8 @@ def claim_shift_closure(generated_by: str, source_instance_id="", turn_id=None):
                    SELECT source_instance_id,turn_id
                    FROM billing_shift_closures
                    WHERE snapshot_created_at IS NOT NULL
-                     AND status IN ('PENDING','ERROR')
+                     AND (status IN ('PENDING','ERROR')
+                          OR (pdf_status='OMITIDO_VACIO' AND status<>'GENERATING'))
                      AND (generation_attempts<3 OR %s=TRUE)
                      AND (%s=FALSE OR (source_instance_id=%s AND turn_id=%s))
                    ORDER BY closed_at,turn_id
@@ -8728,8 +8729,12 @@ def claim_shift_closure(generated_by: str, source_instance_id="", turn_id=None):
                  AND b.turn_id=c.turn_id
                RETURNING b.*""",
             (
-                specific, specific, str(source_instance_id or ""), int(turn_id or 0),
-                now_str(), str(generated_by or "Sistema"),
+                specific,
+                specific,
+                str(source_instance_id or ""),
+                int(turn_id or 0),
+                now_str(),
+                str(generated_by or "Sistema"),
             ),
         ).fetchone()
     return dict(row) if row else None
@@ -14311,7 +14316,13 @@ class PeriodSelectorWidget(QWidget):
 class ComparisonPdfDialog(QDialog):
     """Vista previa, guardado e impresión del PDF comparativo ya generado."""
 
-    def __init__(self, pdf_path, parent=None, dialog_title="Reporte comparativo listo", detail_text=None):
+    def __init__(
+        self,
+        pdf_path,
+        parent=None,
+        dialog_title="Reporte comparativo listo",
+        detail_text=None,
+    ):
         super().__init__(parent)
         self.pdf_path = pdf_path
         self.setWindowTitle("Vista previa de la comparación")
@@ -14319,10 +14330,13 @@ class ComparisonPdfDialog(QDialog):
         root = QVBoxLayout(self)
         title = QLabel(dialog_title)
         title.setStyleSheet("font-size: 16pt; font-weight: 900; color: #123F83;")
-        detail = QLabel(detail_text or (
-            "El documento se generó con la misma información que está visible en el panel. "
-            "Revísalo antes de imprimir o guarda una copia en otra ubicación."
-        ))
+        detail = QLabel(
+            detail_text
+            or (
+                "El documento se generó con la misma información que está visible en el panel. "
+                "Revísalo antes de imprimir o guarda una copia en otra ubicación."
+            )
+        )
         detail.setWordWrap(True)
         detail.setStyleSheet(
             "background: #F3F7FC; color: #36516E; padding: 12px; border-radius: 8px;"
@@ -14333,6 +14347,9 @@ class ComparisonPdfDialog(QDialog):
         root.addWidget(title)
         root.addWidget(detail)
         root.addWidget(filename)
+        if dialog_title == "Reporte histórico":
+            root.addWidget(self._historical_pdf_view())
+            self.resize(1000, 780)
         buttons_card = QWidget()
         buttons_card.setObjectName("ModernActionBar")
         buttons = QHBoxLayout(buttons_card)
@@ -14411,6 +14428,21 @@ class ComparisonPdfDialog(QDialog):
             FloatingToast("Copia del reporte guardada", self).show()
         except Exception as exc:
             QMessageBox.critical(self, "Guardar PDF", f"No se pudo guardar la copia:\n{exc}")
+
+    def _historical_pdf_view(self):
+        from PySide6.QtPdfWidgets import QPdfView
+
+        self.setWindowTitle("Reporte histórico")
+        document = QPdfDocument(self)
+        error = document.load(self.pdf_path)
+        if error != QPdfDocument.Error.None_ or document.pageCount() == 0:
+            raise OSError("El archivo PDF no contiene páginas legibles.")
+        view = QPdfView(self)
+        view.setDocument(document)
+        view.setPageMode(QPdfView.PageMode.MultiPage)
+        view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        return view
+
 
 def _clean_name(s: str):
     s = (s or '').strip()
@@ -16155,6 +16187,8 @@ def _render_legacy_report_metadata(report: NormalizedReportRecord):
 
 
 def _find_cached_report_snapshot_pdf(source_table, source_key_value):
+    from report_pdf_integrity import is_readable_report_pdf
+
     """Return the newest complete local render for an offline history open."""
     safe_source = re.sub(
         r"[^A-Za-z0-9_.-]+", "_", f"{source_table}_{source_key_value}"
@@ -16166,7 +16200,7 @@ def _find_cached_report_snapshot_pdf(source_table, source_key_value):
     )
     for candidate in candidates:
         try:
-            if candidate.is_file() and candidate.stat().st_size > 0:
+            if is_readable_report_pdf(candidate):
                 return str(candidate)
         except OSError:
             continue
@@ -26933,8 +26967,17 @@ class LegacyReportsDialog(QDialog):
         return source_table, source_key_value, os.path.basename(stored_path)
 
     def _report_document_open_ready(self, path: str):
-        if not open_file_path(path):
-            QMessageBox.warning(self, "Reportes", "Windows no pudo abrir el documento.")
+        try:
+            ComparisonPdfDialog(
+                path,
+                self,
+                dialog_title="Reporte histórico",
+                detail_text="Reporte guardado. Puede revisarlo, imprimirlo o guardar una copia.",
+            ).exec()
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Reportes", f"No se pudo abrir el reporte:\n{exc}"
+            )
 
     def _report_document_open_failed(self, message: str):
         QMessageBox.warning(self, "Reportes", str(message))
@@ -29833,17 +29876,25 @@ class EmergencyWorkspacePage(QWidget):
 
     def _prepare_committed_closures(self):
         from billing_closure_recovery import (
-            pending_central_closures, closure_from_interval, closed_turn_attentions,
+            pending_central_closures,
+            closure_from_interval,
+            closed_turn_attentions,
         )
+
         with db_connect() as connection:
             pending = pending_central_closures(connection)
         results = []
         for row in pending:
-            event = closure_from_interval(dict(row))
-            with db_connect() as connection:
-                attentions = closed_turn_attentions(connection, event)
-            capture_shift_closure_snapshot(event, attentions)
-            results.append((event.source_instance_id, event.turn_id))
+            try:
+                event = closure_from_interval(dict(row))
+                with db_connect() as connection:
+                    attentions = closed_turn_attentions(connection, event)
+                capture_shift_closure_snapshot(event, attentions)
+                results.append((event.source_instance_id, event.turn_id))
+            except Exception as exc:
+                write_runtime_log(
+                    f"Recuperación de cierre individual pendiente: {type(exc).__name__}"
+                )
         return results
 
     def _finish_committed_closures(self, results):
@@ -30785,28 +30836,54 @@ class AdmissionHistoryLoadWorker(QThread):
             })
 
 
+def _admission_projection_repair_callback(owner):
+    """Locate the integrated Admission runtime without coupling worker to widgets."""
+    parent = owner.parentWidget() if hasattr(owner, "parentWidget") else None
+    for candidate in (owner, parent):
+        workspace = getattr(candidate, "emergency_workspace", None)
+        runtime = getattr(
+            getattr(workspace, "full_page", None), "_hybrid_runtime", None
+        )
+        repair = getattr(runtime, "repair_admission_attention_projection", None)
+        if callable(repair):
+            return repair
+    return None
+
+
 class AdmissionHistoryEligibilityWorker(QThread):
     resolved = Signal(object, float)
     failed = Signal(str, float)
 
-    def __init__(self, row_data, current_user, session_id="", parent=None):
+    def __init__(
+        self,
+        row_data,
+        current_user,
+        session_id="",
+        parent=None,
+        *,
+        projection_repair=None,
+    ):
         super().__init__(parent)
         self.row_data = dict(row_data or {})
         self.current_user = dict(current_user or {})
         self.session_id = str(session_id or "")
+        self.projection_repair = projection_repair
 
     def run(self):
         started = perf_counter()
         try:
+            global_attention_id = str(
+                self.row_data.get("global_attention_id") or ""
+            ).strip()
+            if global_attention_id and callable(self.projection_repair):
+                self.projection_repair(global_attention_id)
             result = evaluate_attention_billing_eligibility(
                 int(self.row_data.get("attention_id") or 0),
                 self.current_user,
                 source_instance_id=str(
                     self.row_data.get("source_instance_id") or "LEGACY"
                 ),
-                global_attention_id=str(
-                    self.row_data.get("global_attention_id") or ""
-                ),
+                global_attention_id=global_attention_id,
                 session_id=self.session_id,
             )
             self.resolved.emit(result, (perf_counter() - started) * 1000.0)
@@ -31306,7 +31383,11 @@ class AdmissionHistoryDialog(QDialog):
         parent = self.parentWidget()
         session_id = str(getattr(parent, "session_id", "") or "")
         worker = AdmissionHistoryEligibilityWorker(
-            data, self.current_user, session_id, self
+            data,
+            self.current_user,
+            session_id,
+            self,
+            projection_repair=_admission_projection_repair_callback(self),
         )
         self._eligibility_worker = worker
         worker.resolved.connect(self._eligibility_resolved)
@@ -31822,7 +31903,7 @@ class ShiftClosureReportWorker(QThread):
         except Exception as open_error:
             mark_shift_report_opened(closure, str(open_error))
             write_runtime_log(
-                "Reporte automático de cierre generado; apertura pendiente: "
+                "Reporte automático de cierre generado; apertura o impresión pendiente: "
                 f"{type(open_error).__name__}"
             )
             self.completed.emit(
@@ -31840,9 +31921,7 @@ class ShiftClosureReportWorker(QThread):
             "Reporte automático de cierre de Facturación",
             f"Turno {closure['turn_id']} · {os.path.basename(path)}",
         )
-        self.completed.emit(
-            {"status": "GENERATED", "closure": closure, "path": path}
-        )
+        self.completed.emit({"status": "GENERATED", "closure": closure, "path": path})
 
     def _generate_report(self, closure: dict, data: dict) -> str:
         source_tag = re.sub(
@@ -31909,7 +31988,21 @@ class ShiftClosureReportWorker(QThread):
         try:
             existing = get_shift_closure(self.source_instance_id, self.turn_id)
             if existing and existing.get("report_filename"):
-                self.completed.emit({"status": "ALREADY_GENERATED", "closure": existing})
+                if not existing.get("print_requested_at"):
+                    closure = existing
+                    generated = True
+                    path = resolve_report_document(
+                        "billing_shift_closures",
+                        f"{self.source_instance_id}|{self.turn_id}",
+                        "open",
+                        existing["report_filename"],
+                        logo_path=LOGO_PATH,
+                    )
+                    self._complete_generated_report(closure, path)
+                    return
+                self.completed.emit(
+                    {"status": "ALREADY_GENERATED", "closure": existing}
+                )
                 return
             closure = claim_shift_closure(
                 self.username,
@@ -31920,10 +32013,6 @@ class ShiftClosureReportWorker(QThread):
                 self.completed.emit({"status": "ALREADY_CLAIMED"})
                 return
             data = build_shift_closure_report_data(closure)
-            if not (data.get("details") or []):
-                mark_shift_report_skipped_empty(closure)
-                self.completed.emit({"status": "SKIPPED_EMPTY", "closure": closure})
-                return
             path = self._generate_report(closure, data)
             generated = True
             self._complete_generated_report(closure, path)
@@ -34122,10 +34211,12 @@ class MainWindow(QMainWindow):
         data = dict(result or {})
         status = str(data.get("status") or "")
         if status == "GENERATED":
-            FloatingToast("Reporte del turno abierto e impresión solicitada", self).show()
+            FloatingToast(
+                "Reporte del turno abierto e impresión solicitada", self
+            ).show()
         elif status == "GENERATED_OPEN_FAILED":
             FloatingToast(
-                "Reporte de Facturación generado; apertura pendiente.", self
+                "Reporte de Facturación generado; apertura o impresión pendiente.", self
             ).show()
         elif status == "SKIPPED_EMPTY":
             FloatingToast(
@@ -34156,10 +34247,18 @@ class MainWindow(QMainWindow):
 
     def _open_and_print_shift_report(self, closure: dict, pdf_path: str) -> None:
         """Abre siempre el cierre y solicita una sola impresión por SumatraPDF."""
-        if not os.path.isfile(pdf_path) or not open_file_path(pdf_path):
-            raise OSError("El PDF fue generado, pero Windows no pudo abrirlo.")
+        if not os.path.isfile(pdf_path):
+            raise OSError("El archivo del reporte no está disponible.")
+        opening_error = None
+        try:
+            if not open_file_path(pdf_path):
+                opening_error = OSError("Windows no pudo abrir el reporte.")
+        except Exception as exc:
+            opening_error = exc
         print_reserved = claim_shift_print_once(closure)
         if not print_reserved:
+            if opening_error:
+                raise opening_error
             return
         try:
             printed = self.emergency_workspace.print_pdf_with_v15(pdf_path, copies=1)
@@ -34173,11 +34272,14 @@ class MainWindow(QMainWindow):
                 "Cierre Facturación · PDF abierto · intento de impresión no completado "
                 f"| turno={closure.get('turn_id')} | error={type(exc).__name__}"
             )
+            raise
         else:
             finish_shift_print(closure)
             write_runtime_log(
                 f"Cierre Facturación · turno {closure.get('turn_id')} · impresión solicitada"
             )
+        if opening_error:
+            raise opening_error
 
     def _print_shift_pdf_once(self, pdf_path: str):
         printer_info = QPrinterInfo.defaultPrinter()
@@ -36194,14 +36296,20 @@ class MainWindow(QMainWindow):
 
     def _send_emergency_history_to_billing(self, identity):
         if not can_access_billing_admission_history(self.current_user):
-            QMessageBox.warning(self, "Facturación", "Tu rol no permite esta operación.")
+            QMessageBox.warning(
+                self, "Facturación", "Tu rol no permite esta operación."
+            )
             return
         if self._validation_claim_worker is not None:
             return
         self._validation_flow_started_at = perf_counter()
         self.btn_validate_admission.setEnabled(False)
         worker = AdmissionHistoryEligibilityWorker(
-            identity, self.current_user, self.session_id, self
+            identity,
+            self.current_user,
+            self.session_id,
+            self,
+            projection_repair=_admission_projection_repair_callback(self),
         )
         self._validation_claim_worker = worker
         worker.resolved.connect(self._on_history_billing_resolved)

@@ -14,6 +14,7 @@ from admission_hybrid import (
     AdmissionSyncService,
     OfflineAdmissionStore,
     OperationalSession,
+    SyncEvent,
     SyncConflict,
 )
 from sqlite_write_coordinator import (
@@ -420,3 +421,172 @@ def test_seed_resumes_when_local_ack_exists_but_central_marker_was_lost(tmp_path
 
     assert result["imported"] == 3
     assert len(replacement_cloud.latest) == 3
+
+class _ProjectionRepairStore:
+    def __init__(self, entity_uuid: str, event: SyncEvent):
+        self.entity_uuid = entity_uuid
+        self.event = event
+        self.queued = []
+        self.uploaded = []
+
+    def recent_attention_entity_ids(self, *, limit=100):
+        return [self.entity_uuid]
+
+    def queue_missing_attention_events(self, **kwargs):
+        self.queued.append(kwargs)
+        return 1
+
+    def pending_attention_event(self, entity_uuid):
+        return self.event if entity_uuid == self.entity_uuid else None
+
+    def mark_uploaded_batch(self, event_uuids):
+        self.uploaded.extend(event_uuids)
+
+    def get_attention_by_global_id(self, entity_uuid, **_kwargs):
+        return {"global_attention_id": entity_uuid, "is_deleted": True}
+
+
+class _ProjectionRepairCloud:
+    def __init__(self, entity_uuid: str, *, has_event: bool):
+        self.entity_uuid = entity_uuid
+        self.has_event = has_event
+        self.projected = False
+        self.rematerialized = []
+        self.pushed = []
+
+    def missing_projection_entity_ids(self, entity_uuids):
+        return [] if self.projected else list(entity_uuids)
+
+    def rematerialize_attention_events(self, entity_uuids):
+        self.rematerialized.extend(entity_uuids)
+        if self.has_event:
+            self.projected = True
+            return 1
+        return 0
+
+    def push_events(self, events):
+        self.pushed.extend(events)
+        self.projected = True
+        return {event.event_uuid: 41 for event in events}
+
+    def cancel_attention(self, entity_uuid, **_kwargs):
+        assert self.projected
+        return {"global_attention_id": entity_uuid, "event": {}}
+
+
+def _repair_event(entity_uuid: str) -> SyncEvent:
+    return SyncEvent(
+        event_uuid=str(uuid.uuid4()),
+        entity_type="attention",
+        entity_uuid=entity_uuid,
+        operation="RECONCILE",
+        payload={"attention_id": 8, "patient_id": 9},
+        operational_session_id=_session().operational_session_id,
+        generation=_session().generation,
+        device_id="PC-1",
+        created_at="2026-09-11T10:00:00+00:00",
+    )
+
+
+def test_recent_projection_repair_rematerializes_existing_central_event_once():
+    entity_uuid = str(uuid.uuid4())
+    store = _ProjectionRepairStore(entity_uuid, _repair_event(entity_uuid))
+    cloud = _ProjectionRepairCloud(entity_uuid, has_event=True)
+    service = AdmissionSyncService(store, cloud)
+
+    assert service.repair_recent_projections_once(limit=500) == 1
+    assert service.repair_recent_projections_once(limit=500) == 0
+    assert cloud.rematerialized == [entity_uuid]
+    assert store.queued == []
+
+
+def test_missing_central_event_is_requeued_and_projected_idempotently():
+    entity_uuid = str(uuid.uuid4())
+    event = _repair_event(entity_uuid)
+    store = _ProjectionRepairStore(entity_uuid, event)
+    cloud = _ProjectionRepairCloud(entity_uuid, has_event=False)
+    service = AdmissionSyncService(store, cloud)
+
+    assert service.ensure_attention_projected(entity_uuid) is True
+    assert store.queued == [{"limit": 1, "global_attention_id": entity_uuid}]
+    assert cloud.pushed == [event]
+    assert store.uploaded == [event.event_uuid]
+    assert service.ensure_attention_projected(entity_uuid) is True
+    assert len(cloud.pushed) == 1
+
+
+def test_cancellation_repairs_missing_projection_before_central_tombstone():
+    entity_uuid = str(uuid.uuid4())
+    store = _ProjectionRepairStore(entity_uuid, _repair_event(entity_uuid))
+    cloud = _ProjectionRepairCloud(entity_uuid, has_event=True)
+    service = AdmissionSyncService(store, cloud)
+
+    result = service.cancel_attention(
+        entity_uuid,
+        current_user={"role": "administrador"},
+        reason="Registro duplicado",
+        operational_session=_session(),
+        device_id="PC-1",
+        online=True,
+    )
+    assert result["is_deleted"] is True
+    assert cloud.rematerialized == [entity_uuid]
+
+
+def test_cancellation_requeues_local_row_when_central_event_is_also_missing():
+    entity_uuid = str(uuid.uuid4())
+    event = _repair_event(entity_uuid)
+    store = _ProjectionRepairStore(entity_uuid, event)
+    cloud = _ProjectionRepairCloud(entity_uuid, has_event=False)
+    service = AdmissionSyncService(store, cloud)
+
+    result = service.cancel_attention(
+        entity_uuid,
+        current_user={"role": "administrador"},
+        reason="Registro duplicado",
+        operational_session=_session(),
+        device_id="PC-1",
+        online=True,
+    )
+    assert result["is_deleted"] is True
+    assert cloud.pushed == [event]
+    assert store.uploaded == [event.event_uuid]
+
+
+def test_targeted_repair_queues_current_reconciliation_even_after_old_ack(tmp_path):
+    path = tmp_path / "repair-selected.db"
+    _database(path)
+    store = _store(path, "PC-1")
+    _create_attention(path, 1)
+    entity_uuid = store.recent_attention_entity_ids(limit=1)[0]
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE sync_outbox SET sync_status='SYNCED',sent_at=?",
+            ("2026-09-11T10:00:00+00:00",),
+        )
+    repair_session = OperationalSession(
+        operational_session_id="66666666-6666-4666-8666-666666666666",
+        active_username="AUDITOR",
+        active_user_id="8",
+        active_user_display_name="Auditor",
+        primary_device_id="PC-1",
+        primary_login_session_id="login-2",
+        turn_id=351,
+        operational_source_id=_session().operational_source_id,
+        status="ACTIVE",
+        generation=81,
+    )
+    store.configure_runtime_context(repair_session, device_id="PC-1")
+
+    assert (
+        store.queue_missing_attention_events(limit=1, global_attention_id=entity_uuid)
+        == 1
+    )
+    event = store.pending_attention_event(entity_uuid)
+    assert event is not None
+    assert event.operation == "RECONCILE"
+    assert event.operational_session_id == repair_session.operational_session_id
+    assert event.generation == repair_session.generation
+    assert event.payload["turn_id"] == _session().turn_id
+    assert event.payload["admission_username"] == _session().active_username
+    assert event.payload["operational_session_id"] == _session().operational_session_id

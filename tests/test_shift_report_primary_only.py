@@ -45,7 +45,10 @@ def test_existing_shift_report_is_not_generated_or_opened_twice(monkeypatch):
     monkeypatch.setattr(
         app,
         "get_shift_closure",
-        lambda _source, _turn: {"report_filename": "already.pdf"},
+        lambda _source, _turn: {
+            "report_filename": "already.pdf",
+            "print_requested_at": "2026-09-11",
+        },
     )
     worker = app.ShiftClosureReportWorker(
         "source", 316, "admin", lambda *_args: opened.append(True)
@@ -58,31 +61,6 @@ def test_existing_shift_report_is_not_generated_or_opened_twice(monkeypatch):
     assert opened == []
 
 
-def test_empty_shift_finishes_without_pdf_open_or_print(monkeypatch):
-    opened = []
-    skipped = []
-    results = []
-    closure = {"source_instance_id": "source", "turn_id": 316}
-    monkeypatch.setattr(app, "get_shift_closure", lambda *_args: None)
-    monkeypatch.setattr(app, "claim_shift_closure", lambda *_args: closure)
-    monkeypatch.setattr(
-        app,
-        "build_shift_closure_report_data",
-        lambda _closure: {"details": []},
-    )
-    monkeypatch.setattr(
-        app, "mark_shift_report_skipped_empty", lambda value: skipped.append(value)
-    )
-    worker = app.ShiftClosureReportWorker(
-        "source", 316, "admin", lambda *_args: opened.append(True)
-    )
-    worker.completed.connect(results.append)
-
-    worker.run()
-
-    assert results[0]["status"] == "SKIPPED_EMPTY"
-    assert skipped == [closure]
-    assert opened == []
 
 
 def test_billing_shift_report_generates_and_opens_exactly_once(monkeypatch):
@@ -237,6 +215,36 @@ def test_billing_open_failure_completion_is_visible_without_worker_failure(
     app.MainWindow._shift_report_completed(window, {"status": "GENERATED_OPEN_FAILED"})
 
     assert window.cierre_facturacion_en_progreso is False
-    assert messages == ["Reporte de Facturación generado; apertura pendiente."]
+    assert messages == ["Reporte de Facturación generado; apertura o impresión pendiente."]
     app.MainWindow._shift_report_completed(window, {"status": "SKIPPED_EMPTY"})
     assert "no se generó reporte" in messages[-1]
+
+def test_empty_shift_generates_its_zero_activity_report(monkeypatch):
+    opened = []
+    skipped = []
+    results = []
+    closure = {"source_instance_id": "source", "turn_id": 316}
+    monkeypatch.setattr(app, "get_shift_closure", lambda *_args: None)
+    monkeypatch.setattr(app, "claim_shift_closure", lambda *_args: closure)
+    monkeypatch.setattr(
+        app,
+        "build_shift_closure_report_data",
+        lambda _closure: {"details": []},
+    )
+    monkeypatch.setattr(
+        app, "mark_shift_report_skipped_empty", lambda value: skipped.append(value)
+    )
+    worker = app.ShiftClosureReportWorker(
+        "source", 316, "admin", lambda *_args: opened.append(True)
+    )
+    worker.completed.connect(results.append)
+
+    monkeypatch.setattr(worker, "_generate_report", lambda *_args: "empty.pdf")
+    monkeypatch.setattr(app, "mark_shift_report_opened", lambda *_args: None)
+    monkeypatch.setattr(app, "log_action", lambda *_args: None)
+
+    worker.run()
+
+    assert results[0]["status"] == "GENERATED"
+    assert skipped == []
+    assert opened == [True]
