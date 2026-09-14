@@ -20,7 +20,12 @@ from billing_admission_edit import AdmissionDataChanged
 def test_save_preflight_preserves_draft_and_authorization_on_failure(
     monkeypatch, error, dialog
 ):
-    attention = {"attention_id": 17, "source_instance_id": "TEST"}
+    attention = {
+        "attention_id": 17,
+        "source_instance_id": "TEST",
+        "name": "SINTETICO",
+        "service_date": "2026-09-13",
+    }
     form = SimpleNamespace(
         mark_activity=Mock(),
         receipt_read_only=False,
@@ -41,7 +46,12 @@ def test_save_preflight_preserves_draft_and_authorization_on_failure(
     app.MainWindow.generate_pdf(form)
     assert form.current_admission_attention is attention
     assert form.editing_recibo_id == 31
-    assert lookup.call_args.kwargs["expected_snapshot"] is attention
+    assert lookup.call_args.kwargs["expected_snapshot"] == {
+        "attention_id": 17,
+        "source_instance_id": "TEST",
+    }
+    assert attention["name"] == "SINTETICO"
+    assert attention["service_date"] == "2026-09-13"
     assert lookup.call_args.kwargs["receipt_id"] == 31
     assert lookup.call_args.kwargs["explain_denial"] is True
     popup.assert_called_once()

@@ -19,6 +19,34 @@ def linked_save(attention, **changes):
     )
 
 
+def test_admin_corrects_receipt_header_without_changing_admission(inherited):
+    receipt_id = linked_save(inherited)
+    with app.db_connect() as con:
+        original = dict(
+            con.execute(
+                "SELECT patient_name,service_date FROM admission_attention_projection LIMIT 1"
+            ).fetchone()
+        )
+    linked_save(
+        inherited,
+        recibo_id=receipt_id,
+        nombre="CORRECCION SINTETICA",
+        fecha="2026-09-13",
+    )
+    with app.db_connect() as con:
+        receipt = con.execute(
+            "SELECT nombre,fecha FROM recibos WHERE id=%s", (receipt_id,)
+        ).fetchone()
+        admission = dict(
+            con.execute(
+                "SELECT patient_name,service_date FROM admission_attention_projection LIMIT 1"
+            ).fetchone()
+        )
+    assert receipt["nombre"] == "CORRECCION SINTETICA"
+    assert receipt["fecha"] == "2026-09-13"
+    assert admission == original
+
+
 def test_foreign_claim_blocks_edit_but_does_not_delete_receipt(inherited):
     receipt_id = linked_save(inherited)
     with app.db_connect() as con:

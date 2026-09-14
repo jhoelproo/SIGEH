@@ -10,8 +10,10 @@ import pytest
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDateEdit,
     QDoubleSpinBox,
     QLineEdit,
+    QLabel,
     QPushButton,
     QTableWidget,
 )
@@ -22,6 +24,91 @@ import CALCULOS_QT as app
 @pytest.fixture(scope="module")
 def qt_application():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.mark.parametrize("authorization", ["19", "3901505"])
+def test_edit_status_is_consistent_in_real_label(qt_application, authorization):
+    form = SimpleNamespace(
+        current_user={"role": app.ROLE_ADMIN},
+        current_admission_attention=None,
+        editing_recibo_id=1,
+        authorization_edit=QLineEdit(authorization),
+        document_flow_hint=QLabel(),
+        btn_generate=QPushButton("Guardar cambios"),
+    )
+    app.MainWindow._update_document_flow_ui(form)
+    assert "EDICIÓN" in form.document_flow_hint.text()
+    assert "Bypass" not in form.document_flow_hint.text()
+    assert form.btn_generate.text() == "Guardar cambios"
+
+
+@pytest.mark.parametrize("validated", [False, True])
+def test_admin_receipt_edit_controls(qt_application, validated):
+    widgets = {
+        name: QLineEdit()
+        for name in (
+            "name_edit",
+            "date_edit",
+            "dx_edit",
+            "ars_combo",
+            "coverage_combo",
+            "sala_spin",
+        )
+    }
+    form = SimpleNamespace(
+        current_user={"role": app.ROLE_ADMIN},
+        editing_recibo_id=1,
+        current_admission_attention={"attention_id": 1} if validated else None,
+        service_type="CONSULTA",
+        **widgets,
+    )
+    app.MainWindow._apply_billing_field_policy(form)
+    for name in ("name_edit", "date_edit", "dx_edit", "sala_spin"):
+        assert widgets[name].isEnabled()
+    assert not widgets["ars_combo"].isEnabled()
+    assert not widgets["coverage_combo"].isEnabled()
+    form.receipt_read_only = True
+    app.MainWindow._apply_billing_field_policy(form)
+    assert not any(widget.isEnabled() for widget in widgets.values())
+
+
+@pytest.mark.parametrize("stored_date", ["2026-09-13", "13/09/2026", "invalid"])
+def test_loading_legacy_date_and_ars_never_uses_defaults(
+    qt_application, monkeypatch, stored_date
+):
+    data = dict(
+        numero=999001,
+        nombre="SINTETICO",
+        fecha=stored_date,
+        dx="DX",
+        ars="ARS HISTORICA",
+        sala=100,
+        items=[],
+        estado_facturacion=app.BILLING_PENDING,
+    )
+    monkeypatch.setattr(app, "get_recibo_data", lambda _: data)
+    monkeypatch.setattr(app.QMessageBox, "critical", Mock())
+    form = Mock(
+        current_user={"role": app.ROLE_ADMIN},
+        date_edit=QDateEdit(),
+        ars_combo=QComboBox(),
+        name_edit=QLineEdit(),
+        dx_edit=QLineEdit(),
+        authorization_edit=QLineEdit(),
+        coverage_combo=QComboBox(),
+        sala_spin=QDoubleSpinBox(),
+    )
+    form.coverage_combo.addItems(["Asegurado", "No asegurado"])
+    form.ars_combo.addItem("APS")
+    form.cart_has_ars_items.return_value = False
+    loaded = app.MainWindow.load_recibo_for_editing(form, 1)
+    if stored_date == "invalid":
+        assert not loaded
+        form.reset_all.assert_not_called()
+    else:
+        assert loaded
+        assert form.date_edit.date().toString("yyyy-MM-dd") == "2026-09-13"
+        assert form.ars_combo.currentText() == "ARS HISTORICA"
 
 
 @pytest.mark.parametrize(

@@ -115,7 +115,9 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
                 " 001-02 ", turn_filter="HEREDADO", allow_uninsured=False
             )
         self.assertEqual(result, [])
-        sql, params = next(call for call in connection.calls if "AS processing_turn_id" in call[0])
+        sql, params = next(
+            call for call in connection.calls if "AS processing_turn_id" in call[0]
+        )
         self.assertIn("admission_quick_list_dismissals", sql)
         self.assertIn("BANCOCENTRAL", sql)
         self.assertIn("UNIVERSAL", sql)
@@ -144,51 +146,87 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
             )
         sql, params = connection.calls[-1]
         self.assertIn("SIN_SEGURO", params)
-        self.assertIn(
-            "p.operational_source_id::TEXT=cs.operational_source_id", sql
-        )
+        self.assertIn("p.operational_source_id::TEXT=cs.operational_source_id", sql)
         self.assertIn("(%s='SIN_SEGURO' AND p.coverage_status=%s)", sql)
         self.assertTrue(params[2])
 
     def test_bypass_is_rejected_for_normal_role_before_database_write(self):
-        with patch.object(
-            app,
-            "get_user",
-            return_value={"username": "normal", "role": "facturador"},
-        ), patch.object(app, "db_connect") as connect:
+        with (
+            patch.object(
+                app,
+                "get_user",
+                return_value={"username": "normal", "role": "facturador"},
+            ),
+            patch.object(app, "db_connect") as connect,
+        ):
             with self.assertRaises(PermissionError):
                 app.save_receipt_with_items(
-                    None, 1, "Paciente", "2026-08-01", "DX", "HUMANO",
-                    0, 10, "", "normal", 0, "2026-08-01", [],
-                    verification_bypass={"reason": "motivo válido", "role": "facturador"},
+                    None,
+                    1,
+                    "Paciente",
+                    "2026-08-01",
+                    "DX",
+                    "HUMANO",
+                    0,
+                    10,
+                    "",
+                    "normal",
+                    0,
+                    "2026-08-01",
+                    [],
+                    verification_bypass={
+                        "reason": "motivo válido",
+                        "role": "facturador",
+                    },
                 )
         connect.assert_not_called()
 
     def test_authorized_bypass_creates_manual_origin_and_audit_events(self):
         connection = _SaveConnection()
-        with patch.object(
-            app,
-            "get_user",
-            return_value={"username": "audit", "role": app.ROLE_AUDIT},
-        ), patch.object(app, "db_connect", return_value=connection), patch.object(
-            app,
-            "save_receipt_document_snapshot",
-            return_value={"version": 1},
+        with (
+            patch.object(
+                app,
+                "get_user",
+                return_value={"username": "audit", "role": app.ROLE_AUDIT},
+            ),
+            patch.object(app, "db_connect", return_value=connection),
+            patch.object(
+                app,
+                "save_receipt_document_snapshot",
+                return_value={"version": 1},
+            ),
         ):
             saved_id = app.save_receipt_with_items(
-                None, 1, "Paciente", "2026-08-01", "DX", "HUMANO",
-                0, 10, "", "audit", 0, "2026-08-01", [],
-                verification_bypass={"reason": "emergencia administrativa", "role": app.ROLE_AUDIT},
+                None,
+                1,
+                "Paciente",
+                "2026-08-01",
+                "DX",
+                "HUMANO",
+                0,
+                10,
+                "",
+                "audit",
+                0,
+                "2026-08-01",
+                [],
+                verification_bypass={
+                    "reason": "emergencia administrativa",
+                    "role": app.ROLE_AUDIT,
+                },
             )
         self.assertEqual(saved_id, 77)
         joined = "\n".join(sql for sql, _params in connection.calls)
         self.assertIn("receipt_origin='MANUAL_PRIVILEGED'", joined)
-        self.assertTrue(any(
-            "PATIENT_VERIFICATION_BYPASSED" in params
-            for _sql, params in connection.calls
-        ))
+        self.assertTrue(
+            any(
+                "PATIENT_VERIFICATION_BYPASSED" in params
+                for _sql, params in connection.calls
+            )
+        )
         actions = [
-            params for sql, params in connection.calls
+            params
+            for sql, params in connection.calls
             if sql.startswith("INSERT INTO action_history")
         ]
         self.assertTrue(any("BYPASS_RECEIPT_CREATED" in params for params in actions))
@@ -202,20 +240,33 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
         for authorization, document_state, review_status, flagged in scenarios:
             with self.subTest(authorization=authorization):
                 connection = _SaveConnection()
-                with patch.object(
-                    app,
-                    "get_user",
-                    return_value={"username": "audit", "role": app.ROLE_AUDIT},
-                ), patch.object(
-                    app, "db_connect", return_value=connection
-                ), patch.object(
-                    app,
-                    "save_receipt_document_snapshot",
-                    return_value={"version": 1},
+                with (
+                    patch.object(
+                        app,
+                        "get_user",
+                        return_value={"username": "audit", "role": app.ROLE_AUDIT},
+                    ),
+                    patch.object(app, "db_connect", return_value=connection),
+                    patch.object(
+                        app,
+                        "save_receipt_document_snapshot",
+                        return_value={"version": 1},
+                    ),
                 ):
                     app.save_receipt_with_items(
-                        None, 2, "Paciente", "2026-08-01", "DX", "HUMANO",
-                        0, 10, "", "audit", 0, "2026-08-01", [],
+                        None,
+                        2,
+                        "Paciente",
+                        "2026-08-01",
+                        "DX",
+                        "HUMANO",
+                        0,
+                        10,
+                        "",
+                        "audit",
+                        0,
+                        "2026-08-01",
+                        [],
                         authorization_number=authorization,
                         verification_bypass={
                             "reason": "emergencia administrativa",
@@ -244,6 +295,8 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
 
     def test_editing_existing_bypass_reclassifies_authorization_without_attention(self):
         current = {
+            "nombre": "Paciente",
+            "fecha": "2026-08-01",
             "estado_facturacion": app.BILLING_PENDING,
             "revision_version": 0,
             "total": 10,
@@ -273,12 +326,16 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
                 return super().execute(sql, params)
 
         connection = EditingConnection()
-        with patch.object(
-            app, "get_user", return_value={"username": "audit", "role": app.ROLE_AUDIT}
-        ), patch.object(
-            app, "db_connect", return_value=connection
-        ), patch.object(
-            app, "save_receipt_document_snapshot", return_value={"version": 2}
+        with (
+            patch.object(
+                app,
+                "get_user",
+                return_value={"username": "audit", "role": app.ROLE_AUDIT},
+            ),
+            patch.object(app, "db_connect", return_value=connection),
+            patch.object(
+                app, "save_receipt_document_snapshot", return_value={"version": 2}
+            ),
         ):
             saved_id = app.save_receipt_with_items(
                 77,
@@ -320,14 +377,21 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
             return_value={"added": 2, "omitted": 1},
         ) as service:
             result = app.add_all_receipts_to_monthly_batch(
-                9, [1, 2, 3], {"username": "audit"},
-                date_from="2026-08-01", date_to="2026-08-31",
+                9,
+                [1, 2, 3],
+                {"username": "audit"},
+                date_from="2026-08-01",
+                date_to="2026-08-31",
             )
         self.assertEqual(result, {"added": 2, "omitted": 1})
         service.assert_called_once_with(
-            9, [1, 2, 3], {"username": "audit"},
-            date_from="2026-08-01", date_to="2026-08-31",
-            skip_ineligible=True, return_summary=True,
+            9,
+            [1, 2, 3],
+            {"username": "audit"},
+            date_from="2026-08-01",
+            date_to="2026-08-31",
+            skip_ineligible=True,
+            return_summary=True,
         )
 
     def test_validation_dialog_has_turns_history_and_privileged_actions(self):

@@ -16,18 +16,25 @@ def room_price(value) -> Decimal:
 
 
 def editable_billing_fields(
-    *, admin: bool, auxiliary: bool, validated: bool, read_only: bool
+    *,
+    admin: bool,
+    auxiliary: bool,
+    validated: bool,
+    read_only: bool,
+    editing: bool = False,
 ) -> dict:
-    editable = not read_only
-    can_identify = editable and not validated and not auxiliary
-    return {
-        "name_edit": can_identify,
-        "date_edit": can_identify,
-        "dx_edit": editable and (validated or not auxiliary),
-        "ars_combo": can_identify,
-        "coverage_combo": can_identify,
-        "sala_spin": editable and admin,
+    can_identify = not validated and not auxiliary
+    identity_editable = can_identify or (admin and editing)
+    insurance_editable = can_identify and not editing
+    fields = {
+        "name_edit": identity_editable,
+        "date_edit": identity_editable,
+        "dx_edit": validated or not auxiliary,
+        "ars_combo": insurance_editable,
+        "coverage_combo": insurance_editable,
+        "sala_spin": admin,
     }
+    return dict.fromkeys(fields, False) if read_only else fields
 
 
 def require_room_price(*, admin: bool, supplied, catalog, existing=None) -> None:

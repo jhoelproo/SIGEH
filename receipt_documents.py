@@ -290,7 +290,7 @@ def build_receipt_snapshot(
 
     generated_at = str(row["created_at"] or "")
     visible_user = str(
-        context.get("visible_user") or row["visible_user"] or row["username"] or "Sistema"
+        row["visible_user"] or row["username"] or "Sistema"
     )
     snapshot = {
         "schema_version": RECEIPT_SNAPSHOT_SCHEMA_VERSION,

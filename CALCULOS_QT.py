@@ -10808,6 +10808,8 @@ def save_receipt_with_items(
     verification_bypass=None,
 ):
     """Guarda cabecera, ítems, historial y snapshot con un solo commit."""
+    from receipt_edit_integrity import receipt_service_date, require_same_insurance
+    fecha = receipt_service_date(fecha)
     if str(ars or "").strip() and not medication_ars_is_selectable(ars):
         raise ValueError("SENASA SUBSIDIADO no se factura en este módulo.")
     from billing_field_policy import room_price
@@ -10923,7 +10925,7 @@ def save_receipt_with_items(
             receipt_id=recibo_id,
             user_context=actor_user,
         )
-        if admission_attention:
+        if admission_attention and not (editing and is_administrator(actor_user)):
             from billing_admission_edit import validate_admission_snapshot
             validate_admission_snapshot(
                 {"service_date": fecha}, {"service_date": attention_data.get("service_date") or attention_data.get("fecha")},
@@ -10964,6 +10966,7 @@ def save_receipt_with_items(
             ).fetchone()
             if not current:
                 raise ValueError("El recibo que intentas editar ya no existe.")
+            require_same_insurance(ars, coverage, dict(current))
             from billing_field_policy import require_validated_header_edit
             require_validated_header_edit(
                 auxiliary=normalize_role(actor_user.get("role")) == ROLE_AUX,
@@ -11339,6 +11342,8 @@ def save_receipt_with_items(
         if editing:
             revision_snapshot = {
                 "previous": {
+                    "name": str(current["nombre"] or ""),
+                    "service_date": str(current["fecha"] or ""),
                     "total": previous_total,
                     "room": float(current["sala"] or 0),
                     "ars": str(current["ars"] or ""),
@@ -11347,6 +11352,8 @@ def save_receipt_with_items(
                     "document_state": str(current["estado_documento"] or DOCUMENT_PRELIMINARY),
                 },
                 "new": {
+                    "name": str(nombre or ""),
+                    "service_date": str(fecha or ""),
                     "total": float(total),
                     "room": float(sala),
                     "ars": str(ars or ""),
@@ -29346,8 +29353,17 @@ def billing_readiness_presentation(
     authorization: str,
     privileged_unlinked: bool,
     low_height: bool = False,
+    editing: bool = False,
 ) -> tuple[str, bool, str]:
     """Fuente Ãºnica del estado visual de validaciÃ³n y auditorÃ­a."""
+    if editing:
+        has_authorization = bool(str(authorization or "").strip())
+        return (
+            "ready" if has_authorization else "validated",
+            has_authorization,
+            "EDICIÓN · Autorización registrada; sujeta a auditoría."
+            if has_authorization else "EDICIÓN · Sin autorización registrada.",
+        )
     ready_for_audit = billing_is_ready_for_audit(
         patient_validated=patient_validated,
         authorization=authorization,
@@ -35308,8 +35324,12 @@ class MainWindow(QMainWindow):
             auxiliary=normalize_role(self.current_user.get("role")) == ROLE_AUX,
             validated=bool(self.current_admission_attention),
             read_only=bool(getattr(self, "receipt_read_only", False)),
+            editing=getattr(self, "editing_recibo_id", None) is not None,
         )
-        if getattr(self, "service_type", "EMERGENCIA") == "CONSULTA":
+        if (
+            getattr(self, "service_type", "EMERGENCIA") == "CONSULTA"
+            and not (is_administrator(self.current_user) and getattr(self, "editing_recibo_id", None) is not None)
+        ):
             policy["sala_spin"] = False
         for name, editable in policy.items():
             widget = getattr(self, name, None)
@@ -35329,6 +35349,7 @@ class MainWindow(QMainWindow):
             authorization=self.authorization_edit.text(),
             privileged_unlinked=privileged_unlinked,
             low_height=low_height,
+            editing=getattr(self, "editing_recibo_id", None) is not None,
         )
         self.document_flow_hint.setProperty("state", state)
         self.document_flow_hint.setText(hint)
@@ -35589,6 +35610,8 @@ class MainWindow(QMainWindow):
     ):
         try:
             data = get_recibo_data(recibo_id)
+            from receipt_edit_integrity import receipt_service_date
+            service_date = receipt_service_date(data.get("fecha"))
         except Exception as exc:
             QMessageBox.critical(self, "Editar recibo", f"No se pudo cargar el recibo:\n{exc}")
             return False
@@ -35689,10 +35712,7 @@ class MainWindow(QMainWindow):
         self.name_edit.setText(data["nombre"])
         self.dx_edit.setText(data["dx"])
         self.authorization_edit.setText(data.get("numero_autorizacion") or "")
-        try:
-            self.date_edit.setDate(QDate.fromString(data["fecha"], "yyyy-MM-dd"))
-        except Exception:
-            pass
+        self.date_edit.setDate(QDate.fromString(service_date, "yyyy-MM-dd"))
 
         coverage = data.get("tipo_cobertura") or ("NO_ASEGURADO" if not data.get("ars") else "ASEGURADO")
         self.coverage_combo.setCurrentText("No asegurado" if coverage == "NO_ASEGURADO" else "Asegurado")
@@ -35700,7 +35720,8 @@ class MainWindow(QMainWindow):
         if ars_name in [self.ars_combo.itemText(i) for i in range(self.ars_combo.count())]:
             self.ars_combo.setCurrentText(ars_name)
         else:
-            self.ars_combo.setCurrentIndex(0)
+            self.ars_combo.addItem(ars_name)
+            self.ars_combo.setCurrentText(ars_name)
 
         self.sala_spin.setValue(float(data["sala"]))
 
@@ -35781,6 +35802,7 @@ class MainWindow(QMainWindow):
                 or self.current_admission_attention.get("admission_atencion_id")
             )
             try:
+                from receipt_edit_integrity import receipt_validation_snapshot
                 live_attention = get_projected_billable_attention(
                     int(attention_id),
                     str(
@@ -35793,7 +35815,10 @@ class MainWindow(QMainWindow):
                     ),
                     session_id=self.session_id,
                     receipt_id=self.editing_recibo_id,
-                    expected_snapshot=self.current_admission_attention,
+                    expected_snapshot=receipt_validation_snapshot(
+                        self.current_admission_attention,
+                        editable_header=(self.editing_recibo_id is not None and is_administrator(self.current_user)),
+                    ),
                     explain_denial=True,
                 )
             except ValueError as exc:
