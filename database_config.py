@@ -175,7 +175,10 @@ def read_bundled_database_url(path: Path) -> str:
 
 def _bundled_config_paths(root: Path) -> tuple[Path, ...]:
     bundle_root = getattr(sys, "_MEIPASS", None)
-    paths = [root / BUNDLED_DATABASE_FILE]
+    paths = [
+        root / BUNDLED_DATABASE_FILE,
+        root / "_internal" / BUNDLED_DATABASE_FILE,
+    ]
     if bundle_root:
         resource_path = Path(bundle_root) / BUNDLED_DATABASE_FILE
         if resource_path not in paths:
@@ -299,6 +302,49 @@ def install_database_url_for_child(
     for invalid_key in INVALID_DATABASE_KEYS:
         environment.pop(invalid_key, None)
     return value
+
+
+def _existing_install_candidates(
+    root: Path, environment: Mapping[str, str]
+) -> tuple[Path, ...]:
+    """Return bounded, conventional SIGEH locations without scanning user files."""
+    bases = [root.parent]
+    user_profile = str(environment.get("USERPROFILE") or "").strip()
+    if user_profile:
+        profile = Path(user_profile)
+        bases.append(profile / "Desktop")
+    for key in ("OneDrive", "OneDriveCommercial"):
+        one_drive = str(environment.get(key) or "").strip()
+        if one_drive:
+            bases.append(Path(one_drive) / "Desktop")
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    current = root.resolve()
+    for base in bases:
+        for name in ("SIGEH", "HOSPITAL"):
+            candidate = (base / name).resolve()
+            if candidate == current or candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def recover_database_url_from_existing_install(
+    base_dir: os.PathLike[str] | str,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Recover configuration from a known prior install after a direct download."""
+    root = Path(base_dir).resolve()
+    process_environment = os.environ if environment is None else environment
+    for install_root in _existing_install_candidates(root, process_environment):
+        for config_root in (install_root, install_root / "_internal"):
+            value, _source = _resolve_database_url_with_source(config_root, {})
+            if value:
+                return value
+    return ""
 
 
 def configured_database_keys(

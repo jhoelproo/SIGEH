@@ -67,6 +67,34 @@ def test_launcher_fails_when_database_configuration_cannot_be_resolved(
     assert backend_event["credentials_present"] is False
 
 
+def test_launcher_recovers_existing_install_for_direct_download(tmp_path, monkeypatch):
+    executable = tmp_path / "CALCULOS_QT.exe"
+    executable.write_bytes(b"test")
+    (tmp_path / "_internal").mkdir()
+    captured = {}
+    monkeypatch.setattr(portable_launcher, "portable_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        portable_launcher,
+        "install_database_url_for_child",
+        lambda environment, base_dir: "",
+    )
+    monkeypatch.setattr(
+        portable_launcher,
+        "recover_database_url_from_existing_install",
+        lambda root, environment: "postgresql://recovered",
+    )
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(portable_launcher.subprocess, "Popen", fake_popen)
+
+    assert portable_launcher.main() == 0
+    assert captured["env"]["DATABASE_URL"] == "postgresql://recovered"
+
+
 def test_self_test_validates_install_without_launching(tmp_path, monkeypatch):
     (tmp_path / "CALCULOS_QT.exe").write_bytes(b"test")
     (tmp_path / "_internal").mkdir()

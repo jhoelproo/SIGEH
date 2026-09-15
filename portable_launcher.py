@@ -13,8 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from database_config import (
+    CANONICAL_DATABASE_KEY,
     describe_database_configuration,
     install_database_url_for_child,
+    recover_database_url_from_existing_install,
 )
 
 LAUNCHER_LOG_NAME = "lanzador_log.txt"
@@ -38,7 +40,7 @@ def _sanitize_log_text(value: object) -> str:
 
 
 def _write_bootstrap_event(root: Path, event: str, **details: object) -> None:
-    payload = {
+    payload: dict[str, object] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "event": event,
         **{key: _sanitize_log_text(value) for key, value in details.items()},
@@ -98,7 +100,25 @@ def main() -> int:
             root, "LAUNCH_BOOTSTRAP", step="prepare_runtime", status="PASS"
         )
         description = describe_database_configuration(root, environment=environment)
-        if not install_database_url_for_child(environment, base_dir=root):
+        database_url = install_database_url_for_child(environment, base_dir=root)
+        if not database_url:
+            database_url = recover_database_url_from_existing_install(
+                root, environment=environment
+            )
+            if database_url:
+                environment[CANONICAL_DATABASE_KEY] = database_url
+                description = describe_database_configuration(
+                    root, environment=environment
+                )
+                description["config_source"] = "existing_install"
+                _write_bootstrap_event(
+                    root,
+                    "CONFIG_RECOVERY",
+                    status="PASS",
+                    error_code="",
+                    **description,
+                )
+        if not database_url:
             _write_bootstrap_event(
                 root,
                 "BACKEND_BOOTSTRAP",

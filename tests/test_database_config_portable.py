@@ -11,6 +11,7 @@ from database_config import (
     read_bundled_database_url,
     read_protected_env,
     read_sealed_database_url,
+    recover_database_url_from_existing_install,
     resolve_database_url,
     write_bundled_database_url,
     write_sealed_database_url,
@@ -24,6 +25,15 @@ def test_portable_bundle_resolves_without_env_or_local_dotenv(tmp_path: Path):
     assert resolve_database_url(tmp_path, environment={}) == value
     assert CANONICAL_DATABASE_KEY in configured_database_keys(tmp_path)
     assert value.encode("utf-8") not in (tmp_path / BUNDLED_DATABASE_FILE).read_bytes()
+
+
+def test_onedir_bundle_resolves_from_sibling_internal_directory(tmp_path: Path):
+    value = "postgresql://portable-user:portable-pass@central.example/hospital"
+    internal = tmp_path / "_internal"
+    internal.mkdir()
+    write_bundled_database_url(internal / BUNDLED_DATABASE_FILE, value)
+
+    assert resolve_database_url(tmp_path, environment={}) == value
 
 
 def test_process_database_url_has_priority_over_portable_bundle(tmp_path: Path):
@@ -124,3 +134,60 @@ def test_tampered_or_malformed_local_configuration_is_not_accepted(tmp_path: Pat
     assert read_bundled_database_url(bundle) == ""
     assert read_sealed_database_url(tmp_path / SEALED_DATABASE_FILE) == ""
     assert resolve_database_url(tmp_path, environment={}) == ""
+
+
+def test_direct_download_recovers_bundle_from_existing_desktop_install(
+    tmp_path: Path,
+):
+    user_profile = tmp_path / "user"
+    downloaded = user_profile / "Downloads" / "SIGEH"
+    previous_internal = user_profile / "Desktop" / "SIGEH" / "_internal"
+    downloaded.mkdir(parents=True)
+    previous_internal.mkdir(parents=True)
+    value = "postgresql://hospital-user:secret@central.example/hospital"
+    write_bundled_database_url(previous_internal / BUNDLED_DATABASE_FILE, value)
+
+    assert (
+        recover_database_url_from_existing_install(
+            downloaded, environment={"USERPROFILE": str(user_profile)}
+        )
+        == value
+    )
+
+
+def test_direct_download_does_not_scan_unrelated_desktop_directories(tmp_path: Path):
+    user_profile = tmp_path / "user"
+    downloaded = user_profile / "Downloads" / "SIGEH"
+    unrelated = user_profile / "Desktop" / "OTHER_APP" / "_internal"
+    downloaded.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    write_bundled_database_url(
+        unrelated / BUNDLED_DATABASE_FILE,
+        "postgresql://unrelated:secret@central.example/other",
+    )
+
+    assert (
+        recover_database_url_from_existing_install(
+            downloaded, environment={"USERPROFILE": str(user_profile)}
+        )
+        == ""
+    )
+
+
+def test_direct_download_recovers_one_drive_hospital_install_without_profile(
+    tmp_path: Path,
+):
+    one_drive = tmp_path / "OneDrive"
+    downloaded = tmp_path / "Downloads" / "SIGEH"
+    previous = one_drive / "Desktop" / "HOSPITAL"
+    downloaded.mkdir(parents=True)
+    previous.mkdir(parents=True)
+    value = "postgresql://hospital-user:secret@central.example/hospital"
+    write_bundled_database_url(previous / BUNDLED_DATABASE_FILE, value)
+
+    assert (
+        recover_database_url_from_existing_install(
+            downloaded, environment={"OneDrive": str(one_drive)}
+        )
+        == value
+    )
