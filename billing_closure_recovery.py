@@ -1,9 +1,28 @@
 """Recover effects of committed relays; never initiate or expire a turn."""
 
 from uuid import NAMESPACE_URL, uuid5
+from datetime import datetime
 
 from admission_bridge import AdmissionShiftClosure
 from billing_inheritance_scope import HOSPITAL_TIMEZONE, PENDING_RESTART_AT
+
+
+def install_closure_dispatch_schema(connection):
+    """Upgrade old installations and start automatic delivery prospectively."""
+    connection.execute(
+        "ALTER TABLE billing_shift_closure_details "
+        "ADD COLUMN IF NOT EXISTS global_attention_id UUID"
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS billing_closure_dispatch_policy(
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               enabled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+           )"""
+    )
+    connection.execute(
+        "INSERT INTO billing_closure_dispatch_policy(singleton) VALUES(1) "
+        "ON CONFLICT(singleton) DO NOTHING"
+    )
 
 
 def can_recover_closures(state):
@@ -53,6 +72,8 @@ def pending_central_closures(connection):
            JOIN admission_operational_sessions s USING(operational_session_id)
            JOIN sigeh_product_state product
              ON product.singleton=1 AND product.production_epoch_id=i.production_epoch_id
+           JOIN billing_closure_dispatch_policy policy
+             ON policy.singleton=1 AND i.ended_at>=policy.enabled_at
            JOIN LATERAL (
                SELECT username FROM admission_operational_audit audit
                WHERE audit.operational_session_id=i.operational_session_id
@@ -74,19 +95,43 @@ def pending_central_closures(connection):
     ).fetchall()
 
 
-def closed_turn_attentions(connection, event):
+def closed_turn_attentions(connection, event, *, previous=False):
+    turn_filter = "p.turn_id=%s"
+    parameters = (event.source_instance_id, event.turn_id)
+    if previous:
+        turn_filter = """p.turn_id IN (
+            SELECT i.turn_id FROM admission_operational_turn_intervals i
+            JOIN admission_operational_sessions s USING(operational_session_id)
+            WHERE s.operational_source_id::TEXT=%s
+              AND i.ended_at<=COALESCE((
+                  SELECT MIN(current_turn.started_at)
+                  FROM admission_operational_turn_intervals current_turn
+                  JOIN admission_operational_sessions current_session
+                    USING(operational_session_id)
+                  WHERE current_session.operational_source_id::TEXT=%s
+                    AND current_turn.turn_id=%s), %s)
+              AND i.ended_at>=%s AND i.turn_id<>%s)"""
+        parameters = (
+            event.source_instance_id,
+            event.source_instance_id,
+            event.source_instance_id,
+            event.turn_id,
+            datetime.fromisoformat(event.started_at).replace(tzinfo=HOSPITAL_TIMEZONE),
+            PENDING_RESTART_AT,
+            event.turn_id,
+        )
     return [
         dict(row)
         for row in connection.execute(
-            """SELECT p.*,p.patient_name AS name,p.nss_snapshot AS nss_clean,
+            f"""SELECT p.*,p.patient_name AS name,p.nss_snapshot AS nss_clean,
                   p.cedula_snapshot AS cedula_clean,p.service_type AS attention_type
            FROM admission_attention_projection p
-           WHERE p.operational_source_id::TEXT=%s AND p.turn_id=%s
+           WHERE p.operational_source_id::TEXT=%s AND {turn_filter}
              AND NOT COALESCE(p.is_deleted,FALSE)
              AND UPPER(COALESCE(p.source_status,'ACTIVA')) IN ('ACTIVA','PENDIENTE')
              AND NOT EXISTS(SELECT 1 FROM admission_quick_list_dismissals d
                  WHERE d.source_instance_id=p.source_instance_id
                    AND d.attention_id=p.attention_id AND d.is_active)""",
-            (event.source_instance_id, event.turn_id),
+            parameters,
         ).fetchall()
     ]

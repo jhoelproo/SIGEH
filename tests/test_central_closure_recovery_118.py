@@ -21,6 +21,9 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
         epoch, session, source = (str(uuid4()) for _ in range(3))
         with app.db_connect() as con:
             con.execute(
+                "UPDATE billing_closure_dispatch_policy SET enabled_at='2026-09-07 00:00:00-04'"
+            )
+            con.execute(
                 """INSERT INTO sigeh_product_state(singleton,product_id,
                 bootstrap_version,production_epoch_id,bootstrap_status,bootstrap_completed_at)
                 VALUES(1,'SIGEH','1.1.8',%s,'COMPLETED',NOW())""",
@@ -58,8 +61,8 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
                         session,
                         turn,
                         turn,
-                        f"2026-09-{day:02} 08:00:00-04",
-                        f"2026-09-{end:02} 08:00:00-04",
+                        f"2026-09-{day:02} 08:00:00.123456-04",
+                        f"2026-09-{end:02} 08:00:00.123456-04",
                         epoch,
                     ),
                 )
@@ -112,7 +115,18 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
                 == "ORIGINAL"
             )
             pending = pending_central_closures(con)
+            next_event = closure_from_interval(dict(pending[1]))
+            assert len(closed_turn_attentions(con, next_event, previous=True)) == 2
             con.execute("SAVEPOINT boundaries")
+            con.execute(
+                "UPDATE billing_closure_dispatch_policy SET enabled_at='2026-09-10 08:00:01-04'"
+            )
+            assert pending_central_closures(con) == []
+            con.execute(
+                "UPDATE billing_closure_dispatch_policy SET enabled_at='2026-09-10 08:00:00-04'"
+            )
+            assert len(pending_central_closures(con)) == 1
+            con.execute("ROLLBACK TO SAVEPOINT boundaries")
             con.execute(
                 "UPDATE admission_operational_turn_intervals SET ended_at='2026-09-07 00:00:00-04',started_at='2026-09-06 08:00:00-04'"
             )
@@ -147,6 +161,38 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
             con.execute("ROLLBACK TO SAVEPOINT boundaries")
             con.execute("RELEASE SAVEPOINT boundaries")
         assert len(pending) == 3
+        # A future close must include pending prior admissions even when the
+        # operator deliberately does not regenerate the missing older reports.
+        newest = closure_from_interval(dict(pending[-1]))
+        snapshot = app.capture_shift_closure_snapshot(newest, [])
+        assert snapshot["inherited_received"] == 1
+        assert snapshot["pending_next"] == 1
+        for authorization_at, received, authorized, remaining in [
+            ("2026-09-09 09:00:00", 1, 1, 0),
+            ("2026-09-10 09:00:00", 1, 0, 1),
+            ("2026-09-08 09:00:00", 0, 0, 0),
+        ]:
+            with app.db_connect() as con:
+                con.execute("DELETE FROM billing_shift_closure_details")
+                con.execute("DELETE FROM billing_shift_closures")
+                con.execute("DELETE FROM admission_shift_inheritances")
+                con.execute("DELETE FROM recibos WHERE numero=999123")
+                con.execute(
+                    """INSERT INTO recibos(numero,fecha,created_at,numero_autorizacion,
+                    autorizacion_at,admission_global_attention_id,admission_atencion_id,
+                    admission_source_instance_id) VALUES
+                    (999123,'2026-09-07','2026-09-07 12:00:00','AUTH-123',%s,%s,1,'station')""",
+                    (authorization_at, global_id),
+                )
+            snapshot = app.capture_shift_closure_snapshot(newest, [])
+            assert snapshot["inherited_received"] == received
+            assert snapshot["inherited_authorized"] == authorized
+            assert snapshot["pending_next"] == remaining
+        with app.db_connect() as con:
+            con.execute("DELETE FROM billing_shift_closure_details")
+            con.execute("DELETE FROM billing_shift_closures")
+            con.execute("DELETE FROM admission_shift_inheritances")
+            con.execute("DELETE FROM recibos WHERE numero=999123")
         for index, interval in enumerate(pending):
             event = closure_from_interval(dict(interval))
             with app.db_connect() as con:

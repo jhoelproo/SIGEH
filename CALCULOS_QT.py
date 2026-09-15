@@ -2960,6 +2960,9 @@ def db_init():
         _apply_action_history_migration(con)
         _apply_active_sessions_migration(con)
         _apply_billing_shift_closure_snapshot_migration(con)
+        from billing_closure_recovery import install_closure_dispatch_schema
+
+        install_closure_dispatch_schema(con)
         _apply_admission_validation_history_migration(con)
         # The bridge indexes require columns installed by the hybrid schema.
         _apply_admission_hybrid_migration(con)
@@ -3494,6 +3497,15 @@ def db_init():
 
 
 _BOOTSTRAP_REQUIRED_SCHEMA = {
+    "billing_closure_dispatch_policy": {"singleton", "enabled_at"},
+    "billing_shift_closure_details": {
+        "closure_source_instance_id",
+        "closure_turn_id",
+        "attention_source_instance_id",
+        "attention_id",
+        "global_attention_id",
+        "classification",
+    },
     "users": {"id", "username", "role", "is_active"},
     "recibos": {
         "id",
@@ -3700,7 +3712,16 @@ def prepare_database_schema() -> str:
             "column:admission_operational_sessions.operational_revision",
             "column:admission_operational_sessions.turn_code",
         }
-        if missing and set(missing).issubset(operational_snapshot_columns):
+        closure_dispatch_columns = {
+            "column:billing_shift_closure_details.global_attention_id",
+            "table:billing_closure_dispatch_policy",
+        }
+        if missing and set(missing).issubset(closure_dispatch_columns):
+            from billing_closure_recovery import install_closure_dispatch_schema
+
+            with db_connect() as con:
+                install_closure_dispatch_schema(con)
+        elif missing and set(missing).issubset(operational_snapshot_columns):
             with db_connect() as con:
                 if "column:admission_operational_sessions.operational_revision" in missing:
                     con.execute(
@@ -8423,28 +8444,74 @@ def _link_shift_receipts(records: list[dict], receipts: list[dict]) -> dict:
     return linked
 
 
-def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> dict:
-    """Captura una vez el estado del turno y de sus pendientes heredadas."""
+def _closure_text_fields(data):
+    fields = {
+        "global_attention_id": "global_attention_id",
+        "service_date": "service_date",
+        "service_time": "service_time",
+        "patient_name": "name",
+        "nss_snapshot": "nss_clean",
+        "cedula_snapshot": "cedula_clean",
+        "admission_username": "admission_username",
+        "source_updated_at": "source_updated_at",
+    }
+    return {target: str(data.get(source) or "") for target, source in fields.items()}
+
+
+def _closure_attention_records(event, attentions, *, inherited=False):
     current = []
     for attention in attentions:
-        data = attention.snapshot() if isinstance(attention, AdmissionAttention) else dict(attention)
+        data = (
+            attention.snapshot()
+            if isinstance(attention, AdmissionAttention)
+            else dict(attention)
+        )
         if not _eligible_shift_attention(data):
             continue
-        current.append({
-            "source_instance_id": str(data.get("source_instance_id") or event.source_instance_id),
-            "attention_id": int(data["attention_id"]),
-            "global_attention_id": str(data.get("global_attention_id") or ""),
-            "original_turn_id": int(data.get("turn_id") or event.turn_id),
-            "service_date": str(data.get("service_date") or ""),
-            "service_time": str(data.get("service_time") or ""),
-            "patient_name": str(data.get("name") or ""),
-            "ars": str(data.get("canonical_ars") or data.get("ars") or ""),
-            "nss_snapshot": str(data.get("nss_clean") or ""),
-            "cedula_snapshot": str(data.get("cedula_clean") or ""),
-            "admission_username": str(data.get("admission_username") or ""),
-            "source_updated_at": str(data.get("source_updated_at") or ""),
-            "inherited": False,
-        })
+        current.append(
+            {
+                **_closure_text_fields(data),
+                "source_instance_id": str(
+                    data.get("source_instance_id") or event.source_instance_id
+                ),
+                "attention_id": int(data["attention_id"]),
+                "original_turn_id": int(data.get("turn_id") or event.turn_id),
+                "ars": str(data.get("canonical_ars") or data.get("ars") or ""),
+                "inherited": inherited,
+            }
+        )
+    return current
+
+
+def _uncaptured_inherited_records(con, event):
+    from billing_closure_recovery import closed_turn_attentions
+
+    return _closure_attention_records(
+        event, closed_turn_attentions(con, event, previous=True), inherited=True
+    )
+
+
+def _pending_records_at_start(con, records, started_at):
+    receipts = _receipt_candidates_for_shift(con, records, started_at)
+    linked = _link_shift_receipts(records, receipts)
+    return [
+        record
+        for record in records
+        if not _valid_shift_authorization(
+            str(
+                (
+                    linked.get((record["source_instance_id"], record["attention_id"]))
+                    or {}
+                ).get("numero_autorizacion")
+                or ""
+            ).strip()
+        )
+    ]
+
+
+def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> dict:
+    """Captura una vez el estado del turno y de sus pendientes heredadas."""
+    current = _closure_attention_records(event, attentions)
     with db_connect() as con:
         _insert_shift_closure_header(con, event)
         header = con.execute(
@@ -8510,6 +8577,9 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
             ]
 
         merged = {}
+        inherited = _pending_records_at_start(
+            con, _uncaptured_inherited_records(con, event) + inherited, event.started_at
+        )
         for record in inherited + current:
             key = (record["source_instance_id"], record["attention_id"])
             if key in merged and merged[key]["inherited"]:
