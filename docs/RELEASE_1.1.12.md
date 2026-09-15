@@ -15,4 +15,4 @@ Validaciones ejecutadas: 1.538 pruebas y 60 subpruebas PASS, 0 FAIL; una prueba 
 
 SHA-256 del ZIP: `d994eeaff28c55a6a60a33bbd5e2eea429cb3c8a548f71099d2c618a555e58e9`.
 
-Estado: borrador pendiente de cerrar el caso individual de fecha indicado en el informe de QA. No distribuir todavía a producción.
+El caso individual de fecha indicado en el informe de QA queda fuera de esta entrega por instrucción expresa del usuario.

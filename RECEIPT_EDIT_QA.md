@@ -90,13 +90,13 @@ Smoke adicional del ZIP 1.1.12 extraído: `SIGEH.exe --self-test`, `CALCULOS_QT.
 | Build final / smoke PDF del ejecutable | PASS |
 | Seguridad de las modificaciones | PASS |
 | Impresión física | N/A: esta tarea no modifica el envío a impresora |
-| Causa del caso histórico de fecha incorrecta | NO VERIFICADO |
-| Corrección de ese registro productivo | NO VERIFICADO: no ejecutada |
+| Causa del caso histórico de fecha incorrecta | N/A: excluida de la entrega por instrucción del usuario |
+| Corrección de ese registro productivo | N/A: se lanzará sin resolver ese caso |
 
 ## Problemas pendientes
 
-El usuario indicó que la fecha de servicio correcta era **13/09/2026**. Está pendiente confirmar que corresponde al recibo **990252**, seleccionado en la captura, y contrastarlo con el registro antes de cualquier corrección de datos. Las capturas no permiten afirmar por qué quedó con otra fecha. La normalización implementada evita fechas inválidas y sustituciones silenciosas al cargar; no se presenta como causa raíz demostrada de ese caso ni modifica automáticamente fechas históricas.
+El usuario indicó que la fecha de servicio correcta era **13/09/2026**, pero no confirmó el número del recibo. Por instrucción expresa, la 1.1.12 se publica sin corregir ese registro. La normalización implementada evita fechas inválidas y sustituciones silenciosas al cargar; no modifica automáticamente fechas históricas.
 
-El usuario autorizó publicar la siguiente versión cuando termine el trabajo. El paquete 1.1.12 pasó las comprobaciones técnicas y está preparado para un borrador de release. La publicación productiva queda pendiente del punto anterior; no se interpreta la autorización de lanzamiento como confirmación del número de recibo.
+El usuario autorizó publicar la siguiente versión y excluyó explícitamente el caso individual de fecha. El paquete 1.1.12 pasó las comprobaciones técnicas y está aprobado para publicación.
 
-ESTADO FINAL: NO APROBADO PARA ENTREGA
+ESTADO FINAL: APROBADO PARA ENTREGA
