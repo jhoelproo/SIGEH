@@ -27293,6 +27293,8 @@ class ReportsDialog(LegacyReportsDialog):
         QDialog.__init__(self, parent)
         self.setObjectName("ReportsDialog")
         self.current_user = current_user
+        self._report_document_worker = None
+        self._report_document_export_worker = None
         self.panel_access = is_administrator(current_user)
         self.dashboard_data = None
         self._dashboard_snapshot_record_id = None

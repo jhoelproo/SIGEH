@@ -168,8 +168,16 @@ def test_history_print_preview_uses_integrated_viewer():
     parent._report_document_open_ready.assert_called_once_with("history.pdf")
 
 
+@pytest.mark.parametrize(
+    "dialog_type,button_name",
+    [
+        (app.LegacyReportsDialog, "btn_open"),
+        (app.ReportsDialog, "btn_open"),
+        (app.ReportsDialog, "btn_history_print"),
+    ],
+)
 def test_history_button_resolves_and_opens_report_in_integrated_viewer(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, dialog_type, button_name
 ):
     qt_app = QApplication.instance() or QApplication([])
     pdf_path = tmp_path / "closure.pdf"
@@ -192,11 +200,15 @@ def test_history_button_resolves_and_opens_report_in_integrated_viewer(
     monkeypatch.setattr(app, "ars_list", lambda: [])
     monkeypatch.setattr(app, "list_usernames", lambda: [])
     monkeypatch.setattr(app, "list_report_history", lambda: [row])
-    monkeypatch.setattr(app, "resolve_report_document", lambda *_args, **_kwargs: str(pdf_path))
-    dialog = app.LegacyReportsDialog({"username": "audit", "role": app.ROLE_AUDIT})
+    monkeypatch.setattr(
+        app, "resolve_report_document", lambda *_args, **_kwargs: str(pdf_path)
+    )
+    dialog = dialog_type({"username": "audit", "role": app.ROLE_AUDIT})
     try:
         dialog.show()
-        QTest.mouseClick(dialog.btn_open, Qt.LeftButton)
+        if isinstance(dialog, app.ReportsDialog):
+            dialog.tabs.setCurrentIndex(dialog.tabs.count() - 1)
+        QTest.mouseClick(getattr(dialog, button_name), Qt.LeftButton)
         for _ in range(100):
             qt_app.processEvents()
             preview = getattr(dialog, "_report_preview_dialog", None)
