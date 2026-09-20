@@ -2,6 +2,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
+from PyPDF2 import PdfWriter
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
 
 import CALCULOS_QT as app
 import billing_closure_recovery as recovery
@@ -155,13 +159,59 @@ def test_history_open_shows_view_or_visible_error(monkeypatch, failure):
     )
     assert warning.call_count == int(failure)
     if not failure:
-        dialog.return_value.open.assert_called_once()
+        dialog.return_value.show.assert_called_once()
 
 
 def test_history_print_preview_uses_integrated_viewer():
     parent = SimpleNamespace(_report_document_open_ready=Mock())
     app.ReportsDialog._show_prepared_report_print(parent, "history.pdf")
     parent._report_document_open_ready.assert_called_once_with("history.pdf")
+
+
+def test_history_button_resolves_and_opens_report_in_integrated_viewer(
+    tmp_path, monkeypatch
+):
+    qt_app = QApplication.instance() or QApplication([])
+    pdf_path = tmp_path / "closure.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=300, height=300)
+    with pdf_path.open("wb") as stream:
+        writer.write(stream)
+    row = {
+        "record_id": 7,
+        "source_key": "V15-CENTRAL|7",
+        "source_table": "billing_shift_closures",
+        "report_type": "Cierre automático de turno",
+        "start_date": "2026-09-18",
+        "end_date": "2026-09-18",
+        "generated_at": "2026-09-19 08:00:00",
+        "generated_by": "SISTEMA",
+        "filepath": pdf_path.name,
+        "totals_json": "{}",
+    }
+    monkeypatch.setattr(app, "ars_list", lambda: [])
+    monkeypatch.setattr(app, "list_usernames", lambda: [])
+    monkeypatch.setattr(app, "list_report_history", lambda: [row])
+    monkeypatch.setattr(app, "resolve_report_document", lambda *_args, **_kwargs: str(pdf_path))
+    dialog = app.LegacyReportsDialog({"username": "audit", "role": app.ROLE_AUDIT})
+    try:
+        dialog.show()
+        QTest.mouseClick(dialog.btn_open, Qt.LeftButton)
+        for _ in range(100):
+            qt_app.processEvents()
+            preview = getattr(dialog, "_report_preview_dialog", None)
+            if preview is not None and preview.isVisible():
+                break
+            QTest.qWait(10)
+        preview = dialog._report_preview_dialog
+        assert preview.isVisible()
+        assert preview._pdf_document.pageCount() == 1
+        assert dialog.btn_open.isEnabled()
+    finally:
+        preview = getattr(dialog, "_report_preview_dialog", None)
+        if preview is not None:
+            preview.close()
+        dialog.close()
 
 
 @pytest.mark.parametrize("failure", [False, True])

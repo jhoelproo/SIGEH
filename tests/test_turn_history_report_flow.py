@@ -57,6 +57,8 @@ def test_select_historical_shift_generates_original_user_dataset(tmp_path, monke
             for button in controller.reporte_win.findChildren(QPushButton)
             if button.text() == "Historial de turnos"
         )
+        assert history_button.parent() is controls["pdf_button"].parent()
+        assert controls["turn_history_button"] is history_button
         history_button.click()
         history = controller.reporte_win.findChild(AdmissionTurnHistoryDialog)
         assert history.isVisible()

@@ -49,12 +49,25 @@ def test_loading_blocks_duplicate_search_and_selection(dialog):
     dialog.loaded(rows(51))
     assert dialog.table.rowCount() == 50
     assert dialog.next.isEnabled()
+    assert not dialog.previous.isEnabled()
     dialog.next_page()
     assert dialog.controller._ejecutar_en_segundo_plano.call_count == 2
     dialog.loaded(rows(1))
     assert not dialog.next.isEnabled()
+    assert dialog.previous.isEnabled()
     dialog.choose()
     dialog.selected.assert_called_once_with(rows(1)[0])
+
+
+def test_previous_page_returns_to_first_cursor(dialog):
+    dialog.loaded(rows(51))
+    dialog.next_page()
+    dialog.loaded(rows(2))
+    dialog.previous_page()
+    job = dialog.controller._ejecutar_en_segundo_plano.call_args.args[1]
+    job()
+    assert dialog.controller.db.search_admission_turns.call_args.args[-1] is None
+    assert dialog.page_index == 0
 
 
 def test_filter_changes_clear_old_page_and_cursor(dialog):

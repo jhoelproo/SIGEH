@@ -10037,7 +10037,7 @@ class App:
             values=["Turno actual", "Turno anterior", "Todos los turnos", "Turno seleccionado"],
             width=22,
         )
-        combo_turno.grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=4)
+        combo_turno.grid(row=2, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
 
         def select_historical_turn(turn):
             historical_turn["selection"] = turn
@@ -10053,9 +10053,6 @@ class App:
             dialog.open()
             dialog.user.setFocus()
 
-        tb.Button(filtros, text="Historial de turnos", bootstyle=INFO, command=open_turn_history).grid(
-            row=2, column=3, sticky="ew", padx=4, pady=4,
-        )
         tb.Label(filtros, text="Desde").grid(row=3, column=0, sticky="w", padx=4, pady=4)
         fecha_inicio.grid(row=3, column=1, sticky="ew", padx=4, pady=4)
         tb.Label(filtros, text="Hasta").grid(row=3, column=2, sticky="w", padx=4, pady=4)
@@ -10494,6 +10491,14 @@ class App:
         button_row = tb.Frame(barra, style="Card.TFrame")
         button_row.pack(fill="x")
         tb.Button(button_row, text="📊  Generar reporte", bootstyle=PRIMARY, command=generar, width=20).pack(side="left", padx=5, ipady=5)
+        history_button = tb.Button(
+            button_row,
+            text="Historial de turnos",
+            bootstyle=INFO,
+            command=open_turn_history,
+            width=20,
+        )
+        history_button.pack(side="left", padx=5, ipady=5)
         pdf_button = tb.Button(button_row, text="📄  Crear / abrir PDF", bootstyle=SUCCESS, command=guardar_pdf, width=20)
         pdf_button.pack(side="left", padx=5, ipady=5)
         excel_button = tb.Button(button_row, text="📗  Exportar Excel", bootstyle=INFO, command=guardar_excel_reporte, width=18)
@@ -10521,6 +10526,7 @@ class App:
             "cards_frame": cards,
             "preview_card": preview_card,
             "generate": generar,
+            "turn_history_button": history_button,
             "clear": limpiar_filtros,
             "pdf_button": pdf_button,
             "excel_button": excel_button,

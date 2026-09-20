@@ -14523,15 +14523,15 @@ class ComparisonPdfDialog(QDialog):
         from PySide6.QtPdfWidgets import QPdfView
 
         self.setWindowTitle("Reporte histórico")
-        document = QPdfDocument(self)
-        error = document.load(self.pdf_path)
-        if error != QPdfDocument.Error.None_ or document.pageCount() == 0:
+        self._pdf_document = QPdfDocument(self)
+        error = self._pdf_document.load(self.pdf_path)
+        if error != QPdfDocument.Error.None_ or self._pdf_document.pageCount() == 0:
             raise OSError("El archivo PDF no contiene páginas legibles.")
-        view = QPdfView(self)
-        view.setDocument(document)
-        view.setPageMode(QPdfView.PageMode.MultiPage)
-        view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
-        return view
+        self._pdf_view = QPdfView(self)
+        self._pdf_view.setDocument(self._pdf_document)
+        self._pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+        self._pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        return self._pdf_view
 
 
 def _clean_name(s: str):
@@ -27068,7 +27068,7 @@ class LegacyReportsDialog(QDialog):
             self._report_preview_dialog = preview
             preview.setAttribute(Qt.WA_DeleteOnClose)
             preview.setWindowModality(Qt.WindowModal)
-            preview.open()
+            preview.show()
             preview.raise_()
             preview.activateWindow()
         except Exception as exc:
@@ -37676,6 +37676,31 @@ def run_pdf_self_test(output_path: str) -> int:
         return 1
 
 
+def run_report_viewer_self_test(pdf_path: str) -> int:
+    """Comprueba que el visor histórico empaquetado conserva y muestra el PDF."""
+    try:
+        qt_app = QApplication.instance() or QApplication([])
+        preview = ComparisonPdfDialog(
+            os.path.abspath(pdf_path),
+            dialog_title="Reporte histórico",
+            detail_text="Autodiagnóstico del visor integrado.",
+        )
+        preview.setAttribute(Qt.WA_DontShowOnScreen)
+        preview.show()
+        qt_app.processEvents()
+        valid = (
+            preview.isVisible()
+            and preview._pdf_document.pageCount() > 0
+            and preview._pdf_view.document() is preview._pdf_document
+        )
+        preview.close()
+        qt_app.processEvents()
+        return 0 if valid else 2
+    except Exception as exc:
+        write_runtime_log(f"Autodiagnóstico del visor de reportes falló: {exc}")
+        return 1
+
+
 def run_report_exports_self_test(output_dir: str) -> int:
     """Valida los recursos de reportes, Excel y Playwright del paquete onedir."""
     try:
@@ -38215,6 +38240,8 @@ if __name__ == "__main__":
         raise SystemExit(run_config_users_ui_check(sys.argv[2]))
     if len(sys.argv) == 3 and sys.argv[1] == "--self-test-pdf":
         raise SystemExit(run_pdf_self_test(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-test-report-viewer":
+        raise SystemExit(run_report_viewer_self_test(sys.argv[2]))
     if len(sys.argv) == 3 and sys.argv[1] == "--self-test-reports":
         raise SystemExit(run_report_exports_self_test(sys.argv[2]))
     raise SystemExit(main())

@@ -78,12 +78,22 @@ def test_history_view_displays_pages_and_rejects_invalid_pdf(tmp_path, monkeypat
     application.processEvents()
     view = dialog.findChild(QPdfView)
     assert view.document().pageCount() == 2
+    assert dialog._pdf_document is view.document()
+    assert dialog._pdf_view is view
     assert dialog.isVisible()
     dialog.close()
     assert not dialog.isVisible()
     path.write_bytes(b"invalid")
     with pytest.raises(OSError, match="páginas legibles"):
         app.ComparisonPdfDialog(str(path), dialog_title="Reporte histórico")
+
+
+def test_packaged_report_viewer_self_test_contract(tmp_path):
+    import CALCULOS_QT as app
+
+    pdf_path = tmp_path / "viewer-self-test.pdf"
+    write_pdf(pdf_path, pages=1)
+    assert app.run_report_viewer_self_test(str(pdf_path)) == 0
 
 
 def test_regular_report_dialog_does_not_require_embedded_pdf(tmp_path):
