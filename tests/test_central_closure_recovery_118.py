@@ -165,7 +165,8 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
         # operator deliberately does not regenerate the missing older reports.
         newest = closure_from_interval(dict(pending[-1]))
         snapshot = app.capture_shift_closure_snapshot(newest, [])
-        assert snapshot["inherited_received"] == 1
+        assert snapshot["inherited_received"] == 0
+        assert app.build_shift_closure_report_data(snapshot)["historical_received"] == 1
         assert snapshot["pending_next"] == 1
         for authorization_at, received, authorized, remaining in [
             ("2026-09-09 09:00:00", 1, 1, 0),
@@ -181,12 +182,14 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
                     """INSERT INTO recibos(numero,fecha,created_at,numero_autorizacion,
                     autorizacion_at,admission_global_attention_id,admission_atencion_id,
                     admission_source_instance_id) VALUES
-                    (999123,'2026-09-07','2026-09-07 12:00:00','AUTH-123',%s,%s,1,'station')""",
+                    (999123,'2026-09-07','2026-09-07 12:00:00','AUTH-1234',%s,%s,1,'station')""",
                     (authorization_at, global_id),
                 )
             snapshot = app.capture_shift_closure_snapshot(newest, [])
-            assert snapshot["inherited_received"] == received
-            assert snapshot["inherited_authorized"] == authorized
+            assert snapshot["inherited_received"] == 0
+            data = app.build_shift_closure_report_data(snapshot)
+            assert data["historical_received"] == received
+            assert data["historical_authorized"] == authorized
             assert snapshot["pending_next"] == remaining
         with app.db_connect() as con:
             con.execute("DELETE FROM billing_shift_closure_details")
@@ -199,7 +202,7 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
                 rows = closed_turn_attentions(con, event)
             snapshot = app.capture_shift_closure_snapshot(event, rows)
             assert snapshot["pending_next"] == 1
-            assert snapshot["inherited_received"] == (0 if index == 0 else 1)
+            assert snapshot["inherited_received"] == (1 if index == 1 else 0)
             assert not app.capture_shift_closure_snapshot(event, rows)[
                 "snapshot_created"
             ]

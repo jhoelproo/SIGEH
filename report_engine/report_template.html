@@ -39,11 +39,22 @@
       <article class="kpi blue"><span>Elegibles del turno</span><strong>{{ data.eligible_current }}</strong></article>
       <article class="kpi green"><span>Autorizadas del turno</span><strong>{{ data.authorized_current }}</strong></article>
       <article class="kpi orange"><span>Pendientes nuevas</span><strong>{{ data.new_pending }}</strong></article>
-      <article class="kpi purple"><span>Heredadas recibidas</span><strong>{{ data.inherited_received }}</strong></article>
-      <article class="kpi green"><span>Heredadas autorizadas</span><strong>{{ data.inherited_authorized }}</strong></article>
+      <article class="kpi purple"><span>{{ 'Heredadas del turno anterior' if data.get('classification_version', 1) >= 2 else 'Heredadas recibidas' }}</span><strong>{{ data.inherited_received }}</strong></article>
+      <article class="kpi green"><span>Heredadas facturadas</span><strong>{{ data.inherited_authorized }}</strong></article>
       <article class="kpi orange"><span>Pendientes finales</span><strong>{{ data.pending_next }}</strong></article>
+      {% if data.get('classification_version', 1) >= 2 %}
+      <article class="kpi purple"><span>Históricas pendientes al inicio</span><strong>{{ data.get('historical_received', 0) }}</strong></article>
+      <article class="kpi green"><span>Históricas facturadas en el turno</span><strong>{{ data.get('historical_authorized', 0) }}</strong></article>
+      <article class="kpi orange"><span>Históricas pendientes al cierre</span><strong>{{ data.get('historical_pending', 0) }}</strong></article>
+      {% endif %}
     </section>
     <section class="filter-summary">
+      {% if data.get('classification_version', 1) >= 2 %}
+      Facturada: autorización con al menos cuatro dígitos registrada antes del cierre.
+      Heredada: pendiente originada en el turno inmediatamente anterior. Histórica: de un turno más antiguo.
+      {% else %}
+      Cierre conservado con las reglas vigentes al capturarlo. Las heredadas incluyen pendientes de turnos anteriores.
+      {% endif %}
       <strong>Total trabajado aplicable:</strong> {{ data.worked_applicable }} ·
       <strong>Total autorizado aplicable:</strong> {{ data.authorized_applicable }} ·
       <strong>Porcentaje autorizado:</strong> {{ "{:.1f}%".format(data.authorization_rate) }}.
@@ -52,7 +63,6 @@
       <article class="chart-card"><h4>Estado al cierre</h4>{{ status_donut_svg|safe }}</article>
       <article class="chart-card"><h4>Autorizaciones por ARS</h4>{{ ars_amount_svg|safe }}</article>
     </section>
-    <div class="page-break"></div>
     <section class="table-card page-break-avoid">
       <h4>Control por ARS</h4>
       <table><thead><tr><th>ARS</th><th>Trabajadas</th><th>Autorizadas</th><th>Pendientes</th></tr></thead>

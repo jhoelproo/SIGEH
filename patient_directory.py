@@ -309,6 +309,36 @@ class CentralPatientDirectoryRepository:
             rows = self._find_by_document(con, nss=normalized)
         return self._payload(rows[0]) if len(rows) == 1 else None
 
+    @staticmethod
+    def _validate_changed_documents(con, patient_id, current, desired):
+        changed = {
+            field: desired[field + "_normalized"]
+            for field in ("cedula", "nss")
+            if desired[field + "_normalized"] != normalize_patient_document(current[field])
+        }
+        if not any(changed.values()):
+            return
+        for document_key in sorted(set(changed.values()) - {""}):
+            con.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                (f"admission-patient-document:{document_key}",),
+            )
+        cedula, nss = changed.get("cedula", ""), changed.get("nss", "")
+        duplicate = con.execute(
+            """SELECT global_patient_id::TEXT
+                 FROM admission_patient_directory
+                WHERE is_deleted=FALSE AND global_patient_id<>%s::UUID
+                  AND ((%s<>'' AND cedula_normalized=%s)
+                       OR (%s<>'' AND nss_normalized=%s))
+                LIMIT 1""",
+            (patient_id, cedula, cedula, nss, nss),
+        ).fetchone()
+        if duplicate:
+            raise PatientDirectoryConflict(
+                "La cédula o el NSS indicado ya pertenece a otro paciente. "
+                "Revise el identificador modificado; no se combinaron las fichas."
+            )
+
     def update_patient(
         self,
         global_patient_id: str,
@@ -391,40 +421,7 @@ class CentralPatientDirectoryRepository:
                 raise PatientDirectoryConflict(
                     "El paciente fue modificado en otra estación. Recargue los datos e intente de nuevo."
                 )
-            for document_key in sorted(
-                {
-                    value
-                    for value in (
-                        desired["cedula_normalized"],
-                        desired["nss_normalized"],
-                    )
-                    if value
-                }
-            ):
-                con.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
-                    (f"admission-patient-document:{document_key}",),
-                )
-            duplicate = con.execute(
-                """SELECT global_patient_id::TEXT
-                     FROM admission_patient_directory
-                    WHERE is_deleted=FALSE
-                      AND global_patient_id<>%s::UUID
-                      AND ((%s<>'' AND cedula_normalized=%s)
-                           OR (%s<>'' AND nss_normalized=%s))
-                    LIMIT 1""",
-                (
-                    patient_id,
-                    desired["cedula_normalized"],
-                    desired["cedula_normalized"],
-                    desired["nss_normalized"],
-                    desired["nss_normalized"],
-                ),
-            ).fetchone()
-            if duplicate:
-                raise PatientDirectoryConflict(
-                    "La cédula o el NSS indicado ya pertenece a otro paciente."
-                )
+            self._validate_changed_documents(con, patient_id, current, desired)
             next_revision = current_revision + 1
             updated = con.execute(
                 """UPDATE admission_patient_directory SET

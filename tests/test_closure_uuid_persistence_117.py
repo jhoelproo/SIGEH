@@ -47,7 +47,7 @@ def test_uuid_survives_pending_carryforward_and_later_authorization():
                 """INSERT INTO recibos(numero,fecha,created_at,numero_autorizacion,
                 autorizacion_at,admission_global_attention_id,admission_atencion_id,
                 admission_source_instance_id) VALUES
-                (991001,'2026-09-07','2026-09-07 21:00:00','AUTH-123','2026-09-07 21:00:00',%s,999,'different-station')""",
+                (991001,'2026-09-07','2026-09-07 21:00:00','AUTH-1234','2026-09-07 21:00:00',%s,999,'different-station')""",
                 (global_id,),
             )
         second = app.capture_shift_closure_snapshot(
@@ -59,7 +59,8 @@ def test_uuid_survives_pending_carryforward_and_later_authorization():
             ),
             [],
         )
-        assert second["inherited_received"] == second["inherited_authorized"] == 1
+        assert second["authorized_applicable"] == 1
+        assert app.build_shift_closure_report_data(second)["historical_authorized"] == 1
         assert second["pending_next"] == 0
         with app.db_connect() as con:
             saved = con.execute("""SELECT global_attention_id FROM billing_shift_closure_details

@@ -110,14 +110,13 @@ def closed_turn_attentions(connection, event, *, previous=False):
                     USING(operational_session_id)
                   WHERE current_session.operational_source_id::TEXT=%s
                     AND current_turn.turn_id=%s), %s)
-              AND i.ended_at>=%s AND i.turn_id<>%s)"""
+              AND i.turn_id<>%s)"""
         parameters = (
             event.source_instance_id,
             event.source_instance_id,
             event.source_instance_id,
             event.turn_id,
             datetime.fromisoformat(event.started_at).replace(tzinfo=HOSPITAL_TIMEZONE),
-            PENDING_RESTART_AT,
             event.turn_id,
         )
     return [

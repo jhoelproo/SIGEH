@@ -2415,13 +2415,13 @@ def _apply_admission_inheritance_migration(con):
                   d.attention_source_instance_id,d.attention_id,
                   d.original_turn_id,
                   CASE WHEN d.classification IN (
-                            'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE'
+                            'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE','HISTÓRICA PENDIENTE'
                        ) THEN 'PENDIENTE' ELSE 'COMPLETADA' END,
                   CASE WHEN d.classification IN (
-                            'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE'
+                            'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE','HISTÓRICA PENDIENTE'
                        ) THEN NULL ELSE d.closure_turn_id END,
                   CASE WHEN d.classification IN (
-                            'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE'
+                            'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE','HISTÓRICA PENDIENTE'
                        ) THEN NULL ELSE NOW() END,
                   NULLIF(BTRIM(COALESCE(d.responsible_username,'')),''),
                   d.receipt_id,NOW()
@@ -2740,6 +2740,9 @@ def _apply_billing_shift_closure_snapshot_migration(con):
         ALTER TABLE billing_shift_closure_details ADD COLUMN IF NOT EXISTS global_attention_id UUID;
         """
     )
+    from billing_closure_categories import install_closure_categories
+
+    install_closure_categories(con)
 
 
 def _apply_admission_validation_history_migration(con):
@@ -3497,6 +3500,7 @@ def db_init():
 
 
 _BOOTSTRAP_REQUIRED_SCHEMA = {
+    "billing_shift_closures": {"classification_version"},
     "billing_closure_dispatch_policy": {"singleton", "enabled_at"},
     "billing_shift_closure_details": {
         "closure_source_instance_id",
@@ -3713,6 +3717,7 @@ def prepare_database_schema() -> str:
             "column:admission_operational_sessions.turn_code",
         }
         closure_dispatch_columns = {
+            "column:billing_shift_closures.classification_version",
             "column:billing_shift_closure_details.global_attention_id",
             "table:billing_closure_dispatch_policy",
         }
@@ -3721,6 +3726,9 @@ def prepare_database_schema() -> str:
 
             with db_connect() as con:
                 install_closure_dispatch_schema(con)
+                from billing_closure_categories import install_closure_categories
+
+                install_closure_categories(con)
         elif missing and set(missing).issubset(operational_snapshot_columns):
             with db_connect() as con:
                 if "column:admission_operational_sessions.operational_revision" in missing:
@@ -8295,7 +8303,10 @@ _SHIFT_INVALID_AUTHORIZATIONS = {
 
 
 def _valid_shift_authorization(value) -> bool:
-    return normalize_key(value) not in _SHIFT_INVALID_AUTHORIZATIONS
+    return (
+        normalize_key(value) not in _SHIFT_INVALID_AUTHORIZATIONS
+        and len(re.findall(r"[0-9]", str(value or ""))) >= 4
+    )
 
 
 def _insert_shift_closure_header(con, event: AdmissionShiftClosure) -> None:
@@ -8386,7 +8397,11 @@ def _receipt_candidates_for_shift(
 def _shift_receipt_indexes(receipts):
     direct = {}
     central = {}
-    for receipt in receipts:
+    for receipt in sorted(
+        receipts,
+        key=lambda row: _valid_shift_authorization(row.get("numero_autorizacion")),
+        reverse=True,
+    ):
         global_id = str(receipt.get("admission_global_attention_id") or "")
         if global_id:
             central.setdefault(global_id, receipt)
@@ -8532,6 +8547,11 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
                ORDER BY closed_at DESC,turn_id DESC LIMIT 1""",
             (event.source_instance_id, int(event.turn_id), event.closed_at),
         ).fetchone()
+        from billing_closure_categories import (
+            classify_closure_attention, closure_category_counts, previous_operational_turn,
+        )
+
+        previous_turn_id = previous_operational_turn(con, event)
         inherited = []
         if previous:
             from billing_historical_cancellation import inherited_attention_is_active_sql
@@ -8552,7 +8572,7 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
                    FROM billing_shift_closure_details
                    WHERE closure_source_instance_id=%s AND closure_turn_id=%s
                      AND classification IN (
-                       'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE'
+                       'PENDIENTE DE AUTORIZACIÓN','HEREDADA PENDIENTE','HISTÓRICA PENDIENTE'
                      ) AND {active_inheritance}""",
                 (previous["source_instance_id"], int(previous["turn_id"])),
             ).fetchall()
@@ -8597,10 +8617,9 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
             authorization = str(receipt.get("numero_autorizacion") or "").strip() if receipt else ""
             authorized = _valid_shift_authorization(authorization)
             inherited_flag = bool(record["inherited"])
-            classification = (
-                "HEREDADA AUTORIZADA" if authorized else "HEREDADA PENDIENTE"
-            ) if inherited_flag else (
-                "AUTORIZADA" if authorized else "PENDIENTE DE AUTORIZACIÓN"
+            classification = classify_closure_attention(
+                authorized=authorized, inherited=inherited_flag,
+                origin_turn=record["original_turn_id"], previous_turn=previous_turn_id,
             )
             responsible = ""
             updated_at = record["source_updated_at"]
@@ -8620,21 +8639,7 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
                 int(inherited_flag), now_str(), record.get("global_attention_id") or None,
             ))
 
-        counts = {
-            "eligible_current": sum(not bool(row[17]) for row in details),
-            "authorized_current": sum(row[14] == "AUTORIZADA" for row in details),
-            "new_pending": sum(row[14] == "PENDIENTE DE AUTORIZACIÓN" for row in details),
-            "inherited_received": sum(bool(row[17]) for row in details),
-            "inherited_authorized": sum(row[14] == "HEREDADA AUTORIZADA" for row in details),
-            "inherited_pending": sum(row[14] == "HEREDADA PENDIENTE" for row in details),
-        }
-        counts["pending_next"] = counts["new_pending"] + counts["inherited_pending"]
-        counts["worked_applicable"] = counts["eligible_current"] + counts["inherited_received"]
-        counts["authorized_applicable"] = counts["authorized_current"] + counts["inherited_authorized"]
-        counts["authorization_rate"] = (
-            counts["authorized_applicable"] / counts["worked_applicable"] * 100
-            if counts["worked_applicable"] else 0.0
-        )
+        counts = closure_category_counts(row[14] for row in details)
         if details:
             psycopg2.extras.execute_values(
                 con.con.cursor(),
@@ -8654,6 +8659,7 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
                 pending = detail[14] in (
                     "PENDIENTE DE AUTORIZACIÓN",
                     "HEREDADA PENDIENTE",
+                    "HISTÓRICA PENDIENTE",
                 )
                 inheritance_rows.append(
                     (
@@ -8728,7 +8734,7 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
         stamp = now_str()
         row = con.execute(
             """UPDATE billing_shift_closures SET
-                     snapshot_created_at=%s,closed_by=%s,
+                     snapshot_created_at=%s,closed_by=%s,classification_version=2,
                      eligible_current=%s,authorized_current=%s,new_pending=%s,
                      inherited_received=%s,inherited_authorized=%s,
                      inherited_pending=%s,pending_next=%s,worked_applicable=%s,
@@ -8835,6 +8841,9 @@ def build_shift_closure_report_data(closure: dict) -> dict:
         raise RuntimeError("El turno no tiene una instantánea completa para generar el reporte.")
     header = dict(header_row)
     details = [dict(row) for row in detail_rows]
+    from billing_closure_categories import closure_category_counts
+
+    category_counts = closure_category_counts(row["classification"] for row in details)
     by_ars_map = {}
     productivity_map = {}
     for row in details:
@@ -8850,6 +8859,10 @@ def build_shift_closure_report_data(closure: dict) -> dict:
         else:
             bucket["pending"] += 1
     return {
+        "historical_received": category_counts["historical_received"],
+        "classification_version": int(header.get("classification_version") or 1),
+        "historical_authorized": category_counts["historical_authorized"],
+        "historical_pending": category_counts["historical_pending"],
         "closure": header,
         "eligible_current": int(header["eligible_current"] or 0),
         "authorized_current": int(header["authorized_current"] or 0),
@@ -27043,14 +27056,21 @@ class LegacyReportsDialog(QDialog):
         )
         return source_table, source_key_value, os.path.basename(stored_path)
 
+    @Slot(str)
     def _report_document_open_ready(self, path: str):
         try:
-            ComparisonPdfDialog(
+            preview = ComparisonPdfDialog(
                 path,
                 self,
                 dialog_title="Reporte histórico",
                 detail_text="Reporte guardado. Puede revisarlo, imprimirlo o guardar una copia.",
-            ).exec()
+            )
+            self._report_preview_dialog = preview
+            preview.setAttribute(Qt.WA_DeleteOnClose)
+            preview.setWindowModality(Qt.WindowModal)
+            preview.open()
+            preview.raise_()
+            preview.activateWindow()
         except Exception as exc:
             QMessageBox.warning(
                 self, "Reportes", f"No se pudo abrir el reporte:\n{exc}"
@@ -28939,15 +28959,7 @@ class ReportsDialog(LegacyReportsDialog):
         )
 
     def _show_prepared_report_print(self, path: str):
-        ComparisonPdfDialog(
-            path,
-            self,
-            dialog_title="Reporte listo para revisar",
-            detail_text=(
-                "Verifica el documento antes de imprimir. También puedes guardar una copia "
-                "en otra ubicación."
-            ),
-        ).exec()
+        self._report_document_open_ready(path)
 
     def _render_selected_report_async(self, action: str, ready_handler):
         row = self.table.currentRow()

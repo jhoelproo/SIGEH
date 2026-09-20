@@ -3695,6 +3695,27 @@ class _HybridDatabaseProxy:
             )
         return rows
 
+    def search_admission_turns(self, first, last, username="", cursor=None):
+        from admission_turn_history import search_turns
+
+        if bool(getattr(self._runtime, "offline", False)):
+            raise RuntimeError("Conecte la estación para consultar el historial central de turnos.")
+        with self._runtime.host.connection_factory() as connection:
+            return search_turns(connection, first, last, username, cursor)
+
+    def load_historical_turn_report(self, turn):
+        from admission_turn_history import selected_turn_records
+
+        with self._runtime.host.connection_factory() as connection:
+            records = selected_turn_records(connection, turn)
+        selected = dict(turn)
+        selected["representatives"] = [{
+            "username": turn["username"], "display_name": turn["display_name"],
+        }]
+        return self._statistical_report_source_result(
+            turns=[selected], selected_turn=selected, records=records,
+        )
+
     def list_statistical_report_turns(
         self,
         *,

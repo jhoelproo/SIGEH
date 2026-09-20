@@ -12,6 +12,43 @@ from billing_closure_recovery import (
 from tests import test_integral_emergency_to_monthly_list as integration
 
 
+def test_category_upgrade_preserves_old_snapshots_and_accepts_new_categories():
+    from billing_closure_categories import install_closure_categories
+
+    fixture = integration.IntegralEmergencyToMonthlyListTests(
+        "test_emergency_to_audit_to_monthly_ars_list"
+    )
+    fixture.setUp()
+    try:
+        with app.db_connect() as con:
+            con.execute(
+                "ALTER TABLE billing_shift_closures DROP COLUMN classification_version"
+            )
+            con.execute(
+                "ALTER TABLE billing_shift_closure_details DROP CONSTRAINT billing_shift_closure_details_classification_check"
+            )
+            con.execute("""ALTER TABLE billing_shift_closure_details ADD CONSTRAINT billing_shift_closure_details_classification_check
+                CHECK(classification IN ('AUTORIZADA','PENDIENTE DE AUTORIZACIÓN','HEREDADA AUTORIZADA','HEREDADA PENDIENTE'))""")
+            before = con.execute(
+                "SELECT enabled_at FROM billing_closure_dispatch_policy"
+            ).fetchone()[0]
+            install_closure_categories(con)
+            install_closure_categories(con)
+            after = con.execute(
+                "SELECT enabled_at FROM billing_closure_dispatch_policy"
+            ).fetchone()[0]
+            constraint = con.execute("""SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                WHERE conrelid='billing_shift_closure_details'::regclass
+                AND conname='billing_shift_closure_details_classification_check'""").fetchone()[
+                0
+            ]
+            assert "HISTÓRICA AUTORIZADA" in constraint
+            assert "HISTÓRICA PENDIENTE" in constraint
+            assert before == after
+    finally:
+        fixture.tearDown()
+
+
 def test_existing_install_requires_closure_identity_column():
     rows = [
         (table, column)
@@ -29,6 +66,11 @@ def test_existing_install_requires_closure_identity_column():
 @pytest.mark.parametrize(
     "missing,expected_sql,full_migration",
     [
+        (
+            ["column:billing_shift_closures.classification_version"],
+            "ADD CONSTRAINT billing_shift_closure_details_classification_check",
+            False,
+        ),
         (
             [
                 "column:billing_shift_closure_details.global_attention_id",

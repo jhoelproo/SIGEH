@@ -150,10 +150,18 @@ def test_history_open_shows_view_or_visible_error(monkeypatch, failure):
     warning = Mock()
     monkeypatch.setattr(app, "ComparisonPdfDialog", dialog)
     monkeypatch.setattr(app.QMessageBox, "warning", warning)
-    app.LegacyReportsDialog._report_document_open_ready(None, "history.pdf")
+    app.LegacyReportsDialog._report_document_open_ready(
+        SimpleNamespace(), "history.pdf"
+    )
     assert warning.call_count == int(failure)
     if not failure:
-        dialog.return_value.exec.assert_called_once()
+        dialog.return_value.open.assert_called_once()
+
+
+def test_history_print_preview_uses_integrated_viewer():
+    parent = SimpleNamespace(_report_document_open_ready=Mock())
+    app.ReportsDialog._show_prepared_report_print(parent, "history.pdf")
+    parent._report_document_open_ready.assert_called_once_with("history.pdf")
 
 
 @pytest.mark.parametrize("failure", [False, True])

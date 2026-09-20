@@ -10011,6 +10011,7 @@ class App:
         )
         periodo_var = tk.StringVar(value="Diario")
         turno_var = tk.StringVar(value="Turno actual")
+        historical_turn = {"selection": None, "dialog": None}
         especialidad_var = tk.StringVar(value=SPECIALTY_ALL)
         cobertura_var = tk.StringVar(value=COVERAGE_ALL)
         fecha_inicio = crear_selector_fecha(filtros, width=14)
@@ -10033,10 +10034,28 @@ class App:
             filtros,
             textvariable=turno_var,
             state="readonly",
-            values=["Turno actual", "Turno anterior", "Todos los turnos"],
+            values=["Turno actual", "Turno anterior", "Todos los turnos", "Turno seleccionado"],
             width=22,
         )
-        combo_turno.grid(row=2, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        combo_turno.grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=4)
+
+        def select_historical_turn(turn):
+            historical_turn["selection"] = turn
+            turno_var.set("Turno seleccionado")
+            _mark_snapshot_stale()
+            estado_var.set(f"Turno #{turn['turn_id']} · {turn['display_name']}. Pulse Generar reporte.")
+
+        def open_turn_history():
+            from admission_turn_history_dialog import AdmissionTurnHistoryDialog
+
+            dialog = AdmissionTurnHistoryDialog(self, select_historical_turn, win)
+            historical_turn["dialog"] = dialog
+            dialog.open()
+            dialog.user.setFocus()
+
+        tb.Button(filtros, text="Historial de turnos", bootstyle=INFO, command=open_turn_history).grid(
+            row=2, column=3, sticky="ew", padx=4, pady=4,
+        )
         tb.Label(filtros, text="Desde").grid(row=3, column=0, sticky="w", padx=4, pady=4)
         fecha_inicio.grid(row=3, column=1, sticky="ew", padx=4, pady=4)
         tb.Label(filtros, text="Hasta").grid(row=3, column=2, sticky="w", padx=4, pady=4)
@@ -10224,7 +10243,7 @@ class App:
             if selected_turn is None:
                 return scope
             return (
-                f"{scope} · {turn_period.start_at:%d/%m/%Y %I:%M %p} → "
+                f"{scope} · {selected_turn.get('display_name', '')} · {turn_period.start_at:%d/%m/%Y %I:%M %p} → "
                 f"{turn_period.end_at:%d/%m/%Y %I:%M %p}"
             )
 
@@ -10256,6 +10275,9 @@ class App:
             try:
                 period = _period_from_controls()
                 scope = turno_var.get()
+                historical = dict(historical_turn["selection"] or {}) if scope == "Turno seleccionado" else {}
+                if scope == "Turno seleccionado" and not historical:
+                    raise ValueError("Seleccione un turno desde Historial de turnos.")
                 ars_mode = ars_mode_var.get()
                 selected_ars = _selected_ars()
                 specialty = especialidad_var.get()
@@ -10265,13 +10287,13 @@ class App:
                 self.set_status("Generando reporte en segundo plano…", "process")
                 win.update_idletasks()
                 def _trabajo():
-                    source_id = str(snapshot.get("operational_source_id") or "").strip()
+                    source_id = str(historical.get("operational_source_id") or snapshot.get("operational_source_id") or "").strip()
                     current_turn_id = int(snapshot.get("turn_id") or 0)
-                    if not source_id or current_turn_id <= 0:
+                    if not source_id or (current_turn_id <= 0 and not historical):
                         raise RuntimeError(
                             "No existe una identidad operacional central activa."
                         )
-                    source = self.db.load_statistical_report_source(
+                    source = self.db.load_historical_turn_report(historical) if historical else self.db.load_statistical_report_source(
                         operational_source_id=source_id,
                         turn_scope=scope,
                         current_turn_id=current_turn_id,
@@ -10280,7 +10302,12 @@ class App:
                     )
                     turn_id = source.get("turn_id")
                     selected_turn = source.get("selected_turn")
-                    if selected_turn is not None:
+                    if historical:
+                        from admission_turn_history import historical_turn_period
+
+                        turn_period = historical_turn_period(selected_turn)
+                        start_at, end_at = turn_period.start_at, turn_period.end_at
+                    elif selected_turn is not None:
                         turn_period = build_turn_operational_period(
                             selected_turn.get("started_at"),
                             fallback_date=period.start_at.date(),
@@ -10394,6 +10421,7 @@ class App:
             self._ejecutar_en_segundo_plano("Exportando Excel…", _trabajo, _ok, _error)
 
         def limpiar_filtros():
+            historical_turn["selection"] = None
             periodo_var.set("Diario")
             turno_var.set("Turno actual")
             especialidad_var.set(SPECIALTY_ALL)
@@ -14818,10 +14846,7 @@ class App:
             except Exception:
                 pass
 
-        try:
-            ent_buscar.focus_set()
-        except Exception:
-            pass
+        win.after(80, ent_buscar.focus_set)
 
     def _abrir_configuracion_interna(self, prefill_identidad=None):
         if not self._exigir_permiso(CAP_INTERNAL_CONFIG, "abrir la configuración interna"):

@@ -619,7 +619,7 @@ def test_report_window_and_themed_icons_follow_the_host_theme_in_place(
             "total", "insured", "uninsured", "general", "pediatric", "gynecology"
         }
         assert {controls["turn"].itemText(i) for i in range(controls["turn"].count())} == {
-            "Turno actual", "Turno anterior", "Todos los turnos"
+            "Turno actual", "Turno anterior", "Todos los turnos", "Turno seleccionado"
         }
         assert {
             controls["ars_mode"].itemText(i)
