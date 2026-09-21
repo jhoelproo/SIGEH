@@ -7486,6 +7486,7 @@ class AdmissionCloudRepository:
         operational_source_id: str,
         turn_id: int,
         limit: int = 500,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Read authoritative projection rows for one distributed turn only."""
         source_id = str(operational_source_id or "").strip()
@@ -7498,7 +7499,8 @@ class AdmissionCloudRepository:
                           latest.event_uuid::TEXT AS latest_event_uuid,
                           latest.sequence AS latest_sequence,
                           latest.operation AS latest_operation,
-                          latest.payload_json AS latest_payload
+                          CASE WHEN p.latest_payload_json IS NULL OR p.latest_payload_json='{}'::jsonb
+                               THEN latest.payload_json ELSE NULL END AS latest_payload
                      FROM admission_attention_projection p
                      LEFT JOIN LATERAL (
                          SELECT e.event_uuid,e.sequence,e.operation,e.payload_json
@@ -7516,10 +7518,23 @@ class AdmissionCloudRepository:
                              COALESCE(p.origin_device_id,'') ASC,
                              COALESCE(p.device_local_sequence,0) ASC,
                              COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) ASC
-                    LIMIT %s""",
-                (source_id, effective_turn_id, max(1, min(int(limit), 500))),
+                    LIMIT %s OFFSET %s""",
+                (source_id, effective_turn_id, max(1, min(int(limit), 500)), max(0, int(offset))),
             ).fetchall()
         return [self._readthrough_event(_mapping(row)) for row in rows]
+
+    def current_turn_attention_pages(self, *, operational_source_id, turn_id, limit=500):
+        page_size = max(1, min(int(limit), 500))
+        offset = 0
+        while True:
+            events = self.current_turn_attention_events(
+                operational_source_id=operational_source_id,
+                turn_id=turn_id, limit=page_size, offset=offset,
+            )
+            yield events
+            if len(events) < page_size:
+                return
+            offset += len(events)
 
     def cancel_attention(
         self,
@@ -8702,7 +8717,14 @@ class AdmissionCloudRepository:
     def events_after(self, cursor: int, *, limit: int = 200) -> list[dict[str, Any]]:
         with self.connection_factory() as con:
             rows = con.execute(
-                "SELECT * FROM admission_sync_events WHERE sequence>%s ORDER BY sequence LIMIT %s",
+                """SELECT sequence,event_uuid,entity_type,entity_uuid,operation,
+                          payload_json,operational_session_id,operational_source_id,
+                          turn_id,generation,origin_device_id,origin_user_id,origin_username,
+                          base_version,resulting_version,created_at,received_at,
+                          created_at_device,created_at_effective_utc,device_local_sequence,
+                          server_time_offset_ms,reconciliation_status,cloud_event_seq,
+                          server_received_at
+                     FROM admission_sync_events WHERE sequence>%s ORDER BY sequence LIMIT %s""",
                 (max(0,int(cursor)),max(1,min(int(limit),500))),
             ).fetchall()
         return [_mapping(row) for row in rows]
@@ -8712,8 +8734,8 @@ class AdmissionCloudRepository:
         with self.connection_factory() as con:
             row = con.execute(
                 """SELECT f.minimum_available_sequence,f.checkpoint_sequence,
-                          COALESCE((SELECT MAX(e.sequence)
-                                      FROM admission_sync_events e),0) AS latest_sequence,
+                          GREATEST(f.checkpoint_sequence,COALESCE((SELECT MAX(e.sequence)
+                                      FROM admission_sync_events e),0)) AS latest_sequence,
                           NOW() AS server_time
                      FROM admission_replication_event_floors f
                     WHERE f.stream_name='ATTENTION'"""
@@ -9279,6 +9301,7 @@ class AdmissionSyncService:
         previous_identity = getattr(self, "_last_reconciled_turn_identity", None)
         if not force and previous_identity == identity:
             return 0
+        self._last_reconciled_turn_identity = None
         OPERATIONAL_LOG.info(
             "CURRENT_TURN_RECONCILE_START source=%s turn_id=%s",
             source_id,
@@ -9287,37 +9310,14 @@ class AdmissionSyncService:
         loader = getattr(self.cloud, "current_turn_attention_events", None)
         if not callable(loader):
             return 0
-        events = list(
-            loader(
-                operational_source_id=source_id,
-                turn_id=effective_turn_id,
-                limit=limit,
-            )
-            or []
-        )
-        missing_before = sum(
-            not self.store.is_remote_event_materialized(event) for event in events
-        )
-        if missing_before:
-            OPERATIONAL_LOG.info(
-                "CURRENT_TURN_RECONCILE_MISSING source=%s turn_id=%s count=%s",
-                source_id,
-                effective_turn_id,
-                missing_before,
-            )
-        materialized = self.store.hydrate_remote_events(events) if events else 0
-        estimated_bytes = _estimated_transport_bytes(events)
-        unresolved = sum(
-            not self.store.is_remote_event_materialized(event) for event in events
-        )
-        if unresolved:
-            OPERATIONAL_LOG.warning(
-                "CURRENT_TURN_RECONCILE_PENDING source=%s turn_id=%s unresolved=%s",
-                source_id,
-                effective_turn_id,
-                unresolved,
-            )
-            return materialized
+        materialized = estimated_bytes = row_count = 0
+        for events in self._current_turn_pages(source_id, effective_turn_id, limit):
+            materialized += self.store.hydrate_remote_events(events) if events else 0
+            estimated_bytes += _estimated_transport_bytes(events)
+            row_count += len(events)
+            if any(not self.store.is_remote_event_materialized(event) for event in events):
+                OPERATIONAL_LOG.warning("CURRENT_TURN_RECONCILE_PENDING source=%s turn_id=%s", source_id, effective_turn_id)
+                return materialized
         self._last_reconciled_turn_identity = identity
         OPERATIONAL_LOG.info(
             "CURRENT_TURN_RECONCILE_DONE source=%s turn_id=%s count=%s "
@@ -9325,9 +9325,37 @@ class AdmissionSyncService:
             source_id,
             effective_turn_id,
             materialized,
-            len(events),
+            row_count,
             estimated_bytes,
         )
+        return materialized
+
+    def _current_turn_pages(self, source_id, turn_id, limit):
+        page_loader = getattr(self.cloud, "current_turn_attention_pages", None)
+        if callable(page_loader):
+            yield from page_loader(
+                operational_source_id=source_id, turn_id=turn_id, limit=limit
+            )
+        else:
+            yield list(self.cloud.current_turn_attention_events(
+                operational_source_id=source_id, turn_id=turn_id, limit=limit
+            ) or [])
+
+    def _bootstrap_operational_cache(self, window, source_id, turn_id):
+        """New replicas hydrate only the current turn; history stays read-through."""
+        if self.store.last_cloud_cursor() or not source_id or not turn_id:
+            return 0
+        if not callable(getattr(self.cloud, "current_turn_attention_pages", None)):
+            return 0
+        checkpoint = int(window.get("latest_sequence") or 0)
+        if checkpoint <= 0:
+            return 0
+        materialized = self.reconcile_current_turn(
+            operational_source_id=source_id, turn_id=turn_id, force=True
+        )
+        if self._last_reconciled_turn_identity != (source_id, int(turn_id)):
+            raise RuntimeError("No se confirmó la réplica del turno actual; cursor conservado.")
+        self.store.set_last_cloud_cursor(checkpoint)
         return materialized
 
     def recover_stalled_historical_cursor(
@@ -9501,9 +9529,10 @@ class AdmissionSyncService:
         window = self._load_event_window(fallback_limit=pull_limit)
         server_time = window.get("server_time") or self.cloud.server_time()
         clock = self.store.update_server_time_offset(server_time)
+        bootstrapped = self._bootstrap_operational_cache(window, operational_source_id, turn_id)
         # Pull once before push so remote tombstones/conflicts win over stale
         # local outbox records without needing the former second full pull.
-        pulled = self.pull_cloud_changes(limit=pull_limit, window=window)
+        pulled = bootstrapped + self.pull_cloud_changes(limit=pull_limit, window=window)
         checkpoint_recovered = 0
         if bool(self._last_pull_metrics.get("stalled")):
             checkpoint_recovered = self.recover_stalled_historical_cursor(

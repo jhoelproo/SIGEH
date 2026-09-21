@@ -1904,9 +1904,15 @@ class PostgresWrapper:
                     pass
 
     def execute(self, query, params=None):
+        from transfer_budget import MeasuredCursor, get_transfer_meter, query_stream
+
+        meter = get_transfer_meter()
+        stream = query_stream(query)
         cur = self.con.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        meter.record(stream, requests=1)
         cur.execute(query, params)
-        return cur
+        meter.record(stream, responses=1, request_bytes=len(cur.query or b""))
+        return MeasuredCursor(cur, meter, stream)
 
     def executescript(self, script):
         cur = self.con.cursor()
@@ -38217,6 +38223,10 @@ def main():
     return int(controller.run())
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--export-transfer-usage":
+        from transfer_usage import main as export_transfer_usage
+
+        raise SystemExit(export_transfer_usage(["--output", sys.argv[2]]))
     if len(sys.argv) == 3 and sys.argv[1] == "--validate-responsive-ui":
         from responsive_validation import run as run_responsive_validation
         try:

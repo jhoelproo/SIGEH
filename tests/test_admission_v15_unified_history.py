@@ -67,6 +67,18 @@ class _CapturingCloudConnection(_CloudConnection):
         return super().execute(query, params)
 
 
+def test_history_page_without_pending_rows_fetches_only_requested_page():
+    cloud = _CapturingCloudConnection()
+    database = _LocalDatabase()
+    database.connection.execute("DELETE FROM sync_outbox")
+    runtime = SimpleNamespace(offline=False, host=SimpleNamespace(connection_factory=lambda: cloud))
+    proxy = _HybridDatabaseProxy(database, runtime)
+    rows = proxy.listar_atenciones(limite=50, offset=250)
+    assert cloud.params[-2:] == (50, 250)
+    assert len(rows) == 1
+    assert "THEN latest.payload_json ELSE NULL" in cloud.query
+
+
 class _LocalDatabase:
     def __init__(self):
         self.connection = sqlite3.connect(":memory:")

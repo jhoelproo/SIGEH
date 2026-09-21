@@ -184,7 +184,8 @@ def test_current_turn_projection_query_uses_both_distributed_identity_parts():
 
     assert "p.operational_source_id::TEXT=%s" in connection.sql
     assert "p.turn_id=%s" in connection.sql
-    assert connection.params == ("source-a", 77, 500)
+    assert connection.params == ("source-a", 77, 500, 0)
+    assert "LIMIT %s OFFSET %s" in connection.sql
     assert events[0]["entity_uuid"] == global_attention_id
 
 

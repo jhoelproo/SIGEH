@@ -414,6 +414,71 @@ def test_coordinator_backoff_resets_after_success_and_grows_after_failure():
     coordinator.stop()
 
 
+def test_periodic_tick_does_not_queue_an_immediate_duplicate_cycle():
+    coordinator = _HybridCoordinator(object())
+    coordinator._busy = True
+    coordinator._schedule_poll()
+    assert coordinator._pending is False
+    coordinator._schedule()
+    assert coordinator._pending is True  # explicit user-triggered work is retained
+    coordinator.stop()
+
+
+def test_force_reconcile_failure_invalidates_previous_confirmation():
+    store, cloud = _CursorStore(block=False), _MeasuredCloud()
+    service = AdmissionSyncService(store, cloud)
+    service.reconcile_current_turn(operational_source_id=CURRENT_SOURCE, turn_id=3946)
+    store.block = True
+    cloud.current_turn_attention_events = lambda **kwargs: [{"sequence": 250}]
+    service.reconcile_current_turn(operational_source_id=CURRENT_SOURCE, turn_id=3946, force=True)
+    assert service._last_reconciled_turn_identity is None
+
+
+def test_new_replica_confirms_all_current_turn_pages_before_checkpoint():
+    store, cloud = _CursorStore(cursor=0, block=False), _MeasuredCloud()
+    pages = [[{"sequence": i}] for i in range(3)]
+    cloud.current_turn_attention_pages = lambda **kwargs: iter(pages)
+    service = AdmissionSyncService(store, cloud)
+    result = _cycle(service)
+    assert result["cursor_after"] == 249
+    assert result["pulled"] == 3
+    assert cloud.event_queries == 0
+
+
+def test_failed_new_replica_does_not_acknowledge_history():
+    import pytest
+
+    store, cloud = _CursorStore(cursor=0, block=True), _MeasuredCloud()
+    cloud.current_turn_attention_pages = lambda **kwargs: iter([[{"sequence": 1}]])
+    service = AdmissionSyncService(store, cloud)
+    with pytest.raises(RuntimeError, match="cursor conservado"):
+        _cycle(service)
+    assert store.cursor == 0
+
+
+def test_empty_cloud_does_not_repeat_bootstrap_reads():
+    store, cloud = _CursorStore(cursor=0, block=False), _MeasuredCloud()
+    cloud.current_turn_attention_pages = lambda **kwargs: (_ for _ in () )
+    service = AdmissionSyncService(store, cloud)
+    assert service._bootstrap_operational_cache({"latest_sequence": 0}, CURRENT_SOURCE, 3946) == 0
+    assert service._last_reconciled_turn_identity is None
+
+
+def test_coordinator_start_is_idempotent_and_stop_is_final():
+    from unittest.mock import Mock
+
+    runtime = Mock()
+    runtime.state.return_value = {}
+    coordinator = _HybridCoordinator(runtime)
+    coordinator.submit_background = Mock()
+    coordinator.start()
+    coordinator.start()
+    assert coordinator.submit_background.call_count == 1
+    coordinator.stop()
+    coordinator.start()
+    assert coordinator.submit_background.call_count == 1
+
+
 def test_operational_logging_binding_is_noop_without_rotating_handler():
     class _Database:
         __module__ = "module_not_loaded_for_test"

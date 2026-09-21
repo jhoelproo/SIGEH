@@ -629,8 +629,8 @@ class CentralPatientDirectoryRepository:
         with self.connection_factory() as con:
             row = con.execute(
                 """SELECT f.minimum_available_sequence,f.checkpoint_sequence,
-                          COALESCE((SELECT MAX(e.sequence)
-                                      FROM admission_patient_directory_events e),0)
+                          GREATEST(f.checkpoint_sequence,COALESCE((SELECT MAX(e.sequence)
+                                      FROM admission_patient_directory_events e),0))
                               AS latest_sequence
                      FROM admission_replication_event_floors f
                     WHERE f.stream_name='PATIENT_DIRECTORY'
@@ -644,6 +644,31 @@ class CentralPatientDirectoryRepository:
             "checkpoint_sequence": int(data.get("checkpoint_sequence") or 0),
             "latest_sequence": int(data.get("latest_sequence") or 0),
         }
+
+    def event_headers_after(self, sequence: int, *, limit: int = 500):
+        with self.connection_factory() as con:
+            rows = con.execute(
+                """SELECT sequence,global_patient_id::TEXT
+                   FROM admission_patient_directory_events
+                   WHERE sequence>%s ORDER BY sequence LIMIT %s""",
+                (max(0, int(sequence)), max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [_mapping(row) for row in rows]
+
+    def snapshots_for_ids(self, patient_ids):
+        if not patient_ids:
+            return []
+        with self.connection_factory() as con:
+            rows = con.execute(
+                """SELECT global_patient_id,patient_name,cedula,cedula_normalized,
+                          nss,nss_normalized,phone,address,deleted_at,
+                          nationality,canonical_ars,legacy_source_instance_id,
+                          legacy_patient_id,server_revision,is_deleted,updated_at
+                   FROM admission_patient_directory
+                   WHERE global_patient_id=ANY(%s::uuid[])""",
+                (list(patient_ids),),
+            ).fetchall()
+        return [self._payload(_mapping(row)) for row in rows]
 
     def snapshot_page(
         self, *, after_global_patient_id: str = "", limit: int = 500
@@ -1001,6 +1026,14 @@ class LocalPatientDirectory:
             ).fetchone()
         return int(row[0] or 0) if row else 0
 
+    def cached_patient_ids(self) -> set[str]:
+        self.initialize()
+        with closing(sqlite3.connect(self.database)) as con:
+            rows = con.execute(
+                "SELECT global_patient_id FROM pacientes WHERE global_patient_id IS NOT NULL"
+            ).fetchall()
+        return {value for row in rows if (value := _uuid_or_empty(row[0]))}
+
     def set_patient_cursor(self, sequence: int) -> None:
         self.initialize()
         with connect_local_sqlite(
@@ -1029,10 +1062,12 @@ class PatientDirectoryService:
         connection_factory: Callable[[], Any],
         *,
         is_online: Callable[[], bool] | None = None,
+        cache_only: bool = False,
     ):
         self.local = LocalPatientDirectory(database)
         self.central = CentralPatientDirectoryRepository(connection_factory)
         self.is_online = is_online or (lambda: True)
+        self.cache_only = cache_only
 
     def find_by_cedula(self, cedula: str) -> dict[str, Any] | None:
         local = self.local.find_local(cedula=cedula)
@@ -1095,6 +1130,11 @@ class PatientDirectoryService:
         return self.find_by_cedula(normalized) or self.find_by_nss(normalized)
 
     def pull_incremental(self, *, limit: int = 500) -> int:
+        if self.cache_only:
+            return self._pull_cached_incremental(limit=limit)
+        return self._pull_full_incremental(limit=limit)
+
+    def _pull_full_incremental(self, *, limit: int) -> int:
         cursor = self.local.patient_cursor()
         window_loader = getattr(self.central, "event_window", None)
         window: dict[str, Any] = {}
@@ -1117,6 +1157,37 @@ class PatientDirectoryService:
             payloads.append(dict(payload))
         final_sequence = max(int(event.get("sequence") or cursor) for event in events)
         return self.local.hydrate_many(payloads, final_sequence=final_sequence)
+
+    def _refresh_cached_ids(self, patient_ids, checkpoint):
+        ids = sorted(patient_ids)
+        total = 0
+        for start in range(0, len(ids), 100):
+            requested = ids[start:start + 100]
+            rows = self.central.snapshots_for_ids(requested)
+            found = {_uuid_or_empty(row.get("global_patient_id")) for row in rows}
+            if found != set(requested):
+                raise RuntimeError("El directorio central no devolvió todas las identidades solicitadas.")
+            total += self.local.hydrate_many(rows)
+        # A failed page never acknowledges the remaining stream. Replaying
+        # already committed cache pages is safe because hydration is versioned.
+        self.local.hydrate_many([], final_sequence=checkpoint)
+        return total
+
+    def _pull_cached_incremental(self, *, limit):
+        cursor = self.local.patient_cursor()
+        window = self.central.event_window()
+        latest = int(window.get("latest_sequence") or 0)
+        if latest <= cursor:
+            return 0
+        cached = self.local.cached_patient_ids()
+        if cursor == 0 or cursor < int(window.get("minimum_available_sequence") or 0):
+            return self._refresh_cached_ids(cached, latest)
+        headers = self.central.event_headers_after(cursor, limit=limit)
+        if not headers:
+            return 0
+        changed = {str(row["global_patient_id"]) for row in headers} & cached
+        checkpoint = int(headers[-1]["sequence"])
+        return self._refresh_cached_ids(changed, checkpoint)
 
     def bootstrap_from_projection(
         self,

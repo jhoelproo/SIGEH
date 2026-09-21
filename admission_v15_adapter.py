@@ -1100,6 +1100,7 @@ class _HybridAdmissionRuntime:
                 database.db_name,
                 self.host.connection_factory,
                 is_online=lambda: not self.offline,
+                cache_only=True,
             )
 
     def search_patient_directory(self, *, cedula: str = "", nss: str = "") -> dict[str, Any] | None:
@@ -1832,12 +1833,13 @@ class _HybridAdmissionRuntime:
 
     def _pull_patient_directory_if_due(self) -> int:
         from admission_hybrid import PATIENT_DIRECTORY_POLL_SECONDS
+        from transfer_budget import get_transfer_meter
 
         patient_poll_now = perf_counter()
         if (
             self.patient_directory is None
             or patient_poll_now - self._last_patient_pull_at
-            < PATIENT_DIRECTORY_POLL_SECONDS
+            < max(PATIENT_DIRECTORY_POLL_SECONDS, get_transfer_meter().background_delay())
         ):
             return 0
         pulled = self.patient_directory.pull_incremental(limit=500)
@@ -2718,6 +2720,13 @@ class _HybridDatabaseProxy:
             params.append(f"%{ars}%")
         self._append_central_turn_filters(values, mode, where, params)
 
+        pending_rows = self._pending_history_rows(
+            method_name, names, values, limit, offset, logger
+        )
+        from transfer_budget import history_page_window
+
+        page_limit, page_offset, merge_offset = history_page_window(limit, offset, bool(pending_rows))
+
         sql = f"""SELECT p.*,p.attention_id AS origin_attention_id,
                           p.attention_id AS id,p.service_date AS fecha,
                           p.service_time AS hora,p.patient_name AS nombre,
@@ -2731,7 +2740,8 @@ class _HybridDatabaseProxy:
                           latest.event_uuid::TEXT AS latest_event_uuid,
                           latest.sequence AS latest_sequence,
                           latest.operation AS latest_operation,
-                          latest.payload_json AS latest_payload
+                          CASE WHEN p.latest_payload_json IS NULL OR p.latest_payload_json='{{}}'::jsonb
+                               THEN latest.payload_json ELSE NULL END AS latest_payload
                    FROM admission_attention_projection p
                    LEFT JOIN LATERAL (
                        SELECT e.event_uuid,e.sequence,e.operation,e.payload_json
@@ -2749,7 +2759,7 @@ class _HybridDatabaseProxy:
                             COALESCE(p.device_local_sequence,0) ASC,
                             COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) ASC
                    LIMIT %s OFFSET %s"""
-        params.extend((limit + offset, 0))
+        params.extend((page_limit, page_offset))
         with self._runtime.host.connection_factory() as con:
             cloud_rows = [with_resolved_specialty(row) for row in con.execute(sql, tuple(params)).fetchall()]
         if logger is not None:
@@ -2797,9 +2807,6 @@ class _HybridDatabaseProxy:
                     )
 
         # Native V15 data is supplemental and only keeps unacknowledged rows visible.
-        pending_rows = self._pending_history_rows(
-            method_name, names, values, limit, offset, logger
-        )
         if logger is not None:
             logger.info(
                 "HISTORY_LOCAL_PENDING_COUNT method=%s rows=%s",
@@ -2816,7 +2823,7 @@ class _HybridDatabaseProxy:
             if key and key not in by_uuid:
                 by_uuid[key] = row
         merged = sorted(by_uuid.values(), key=self._history_sort_key)
-        result = merged[offset:offset + limit]
+        result = merged[merge_offset:merge_offset + limit]
         if logger is not None:
             estimated_bytes = sum(
                 len(str(row).encode("utf-8", errors="replace")) for row in cloud_rows
@@ -3979,12 +3986,15 @@ class _HybridCoordinator(QObject):
     def __init__(self, runtime: _HybridAdmissionRuntime, parent=None):
         super().__init__(parent)
         from admission_hybrid import SYNC_TICK_SECONDS
+        from transfer_budget import AdaptivePoll
 
         self.runtime = runtime
         self._busy = False
         self._pending = False
         self._mirror_busy = False
         self._stopped = False
+        self._started = False
+        self._poll_policy = AdaptivePoll(minimum=SYNC_TICK_SECONDS, maximum=30)
         self._failure_count = 0
         self._retry_not_before = 0.0
         self._last_state_fingerprint = None
@@ -3993,9 +4003,12 @@ class _HybridCoordinator(QObject):
         self._pool.setExpiryTimeout(0)
         self._timer = QTimer(self)
         self._timer.setInterval(int(SYNC_TICK_SECONDS * 1000))
-        self._timer.timeout.connect(self._schedule)
+        self._timer.timeout.connect(self._schedule_poll)
 
     def start(self) -> None:
+        if self._started or self._stopped:
+            return
+        self._started = True
         self.state_changed.emit(self.runtime.state())
         self._timer.start()
         self._busy = True
@@ -4037,6 +4050,11 @@ class _HybridCoordinator(QObject):
         self._pool.start(_BackgroundTask(operation, signals))
 
     @Slot()
+    def _schedule_poll(self) -> None:
+        if not self._busy and not self._mirror_busy:
+            self._schedule()
+
+    @Slot()
     def _schedule(self) -> None:
         if self._stopped:
             return
@@ -4059,6 +4077,7 @@ class _HybridCoordinator(QObject):
                 "turn_ends_at", "primary_device_id", "lease_generation",
                 "pending_sync_count", "force_logout_required", "sync_state",
                 "reason_code",
+                "transfer_alert_percent",
             )
         )
 
@@ -4115,12 +4134,16 @@ class _HybridCoordinator(QObject):
 
     @Slot(object)
     def _sync_succeeded(self, result: Any) -> None:
+        from transfer_budget import get_transfer_meter
+
         data = dict(result or {})
+        data["transfer_alert_percent"] = get_transfer_meter().snapshot()["alert_percent"]
         if bool(data.get("offline")):
             self._record_connection_failure()
         else:
             self._reset_connection_backoff()
         fingerprint = self._state_fingerprint(data)
+        self._update_poll_interval(data, fingerprint)
         if fingerprint != self._last_state_fingerprint:
             self._last_state_fingerprint = fingerprint
             self.state_changed.emit(data)
@@ -4137,6 +4160,15 @@ class _HybridCoordinator(QObject):
                 self._mirror_failed,
             )
         self._finish_cycle()
+
+    def _update_poll_interval(self, data, fingerprint):
+        changed = fingerprint != self._last_state_fingerprint or any(
+            int(data.get(name) or 0) > 0 for name in (
+                "pushed", "pulled", "patient_pulled", "pending_sync_count", "reconciled"
+            )
+        )
+        interval = self._poll_policy.completed(changed=changed)
+        self._timer.setInterval(int(interval * 1000))
 
     @Slot(object)
     def _mirror_succeeded(self, result: Any) -> None:
@@ -5518,6 +5550,9 @@ class AdmissionV15Factory:
                     text, colors = _online_sync_status(
                         role, int(state.get("pending_sync_count") or 0)
                     )
+                transfer_alert = int(state.get("transfer_alert_percent") or 0)
+                if transfer_alert:
+                    text += f" · Consumo estimado de esta estación: ≥{transfer_alert}% del presupuesto"
                 status_label.setText(text)
                 status_label.setStyleSheet(
                     f"background:{colors[0]};color:{colors[1]};"

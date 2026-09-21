@@ -602,6 +602,7 @@ class _PatientCentral:
 
 def test_patient_new_replica_bootstraps_projection_and_continues_incremental():
     service = PatientDirectoryService.__new__(PatientDirectoryService)
+    service.cache_only = False
     service.local = _PatientLocal()
     service.central = _PatientCentral()
     service.is_online = lambda: True
