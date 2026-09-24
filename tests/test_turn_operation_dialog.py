@@ -12,13 +12,16 @@ import pytest
 from admission_v15_adapter import load_v15_application_module
 
 
-def dialog_callback(v15, **closure):
+def dialog_callback(v15, callback_name="_aplicar_cambio", **closure):
+    from admission_handoff_ui import HandoffSubmission
+
+    closure.setdefault("aplicando", HandoffSubmission())
     source, line = inspect.getsourcelines(v15.App._dialogo_turno)
     tree = ast.parse(textwrap.dedent("".join(source)))
     callback = next(
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_aplicar_cambio"
+        if isinstance(n, ast.FunctionDef) and n.name == callback_name
     )
     ast.increment_lineno(callback, line - 1)
     namespace = dict(vars(v15), **closure)
@@ -26,7 +29,7 @@ def dialog_callback(v15, **closure):
         compile(ast.Module(body=[callback], type_ignores=[]), v15.__file__, "exec"),
         namespace,
     )
-    return namespace["_aplicar_cambio"]
+    return namespace[callback_name]
 
 
 @pytest.mark.parametrize(

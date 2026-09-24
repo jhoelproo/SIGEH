@@ -808,6 +808,12 @@ def export_report_snapshot_xlsx(
     _validate_snapshot(snapshot)
     context = _render_context_from_snapshot(snapshot)
     dataset = deepcopy(snapshot.get("dataset") or {})
+    summary = snapshot.get("summary") or {}
+    if str(context.get("mode") or "") == "shift_closure" and dataset.get("classification_version", 1) >= 3:
+        from billing_close_report import spreadsheet_summary
+
+        summary = spreadsheet_summary(dataset)
+        dataset = {"Resumen": summary, "Por ARS": dataset["by_ars"]}
     output_path = os.path.abspath(str(output_path))
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     if str(context.get("mode") or "") == "panel":
@@ -861,7 +867,7 @@ def export_report_snapshot_xlsx(
         summary_sheet.cell(row_number, 2, _spreadsheet_value(value))
     summary_sheet.cell(10, 1, "Resumen histórico").font = section_font
     for row_number, (label, value) in enumerate(
-        _flatten_snapshot_values(snapshot.get("summary") or {}), start=11
+        _flatten_snapshot_values(summary), start=11
     ):
         summary_sheet.cell(row_number, 1, label)
         summary_sheet.cell(row_number, 2, value)

@@ -1143,6 +1143,7 @@ class _HybridAdmissionRuntime:
             expected_revision=expected_revision,
             actor_user=self.username,
             actor_role=str(self.current_user.get("role") or ""),
+            propagate_recent=True,
         )
 
     def require_write(self, *, primary_only: bool = False):
@@ -3839,7 +3840,7 @@ class _HybridDatabaseProxy:
                 changes: Mapping[str, Any],
                 actualizar_ficha: bool = True,
             ) -> tuple[int, int]:
-                del actualizar_ficha  # Patient edit never mutates an attention snapshot.
+                del actualizar_ficha  # Recent demographic snapshots follow the central edit.
                 current = self._database.buscar_paciente_para_edicion(
                     original_identity
                 )
@@ -3879,14 +3880,14 @@ class _HybridDatabaseProxy:
                         changes.get("Aseguradora (ARS)") or ""
                     ).strip(),
                 }
-                self._runtime.update_patient_directory(
+                updated = self._runtime.update_patient_directory(
                     global_patient_id,
                     normalized_changes,
                     expected_revision=int(
                         (verified or current).get("server_revision") or 0
                     ),
                 )
-                return 0, 1
+                return int(updated.get("corrected_attentions") or 0), 1
 
             return update_patient_master
         if name == "borrar_atencion" and callable(value):

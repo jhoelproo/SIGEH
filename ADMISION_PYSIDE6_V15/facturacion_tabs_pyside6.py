@@ -17251,6 +17251,7 @@ class App:
             committed = bool(getattr(transition, "committed", False))
             if not committed:
                 raise RuntimeError("La transición central no fue confirmada.")
+            aplicando.mark_committed()
             changed_session = getattr(transition, "operational_session", None)
             central_turn_id = int(getattr(changed_session, "turn_id", 0) or 0)
             if central_turn_id <= 0:
@@ -17430,10 +17431,12 @@ class App:
                 APP_LOG.exception("Turno confirmado; no se pudo mostrar el aviso final")
             return True
 
-        aplicando = {"activo": False}
+        from admission_handoff_ui import HandoffSubmission
+
+        aplicando = HandoffSubmission()
 
         def aplicar_una_vez():
-            if aplicando["activo"]:
+            if aplicando.blocked:
                 return
             allowed, _reason_code, reason = self.can_change_admission_turn(
                 allow_open_dialog=True
@@ -17441,7 +17444,8 @@ class App:
             if not allowed:
                 messagebox.showwarning("Cambiar turno", reason, parent=win)
                 return
-            aplicando["activo"] = True
+            if not aplicando.begin():
+                return
             self._turn_change_committing = True
             aplicar_btn.configure(state="disabled", text="Aplicando cambio...")
             aviso_var.set("Aplicando cambio...")
@@ -17452,15 +17456,20 @@ class App:
                 if win.winfo_exists():
                     messagebox.showerror(
                         "No se pudo aplicar",
-                        "El cambio no se confirmó. Revise el error e intente nuevamente.\n\n"
+                        ("El relevo ya se confirmó. Quedó pendiente actualizar la pantalla o el reporte.\n\n"
+                         if aplicando.committed else
+                         "El cambio no se confirmó. Revise el error e intente nuevamente.\n\n")
                         + str(exc),
                         parent=win,
                     )
             finally:
                 self._turn_change_committing = False
+                retry_allowed = aplicando.finish()
                 if win.winfo_exists():
-                    aplicando["activo"] = False
-                    aplicar_btn.configure(state="normal", text="Aplicar")
+                    aplicar_btn.configure(
+                        state="normal" if retry_allowed else "disabled",
+                        text="Aplicar" if retry_allowed else "Cambio aplicado",
+                    )
 
         aplicar_btn = tb.Button(
             form_card, text="Aplicar", bootstyle=SUCCESS, command=aplicar_una_vez

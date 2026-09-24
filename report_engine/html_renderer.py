@@ -236,10 +236,16 @@ class ReportHTMLRenderer:
             prepared["date_basis_label"] = filters.get("date_basis_label", "Fecha de validación")
         if prepared.get("mode") == "shift_closure":
             data = prepared["data"]
-            prepared["status_donut_svg"] = doughnut_chart_svg([
+            status_rows = [
                 {"label": "Autorizadas", "total": data.get("authorized_applicable", 0)},
                 {"label": "Pendientes", "total": data.get("pending_next", 0)},
-            ], currency=False)
+            ]
+            if data.get("classification_version", 1) >= 3:
+                status_rows = [
+                    {"label": "Recibos con autorización", "total": data["authorized"]},
+                    {"label": "Recibos sin autorización", "total": data["receipt_count"] - data["authorized"]},
+                ]
+            prepared["status_donut_svg"] = doughnut_chart_svg(status_rows, currency=False)
             prepared["ars_amount_svg"] = bar_chart_svg(
                 data.get("by_ars", []), "authorized", "Autorizaciones por ARS"
             )

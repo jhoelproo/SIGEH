@@ -67,6 +67,11 @@ def test_existing_install_requires_closure_identity_column():
     "missing,expected_sql,full_migration",
     [
         (
+            ["table:billing_reporting_policy", "table:billing_close_snapshots"],
+            "CREATE TABLE IF NOT EXISTS billing_close_snapshots",
+            False,
+        ),
+        (
             ["column:billing_shift_closures.classification_version"],
             "ADD CONSTRAINT billing_shift_closure_details_classification_check",
             False,
@@ -119,6 +124,7 @@ def test_startup_selects_targeted_migration_for_schema_change(
     assert app.prepare_database_schema() == "MIGRATED"
     assert migration.call_count == int(full_migration)
     statements = [call.args[0] for call in connection.execute.call_args_list]
+    statements += [call.args[0] for call in connection.executescript.call_args_list]
     if expected_sql:
         assert any(expected_sql in sql for sql in statements)
 

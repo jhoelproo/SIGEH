@@ -473,7 +473,7 @@ def test_hybrid_patient_edit_does_not_require_operational_write_or_primary():
 
     calls = []
     runtime = SimpleNamespace(
-        update_patient_directory=lambda *args, **kwargs: calls.append((args, kwargs)),
+        update_patient_directory=lambda *args, **kwargs: (calls.append((args, kwargs)) or {"corrected_attentions": 0}),
         verify_patient_with_cloud=lambda **_query: None,
     )
     proxy = _HybridDatabaseProxy(_LocalDatabase(), runtime)
@@ -504,7 +504,7 @@ def test_hybrid_patient_edit_recovers_missing_global_identity_from_central():
             "server_revision": 6,
             "query": query,
         },
-        update_patient_directory=lambda *args, **kwargs: calls.append((args, kwargs)),
+        update_patient_directory=lambda *args, **kwargs: (calls.append((args, kwargs)) or {"corrected_attentions": 0}),
     )
     proxy = _HybridDatabaseProxy(_LegacyPatientDatabase(), runtime)
 
@@ -533,7 +533,7 @@ def test_hybrid_patient_edit_can_recover_identity_by_nss():
             verified_queries.append(query)
             or {"global_patient_id": patient_id, "server_revision": 5}
         ),
-        update_patient_directory=lambda *args, **kwargs: calls.append((args, kwargs)),
+        update_patient_directory=lambda *args, **kwargs: (calls.append((args, kwargs)) or {"corrected_attentions": 0}),
     )
     proxy = _HybridDatabaseProxy(_NssOnlyDatabase(), runtime)
 

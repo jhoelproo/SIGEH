@@ -1,5 +1,7 @@
 # Validación de la optimización de sincronización
 
+Actualización del 24 de septiembre de 2026: el usuario confirmó haber realizado las comprobaciones en el hospital y autorizó integrar esta optimización en 1.2.3. La validación posterior con PostgreSQL local real y los nuevos cierres se documenta en `CONSISTENCY_AND_CLOSE_QA.md`. Las cifras de ahorro siguientes siguen siendo sintéticas; no se recibió una medición hospitalaria comparable para afirmar un consumo mensual concreto. El estado de candidato que figura más abajo corresponde a la evaluación original del 21 de septiembre.
+
 Fecha: 21 de septiembre de 2026. Base: `f1f5d83`, SIGEH 1.2.2.
 Rama: `codex/sync-transfer-budget`. Candidato local; no publicado.
 

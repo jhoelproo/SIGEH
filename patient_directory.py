@@ -347,6 +347,7 @@ class CentralPatientDirectoryRepository:
         expected_revision: int = 0,
         actor_user: str,
         actor_role: str,
+        propagate_recent: bool = False,
     ) -> dict[str, Any]:
         """Update one central patient without altering any attention identity."""
         patient_id = _uuid_or_empty(global_patient_id)
@@ -354,6 +355,10 @@ class CentralPatientDirectoryRepository:
             raise ValueError("El paciente no posee una identidad global válida.")
         requested = dict(changes or {})
         with self.connection_factory() as con:
+            if propagate_recent:
+                from admission_demographics import lock_recent_attentions
+
+                lock_recent_attentions(con, patient_id)
             row = con.execute(
                 """SELECT * FROM admission_patient_directory
                      WHERE global_patient_id=%s::UUID FOR UPDATE""",
@@ -453,7 +458,14 @@ class CentralPatientDirectoryRepository:
                 "timestamp": _timestamp(),
             }
             self._insert_event(con, _mapping(updated), "PATIENT_UPDATED", audit=audit)
-        return self._payload(_mapping(updated))
+            result = self._payload(_mapping(updated))
+            if propagate_recent:
+                from admission_demographics import correct_recent_attentions
+
+                result["corrected_attentions"] = correct_recent_attentions(
+                    con, result, edited_at=_mapping(updated).get("updated_at") or _timestamp()
+                )
+        return result
 
     def upsert_patient(
         self,
@@ -1107,6 +1119,7 @@ class PatientDirectoryService:
         expected_revision: int = 0,
         actor_user: str,
         actor_role: str,
+        propagate_recent: bool = False,
     ) -> dict[str, Any]:
         """Commit centrally, then refresh the local cache with the same revision."""
         if not self.is_online():
@@ -1119,6 +1132,7 @@ class PatientDirectoryService:
             expected_revision=expected_revision,
             actor_user=actor_user,
             actor_role=actor_role,
+            propagate_recent=propagate_recent,
         )
         self.local.hydrate(updated)
         return dict(updated)

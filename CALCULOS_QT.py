@@ -264,7 +264,7 @@ DB_URL = resolve_database_url()
 CENTRAL_OFFLINE_BOOT = False
 BOOTSTRAP_OPERATIONAL_SNAPSHOT: dict = {}
 BOOTSTRAP_LOGIN_USERNAMES: list[str] = []
-BOOTSTRAP_SCHEMA_MIGRATION_ID = "20260821-operational-revision-v1"
+BOOTSTRAP_SCHEMA_MIGRATION_ID = "20260923-quantitative-close-decimal-money-v1"
 BOOTSTRAP_APP_VERSION = "2026.08.21"
 
 
@@ -2977,6 +2977,12 @@ def db_init():
         _apply_admission_hybrid_migration(con)
         _apply_billing_admission_bridge_identity_migration(con)
         _apply_billing_bypass_authorization_review_migration(con)
+        from billing_close_store import install_close_snapshot_schema
+
+        install_close_snapshot_schema(con)
+        from billing_money import install_money_storage
+
+        install_money_storage(con)
 
         projection_columns = {
             row[0]
@@ -3508,6 +3514,8 @@ def db_init():
 _BOOTSTRAP_REQUIRED_SCHEMA = {
     "billing_shift_closures": {"classification_version"},
     "billing_closure_dispatch_policy": {"singleton", "enabled_at"},
+    "billing_reporting_policy": {"singleton", "baseline_at", "enabled_at"},
+    "billing_close_snapshots": {"source_id", "turn_id", "transition_id", "dataset"},
     "billing_shift_closure_details": {
         "closure_source_instance_id",
         "closure_turn_id",
@@ -3703,6 +3711,9 @@ def prepare_database_schema() -> str:
         if compatible:
             if not marker:
                 with db_connect() as con:
+                    from billing_money import install_money_storage
+
+                    install_money_storage(con)
                     con.execute(
                         """INSERT INTO schema_migrations(migration_id,app_version)
                            VALUES(%s,%s) ON CONFLICT(migration_id) DO NOTHING""",
@@ -3727,7 +3738,13 @@ def prepare_database_schema() -> str:
             "column:billing_shift_closure_details.global_attention_id",
             "table:billing_closure_dispatch_policy",
         }
-        if missing and set(missing).issubset(closure_dispatch_columns):
+        quantitative_closure_tables = {"table:billing_reporting_policy", "table:billing_close_snapshots"}
+        if missing and set(missing).issubset(quantitative_closure_tables):
+            from billing_close_store import install_close_snapshot_schema
+
+            with db_connect() as con:
+                install_close_snapshot_schema(con)
+        elif missing and set(missing).issubset(closure_dispatch_columns):
             from billing_closure_recovery import install_closure_dispatch_schema
 
             with db_connect() as con:
@@ -3752,6 +3769,9 @@ def prepare_database_schema() -> str:
             db_init()
 
         with db_connect() as con:
+            from billing_money import install_money_storage
+
+            install_money_storage(con)
             compatible, missing = inspect_database_schema_compatibility(con)
             if not compatible:
                 raise DatabaseSchemaIncompatible(
@@ -6799,7 +6819,8 @@ class AdmissionDocumentResolver:
         with self.connection_factory() as con:
             row = con.execute(
                 f"""SELECT p.*,
-                          event.payload_json AS document_payload
+                          CASE WHEN NULLIF(p.latest_payload_json,'{{}}'::jsonb) IS NULL
+                               THEN event.payload_json ELSE NULL END AS document_payload
                    FROM admission_attention_projection p
                    LEFT JOIN LATERAL (
                        SELECT payload_json
@@ -6815,7 +6836,9 @@ class AdmissionDocumentResolver:
         if not row:
             raise LookupError("La atención no existe en la fuente central.")
         projection = dict(row)
-        payload_value = projection.get("document_payload") or {}
+        payload_value = (
+            projection.get("latest_payload_json") or projection.get("document_payload") or {}
+        )
         if isinstance(payload_value, str):
             try:
                 payload = dict(json.loads(payload_value) or {})
@@ -6860,6 +6883,7 @@ class AdmissionDocumentResolver:
             "Hora": payload.get("service_time") or projection.get("service_time") or "",
             "Nombre": payload.get("name") or projection.get("patient_name") or "",
             "Sexo": payload.get("sex") or payload.get("sexo") or "",
+            "Embarazada": bool(payload.get("pregnant") or payload.get("embarazada")),
             "Edad_num": int(payload.get("age") or payload.get("edad_num") or 0),
             "Unidad": payload.get("age_unit") or payload.get("unidad") or "Años",
             "Cédula": payload.get("cedula") or projection.get("cedula_snapshot") or "",
@@ -8532,7 +8556,6 @@ def _pending_records_at_start(con, records, started_at):
 
 def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> dict:
     """Captura una vez el estado del turno y de sus pendientes heredadas."""
-    current = _closure_attention_records(event, attentions)
     with db_connect() as con:
         _insert_shift_closure_header(con, event)
         header = con.execute(
@@ -8544,6 +8567,20 @@ def capture_shift_closure_snapshot(event: AdmissionShiftClosure, attentions) -> 
             result = dict(header)
             result["snapshot_created"] = False
             return result
+
+        from billing_close_store import load_close_snapshot
+
+        canonical_snapshot = load_close_snapshot(
+            con, event.source_instance_id, event.turn_id, closed_at=event.closed_at
+        )
+        if canonical_snapshot is not None:
+            from billing_close_report import persist_header
+
+            result = dict(persist_header(con, event, canonical_snapshot))
+            result["snapshot_created"] = True
+            return result
+
+        current = _closure_attention_records(event, attentions)
 
         previous = con.execute(
             """SELECT source_instance_id,turn_id
@@ -8834,6 +8871,15 @@ def build_shift_closure_report_data(closure: dict) -> dict:
                WHERE source_instance_id=%s AND turn_id=%s""",
             (closure["source_instance_id"], int(closure["turn_id"])),
         ).fetchone()
+        if header_row and int(dict(header_row).get("classification_version") or 1) >= 3:
+            from billing_close_report import log_snapshot, report_data
+            from billing_close_store import load_close_snapshot
+
+            snapshot = load_close_snapshot(con, closure["source_instance_id"], closure["turn_id"])
+            if snapshot is None:
+                raise RuntimeError("Falta la captura central del cierre; no se generará un reporte vacío.")
+            log_snapshot(snapshot, now_str())
+            return report_data(snapshot, header_row)
         detail_rows = con.execute(
             """SELECT attention_id,patient_name,ars,original_turn_id,
                       receipt_number,authorization_number,classification,
@@ -13741,12 +13787,16 @@ def calculate_medication_price(base_price: float, percent=None) -> float:
         get_medication_markup_percent()
         if percent is None else max(0.0, min(100.0, float(percent)))
     )
-    return round(float(base_price) * (1.0 + markup / 100.0), 2)
+    from billing_money import effective_medication_price
+
+    return float(effective_medication_price(base_price, markup))
 
 
 def medication_base_price_from_effective(effective_price: float, percent=None) -> float:
     markup = get_medication_markup_percent() if percent is None else float(percent)
-    return round(float(effective_price) / (1.0 + markup / 100.0), 2)
+    from billing_money import medication_base_price
+
+    return float(medication_base_price(effective_price, markup))
 
 
 def set_medication_markup_percent(percent: float, current_user: dict) -> float:
@@ -32038,10 +32088,11 @@ class ShiftClosureReportWorker(QThread):
             f"{source_tag}_{int(closure['turn_id'])}.pdf"
         )
         generated_at = now_str()
+        quantitative = int(data.get("classification_version") or 1) >= 3
         document_context = {
             "mode": "shift_closure",
             "title": shift_closure_report_type(closure),
-            "subtitle": "Control de autorizaciones de Emergencias por turno",
+            "subtitle": "Resumen de recibos y pendientes" if quantitative else "Control de autorizaciones de Emergencias por turno",
             "generated_by": str(
                 closure.get("closed_by")
                 or closure.get("actor")
@@ -32050,7 +32101,7 @@ class ShiftClosureReportWorker(QThread):
             ),
             "generated_at": generated_at,
             "data": data,
-            "landscape": True,
+            "landscape": not quantitative,
         }
         save_shift_report_snapshot(
             closure, data, document_context, generated_at
@@ -34630,7 +34681,9 @@ class MainWindow(QMainWindow):
         price = price_item.data(Qt.UserRole)
         if price is None:
             price = float(price_item.text().replace("$", "").replace(",", ""))
-        subtotal = float(price) * quantity
+        from billing_money import line_total
+
+        subtotal = float(line_total(price, quantity))
         subtotal_item.setText(f"${subtotal:,.2f}")
         subtotal_item.setData(Qt.UserRole, subtotal)
         if recalculate:
@@ -34749,9 +34802,12 @@ class MainWindow(QMainWindow):
         price_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         price_item.setData(Qt.UserRole, price)
 
-        sub_item = QTableWidgetItem(f"${price * qty:,.2f}")
+        from billing_money import line_total
+
+        subtotal = float(line_total(price, qty))
+        sub_item = QTableWidgetItem(f"${subtotal:,.2f}")
         sub_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        sub_item.setData(Qt.UserRole, price * qty)
+        sub_item.setData(Qt.UserRole, subtotal)
 
         self.cart_table.setItem(r, 0, cat_item)
         self.cart_table.setItem(r, 1, QTableWidgetItem(name))
@@ -35591,20 +35647,22 @@ class MainWindow(QMainWindow):
             FloatingToast("🗑️ Ítem removido", self).show()
 
     def update_totals(self):
-        total = 0.0
-        medicamentos_sub = 0.0
-        materiales_sub = 0.0
+        from billing_money import money
+
+        total = money(0)
+        medicamentos_sub = money(0)
+        materiales_sub = money(0)
         
         for r in range(self.cart_table.rowCount()):
             cat = self.cart_table.item(r, 0).text()
-            sub = float(self.cart_table.item(r, 4).text().replace('$', '').replace(',', ''))
+            sub = money(self.cart_table.item(r, 4).text().replace('$', '').replace(',', ''))
             total += sub
             if "Medicamentos" in cat:
                 medicamentos_sub += sub
             elif "Materiales" in cat:
                 materiales_sub += sub
         
-        total += self.sala_spin.value()
+        total += money(self.sala_spin.value())
         
         txt = f"Total: RD$ {total:,.2f}"
         self.lbl_total.setText(txt)
@@ -35994,9 +36052,11 @@ class MainWindow(QMainWindow):
             
         grouped = [(c, grouped_dict[c]) for c in ALL_CATEGORIES if grouped_dict[c]]
 
+        from billing_money import sum_money
+
         sala = self.sala_spin.value()
-        subtotales = {label: sum(sub for _, _, _, sub, _ in lst) for label, lst in grouped}
-        total_general = sum(subtotales.values()) + sala
+        subtotales = {label: float(sum_money(sub for _, _, _, sub, _ in lst)) for label, lst in grouped}
+        total_general = float(sum_money([*subtotales.values(), sala]))
 
         if (
             self.coverage_combo.currentText() == "Asegurado"
