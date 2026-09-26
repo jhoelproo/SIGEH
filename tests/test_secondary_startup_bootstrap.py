@@ -57,6 +57,27 @@ def test_bootstrap_blocking_calls_run_outside_main_thread(monkeypatch, tmp_path)
     monkeypatch.setattr(app, "db_connect", lambda: connection)
     monkeypatch.setattr(
         app,
+        "prepare_sigeh_production_bootstrap",
+        lambda _factory: record(
+            "production_bootstrap",
+            SimpleNamespace(
+                production_epoch_id="synthetic-epoch",
+                applied=False,
+                closed_sessions=0,
+                released_devices=0,
+                closed_intervals=0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "reset_local_operational_pointers",
+        lambda *_args: record(
+            "local_pointers", {"closed_turns": 0, "superseded_events": 0}
+        ),
+    )
+    monkeypatch.setattr(
+        app,
         "inspect_database_schema_compatibility",
         lambda _con: (True, []),
     )
@@ -86,7 +107,9 @@ def test_bootstrap_blocking_calls_run_outside_main_thread(monkeypatch, tmp_path)
     thread.join(timeout=5)
 
     assert not thread.is_alive()
-    assert {name for name, _ident in calls} >= {"probe", "pool", "schema", "snapshot"}
+    assert {name for name, _ident in calls} >= {
+        "probe", "pool", "schema", "production_bootstrap", "local_pointers", "snapshot"
+    }
     assert all(ident != threading.main_thread().ident for _name, ident in calls)
 
 

@@ -422,6 +422,15 @@ class _OperationalDB:
             return _Result(rowcount=1)
         if upper.startswith("UPDATE ADMISSION_OPERATIONAL_SESSIONS SET PRIMARY_LAST_SEEN"):
             return _Result(rowcount=1)
+        if upper.startswith("UPDATE ADMISSION_OPERATIONAL_SESSIONS SET TURN_CODE"):
+            code, hours, _actor, _reason, _session = params
+            start = datetime.fromisoformat(self.session["turn_started_at"])
+            self.session.update(
+                turn_code=code,
+                turn_ends_at=(start + timedelta(hours=hours)).isoformat(),
+                operational_revision=self.session["operational_revision"] + 1,
+            )
+            return _Result(rowcount=1)
         if upper.startswith("UPDATE ADMISSION_OPERATIONAL_DEVICES SET LOGIN_SESSION_ID"):
             login_id, _sid, device_id = params
             self.devices[str(device_id)].update({

@@ -3,7 +3,7 @@
 import ast
 import inspect
 import textwrap
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -137,7 +137,7 @@ def test_real_qt_dialog_operation_preview_and_permissions(monkeypatch, role, tmp
             checkbox.click()
             qt.processEvents()
             assert "REPRESENTANTE ANTERIOR" in labels()
-            assert any("Corrección administrativa:" in text for text in labels())
+            assert any("Corregir horario:" in text for text in labels())
             apply = next(
                 button
                 for button in dialog.findChildren(QPushButton)
@@ -221,3 +221,49 @@ def test_confirmed_handoff_after_nominal_end_uses_central_configuration():
     assert not window.db.perform_explicit_turn_handoff.call_args.kwargs[
         "shift_metadata"
     ].get("administrative_override", False)
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+@pytest.mark.parametrize("aware", [False, True])
+def test_schedule_correction_mirrors_original_start_and_does_not_close(serialized, aware):
+    v15 = load_v15_application_module()
+    original = datetime(2026, 9, 25, 7, 45)
+    central_start = original.astimezone(timezone.utc) if aware else original
+    transition = SimpleNamespace(
+        committed=True, transition_id="correction", old_turn_id=111,
+        operational_session=SimpleNamespace(
+            turn_id=111,
+            turn_started_at=central_start.isoformat() if serialized else central_start,
+        ),
+    )
+    window = Mock(
+        db=Mock(
+            _runtime=SimpleNamespace(
+                state=lambda: {"active_username": "REPRESENTANTE"},
+                is_primary_shift_handover=lambda: False,
+            ),
+            perform_explicit_turn_handoff=Mock(return_value=transition),
+        ),
+        session_context=SimpleNamespace(
+            role=v15.ROLE_ADMIN,username="admin",display_name="ADMIN",session_id="login",
+        ),
+    )
+    save = Mock(return_value=True)
+    close = Mock()
+    callback = dialog_callback(
+        v15,self=window,win=Mock(),fecha_base=datetime(2026, 9, 26).date(),
+        combo_turno=Mock(get=lambda: "8AM_8PM"),
+        normalizar_turno_desde_combo=lambda value: value,
+        administrative_var=Mock(get=lambda: True),
+        cargar_turno_config=Mock(return_value={"turn_id": 111}),
+        guardar_turno_config=save,guardar_representante_catalogo=Mock(),
+        enqueue_excel_export_job=Mock(),schedule_turn_closure_post_commit=close,
+        messagebox=Mock(askyesno=lambda *_args, **_kwargs: True),
+        simpledialog=Mock(askstring=lambda *_args, **_kwargs: "Horario incorrecto"),
+        APP_LOG=Mock(),
+    )
+    assert callback() is True
+    assert save.call_args.args[2] == original.date()
+    assert save.call_args.kwargs["inicio_real"] == original
+    close.assert_not_called()
+    window.db.cerrar_turno_existente.assert_not_called()

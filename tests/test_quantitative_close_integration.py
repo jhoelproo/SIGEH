@@ -21,6 +21,10 @@ def test_central_capture_header_pdf_data_and_excel_agree(tmp_path):
         end = datetime(2026, 9, 25, 12, tzinfo=timezone.utc)
         with app.db_connect() as con:
             con.execute(
+                "UPDATE billing_reporting_policy SET enabled_at=%s",
+                (start,),
+            )
+            con.execute(
                 """INSERT INTO admission_operational_sessions(
                 operational_session_id,operational_source_id,active_username,
                 primary_device_id,primary_login_session_id,turn_id)

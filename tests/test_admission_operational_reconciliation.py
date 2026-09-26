@@ -255,6 +255,13 @@ def test_primary_same_user_relogin_rebinds_without_turn_or_generation_change(tmp
     assert state["generation"] == 80
     assert service.central.primary_login_session_id == "PRIMARY-LOGIN-B"
 
+    # An older window must not reclaim this computer every time it polls
+    # after another window has bound a different authenticated session.
+    service.central = replace(service.central, primary_login_session_id="NEW-WINDOW")
+    runtime.refresh_operational_state(force_remote=True)
+    runtime.refresh_operational_state(force_remote=True)
+    assert service.rebind_calls == 1
+
 
 def test_primary_auxiliary_then_operational_user_reattaches_same_turn(tmp_path):
     service = _PrimaryReloginService(

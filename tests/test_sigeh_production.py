@@ -36,6 +36,8 @@ class ProductConnection:
     def execute(self, query, params=None):
         normalized = " ".join(query.split())
         self.executed.append((normalized, params))
+        if normalized == "SELECT to_regclass('public.sigeh_product_state')":
+            return Cursor([("sigeh_product_state",)] if self.state else [])
         if normalized.startswith("SELECT * FROM sigeh_product_state"):
             return Cursor([self.state] if self.state else [])
         if "SELECT COUNT(*) FROM admission_operational_sessions" in normalized:
@@ -83,6 +85,148 @@ def test_bootstrap_refuses_unmarked_production_state():
     connection = ProductConnection(production_count=1)
     with pytest.raises(RuntimeError, match="estado productivo sin marcador"):
         prepare_sigeh_production_bootstrap(lambda: factory(connection))
+
+
+def test_existing_empty_product_table_is_initialized():
+    class EmptyProductTable(ProductConnection):
+        def execute(self, query, params=None):
+            if "to_regclass" in query:
+                return Cursor([("sigeh_product_state",)])
+            return super().execute(query, params)
+
+    connection = EmptyProductTable()
+    result = prepare_sigeh_production_bootstrap(lambda: factory(connection))
+    assert result.applied is True
+    assert result.production_epoch_id == connection.state["production_epoch_id"]
+
+
+def test_existing_database_epoch_restores_missing_file_marker_without_reset(tmp_path):
+    database = tmp_path / "pacientes.db"
+    _create_replica(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO app_metadata VALUES('sigeh.production_bootstrap_epoch',?)",
+            ("EPOCH-REAL",),
+        )
+    assert reset_local_operational_pointers(tmp_path, "EPOCH-REAL") == {
+        "closed_turns": 0, "superseded_events": 0
+    }
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT estado FROM turnos").fetchone()[0] == "ABIERTO"
+        assert connection.execute("SELECT sync_status FROM sync_outbox").fetchone()[0] == "PENDING"
+    assert json.loads((tmp_path / "sigeh_production_epoch.json").read_text()) == "EPOCH-REAL"
+
+
+def test_completed_bootstrap_does_not_repeat_ddl_or_take_write_locks():
+    connection = ProductConnection(existing_state={
+        "production_epoch_id": "EPOCH-1",
+        "bootstrap_version": PRODUCTION_BOOTSTRAP_VERSION,
+        "production_initialized_at": "2026-09-23",
+    })
+    result = prepare_sigeh_production_bootstrap(lambda: factory(connection))
+    assert not result.applied
+    assert all(query.startswith("SELECT") and "FOR UPDATE" not in query
+               and "pg_advisory_xact_lock" not in query
+               for query, _ in connection.executed)
+
+
+def test_reopening_same_epoch_preserves_pending_events_and_current_turn(tmp_path):
+    database = tmp_path / "pacientes.db"
+    _create_replica(database)
+    reset_local_operational_pointers(tmp_path, "EPOCH-REAL")
+    with sqlite3.connect(database) as con:
+        con.execute("UPDATE turnos SET estado='ABIERTO'")
+        con.execute("UPDATE sync_outbox SET sync_status='PENDING'")
+        con.execute("INSERT INTO admission_operational_cache VALUES(1)")
+    config = tmp_path / "turnos_config.json"
+    config.write_text('{"turn_id":111}', encoding="utf-8")
+    assert reset_local_operational_pointers(tmp_path, "EPOCH-REAL") == {
+        "closed_turns": 0, "superseded_events": 0,
+    }
+    with sqlite3.connect(database) as con:
+        assert con.execute("SELECT estado FROM turnos").fetchone()[0] == "ABIERTO"
+        assert con.execute("SELECT sync_status FROM sync_outbox").fetchone()[0] == "PENDING"
+        assert con.execute("SELECT COUNT(*) FROM admission_operational_cache").fetchone()[0] == 1
+    assert json.loads(config.read_text("utf-8")) == {"turn_id": 111}
+
+
+def test_reopening_initialized_directory_does_not_touch_locked_database(tmp_path):
+    database = tmp_path / "pacientes.db"
+    _create_replica(database)
+    reset_local_operational_pointers(tmp_path, "EPOCH-REAL")
+    with sqlite3.connect(database) as busy:
+        busy.execute("BEGIN EXCLUSIVE")
+        assert reset_local_operational_pointers(tmp_path, "EPOCH-REAL") == {
+            "closed_turns": 0, "superseded_events": 0,
+        }
+
+
+@pytest.mark.parametrize("content", ['"OLD-EPOCH"', 'invalid json'])
+def test_old_or_damaged_marker_falls_back_to_database(tmp_path, content):
+    database = tmp_path / "pacientes.db"
+    _create_replica(database)
+    (tmp_path / "sigeh_production_epoch.json").write_text(content, encoding="utf-8")
+    assert reset_local_operational_pointers(tmp_path, "NEW-EPOCH")["closed_turns"] == 1
+
+
+def test_bootstrap_does_not_discard_events_from_database_created_after_first_start(tmp_path):
+    reset_local_operational_pointers(tmp_path, "EPOCH-REAL")
+    database = tmp_path / "pacientes.db"
+    _create_replica(database)
+    reset_local_operational_pointers(tmp_path, "EPOCH-REAL")
+    with sqlite3.connect(database) as con:
+        assert con.execute("SELECT sync_status FROM sync_outbox").fetchone()[0] == "PENDING"
+
+
+def test_failed_json_reset_rolls_back_local_epoch_and_events(tmp_path, monkeypatch):
+    import sigeh_product
+
+    database = tmp_path / "pacientes.db"
+    _create_replica(database)
+
+    def fail(*_):
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(sigeh_product, "_reset_local_json", fail)
+    with pytest.raises(OSError, match="disk failure"):
+        reset_local_operational_pointers(tmp_path, "EPOCH-REAL")
+    with sqlite3.connect(database) as con:
+        assert con.execute("SELECT estado FROM turnos").fetchone()[0] == "ABIERTO"
+        assert con.execute("SELECT sync_status FROM sync_outbox").fetchone()[0] == "PENDING"
+        assert con.execute("SELECT COUNT(*) FROM app_metadata").fetchone()[0] == 0
+
+
+def test_empty_epoch_is_rejected_before_modifying_local_data(tmp_path):
+    with pytest.raises(ValueError, match="época"):
+        reset_local_operational_pointers(tmp_path, "")
+
+
+def test_simultaneous_first_starts_only_reset_the_replica_once(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, local
+    import sigeh_product
+
+    database = tmp_path / "pacientes.db"
+    _create_replica(database)
+    barrier = Barrier(3)
+    seen = local()
+    original = sigeh_product._local_epoch_matches
+
+    def coordinated_check(connection, epoch_id):
+        result = original(connection, epoch_id)
+        if not getattr(seen, "checked", False):
+            seen.checked = True
+            barrier.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(sigeh_product, "_local_epoch_matches", coordinated_check)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(
+            lambda _: reset_local_operational_pointers(tmp_path, "EPOCH-REAL"), range(3),
+        ))
+    assert sum(result["closed_turns"] for result in results) == 1
+    assert sum(result["superseded_events"] for result in results) == 1
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_bootstrap_without_test_sessions_still_creates_epoch():

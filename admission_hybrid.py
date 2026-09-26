@@ -5115,8 +5115,8 @@ class OperationalSessionService:
 
     def heartbeat(self, *, operational_session_id: str, device_id: str) -> None:
         with self.connection_factory() as con:
-            con.execute("UPDATE admission_operational_devices SET last_seen=NOW() WHERE operational_session_id=%s AND device_id=%s AND detached_at IS NULL", (operational_session_id, device_id))
             con.execute("UPDATE admission_operational_sessions SET primary_last_seen=NOW(),updated_at=NOW() WHERE operational_session_id=%s AND primary_device_id=%s AND status='ACTIVE'", (operational_session_id,device_id))
+            con.execute("UPDATE admission_operational_devices SET last_seen=NOW() WHERE operational_session_id=%s AND device_id=%s AND detached_at IS NULL", (operational_session_id, device_id))
 
 
     def resolve_operational_state(
@@ -5609,11 +5609,10 @@ class OperationalSessionService:
                     "estación PRIMARY puede cambiar el turno de Admisión."
                 )
 
-            target_turn_id = (
-                self._allocate_next_central_turn_id(con)
-                if allocate_central_turn_id
-                else requested_turn_id
-            )
+            if allocate_central_turn_id:
+                return self._correct_turn_schedule(con, current, request)
+
+            target_turn_id = requested_turn_id
             if current.turn_id != target_turn_id:
                 raced_transition = self._reserve_handoff_transition(
                     con,
@@ -5833,6 +5832,106 @@ class OperationalSessionService:
             new_user_id=changed.active_user_id,
             old_username=current.active_username,
             new_username=changed.active_username,
+        )
+
+    def _correct_turn_schedule(
+        self,
+        con: Any,
+        current: OperationalSession,
+        request: HandoffTransitionRequest,
+    ) -> PrimaryTransitionResult:
+        """Correct the schedule without closing or splitting the admission cohort."""
+        code = request.new_turn_code or current.turn_code
+        if code not in {"8AM_8AM", "8AM_8PM", "8PM_8AM"}:
+            raise AdmissionWriteBlocked("Seleccione un horario de turno válido.")
+        if current.turn_id is None or not current.turn_started_at:
+            raise AdmissionWriteBlocked(
+                "El turno no tiene una identidad e inicio confirmados."
+            )
+        duplicate = self._reserve_handoff_transition(
+            con,
+            request=request,
+            username=request.actor_username,
+        )
+        if duplicate:
+            return self._recover_committed_handoff(
+                transition_row=duplicate,
+                request=request,
+                current=current,
+            )
+        con.execute(
+            """UPDATE admission_operational_sessions
+                  SET turn_code=%s,
+                      turn_ends_at=turn_started_at+(%s*INTERVAL '1 hour'),
+                      operational_revision=operational_revision+1,
+                      changed_by=%s,change_reason=%s,updated_at=NOW()
+                WHERE operational_session_id=%s""",
+            (
+                code,
+                operational_turn_duration_hours(code),
+                request.actor_username,
+                request.reason[:240],
+                current.operational_session_id,
+            ),
+        )
+        updated = self._row_to_session(
+            con.execute(
+                "SELECT * FROM admission_operational_sessions WHERE operational_session_id=%s",
+                (current.operational_session_id,),
+            ).fetchone()
+        )
+        if updated is None:
+            raise AdmissionWriteBlocked(
+                "No fue posible confirmar la corrección de horario."
+            )
+        interval = con.execute(
+            """UPDATE admission_operational_turn_intervals SET nominal_ends_at=%s
+                WHERE operational_session_id=%s AND turn_id=%s
+                  AND generation=%s AND ended_at IS NULL""",
+            (
+                updated.turn_ends_at,
+                current.operational_session_id,
+                current.turn_id,
+                current.generation,
+            ),
+        )
+        if interval.rowcount != 1:
+            raise AdmissionWriteBlocked("El intervalo abierto del turno no es único.")
+        self._commit_handoff_transition(
+            con,
+            request=request,
+            username=request.actor_username,
+            generation=updated.generation,
+            result={
+                "old_turn_id": current.turn_id,
+                "new_turn_id": updated.turn_id,
+                "old_generation": current.generation,
+                "new_generation": updated.generation,
+                "old_operational_revision": current.operational_revision,
+                "new_operational_revision": updated.operational_revision,
+                "old_user_id": current.active_user_id,
+                "new_user_id": updated.active_user_id,
+                "old_username": current.active_username,
+                "new_username": updated.active_username,
+                "old_primary_login_session_id": current.primary_login_session_id,
+                "invalidated_login_session_ids": [],
+                "schedule_only": True,
+                "old_turn_code": current.turn_code,
+                "new_turn_code": updated.turn_code,
+            },
+        )
+        return PrimaryTransitionResult(
+            operational_session=updated,
+            transition_id=request.transition_id,
+            committed=True,
+            old_turn_id=current.turn_id,
+            new_turn_id=updated.turn_id,
+            old_generation=current.generation,
+            new_generation=updated.generation,
+            old_user_id=current.active_user_id,
+            new_user_id=updated.active_user_id,
+            old_username=current.active_username,
+            new_username=updated.active_username,
         )
 
     def admin_change_admission_turn(

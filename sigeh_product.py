@@ -13,7 +13,7 @@ from typing import Any
 
 PRODUCT_NAME = "SIGEH"
 PRODUCT_ID = "SIGEH"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 GITHUB_OWNER = "jhoelproo"
 GITHUB_REPOSITORY = f"{GITHUB_OWNER}/SIGEH"
 PRODUCTION_BOOTSTRAP_VERSION = "SIGEH_PRODUCTION_BOOTSTRAP_V1"
@@ -138,6 +138,15 @@ def prepare_sigeh_production_bootstrap(
     dos estaciones arranquen simultáneamente.
     """
     with connection_factory() as connection:
+        table = connection.execute(
+            "SELECT to_regclass('public.sigeh_product_state')"
+        ).fetchone()
+        if table and table[0]:
+            existing = connection.execute(
+                "SELECT * FROM sigeh_product_state WHERE singleton=1"
+            ).fetchone()
+            if existing:
+                return _bootstrap_result(existing, applied=False)
         connection.execute(
             "SELECT pg_advisory_xact_lock(hashtext(%s))",
             (PRODUCTION_BOOTSTRAP_VERSION,),
@@ -220,7 +229,6 @@ def prepare_sigeh_production_bootstrap(
 
 
 def current_production_epoch(connection: Any) -> str:
-    ensure_sigeh_production_schema(connection)
     row = connection.execute(
         """SELECT production_epoch_id::TEXT
              FROM sigeh_product_state
@@ -260,7 +268,29 @@ def reset_local_operational_pointers(
     """Neutraliza punteros TEST de una réplica sin borrar pacientes/historia."""
     root = Path(data_directory).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    counts = _reset_local_database(root / "pacientes.db", epoch_id)
+    if not str(epoch_id).strip():
+        raise ValueError("La época de producción es obligatoria.")
+    marker = root / "sigeh_production_epoch.json"
+    if _epoch_marker_matches(marker, epoch_id):
+        return {"closed_turns": 0, "superseded_events": 0}
+    database_path = root / "pacientes.db"
+    if database_path.is_file():
+        counts = _reset_local_database(database_path, epoch_id)
+    else:
+        _reset_local_json(root, epoch_id)
+        counts = {"closed_turns": 0, "superseded_events": 0}
+    _write_json(marker, str(epoch_id))
+    return counts
+
+
+def _epoch_marker_matches(path: Path, epoch_id: str) -> bool:
+    try:
+        return json.loads(path.read_text("utf-8")) == str(epoch_id)
+    except (OSError, ValueError):
+        return False
+
+
+def _reset_local_json(root: Path, epoch_id: str) -> None:
 
     _write_json(root / "turnos_config.json", {})
     _write_json(root / "representantes.json", [])
@@ -278,7 +308,17 @@ def reset_local_operational_pointers(
             "consultas": 0,
         },
     )
-    return counts
+
+
+def _local_epoch_matches(connection: sqlite3.Connection, epoch_id: str) -> bool:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_metadata'"
+    ).fetchone():
+        return False
+    row = connection.execute(
+        "SELECT valor FROM app_metadata WHERE clave='sigeh.production_bootstrap_epoch'"
+    ).fetchone()
+    return bool(row and str(row[0]) == str(epoch_id))
 
 
 def _reset_local_database(database_path: Path, epoch_id: str) -> dict[str, int]:
@@ -287,8 +327,13 @@ def _reset_local_database(database_path: Path, epoch_id: str) -> dict[str, int]:
         return counts
     connection = sqlite3.connect(database_path, timeout=5.0)
     try:
+        if _local_epoch_matches(connection, epoch_id):
+            return counts
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("BEGIN IMMEDIATE")
+        if _local_epoch_matches(connection, epoch_id):
+            connection.rollback()
+            return counts
         tables = {
             str(row[0])
             for row in connection.execute(
@@ -300,12 +345,15 @@ def _reset_local_database(database_path: Path, epoch_id: str) -> dict[str, int]:
         for table in ("admission_operational_cache", "sync_runtime_context"):
             if table in tables:
                 connection.execute(f"DELETE FROM {table}")
-        if "app_metadata" in tables:
-            connection.execute(
-                """INSERT INTO app_metadata(clave,valor) VALUES(?,?)
+        _reset_local_json(database_path.parent, epoch_id)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS app_metadata(clave TEXT PRIMARY KEY,valor TEXT)"
+        )
+        connection.execute(
+            """INSERT INTO app_metadata(clave,valor) VALUES(?,?)
                    ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor""",
-                ("sigeh.production_bootstrap_epoch", str(epoch_id)),
-            )
+            ("sigeh.production_bootstrap_epoch", str(epoch_id)),
+        )
         connection.commit()
     except Exception:
         connection.rollback()
@@ -342,9 +390,12 @@ def _supersede_pending_events(
 
 
 def _write_json(path: Path, value: Any) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)

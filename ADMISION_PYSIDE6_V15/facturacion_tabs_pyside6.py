@@ -17077,8 +17077,8 @@ class App:
                 )
             )
             operacion_detalle_var.set(
-                "Corrección administrativa: conserva representante y PRIMARY; "
-                "puede asignar una nueva identidad de turno. Requiere confirmación y razón."
+                "Corregir horario: conserva el turno, su inicio y todos sus pacientes. "
+                "El representante y el equipo principal no cambian."
                 if correccion else
                 "Relevo formal: el usuario autenticado recibirá el nuevo turno. "
                 "Debe ser diferente del representante actual."
@@ -17087,7 +17087,10 @@ class App:
             datos_turno = obtener_datos_turno_visual(fecha_base, turno_codigo)
             vista_turno_var.set(datos_turno["turno_label"])
             vista_fecha_var.set(datos_turno["fecha_label"])
-            vista_inicio_real_var.set(datetime.now().strftime("%d/%m/%Y %I:%M %p"))
+            vista_inicio_real_var.set(
+                str(snapshot_turno.get("turn_started_at") or "Se conserva el inicio original")
+                if correccion else datetime.now().strftime("%d/%m/%Y %I:%M %p")
+            )
 
         def refrescar_turnos():
             combo_turno.configure(values=[
@@ -17104,7 +17107,7 @@ class App:
         if normalize_role(self.session_context.role) == ROLE_ADMIN:
             tb.Checkbutton(
                 form_card,
-                text="Aplicar como corrección administrativa (conservar representante)",
+                text="Corregir horario del turno actual (conservar pacientes)",
                 variable=administrative_var,
                 command=actualizar_vista_previa,
             ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 8))
@@ -17180,8 +17183,8 @@ class App:
                 if not messagebox.askyesno(
                     "Corrección administrativa de turno",
                     "Ha seleccionado una corrección administrativa. "
-                    "Esta operación puede crear una nueva identidad de turno.\n\n"
-                    "El representante y PRIMARY no cambiarán.\n\n"
+                    "Se ajustará únicamente el horario del turno actual.\n\n"
+                    "Se conservarán su inicio, representante y todos sus pacientes.\n\n"
                     "¿Desea aplicarlo como corrección administrativa?",
                     parent=win,
                 ):
@@ -17300,11 +17303,20 @@ class App:
                         getattr(transition, "old_turn_id", None),
                     )
             try:
+                inicio_espejo = momento_cambio
+                fecha_espejo = fecha_base
+                if administrative_override:
+                    inicio_espejo = changed_session.turn_started_at
+                    if isinstance(inicio_espejo, str):
+                        inicio_espejo = datetime.fromisoformat(inicio_espejo.replace("Z", "+00:00"))
+                    if inicio_espejo.tzinfo is not None:
+                        inicio_espejo = inicio_espejo.astimezone().replace(tzinfo=None)
+                    fecha_espejo = inicio_espejo.date()
                 saved = guardar_turno_config(
                     representante,
                     turno_codigo,
-                    fecha_base,
-                    inicio_real=momento_cambio,
+                    fecha_espejo,
+                    inicio_real=inicio_espejo,
                     administrative_override=administrative_override,
                     override_reason=override_reason,
                 )
@@ -17413,7 +17425,8 @@ class App:
                     "Cambio aplicado",
                     (
                         "Corrección administrativa de turno aplicada correctamente.\n\n"
-                        "El representante y PRIMARY se conservaron. No se generó reporte de cierre."
+                        "El turno conserva su inicio y todos sus pacientes. "
+                        "El cierre se generará al realizar el relevo al siguiente usuario."
                         if administrative_override
                         else (
                             "Relevo formal aplicado correctamente.\n\n"

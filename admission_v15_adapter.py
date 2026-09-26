@@ -1782,6 +1782,12 @@ class _HybridAdmissionRuntime:
             or login_rebind_required
         )
         if not needs_attachment:
+            self._confirmed_login_binding = self.login_session_id
+            return state
+        if (
+            login_rebind_required
+            and getattr(self, "_confirmed_login_binding", None) == self.login_session_id
+        ):
             return state
 
         self.logger.info(
@@ -1800,6 +1806,7 @@ class _HybridAdmissionRuntime:
             login_session_id=self.login_session_id,
             device_name=str(getattr(self.host, "device_name", "")),
         )
+        self._confirmed_login_binding = self.login_session_id
         self._attachment_from_cache = False
         rebound = self._refresh_authoritative_state(
             reason="automatic_login_reattach",
