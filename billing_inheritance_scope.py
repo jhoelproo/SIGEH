@@ -55,8 +55,18 @@ def inherited_attention_sql(
                               inherited_interval.operational_session_id
                           AND inherited_audit.event_type='TURN_HANDOFF_TRANSITION'
                           AND inherited_audit.details_json->>'status'='COMMITTED'
-                          AND inherited_audit.details_json->'request'->>
-                              'transition_type'='PRIMARY_USER_HANDOFF'
+                          AND (
+                              inherited_audit.details_json->'request'->>
+                                  'transition_type'='PRIMARY_USER_HANDOFF'
+                              OR (
+                                  inherited_audit.details_json->'request'->>
+                                      'transition_type'='ADMIN_TURN_OVERRIDE'
+                                  AND inherited_audit.details_json->'result'->>
+                                      'new_turn_id' IS NOT NULL
+                                  AND inherited_audit.details_json->'result'->>
+                                      'new_turn_id'<>{p}.turn_id::TEXT
+                              )
+                          )
                           AND inherited_audit.details_json->'result'->>
                               'old_turn_id'={p}.turn_id::TEXT
                    )

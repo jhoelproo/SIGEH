@@ -3,6 +3,7 @@ import ctypes
 import hashlib
 import hmac
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Mapping
@@ -20,6 +21,10 @@ _DPAPI_ENTROPY = b"HospitalFacturacion:DatabaseUrl:v1"
 # HMAC detecta alteraciones del archivo entregado.
 _BUNDLE_KEY_MATERIAL = b"HospitalFacturacion:PortableDatabaseConfig:v1"
 _BUNDLE_PREFIX = b"HOSPITAL_DB_BUNDLE_V1:"
+_VERSIONED_INSTALL_DIRECTORY = re.compile(
+    r"^SIGEH-\d+\.\d+\.\d+(?:-windows-x64)?(?:-internal)?$",
+    re.IGNORECASE,
+)
 
 
 def application_root() -> Path:
@@ -308,7 +313,21 @@ def _existing_install_candidates(
     root: Path, environment: Mapping[str, str]
 ) -> tuple[Path, ...]:
     """Return bounded, conventional SIGEH locations without scanning user files."""
-    bases = [root.parent]
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    current = root.resolve()
+    for base in _candidate_base_directories(root, environment):
+        for name in ("SIGEH", "HOSPITAL"):
+            _append_install_candidate(candidates, seen, current, base / name)
+        for candidate in _versioned_install_candidates(base):
+            _append_install_candidate(candidates, seen, current, candidate)
+    return tuple(candidates)
+
+
+def _candidate_base_directories(
+    root: Path, environment: Mapping[str, str]
+) -> tuple[Path, ...]:
+    bases = [root.parent, root.parent.parent]
     user_profile = str(environment.get("USERPROFILE") or "").strip()
     if user_profile:
         profile = Path(user_profile)
@@ -317,18 +336,36 @@ def _existing_install_candidates(
         one_drive = str(environment.get(key) or "").strip()
         if one_drive:
             bases.append(Path(one_drive) / "Desktop")
+    return tuple(dict.fromkeys(bases))
 
-    candidates: list[Path] = []
-    seen: set[Path] = set()
-    current = root.resolve()
-    for base in bases:
-        for name in ("SIGEH", "HOSPITAL"):
-            candidate = (base / name).resolve()
-            if candidate == current or candidate in seen:
-                continue
-            seen.add(candidate)
-            candidates.append(candidate)
-    return tuple(candidates)
+
+def _append_install_candidate(
+    candidates: list[Path], seen: set[Path], current: Path, candidate: Path
+) -> None:
+    resolved = candidate.resolve()
+    if resolved == current or resolved in seen:
+        return
+    seen.add(resolved)
+    candidates.append(resolved)
+
+
+def _versioned_install_candidates(base: Path) -> tuple[Path, ...]:
+    try:
+        directories = tuple(base.iterdir())
+    except OSError:
+        return ()
+    matching = sorted(
+        (
+            entry
+            for entry in directories
+            if entry.is_dir() and _VERSIONED_INSTALL_DIRECTORY.fullmatch(entry.name)
+        ),
+        key=lambda entry: entry.name.casefold(),
+        reverse=True,
+    )
+    return tuple(
+        candidate for entry in matching for candidate in (entry / "SIGEH", entry)
+    )
 
 
 def recover_database_url_from_existing_install(

@@ -1,6 +1,8 @@
 import json
 from uuid import uuid4
 
+import pytest
+
 import CALCULOS_QT as app
 from admission_authorship import repair_admission_authorship
 from admission_urgency_repair import repair_urgency_projection
@@ -12,7 +14,12 @@ from billing_closure_recovery import (
 from tests import test_integral_emergency_to_monthly_list as integration
 
 
-def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
+@pytest.mark.parametrize(
+    "transition_type", ["PRIMARY_USER_HANDOFF", "ADMIN_TURN_OVERRIDE"]
+)
+def test_recovery_carries_pending_across_multiple_days_and_is_idempotent(
+    transition_type,
+):
     fixture = integration.IntegralEmergencyToMonthlyListTests(
         "test_emergency_to_audit_to_monthly_ars_list"
     )
@@ -46,8 +53,11 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
                         json.dumps(
                             {
                                 "status": "COMMITTED",
-                                "request": {"transition_type": "PRIMARY_USER_HANDOFF"},
-                                "result": {"old_turn_id": turn},
+                                "request": {"transition_type": transition_type},
+                                "result": {
+                                    "old_turn_id": turn,
+                                    "new_turn_id": turn + 1,
+                                },
                             }
                         ),
                     ),
@@ -115,6 +125,23 @@ def test_recovery_carries_pending_across_multiple_days_and_is_idempotent():
                 == "ORIGINAL"
             )
             pending = pending_central_closures(con)
+            assert len(pending) == 3
+            if transition_type == "ADMIN_TURN_OVERRIDE":
+                for new_turn in ("same", "missing"):
+                    con.execute("SAVEPOINT administrative_boundary")
+                    if new_turn == "same":
+                        con.execute(
+                            """UPDATE admission_operational_audit SET details_json=
+                            jsonb_set(details_json,'{result,new_turn_id}',
+                                      details_json->'result'->'old_turn_id')"""
+                        )
+                    else:
+                        con.execute(
+                            """UPDATE admission_operational_audit SET details_json=
+                            details_json #- '{result,new_turn_id}'"""
+                        )
+                    assert pending_central_closures(con) == []
+                    con.execute("ROLLBACK TO SAVEPOINT administrative_boundary")
             next_event = closure_from_interval(dict(pending[1]))
             assert len(closed_turn_attentions(con, next_event, previous=True)) == 2
             con.execute("SAVEPOINT boundaries")

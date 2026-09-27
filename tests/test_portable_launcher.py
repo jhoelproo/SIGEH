@@ -1,6 +1,7 @@
 import json
 
 import portable_launcher
+from database_config import BUNDLED_DATABASE_FILE, write_bundled_database_url
 
 
 def test_launcher_uses_bundled_database_configuration_without_env_file(
@@ -93,6 +94,32 @@ def test_launcher_recovers_existing_install_for_direct_download(tmp_path, monkey
 
     assert portable_launcher.main() == 0
     assert captured["env"]["DATABASE_URL"] == "postgresql://recovered"
+
+
+def test_launcher_recovers_real_bundle_from_versioned_previous_install(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    one_drive = tmp_path / "OneDrive"
+    downloaded = one_drive / "Desktop" / "SIGEH-1.2.5-windows-x64" / "SIGEH"
+    previous = one_drive / "Desktop" / "SIGEH-1.2.4-windows-x64" / "SIGEH" / "_internal"
+    downloaded.mkdir(parents=True)
+    previous.mkdir(parents=True)
+    (downloaded / "CALCULOS_QT.exe").write_bytes(b"synthetic")
+    (downloaded / "_internal").mkdir()
+    expected = "postgresql://synthetic-user:synthetic-pass@central.example/hospital"
+    write_bundled_database_url(previous / BUNDLED_DATABASE_FILE, expected)
+    captured = {}
+    monkeypatch.setattr(portable_launcher, "portable_root", lambda: downloaded)
+    monkeypatch.setattr(
+        portable_launcher.subprocess,
+        "Popen",
+        lambda command, **kwargs: captured.update(command=command, **kwargs),
+    )
+
+    assert portable_launcher.main() == 0
+    assert captured["env"]["DATABASE_URL"] == expected
+    assert captured["command"] == [str(downloaded / "CALCULOS_QT.exe")]
 
 
 def test_self_test_validates_install_without_launching(tmp_path, monkeypatch):

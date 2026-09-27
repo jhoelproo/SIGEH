@@ -26,12 +26,13 @@ BEGIN
  IF NEW.transition_id IS NULL
     OR NEW.event_type IS DISTINCT FROM 'TURN_HANDOFF_TRANSITION'
     OR NEW.details_json->>'status' IS DISTINCT FROM 'COMMITTED'
-    OR NEW.details_json->'request'->>'transition_type' IS DISTINCT FROM 'PRIMARY_USER_HANDOFF'
+    OR COALESCE(NEW.details_json->'request'->>'transition_type','')
+       NOT IN ('PRIMARY_USER_HANDOFF','ADMIN_TURN_OVERRIDE')
     THEN RETURN NEW; END IF;
  source := (NEW.details_json->'request'->>'operational_source_id')::UUID;
  old_turn := (NEW.details_json->'result'->>'old_turn_id')::BIGINT;
  new_turn := (NEW.details_json->'result'->>'new_turn_id')::BIGINT;
- IF old_turn IS NULL OR old_turn=new_turn THEN RETURN NEW; END IF;
+ IF old_turn IS NULL OR new_turn IS NULL OR old_turn=new_turn THEN RETURN NEW; END IF;
  SELECT transition_id INTO existing_transition FROM billing_close_snapshots
   WHERE source_id=source AND turn_id=old_turn;
  IF FOUND THEN

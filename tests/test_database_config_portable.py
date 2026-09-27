@@ -174,6 +174,48 @@ def test_direct_download_does_not_scan_unrelated_desktop_directories(tmp_path: P
     )
 
 
+def test_direct_download_recovers_from_versioned_desktop_install(tmp_path: Path):
+    one_drive = tmp_path / "OneDrive"
+    user_profile = tmp_path / "user"
+    downloaded = one_drive / "Desktop" / "SIGEH-1.2.5-windows-x64" / "SIGEH"
+    previous_internal = (
+        one_drive / "Desktop" / "SIGEH-1.2.4-windows-x64" / "SIGEH" / "_internal"
+    )
+    downloaded.mkdir(parents=True)
+    previous_internal.mkdir(parents=True)
+    value = "postgresql://hospital-user:secret@central.example/hospital"
+    write_bundled_database_url(previous_internal / BUNDLED_DATABASE_FILE, value)
+
+    assert (
+        recover_database_url_from_existing_install(
+            downloaded,
+            environment={"USERPROFILE": str(user_profile), "OneDrive": str(one_drive)},
+        )
+        == value
+    )
+
+
+def test_direct_download_skips_nonproduct_versioned_directories(tmp_path: Path):
+    user_profile = tmp_path / "user"
+    downloaded = user_profile / "Downloads" / "SIGEH-1.2.5-windows-x64" / "SIGEH"
+    unrelated = (
+        user_profile / "Desktop" / "SIGEH-backup-1.2.4-windows-x64" / "_internal"
+    )
+    downloaded.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    write_bundled_database_url(
+        unrelated / BUNDLED_DATABASE_FILE,
+        "postgresql://unrelated:secret@central.example/other",
+    )
+
+    assert (
+        recover_database_url_from_existing_install(
+            downloaded, environment={"USERPROFILE": str(user_profile)}
+        )
+        == ""
+    )
+
+
 def test_direct_download_recovers_one_drive_hospital_install_without_profile(
     tmp_path: Path,
 ):

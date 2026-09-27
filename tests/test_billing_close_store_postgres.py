@@ -38,14 +38,16 @@ def close_database(server):
     return lambda: pg.Connection(server)
 
 
-def commit_handoff(con, transition):
+def commit_handoff(
+    con, transition, transition_type="PRIMARY_USER_HANDOFF", new_turn=12
+):
     details = {
         "status": "COMMITTED",
         "request": {
             "operational_source_id": pg.SOURCE,
-            "transition_type": "PRIMARY_USER_HANDOFF",
+            "transition_type": transition_type,
         },
-        "result": {"old_turn_id": 11, "new_turn_id": 12},
+        "result": {"old_turn_id": 11, "new_turn_id": new_turn},
     }
     con.execute(
         """INSERT INTO admission_operational_audit
@@ -56,7 +58,12 @@ def commit_handoff(con, transition):
     )
 
 
-def test_capture_canonical_receipts_once_and_preserve_snapshot(close_database):
+@pytest.mark.parametrize(
+    "transition_type", ["PRIMARY_USER_HANDOFF", "ADMIN_TURN_OVERRIDE"]
+)
+def test_capture_canonical_receipts_once_and_preserve_snapshot(
+    close_database, transition_type
+):
     transition = str(uuid4())
     with close_database() as con:
         con.execute(
@@ -72,8 +79,8 @@ def test_capture_canonical_receipts_once_and_preserve_snapshot(close_database):
         )
         con.execute("""INSERT INTO recibos(id,created_at,numero_autorizacion)
             SELECT n,'2026-09-24T11:00:00-04','1234' FROM generate_series(2,50) n""")
-        commit_handoff(con, transition)
-        commit_handoff(con, transition)
+        commit_handoff(con, transition, transition_type)
+        commit_handoff(con, transition, transition_type)
         snapshot = load_close_snapshot(con, pg.SOURCE, 11)
         assert snapshot["receipt_count"] == 50
         assert snapshot["linked_billed"] == 1
@@ -94,10 +101,22 @@ def test_capture_canonical_receipts_once_and_preserve_snapshot(close_database):
             con.execute("DELETE FROM billing_close_snapshots")
 
 
-def test_capture_rolls_back_with_handoff(close_database):
+@pytest.mark.parametrize("new_turn", [11, None])
+def test_administrative_correction_without_rollover_has_no_close(
+    close_database, new_turn
+):
+    with close_database() as con:
+        commit_handoff(con, str(uuid4()), "ADMIN_TURN_OVERRIDE", new_turn)
+        assert load_close_snapshot(con, pg.SOURCE, 11) is None
+
+
+@pytest.mark.parametrize(
+    "transition_type", ["PRIMARY_USER_HANDOFF", "ADMIN_TURN_OVERRIDE"]
+)
+def test_capture_rolls_back_with_handoff(close_database, transition_type):
     with pytest.raises(RuntimeError, match="simulated"):
         with close_database() as con:
-            commit_handoff(con, str(uuid4()))
+            commit_handoff(con, str(uuid4()), transition_type)
             raise RuntimeError("simulated transaction failure")
     with close_database() as con:
         assert load_close_snapshot(con, pg.SOURCE, 11) is None

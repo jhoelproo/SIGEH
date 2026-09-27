@@ -80,7 +80,14 @@ def pending_central_closures(connection):
                  AND audit.details_json->'result'->>'old_turn_id'=i.turn_id::TEXT
                  AND audit.details_json->>'status'='COMMITTED'
                  AND audit.event_type='TURN_HANDOFF_TRANSITION'
-                 AND audit.details_json->'request'->>'transition_type'='PRIMARY_USER_HANDOFF'
+                 AND (
+                     audit.details_json->'request'->>'transition_type'='PRIMARY_USER_HANDOFF'
+                     OR (
+                         audit.details_json->'request'->>'transition_type'='ADMIN_TURN_OVERRIDE'
+                         AND audit.details_json->'result'->>'new_turn_id' IS NOT NULL
+                         AND audit.details_json->'result'->>'new_turn_id'<>i.turn_id::TEXT
+                     )
+                 )
                ORDER BY audit.id DESC LIMIT 1
            ) a ON TRUE
            LEFT JOIN billing_shift_closures c
