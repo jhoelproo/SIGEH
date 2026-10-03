@@ -4,6 +4,8 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QColor
@@ -47,7 +49,7 @@ class _SummaryConnection:
 
     def execute(self, sql, params=()):
         self.calls.append((sql, params))
-        if "SELECT p.* FROM admission_attention_projection" in sql:
+        if "SELECT p.source_instance_id,p.attention_id" in sql:
             return _Result(
                 rows=[
                     {
@@ -150,6 +152,57 @@ def test_shift_summary_uses_central_operational_turn_not_local_v15_turn():
     assert summary["correction"] == 1
     assert [row["ars"] for row in summary["by_ars"]] == ["APS", "FUTURO"]
     assert all("MAX(p2.turn_id)" not in sql for sql, _params in connection.calls)
+    projection_sql = connection.calls[0][0]
+    assert "p.*" not in projection_sql
+    assert "latest_payload_json" not in projection_sql
+
+
+@pytest.mark.parametrize("source,turn", [("", 1), ("source", 0), ("source", -1)])
+def test_shift_summary_rejects_missing_or_invalid_turn_without_query(source, turn):
+    with (
+        patch.object(
+            app,
+            "get_central_operational_context",
+            return_value={
+                "operational_source_id": source,
+                "turn_id": turn,
+            },
+        ),
+        patch.object(app, "db_connect") as connect,
+    ):
+        with pytest.raises(app.AdmissionBridgeError):
+            app.load_current_shift_billing_summary()
+    connect.assert_not_called()
+
+
+def test_empty_shift_summary_keeps_inherited_count_and_skips_receipt_lookup():
+    class EmptyConnection(_SummaryConnection):
+        def execute(self, sql, params=()):
+            result = super().execute(sql, params)
+            return (
+                _Result()
+                if "SELECT p.source_instance_id,p.attention_id" in sql
+                else result
+            )
+
+    connection = EmptyConnection()
+    with (
+        patch.object(app, "db_connect", return_value=connection),
+        patch.object(
+            app,
+            "get_central_operational_context",
+            return_value={
+                "operational_source_id": "source",
+                "turn_id": 33,
+            },
+        ),
+    ):
+        summary = app.load_current_shift_billing_summary()
+    assert summary["admitted"] == summary["invoiced"] == summary["pending"] == 0
+    assert summary["inherited_pending"] == 1
+    assert summary["previous_day_invoiced"] == 0
+    assert summary["by_ars"] == []
+    assert len(connection.calls) == 2
 
 
 class _SelectionConnection:

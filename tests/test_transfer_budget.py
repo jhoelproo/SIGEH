@@ -109,6 +109,7 @@ def test_meter_singleton_valid_and_invalid_config(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setattr(module, "_METER", None)
     first = module.get_transfer_meter()
+    assert first.allowance == 5_000_000_000 // 3
     assert module.get_transfer_meter() is first
     config = tmp_path / "SIGEH" / "telemetry" / "budget.json"
     config.parent.mkdir(parents=True)
@@ -117,7 +118,20 @@ def test_meter_singleton_valid_and_invalid_config(tmp_path, monkeypatch):
     assert module.get_transfer_meter().allowance == 2_500_000_000
     config.write_text("invalid")
     monkeypatch.setattr(module, "_METER", None)
-    assert module.get_transfer_meter().allowance == 5_000_000_000
+    assert module.get_transfer_meter().allowance == 5_000_000_000 // 3
+
+
+def test_partial_budget_config_preserves_three_station_default(tmp_path, monkeypatch):
+    import transfer_budget as module
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(module, "_METER", None)
+    config = tmp_path / "SIGEH" / "telemetry" / "budget.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"start_day":2}')
+    meter = module.get_transfer_meter()
+    assert meter.start_day == 2
+    assert meter.allowance == 5_000_000_000 // 3
 
 
 def test_aggregation_and_export(tmp_path, monkeypatch):

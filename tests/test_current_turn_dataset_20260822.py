@@ -52,7 +52,14 @@ class _CloudConnection:
         return False
 
     def execute(self, _sql, params=()):
-        self.params = tuple(params)
+        self.params = tuple(params[:2])
+        if "AS row_fingerprint" in _sql:
+            return _Cursor(
+                [
+                    {"attention_id": row["attention_id"], "row_fingerprint": repr(row)}
+                    for row in self.rows
+                ]
+            )
         return _Cursor(self.rows)
 
 

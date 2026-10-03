@@ -38,10 +38,12 @@ Las consultas de `db_init` y migraciones se revisaron como preparación del esqu
 Configuración local opcional `%LOCALAPPDATA%/SIGEH/telemetry/budget.json`:
 
 ```json
-{"quota_bytes": 5000000000, "stations": 4, "start_day": 1}
+{"quota_bytes": 5000000000, "stations": 3, "start_day": 1}
 ```
 
-`stations: 4` es un **ejemplo**, no un dato confirmado del hospital. Se reparte la cuota entre las estaciones configuradas. Sin configuración se mide contra 5 GB para una estación; no debe interpretarse como presupuesto global correctamente repartido. El día de corte admite 1 a 31 y se ajusta al último día de meses cortos. Falta confirmar la cantidad real de estaciones y el inicio del ciclo.
+El 2 de octubre el usuario confirmó un máximo de **tres estaciones**: Admisión, Facturación y coordinación de Emergencias. La configuración predeterminada usa tres estaciones y reparte los 5 GB en cuotas orientativas iguales. Una configuración explícita conserva sus valores; revisar `stations` si ya existe el archivo. Las alertas siguen siendo locales y no representan por sí solas el consumo global del proveedor. El día de corte admite 1 a 31 y se ajusta al último día de meses cortos; se mantiene configurable.
+
+La lectura incremental del listado central por huellas y la medición comparativa del 2 de octubre se documentan en [EGRESS_OPTIMIZATION_20261002_QA.md](EGRESS_OPTIMIZATION_20261002_QA.md).
 
 Las alertas locales aparecen al 50%, 70% y 85%, en el registro y en la barra de estado de Admisión. Solo el refresco de la caché del directorio se espacia (30/60/120/300 segundos). Las búsquedas explícitas, escrituras, facturación y sincronización de atenciones no se suspenden por presupuesto. Una falla del archivo de métricas tampoco bloquea operaciones.
 

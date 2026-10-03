@@ -32,10 +32,13 @@ class _CloudConnection:
         return False
 
     def execute(self, _sql, _params=()):
+        if "AS row_fingerprint" in _sql:
+            return _Cursor([{"attention_id": 200, "row_fingerprint": "central"}])
         return _Cursor(
             [
                 {
                     "id": 200,
+                    "attention_id": 200,
                     "fecha": "2026-08-12",
                     "hora": "12:00:00",
                     "nombre": "CENTRAL",

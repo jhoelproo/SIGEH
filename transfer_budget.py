@@ -19,6 +19,7 @@ from pathlib import Path
 
 LOG = logging.getLogger("hospital.transfer")
 DEFAULT_QUOTA_BYTES = 5_000_000_000
+DEFAULT_HOSPITAL_STATIONS = 3
 STREAMS = ("attention", "patients", "projection", "other")
 _METER = None
 _METER_LOCK = threading.Lock()
@@ -33,17 +34,22 @@ def get_transfer_meter():
                 / "SIGEH"
                 / "telemetry"
             )
-            options = {}
+            options = {"stations": DEFAULT_HOSPITAL_STATIONS}
             config = root / "budget.json"
             try:
                 if config.exists():
-                    options = json.loads(config.read_text(encoding="utf-8"))
+                    options = {
+                        **options,
+                        **json.loads(config.read_text(encoding="utf-8")),
+                    }
                 _METER = TransferMeter(root / "transfer.sqlite", **options)
             except (OSError, ValueError, TypeError):
                 LOG.warning(
                     "TRANSFER_BUDGET_CONFIG_INVALID: usando presupuesto predeterminado"
                 )
-                _METER = TransferMeter(root / "transfer.sqlite")
+                _METER = TransferMeter(
+                    root / "transfer.sqlite", stations=DEFAULT_HOSPITAL_STATIONS
+                )
         return _METER
 
 

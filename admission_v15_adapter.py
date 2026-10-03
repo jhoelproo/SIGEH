@@ -2196,7 +2196,10 @@ class _HybridDatabaseProxy:
     }
 
     def __init__(self, database: Any, runtime: _HybridAdmissionRuntime):
+        from admission_turn_row_cache import TurnRowCache
+
         object.__setattr__(self, "_database", database)
+        object.__setattr__(self, "_central_turn_row_cache", TurnRowCache())
         object.__setattr__(self, "_runtime", runtime)
         object.__setattr__(self, "_last_transition_result", None)
         object.__setattr__(self, "_summary_lock", threading.RLock())
@@ -3071,9 +3074,9 @@ class _HybridDatabaseProxy:
         with self._runtime.host.connection_factory() as connection:
             return [
                 with_resolved_specialty(row)
-                for row in connection.execute(
-                    sql, (str(operational_source_id), int(turn_id))
-                ).fetchall()
+                for row in self._central_turn_row_cache.load(
+                    connection, operational_source_id, turn_id, sql
+                )
             ]
 
     def _dataset_error_status(self, exc: Exception) -> str:

@@ -7974,7 +7974,15 @@ def load_current_shift_billing_summary(repository=None) -> dict:
 
     with db_connect() as con:
         projected_cursor = con.execute(
-            """SELECT p.* FROM admission_attention_projection p
+            """SELECT p.source_instance_id,p.attention_id,p.patient_id,p.turn_id,
+                      p.service_date,p.service_time,p.patient_name,p.coverage_status,
+                      p.canonical_ars,p.nss_snapshot,p.cedula_snapshot,p.service_type,
+                      p.specialty,p.admission_username,p.authorization_snapshot,
+                      p.source_status,p.has_detail_sheet,p.readiness,p.readiness_reasons,
+                      p.source_updated_at,p.snapshot_hash,p.contract_version,
+                      p.global_attention_id,p.global_patient_id,p.operational_source_id,
+                      p.operational_session_id,p.generation,p.origin_device_id,p.version
+                 FROM admission_attention_projection p
                WHERE p.operational_source_id=%s AND p.turn_id=%s
                  AND COALESCE(p.is_deleted,FALSE)=FALSE
                  AND UPPER(TRIM(COALESCE(p.source_status,'ACTIVA')))
@@ -25758,6 +25766,10 @@ class ReceiptHistoryDialog(QDialog):
             "Ver validación"
         )
         self.action_assign_audit = self.more_actions_menu.addAction("Asignarme")
+        self.action_link_attention = self.more_actions_menu.addAction(
+            "Vincular a atención heredada…"
+        )
+        self.action_link_attention.triggered.connect(self.link_selected_attention)
         self.btn_more_actions.setMenu(self.more_actions_menu)
 
         row.addWidget(self.btn_open_receipt)
@@ -25828,6 +25840,17 @@ class ReceiptHistoryDialog(QDialog):
             bool(getattr(self.main_window, "is_dark_mode", False))
         )
         self.refresh_session_context(force=True)
+
+    def link_selected_attention(self):
+        from receipt_attention_link_dialog import open_receipt_link
+
+        open_receipt_link(self, sys.modules[__name__])
+
+    def _update_link_action(self, user, receipt):
+        self.action_link_attention.setVisible(is_administrator(user))
+        self.action_link_attention.setEnabled(
+            bool(is_administrator(user) and receipt and not receipt.get("admission_atencion_id"))
+        )
 
     def open_trash(self):
         if not user_has_permission(
@@ -26177,6 +26200,7 @@ class ReceiptHistoryDialog(QDialog):
         self.action_assign_audit.setEnabled(
             self.btn_assign_audit.isEnabled()
         )
+        self._update_link_action(user, receipt)
         self.btn_more_actions.setEnabled(
             self._is_high_history_role()
             and any(
@@ -26187,6 +26211,7 @@ class ReceiptHistoryDialog(QDialog):
                     self.action_reopen_receipt,
                     self.action_billing_history,
                     self.action_assign_audit,
+                    self.action_link_attention,
                 )
             )
         )

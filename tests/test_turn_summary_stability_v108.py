@@ -71,6 +71,13 @@ class _CentralConnection:
             raise self.state.failure
         if "COUNT(*) FILTER" in sql:
             return _Cursor(single={"emergency_count": self.state.emergency_count})
+        if "AS row_fingerprint" in sql:
+            return _Cursor(
+                rows=[
+                    {"attention_id": row["attention_id"], "row_fingerprint": repr(row)}
+                    for row in self.state.rows
+                ]
+            )
         return _Cursor(rows=self.state.rows)
 
 
