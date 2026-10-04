@@ -24,16 +24,17 @@ def receipt_service_date(value) -> str:
     )
 
 
-def require_same_insurance(ars: str, coverage: str, previous: dict) -> None:
+def require_same_insurance(
+    ars: str, coverage: str, previous: dict, *, admin: bool = False
+) -> None:
     previous_ars = str(previous.get("ars") or "").strip()
     previous_coverage = str(
         previous.get("tipo_cobertura")
         or ("ASEGURADO" if previous_ars else "NO_ASEGURADO")
     )
-    if (
-        ars.strip().casefold() != previous_ars.casefold()
-        or coverage != previous_coverage
-    ):
+    ars_changed = ars.strip().casefold() != previous_ars.casefold()
+    can_correct_ars = admin and coverage == "ASEGURADO"
+    if coverage != previous_coverage or (ars_changed and not can_correct_ars):
         raise PermissionError(
             "No se permite cambiar el seguro ni la cobertura al editar un recibo."
         )

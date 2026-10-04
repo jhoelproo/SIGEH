@@ -65,7 +65,7 @@ def test_admin_receipt_edit_controls(qt_application, validated):
     app.MainWindow._apply_billing_field_policy(form)
     for name in ("name_edit", "date_edit", "dx_edit", "sala_spin"):
         assert widgets[name].isEnabled()
-    assert not widgets["ars_combo"].isEnabled()
+    assert widgets["ars_combo"].isEnabled()
     assert not widgets["coverage_combo"].isEnabled()
     form.receipt_read_only = True
     app.MainWindow._apply_billing_field_policy(form)
@@ -85,6 +85,7 @@ def test_loading_legacy_date_and_ars_never_uses_defaults(
         sala=100,
         items=[],
         estado_facturacion=app.BILLING_PENDING,
+        service_type="CONSULTA",
     )
     monkeypatch.setattr(app, "get_recibo_data", lambda _: data)
     monkeypatch.setattr(app.QMessageBox, "critical", Mock())
@@ -109,6 +110,7 @@ def test_loading_legacy_date_and_ars_never_uses_defaults(
         assert loaded
         assert form.date_edit.date().toString("yyyy-MM-dd") == "2026-09-13"
         assert form.ars_combo.currentText() == "ARS HISTORICA"
+        assert form.service_type == "CONSULTA"
 
 
 @pytest.mark.parametrize(

@@ -104,6 +104,7 @@ def receipt_scope(
         f"{alias}.is_deleted=0",
         f"COALESCE({alias}.service_type, 'EMERGENCIA')=%s",
         medication_ars_sql_exclusion(alias),
+        f"COALESCE({alias}.receipt_origin,'')<>'SELF_PAY'",
     ]
     params: list = [start_date, end_date, service_type]
     statuses = list(definition["statuses"])

@@ -142,8 +142,9 @@ def test_link_without_claim_and_missing_records(inherited):
 
 
 def test_uninsured_receipt_with_empty_ars_can_link(inherited):
-    identity = save(ars="", coverage="NO_ASEGURADO", authorization_number="")
+    identity = save(authorization_number="")
     with app.db_connect() as con:
+        con.execute("UPDATE recibos SET ars='',tipo_cobertura='NO_ASEGURADO' WHERE id=%s", (identity,))
         con.execute(
             "UPDATE admission_attention_projection SET canonical_ars='SIN SEGURO',coverage_status='SIN_SEGURO_DECLARADO'"
         )

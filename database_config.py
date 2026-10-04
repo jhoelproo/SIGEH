@@ -5,6 +5,7 @@ import hmac
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import parse_qs, urlparse
@@ -107,7 +108,23 @@ def write_sealed_database_url(path: Path, database_url: str) -> None:
     if not value:
         raise ValueError("DATABASE_URL está vacía.")
     sealed = _dpapi(value.encode("utf-8"), protect=True)
-    path.write_text(base64.b64encode(sealed).decode("ascii"), encoding="ascii")
+    payload = base64.b64encode(sealed).decode("ascii")
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="ascii", dir=path.parent, prefix=".database-", delete=False
+    ) as stream:
+        temporary_path = Path(stream.name)
+        try:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        except OSError:
+            stream.close()
+            temporary_path.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def read_sealed_database_url(path: Path) -> str:
@@ -204,15 +221,16 @@ def _resolve_database_url_with_source(
         if bundled_value:
             return bundled_value, "portable_bundle"
 
-    sealed_value = read_sealed_database_url(root / SEALED_DATABASE_FILE)
-    if sealed_value:
-        return sealed_value, "dpapi_protected"
-
-    local_value = str(
-        read_protected_env(root / ".env").get(CANONICAL_DATABASE_KEY) or ""
-    ).strip()
-    if local_value:
-        return local_value, "local_env_file"
+    for config_root in (root, root / "_internal"):
+        sealed_value = read_sealed_database_url(config_root / SEALED_DATABASE_FILE)
+        if sealed_value:
+            return sealed_value, "dpapi_protected"
+    for config_root in (root, root / "_internal"):
+        local_value = str(
+            read_protected_env(config_root / ".env").get(CANONICAL_DATABASE_KEY) or ""
+        ).strip()
+        if local_value:
+            return local_value, "local_env_file"
     return "", "missing"
 
 

@@ -66,6 +66,7 @@ def test_existing_install_requires_closure_identity_column():
 @pytest.mark.parametrize(
     "missing,expected_sql,full_migration",
     [
+        (["table:receipt_self_pay"], "CREATE TABLE IF NOT EXISTS receipt_self_pay", False),
         (
             ["table:billing_reporting_policy", "table:billing_close_snapshots"],
             "CREATE TABLE IF NOT EXISTS billing_close_snapshots",

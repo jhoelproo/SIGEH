@@ -352,6 +352,8 @@ class ReceiptPDFRenderer:
             "generado": clean_text(data.get("generado") or data.get("generated_at"), datetime.now().strftime("%d/%m/%Y  %I:%M %p")),
             "numero_autorizacion": clean_text(data.get("numero_autorizacion"), ""),
             "estado_documento": clean_text(data.get("estado_documento"), "PRELIMINAR"),
+            "payment_status": clean_text(data.get("payment_status"), ""),
+            "exemption_reason": clean_text(data.get("exemption_reason"), ""),
             "logo_url": self._logo_data_url(data.get("logo_path")),
             "inline_css": self._inline_css,
         }

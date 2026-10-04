@@ -5,6 +5,7 @@ from datetime import datetime
 import re
 from billing_inheritance_scope import HOSPITAL_TIMEZONE
 from billing_money import money
+from self_pay_billing import payment_summary, is_self_pay, PAID
 
 REPORTING_BASELINE_AT = "2026-09-23T00:00:00-04:00"
 SCHEMA_VERSION = 3
@@ -157,6 +158,30 @@ def _summary_counts(counts):
     return result
 
 
+def _direct_payment_in_period(receipt, start, end):
+    date = receipt.get("paid_at") if receipt.get("payment_status") == PAID else None
+    effective_at = instant(date or receipt["created_at"])
+    return start <= effective_at < end
+
+
+def _direct_payment_scope(admissions, receipts, start, end):
+    direct_attention_ids = set()
+    direct, insured = [], []
+    for row in receipts:
+        if is_self_pay(row.get("self_pay_coverage")):
+            direct_attention_ids.update(_linked_ids([row]))
+            if _direct_payment_in_period(row, start, end):
+                direct.append(row)
+        elif instant(row["created_at"]) >= start:
+            insured.append(row)
+    remaining = {
+        identity: row
+        for identity, row in admissions.items()
+        if identity not in direct_attention_ids
+    }
+    return remaining, insured, direct
+
+
 def build_close_snapshot(
     *,
     source,
@@ -176,7 +201,7 @@ def build_close_snapshot(
     rows = {str(row["id"]): dict(row) for row in _before(admissions, end)}
     applicable = _before(effective_receipts(receipts), end)
     linked = _linked_ids(applicable)
-    period = [row for row in applicable if instant(row["created_at"]) >= start]
+    rows, period, direct = _direct_payment_scope(rows, applicable, start, end)
     counts: Counter[str] = Counter()
     by_ars: defaultdict[str, Counter[str]] = defaultdict(Counter)
     pending = _count_admissions(
@@ -203,6 +228,10 @@ def build_close_snapshot(
             "by_ars": _ars_summary(by_ars),
         }
     )
+    if direct:
+        result["self_pay"] = payment_summary(
+            [{**row, "coverage": row["self_pay_coverage"]} for row in direct]
+        )
     if canonical_receipt_count is not None and len(worked) != int(
         canonical_receipt_count
     ):

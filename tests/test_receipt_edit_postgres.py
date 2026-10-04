@@ -58,7 +58,7 @@ def test_legacy_edit_preserves_creator_timestamp_and_insurance(database):
             assert row["receipt_origin"] == "LEGACY"
             assert not row["verification_bypassed"]
             assert snapshot["snapshot"]["document"]["visible_user"] == "original"
-        with pytest.raises(PermissionError):
+        with pytest.raises(ValueError, match="tarifa"):
             app.save_receipt_with_items(
                 receipt_id,
                 999001,

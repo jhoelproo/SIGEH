@@ -876,6 +876,99 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
             all(row["candidate_kind"] == "RECEIPT" for row in unlimited)
         )
 
+    def test_manual_august_receipts_include_invoiced_without_duplicate_batches(self):
+        actor = {"username": "admin", "role": app.ROLE_ADMIN}
+        batch_id = app.create_monthly_billing_batch(2026, 10, "MONUMENTAL", actor)
+        receipt_ids = []
+        with app.db_connect() as connection:
+            for index in range(11):
+                service_date = "2026-08-01" if index < 6 else "2026-08-28"
+                status = app.BILLING_PENDING if index < 6 else app.BILLING_INVOICED
+                row = connection.execute(
+                    """INSERT INTO recibos(numero,nombre,fecha,ars,total,created_at,
+                           estado_facturacion,receipt_origin,tipo_cobertura,service_type)
+                       VALUES(%s,%s,%s,'MONUMENTAL',100,
+                           '2026-10-03 12:00:00',%s,'MANUAL_PRIVILEGED','ASEGURADO','EMERGENCIA')
+                       RETURNING id""",
+                    (
+                        993000 + index,
+                        f"PACIENTE FICTICIO {index}",
+                        service_date,
+                        status,
+                    ),
+                ).fetchone()
+                receipt_ids.append(int(row["id"]))
+            for index, service_date in enumerate(("2026-07-31", "2026-08-29")):
+                connection.execute(
+                    """INSERT INTO recibos(numero,nombre,fecha,ars,total,created_at,
+                           estado_facturacion,receipt_origin)
+                       VALUES(%s,'FUERA DEL RANGO',%s,'MONUMENTAL',100,
+                           '2026-08-10 12:00:00','FACTURADO','MANUAL_PRIVILEGED')""",
+                    (993100 + index, service_date),
+                )
+        bounds = {"date_from": "2026-08-01", "date_to": "2026-08-28"}
+        candidates = app.obtener_candidatos_listado_ars(batch_id, **bounds)
+        self.assertEqual(
+            {int(row["recibo_id"]) for row in candidates}, set(receipt_ids)
+        )
+        self.assertEqual(
+            app.add_receipts_to_monthly_batch(batch_id, receipt_ids, actor, **bounds),
+            11,
+        )
+        included = app.list_monthly_batch_receipts(batch_id)
+        self.assertEqual(len(included), 11)
+        self.assertEqual(
+            {row["service_date_snapshot"] for row in included},
+            {"2026-08-01", "2026-08-28"},
+        )
+        self.assertEqual(
+            sum(row["estado_facturacion"] == app.BILLING_INVOICED for row in included),
+            5,
+        )
+        another_batch = app.create_monthly_billing_batch(2026, 10, "MONUMENTAL", actor)
+        self.assertEqual(
+            app.obtener_candidatos_listado_ars(another_batch, **bounds), []
+        )
+        with self.assertRaisesRegex(ValueError, "ya pertenece"):
+            app.add_receipts_to_monthly_batch(
+                another_batch, [receipt_ids[-1]], actor, **bounds
+            )
+
+    def test_insurance_candidates_exclude_self_pay_cancelled_and_wrong_ars(self):
+        actor = {"username": "admin", "role": app.ROLE_ADMIN}
+        batch_id = app.create_monthly_billing_batch(2026, 10, "MONUMENTAL", actor)
+        with app.db_connect() as connection:
+            for index, (ars, coverage, origin, status, deleted) in enumerate(
+                (
+                    ("MONUMENTAL", "EXTRANJERO", "SELF_PAY", "FACTURADO", 0),
+                    ("MONUMENTAL", "NO_ASEGURADO", "SELF_PAY", "PENDIENTE", 0),
+                    ("MONUMENTAL", "ASEGURADO", "MANUAL_PRIVILEGED", "NO_FACTURADO", 0),
+                    ("MONUMENTAL", "ASEGURADO", "MANUAL_PRIVILEGED", "FACTURADO", 1),
+                    ("HUMANO", "ASEGURADO", "MANUAL_PRIVILEGED", "FACTURADO", 0),
+                )
+            ):
+                connection.execute(
+                    """INSERT INTO recibos(numero,nombre,fecha,ars,total,created_at,
+                           tipo_cobertura,receipt_origin,estado_facturacion,is_deleted)
+                       VALUES(%s,%s,'2026-08-10',%s,100,
+                           '2026-10-03 12:00:00',%s,%s,%s,%s)""",
+                    (
+                        993200 + index,
+                        f"EXCLUSIÓN QA {index}",
+                        ars,
+                        coverage,
+                        origin,
+                        status,
+                        deleted,
+                    ),
+                )
+        self.assertEqual(
+            app.obtener_candidatos_listado_ars(
+                batch_id, date_from="2026-08-01", date_to="2026-08-28"
+            ),
+            [],
+        )
+
     def test_saved_batches_migration_is_idempotent(self):
         migration = (
             Path(app.APP_DIR)

@@ -2,7 +2,7 @@ import inspect
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,6 +16,27 @@ class MonthlyArsCandidateSelectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.qt_app = QApplication.instance() or QApplication([])
+
+    def test_non_selectable_ars_never_queries_receipt_candidates(self):
+        connection = Mock()
+        self.assertEqual(
+            app._query_available_receipts_for_batch(
+                connection, 1, {"ars": "SENASA SUBSIDIADO"}
+            ),
+            [],
+        )
+        connection.execute.assert_not_called()
+
+    def test_candidate_query_discards_unexpected_insurer_rows(self):
+        connection = Mock()
+        connection.execute.return_value.fetchall.return_value = [
+            {"recibo_id": 1, "ars_snapshot": "HUMANO"},
+            {"recibo_id": 2, "ars_snapshot": " monumental "},
+        ]
+        rows = app._query_available_receipts_for_batch(
+            connection, 1, {"ars": "MONUMENTAL"}
+        )
+        self.assertEqual([row["candidate_key"] for row in rows], ["R:2"])
 
     def setUp(self):
         self.candidates = [

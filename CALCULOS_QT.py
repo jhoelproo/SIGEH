@@ -69,6 +69,15 @@ from app_icons import APP_ICONS
 from app_resources import get_app_logo_path
 from offline_auth import OfflineAuthCache
 from sigeh_visual_theme import visual_theme_tokens as shared_visual_theme_tokens
+from self_pay_billing import (
+    COVERAGE_LABELS,
+    CONTRIBUTIVE_TARIFF,
+    coverage_code,
+    coverage_label,
+    form_coverage,
+    is_self_pay,
+    tariff_ars,
+)
 
 def application_base_dir() -> Path:
     """Carpeta externa de la aplicación, estable para código fuente y EXE."""
@@ -135,6 +144,7 @@ from report_engine import (
     export_panel_xlsx,
     receipt_scope,
 )
+
 from admission_contract import (
     CONTRACT_VERSION as ADMISSION_CONTRACT_VERSION,
     COVERAGE_UNINSURED_DECLARED,
@@ -2977,6 +2987,9 @@ def db_init():
         _apply_admission_hybrid_migration(con)
         _apply_billing_admission_bridge_identity_migration(con)
         _apply_billing_bypass_authorization_review_migration(con)
+        from self_pay_billing import install_schema as install_self_pay_schema
+
+        install_self_pay_schema(con)
         from billing_close_store import install_close_snapshot_schema
 
         install_close_snapshot_schema(con)
@@ -3512,6 +3525,7 @@ def db_init():
 
 
 _BOOTSTRAP_REQUIRED_SCHEMA = {
+    "receipt_self_pay": {"receipt_id", "coverage", "payment_status", "exemption_reason", "paid_at"},
     "billing_shift_closures": {"classification_version"},
     "billing_closure_dispatch_policy": {"singleton", "enabled_at"},
     "billing_reporting_policy": {"singleton", "baseline_at", "enabled_at"},
@@ -3739,7 +3753,14 @@ def prepare_database_schema() -> str:
             "table:billing_closure_dispatch_policy",
         }
         quantitative_closure_tables = {"table:billing_reporting_policy", "table:billing_close_snapshots"}
-        if missing and set(missing).issubset(quantitative_closure_tables):
+        if missing and set(missing).issubset({"table:receipt_self_pay", "column:receipt_self_pay.paid_at"}):
+            from self_pay_billing import install_schema as install_self_pay_schema
+            from billing_close_store import install_close_snapshot_schema
+
+            with db_connect() as con:
+                install_self_pay_schema(con)
+                install_close_snapshot_schema(con)
+        elif missing and set(missing).issubset(quantitative_closure_tables):
             from billing_close_store import install_close_snapshot_schema
 
             with db_connect() as con:
@@ -9671,7 +9692,9 @@ def _query_available_receipts_for_batch(
                         COALESCE(r.total,0) AS total_snapshot
                  FROM recibos r
                  WHERE r.is_deleted=0
-                   AND r.estado_facturacion IN ('PENDIENTE','SIN_CLASIFICAR')
+                   AND r.estado_facturacion IN ('PENDIENTE','SIN_CLASIFICAR','FACTURADO')
+                   AND COALESCE(r.tipo_cobertura,'ASEGURADO')='ASEGURADO'
+                   AND COALESCE(r.receipt_origin,'')<>'SELF_PAY'
                    AND NULLIF(TRIM(COALESCE(r.ars,'')),'') IS NOT NULL
                    AND REGEXP_REPLACE(LOWER(TRIM({ars_expr})), '\\s+', ' ', 'g')=%s
                    AND (
@@ -10757,6 +10780,8 @@ def _lock_and_validate_admission_processing(
     attention_id = int(data.get("attention_id") or data.get("admission_atencion_id") or 0)
     source = str(data.get("source_instance_id") or data.get("admission_source_instance_id") or "LEGACY")
     global_id = str(data.get("global_attention_id") or "")
+    if global_id:
+        con.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"admission-sync:attention:{global_id}",))
     con.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
         (f"admission-billing:{source}:{attention_id}",),
@@ -10949,10 +10974,20 @@ def save_receipt_with_items(
     admission_session_id="",
     document_context=None,
     verification_bypass=None,
+    payment_status="",
+    exemption_reason="",
 ):
     """Guarda cabecera, ítems, historial y snapshot con un solo commit."""
     from receipt_edit_integrity import receipt_service_date, require_same_insurance
     fecha = receipt_service_date(fecha)
+    self_pay = is_self_pay(coverage)
+    tariff_name = tariff_ars(coverage, ars)
+    if self_pay:
+        from self_pay_billing import validate_payment
+        exemption_reason = validate_payment(coverage, payment_status, exemption_reason)
+        ars = ""
+        authorization_number = ""
+        verification_bypass = None
     if str(ars or "").strip() and not medication_ars_is_selectable(ars):
         raise ValueError("SENASA SUBSIDIADO no se factura en este módulo.")
     from billing_field_policy import room_price
@@ -10964,6 +10999,8 @@ def save_receipt_with_items(
         "role": str(bypass_data.get("role") or ""),
     }
     actor_user = get_user(str(username or "")) or {"username": str(username or ""), "role": ""}
+    if self_pay and normalize_role(actor_user.get("role")) not in ROLE_PERMISSIONS:
+        raise PermissionError("El usuario no está autorizado para registrar cobros.")
     if bypass_data and not admission_attention:
         actor_user = get_user(str(username or "")) or actor_user
         bypass_reason = str(bypass_data.get("reason") or "").strip()
@@ -10981,7 +11018,7 @@ def save_receipt_with_items(
             or os.environ.get("COMPUTERNAME")
             or "ESTACION"
         )
-    elif not admission_attention and recibo_id is None:
+    elif not admission_attention and recibo_id is None and not self_pay:
         raise ValueError("Debes verificar una atención antes de crear el recibo.")
     if admission_attention:
         attention_data = (
@@ -11017,7 +11054,7 @@ def save_receipt_with_items(
             )
     item_rows = []
     for categoria, items in grouped:
-        item_ars = ars if categoria in ARS_CATEGORIES else ""
+        item_ars = tariff_name if categoria in ARS_CATEGORIES else ""
         for item_name, precio, cantidad, item_total, _ in items:
             item_rows.append(
                 (
@@ -11032,7 +11069,10 @@ def save_receipt_with_items(
 
     editing = recibo_id is not None
     authorization_number = str(authorization_number or "").strip()
-    if bypass_data and not admission_attention:
+    if self_pay:
+        document_state = DOCUMENT_READY
+        review_status, review_reason = AUTH_REVIEW_NOT_APPLICABLE, ""
+    elif bypass_data and not admission_attention:
         document_state, review_status, review_reason = (
             classify_privileged_bypass_authorization(authorization_number)
         )
@@ -11061,6 +11101,10 @@ def save_receipt_with_items(
         write_runtime_log, bypass=bypass_data,
         global_id=admission_values[15], source_id=admission_values[8],
     ), db_connect() as con:
+        if self_pay:
+            from self_pay_billing import validate_tariffs, validate_amounts
+            validate_amounts(sala, item_rows, total)
+            validate_tariffs(con, room=sala, items=item_rows, service_type=service_type, receipt_id=recibo_id)
         admission_processing = _lock_and_validate_admission_processing(
             con,
             admission_attention,
@@ -11083,9 +11127,9 @@ def save_receipt_with_items(
                 old_price = existing_price["sala"] if existing_price else None
             tariff = con.execute(
                 "SELECT sala_emergencia,consulta_price FROM ars WHERE nombre=%s AND is_active=1 FOR SHARE",
-                (ars,),
+                (tariff_name,),
             ).fetchone()
-            if ars and tariff is None and old_price is None:
+            if tariff_name and tariff is None and old_price is None:
                 raise ValueError("No se pudo resolver la tarifa vigente de la ARS. Solicite revisión a ADMIN.")
             catalog_price = (
                 tariff["consulta_price" if service_type == "CONSULTA" else "sala_emergencia"]
@@ -11095,8 +11139,8 @@ def save_receipt_with_items(
         if editing:
             current = con.execute(
                 """SELECT estado_facturacion, revision_version, total, sala, ars, nombre, fecha, dx,
-                          tipo_cobertura, numero_autorizacion, estado_documento,
-                          admission_atencion_id, admission_nss_snapshot,
+                          tipo_cobertura, numero_autorizacion, estado_documento, service_type,
+                          admission_atencion_id, admission_global_attention_id, admission_nss_snapshot,
                           admission_cedula_snapshot, admission_source_instance_id,
                           verification_bypassed, verification_bypass_role,
                           verification_bypass_device, receipt_origin,
@@ -11109,10 +11153,10 @@ def save_receipt_with_items(
             ).fetchone()
             if not current:
                 raise ValueError("El recibo que intentas editar ya no existe.")
-            require_same_insurance(ars, coverage, dict(current))
+            require_same_insurance(ars, coverage, dict(current), admin=is_administrator(actor_user))
             from billing_field_policy import require_validated_header_edit
             require_validated_header_edit(
-                auxiliary=normalize_role(actor_user.get("role")) == ROLE_AUX,
+                auxiliary=normalize_role(actor_user.get("role")) == ROLE_AUX and not self_pay,
                 validated=bool(admission_attention),
                 supplied={"nombre": nombre, "dx": dx, "fecha": fecha, "ars": ars, "sala": sala},
                 previous=dict(current),
@@ -11122,11 +11166,23 @@ def save_receipt_with_items(
                     classify_privileged_bypass_authorization(authorization_number)
                 )
             current_status = str(current["estado_facturacion"] or BILLING_UNCLASSIFIED)
-            if current_status not in (BILLING_PENDING, BILLING_UNCLASSIFIED):
+            editable_statuses = (BILLING_PENDING, BILLING_UNCLASSIFIED, BILLING_NOT_INVOICED) if self_pay else (BILLING_PENDING, BILLING_UNCLASSIFIED)
+            if current_status not in editable_statuses:
                 raise ValueError(
                     f"El recibo está {BILLING_STATUS_LABELS.get(current_status, current_status).lower()} y no puede editarse. "
                     "Debe reabrirse como pendiente antes de modificarlo."
                 )
+            if str(current["ars"] or "").strip().casefold() != str(ars or "").strip().casefold():
+                from receipt_ars_correction import require_current_tariff, correct_linked_insurer
+                service_type = str(current["service_type"] or service_type)
+                require_current_tariff(con, ars, sala, item_rows, total, service_type, get_effective_price)
+                if current["admission_atencion_id"] or current["admission_global_attention_id"]:
+                    corrected = correct_linked_insurer(con, dict(current), attention_data if admission_attention else None, ars, actor_user)
+                    admission_values[4] = corrected["canonical_ars"]
+                    admission_values[7] = corrected["source_updated_at"]
+                    admission_values[9] = corrected["snapshot_hash"]
+                    admission_values[10] = corrected["coverage_status"]
+                    admission_values[11] = corrected["readiness"]
             has_new_attention = admission_values[0] is not None
             effective_attention_id = (
                 current["admission_atencion_id"] or admission_values[0]
@@ -11196,7 +11252,8 @@ def save_receipt_with_items(
                        service_type=COALESCE(NULLIF(%s,''), service_type),
                        specialty_snapshot=COALESCE(NULLIF(%s,''), specialty_snapshot),
                        admission_username_snapshot=COALESCE(NULLIF(%s,''), admission_username_snapshot)
-                   WHERE id=%s AND estado_facturacion IN ('PENDIENTE','SIN_CLASIFICAR')""",
+                   WHERE id=%s AND (estado_facturacion IN ('PENDIENTE','SIN_CLASIFICAR')
+                     OR (%s AND estado_facturacion='NO_FACTURADO'))""",
                 (
                     nombre or "", fecha or "", dx or "", ars or "", coverage,
                     float(sala), float(total), int(is_backdated), authorization_number,
@@ -11226,7 +11283,7 @@ def save_receipt_with_items(
                     now_str() if admission_processing else None,
                     str(username or "Sistema") if admission_processing else None,
                     service_type, admission_values[13], admission_values[14],
-                    int(recibo_id),
+                    int(recibo_id), self_pay,
                 ),
             )
             if updated.rowcount != 1:
@@ -11278,7 +11335,7 @@ def save_receipt_with_items(
                     int(numero), nombre or "", fecha or "", dx or "", ars or "", coverage,
                     float(sala), float(total), "", username or "",
                     created_at or now_str(), int(is_backdated),
-                    BILLING_PENDING, created_at or now_str(),
+                    BILLING_NOT_INVOICED if self_pay else BILLING_PENDING, created_at or now_str(),
                     authorization_number, authorization_changed_at,
                     authorization_actor,
                     document_state,
@@ -11332,9 +11389,9 @@ def save_receipt_with_items(
                        motivo, observacion, referencia, total_al_momento, ars_al_momento, recibo_version
                    ) VALUES(%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,0)""",
                 (
-                    saved_id, BILLING_PENDING, str(username or "Sistema"), now_str(),
+                    saved_id, BILLING_NOT_INVOICED if self_pay else BILLING_PENDING, str(username or "Sistema"), now_str(),
                     "Creación del recibo",
-                    "Documento completo; listo para auditoría"
+                    f"Cobro directo: {payment_status}" if self_pay else "Documento completo; listo para auditoría"
                     if document_state == DOCUMENT_READY
                     else "Documento preliminar pendiente de autorización",
                     "",
@@ -11529,6 +11586,12 @@ def save_receipt_with_items(
                     float(total), str(ars or ""), next_revision,
                 ),
             )
+
+        if self_pay:
+            from self_pay_billing import save_payment
+            save_payment(con, saved_id, coverage, payment_status, exemption_reason, username)
+            con.execute("UPDATE recibos SET receipt_origin='SELF_PAY',estado_facturacion='NO_FACTURADO' WHERE id=%s", (saved_id,))
+            document_context = {**dict(document_context or {}), "payment_status": payment_status, "exemption_reason": exemption_reason}
 
         document_version = save_receipt_document_snapshot(
             con,
@@ -12027,7 +12090,7 @@ def _receipt_history_filter_sql(
     current_username="", date_from="", date_to="", user_mode="include",
     usernames=None, include_excluded_ars=False,
 ):
-    clauses = ["r.is_deleted=0"]
+    clauses = ["r.is_deleted=0", "COALESCE(r.receipt_origin,'')<>'SELF_PAY'"]
     if not include_excluded_ars:
         clauses.append(medication_ars_sql_exclusion("r.ars"))
     params = []
@@ -12190,7 +12253,7 @@ def get_receipt_history_metrics(*, _connection=None):
         WITH active AS (
             SELECT estado_facturacion,total,created_at,auditoria_asignada_a,
                    estado_documento,tipo_cobertura,ars
-            FROM recibos WHERE is_deleted=0
+            FROM recibos WHERE is_deleted=0 AND COALESCE(receipt_origin,'')<>'SELF_PAY'
               AND """ + medication_ars_sql_exclusion("ars") + """
         ), status_summary AS (
             SELECT COALESCE(estado_facturacion,%s) AS status,
@@ -13034,6 +13097,9 @@ def get_recibo_data(recibo_id: int):
         recibo = dict(cur.fetchone())
         cur = con.execute("SELECT * FROM recibo_items WHERE recibo_id=%s", (recibo_id,))
         recibo["items"] = [dict(r) for r in cur.fetchall()]
+        if recibo.get("receipt_origin") == "SELF_PAY":
+            payment = con.execute("SELECT payment_status,exemption_reason FROM receipt_self_pay WHERE receipt_id=%s", (int(recibo_id),)).fetchone()
+            recibo.update(dict(payment or {}))
         return recibo
 
 
@@ -13363,12 +13429,14 @@ def change_receipt_billing_status(
         row = con.execute(
             """SELECT id, numero, ars, total, estado_facturacion, revision_version,
                       pdf_synced, is_deleted, is_backdated, auditoria_asignada_a,
-                      numero_autorizacion, estado_documento, tipo_cobertura
+                      numero_autorizacion, estado_documento, tipo_cobertura, receipt_origin
                FROM recibos WHERE id=%s FOR UPDATE""",
             (int(recibo_id),),
         ).fetchone()
         if not row:
             raise ValueError("El recibo no existe.")
+        if row.get("receipt_origin") == "SELF_PAY":
+            raise ValueError("Los cobros directos se gestionan como pagados o exonerados en su historial propio.")
         if int(row["is_deleted"] or 0):
             raise ValueError("Restaura el recibo antes de cambiar su estado de facturación.")
         current = str(row["estado_facturacion"] or BILLING_UNCLASSIFIED).upper()
@@ -13706,7 +13774,7 @@ def get_billing_status_summary():
     with db_connect() as con:
         rows = con.execute(
             """SELECT estado_facturacion, COUNT(*), COALESCE(SUM(total), 0)
-               FROM recibos WHERE is_deleted=0 GROUP BY estado_facturacion"""
+               FROM recibos WHERE is_deleted=0 AND COALESCE(receipt_origin,'')<>'SELF_PAY' GROUP BY estado_facturacion"""
         ).fetchall()
     for row in rows:
         status = str(row[0] or BILLING_UNCLASSIFIED)
@@ -15892,8 +15960,8 @@ def _receipt_snapshot_render_data(document_record):
         "paciente": patient.get("name"),
         "diagnostico": header.get("diagnosis"),
         "ars": header.get("ars") or (
-            "NO ASEGURADO"
-            if str(header.get("coverage") or "").upper() == "NO_ASEGURADO"
+            coverage_label(str(header.get("coverage"))).upper()
+            if is_self_pay(str(header.get("coverage")))
             else "N/A"
         ),
         "sala": float(header.get("room_charge") or 0),
@@ -15904,6 +15972,8 @@ def _receipt_snapshot_render_data(document_record):
         "generado": header.get("generated_at"),
         "numero_autorizacion": header.get("authorization_number"),
         "estado_documento": header.get("document_state"),
+        "payment_status": document.get("payment_status"),
+        "exemption_reason": document.get("exemption_reason"),
         "logo_path": LOGO_PATH,
     }
 
@@ -17038,6 +17108,8 @@ class PDFDatabaseWorker(threading.Thread):
                     )
                 },
                 verification_bypass=job.get("verification_bypass"),
+                payment_status=str(job.get("payment_status") or ""),
+                exemption_reason=str(job.get("exemption_reason") or ""),
             )
             database_elapsed = perf_counter() - database_started
             try:
@@ -32637,6 +32709,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.current_user = current_user
         startup_data = dict(startup_data or {})
+        self._pending_ars_correction: dict[str, str] | None = None
         self.offline_login = bool(current_user.get("_offline_login"))
         self.setWindowTitle(APP_TITLE)
         self.setMinimumSize(800, 600) 
@@ -32954,6 +33027,9 @@ class MainWindow(QMainWindow):
         )
         self.btn_view_history = None
         self.btn_receipts_history = QPushButton("Recibos Guardados")
+        self.btn_self_pay_history = QPushButton("Cobros directos")
+        self.btn_self_pay_history.setToolTip("Historial de extranjeros y no asegurados: pagados y exonerados")
+        self.btn_self_pay_history.setProperty("semanticIcon", "billing_receipts")
         self.btn_audit_workspace = (
             QPushButton("Auditoría Médica")
             if user_has_permission(self.current_user, PERMISSION_VIEW_BILLING_AUDIT)
@@ -32980,6 +33056,7 @@ class MainWindow(QMainWindow):
             self.btn_add_catalog_item,
             self.btn_view_history,
             self.btn_receipts_history,
+            self.btn_self_pay_history,
             self.btn_audit_workspace,
             self.btn_view_reports,
             self.btn_ars_mgmt,
@@ -33086,7 +33163,13 @@ class MainWindow(QMainWindow):
             [] if self.offline_login else ars_list()
         )
         self.coverage_combo = QComboBox()
-        self.coverage_combo.addItems(["Asegurado", "No asegurado"])
+        self.coverage_combo.addItems(list(COVERAGE_LABELS.values()))
+        self.payment_combo = QComboBox()
+        self.payment_combo.addItem("Pagado", "PAGADO")
+        self.exemption_reason_edit = QLineEdit()
+        self.exemption_reason_edit.setPlaceholderText("Motivo de exoneración")
+        self.payment_combo.hide()
+        self.exemption_reason_edit.hide()
         self.sala_spin = configure_decimal_spinbox(QDoubleSpinBox()); self.sala_spin.setRange(0, 1_000_000); self.sala_spin.setDecimals(2); self.sala_spin.setSingleStep(SALA_STEP)
         self.sala_spin.valueChanged.connect(lambda v: self.update_totals())
         self.authorization_edit = QLineEdit()
@@ -33140,6 +33223,8 @@ class MainWindow(QMainWindow):
         billing_lay.addRow("ARS:", self.ars_combo)
         billing_lay.addRow("Cobertura:", self.coverage_combo)
         billing_lay.addRow("Autorización:", self.authorization_edit)
+        billing_lay.addRow(self.payment_combo)
+        billing_lay.addRow(self.exemption_reason_edit)
         patient_group_layout.addLayout(billing_lay)
         patient_group_layout.addWidget(self.document_flow_hint)
         patient_group_layout.addWidget(self.btn_validate_admission)
@@ -33422,6 +33507,7 @@ class MainWindow(QMainWindow):
         
         self.ars_combo.currentTextChanged.connect(self.on_ars_changed)
         self.coverage_combo.currentTextChanged.connect(self.on_coverage_changed)
+        self.payment_combo.currentIndexChanged.connect(self._update_document_flow_ui)
         self.authorization_edit.textChanged.connect(self._update_document_flow_ui)
         self.btn_add_catalog_item.clicked.connect(self.add_catalog_item_inline)
         self.btn_ars_mgmt.clicked.connect(self.open_ars_manager)
@@ -33436,6 +33522,7 @@ class MainWindow(QMainWindow):
             self.btn_admin_catalog.clicked.connect(self.open_universal_catalog_admin)
         self.btn_validate_admission.clicked.connect(self.validate_admission_patient)
         self.btn_receipts_history.clicked.connect(self.open_receipts_history_dialog)
+        self.btn_self_pay_history.clicked.connect(self.open_self_pay_history)
         if self.btn_audit_workspace:
             self.btn_audit_workspace.clicked.connect(self.open_audit_workspace)
         if self.btn_view_history: self.btn_view_history.clicked.connect(self.open_history_dialog)
@@ -33543,6 +33630,7 @@ class MainWindow(QMainWindow):
         nav_buttons = [
             self.btn_view_history,
             self.btn_receipts_history,
+            getattr(self, "btn_self_pay_history", None),
             self.btn_audit_workspace,
             self.btn_view_reports,
             self.btn_ars_mgmt,
@@ -33736,6 +33824,7 @@ class MainWindow(QMainWindow):
             self.btn_add_catalog_item,
             self.btn_view_history,
             self.btn_receipts_history,
+            getattr(self, "btn_self_pay_history", None),
             self.btn_audit_workspace,
             self.btn_view_reports,
             self.btn_ars_mgmt,
@@ -35235,6 +35324,17 @@ class MainWindow(QMainWindow):
         self._last_ui_action = "cambiar ARS"
         proposed_ars = name or ""
         previous_ars = self.current_ars
+        if getattr(self, "_pending_ars_correction", None):
+            self.ars_combo.blockSignals(True)
+            self.ars_combo.setCurrentText(previous_ars)
+            self.ars_combo.blockSignals(False)
+            return
+        admin_correction = (
+            getattr(self, "editing_recibo_id", None) is not None
+            and is_administrator(self.current_user)
+            and not is_self_pay(form_coverage(self))
+            and not getattr(self, "receipt_read_only", False)
+        )
 
         if proposed_ars and not medication_ars_is_selectable(proposed_ars):
             self.ars_combo.blockSignals(True)
@@ -35263,6 +35363,7 @@ class MainWindow(QMainWindow):
             self.locked_ars
             and proposed_ars != self.locked_ars
             and self.cart_has_ars_items()
+            and not admin_correction
             and not getattr(self, "_reverting_ars_change", False)
         ):
             FloatingToast(
@@ -35284,6 +35385,8 @@ class MainWindow(QMainWindow):
             self.mascarilla_prompt_done = False
             self.bajante_cateter_auto_added = False
             self.bajante_added_for_solucion = False
+            if admin_correction:
+                self._pending_ars_correction = {"previous": previous_ars, "target": proposed_ars}
 
         self.set_current_ars_from_cache(proposed_ars)
 
@@ -35305,7 +35408,8 @@ class MainWindow(QMainWindow):
                 "consulta_price" if self.service_type == "CONSULTA"
                 else "sala_emergencia"
             )
-            self.sala_spin.setValue(float(cached.get(price_key) or 0.0))
+            if not getattr(self, "_pending_ars_correction", None):
+                self.sala_spin.setValue(float(cached.get(price_key) or 0.0))
             QTimer.singleShot(
                 0,
                 lambda name=self.current_ars, value=cached:
@@ -35318,6 +35422,22 @@ class MainWindow(QMainWindow):
     def _apply_ars_runtime_data(self, ars_name: str, data: dict):
         if str(ars_name or "") != self.current_ars:
             return
+        pending = getattr(self, "_pending_ars_correction", None)
+        if pending and pending["target"] == ars_name:
+            try:
+                if not data.get("ars_id"):
+                    raise ValueError("La ARS no tiene una tarifa activa.")
+                from receipt_ars_correction import reprice_cart
+                reprice_cart(self, data, get_effective_price)
+            except ValueError as exc:
+                self._pending_ars_correction = None
+                self.ars_combo.blockSignals(True)
+                self.ars_combo.setCurrentText(pending["previous"])
+                self.ars_combo.blockSignals(False)
+                self.current_ars = pending["previous"]
+                QMessageBox.warning(self, "Cambio de ARS", str(exc))
+                return
+            self._pending_ars_correction = None
         price_key = (
             "consulta_price" if self.service_type == "CONSULTA"
             else "sala_emergencia"
@@ -35364,6 +35484,14 @@ class MainWindow(QMainWindow):
         self, ars_name: str, error_type: str, elapsed_ms: float
     ):
         self._ars_runtime_worker = None
+        pending = getattr(self, "_pending_ars_correction", None)
+        if pending and pending["target"] == ars_name:
+            self._pending_ars_correction = None
+            self.ars_combo.blockSignals(True)
+            self.ars_combo.setCurrentText(pending["previous"])
+            self.ars_combo.blockSignals(False)
+            self.current_ars = pending["previous"]
+            QMessageBox.warning(self, "Cambio de ARS", "No fue posible cargar la tarifa. El cambio no se aplicó.")
         write_runtime_log(
             f"ARSRuntimeCache ars={ars_name} error={error_type} "
             f"background_ms={elapsed_ms:.1f}"
@@ -35496,6 +35624,7 @@ class MainWindow(QMainWindow):
             validated=bool(self.current_admission_attention),
             read_only=bool(getattr(self, "receipt_read_only", False)),
             editing=getattr(self, "editing_recibo_id", None) is not None,
+            self_pay=is_self_pay(form_coverage(self)),
         )
         if (
             getattr(self, "service_type", "EMERGENCIA") == "CONSULTA"
@@ -35506,6 +35635,8 @@ class MainWindow(QMainWindow):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(editable)
+        if is_self_pay(form_coverage(self)):
+            self.ars_combo.setEnabled(False)
 
     def _update_document_flow_ui(self):
         MainWindow._apply_billing_field_policy(self)
@@ -35522,18 +35653,41 @@ class MainWindow(QMainWindow):
             low_height=low_height,
             editing=getattr(self, "editing_recibo_id", None) is not None,
         )
+        if is_self_pay(form_coverage(self)):
+            state, ready, hint = "ready", True, "COBRO DIRECTO · Tarifa SENASA Contributivo. No requiere autorización ni verificación."
         self.document_flow_hint.setProperty("state", state)
         self.document_flow_hint.setText(hint)
         self.document_flow_hint.style().unpolish(self.document_flow_hint)
         self.document_flow_hint.style().polish(self.document_flow_hint)
+        if is_self_pay(form_coverage(self)):
+            self.btn_validate_admission.hide()
+            self.authorization_edit.setEnabled(False)
+            self.exemption_reason_edit.setVisible(self.payment_combo.currentData() == "EXONERADO")
+            if not self.editing_recibo_id:
+                self.btn_generate.setText("GUARDAR RECIBO DE COBRO (F5)")
+            return
+        if hasattr(self, "btn_validate_admission"):
+            self.btn_validate_admission.show()
         if not self.editing_recibo_id:
             self.btn_generate.setText(
                 "GUARDAR PARA AUDITORÍA (F5)" if ready
                 else "GUARDAR E IMPRIMIR PRELIMINAR (F5)"
             )
 
+    def _coverage_conflicts_with_cart(self, coverage):
+        if not hasattr(self, "current_ars"):
+            return False
+        target_ars = tariff_ars(coverage_code(coverage), self.current_ars)
+        return bool(target_ars and getattr(self, "locked_ars", None) and target_ars != self.locked_ars and self.cart_has_ars_items())
+
     def on_coverage_changed(self, coverage):
         """Separa la condición de cobertura de las aseguradoras reales."""
+        if MainWindow._coverage_conflicts_with_cart(self, coverage):
+            self.coverage_combo.blockSignals(True)
+            self.coverage_combo.setCurrentText(getattr(self, "_last_coverage", "Asegurado"))
+            self.coverage_combo.blockSignals(False)
+            FloatingToast("Quite los ítems con otra tarifa antes de cambiar la cobertura.", self, is_error=True).show()
+            return
         if self.current_admission_attention:
             expected_uninsured = bool(
                 self.current_admission_attention.get("uninsured")
@@ -35553,21 +35707,26 @@ class MainWindow(QMainWindow):
                     is_error=True,
                 ).show()
                 return
-        uninsured = coverage == "No asegurado"
-        self.ars_combo.setEnabled(not uninsured)
-        self.btn_ars_mgmt.setEnabled(not uninsured)
-        self.authorization_edit.setEnabled(not uninsured)
-        if uninsured:
+        self_pay = is_self_pay(coverage_code(coverage))
+        self._last_coverage = coverage
+        if hasattr(self, "payment_combo"):
+            from self_pay_billing import payment_states, PAYMENT_LABELS
+            self.payment_combo.blockSignals(True)
+            self.payment_combo.clear()
+            for state in payment_states(coverage_code(coverage)):
+                self.payment_combo.addItem(PAYMENT_LABELS[state], state)
+            self.payment_combo.blockSignals(False)
+            self.payment_combo.setVisible(self_pay)
+            self.exemption_reason_edit.setVisible(self_pay)
+        self.ars_combo.setEnabled(not self_pay)
+        self.btn_ars_mgmt.setEnabled(not self_pay)
+        self.authorization_edit.setEnabled(not self_pay)
+        if self_pay:
             self.authorization_edit.clear()
             self.ars_combo.blockSignals(True)
-            self.ars_combo.setCurrentIndex(-1)
+            self.ars_combo.setCurrentText(CONTRIBUTIVE_TARIFF)
             self.ars_combo.blockSignals(False)
-            self.current_ars = ""
-            self.locked_ars = None
-            for category in ARS_CATEGORIES:
-                self.ars_cache[category] = {}
-            self.refresh_picker()
-            self.sala_spin.setValue(0.0)
+            self.set_current_ars_from_cache(CONTRIBUTIVE_TARIFF)
         elif self.ars_combo.count() > 0:
             self.ars_combo.setCurrentIndex(0)
             self.on_ars_changed(self.ars_combo.currentText())
@@ -35695,6 +35854,7 @@ class MainWindow(QMainWindow):
         self.lbl_sub_materiales.setText(f"Materiales: RD$ {materiales_sub:,.2f}")
 
     def reset_all(self, *, preserve_claim=None):
+        self._pending_ars_correction = None
         schedule_replaced_admission_claim_release(
             self.current_admission_attention, preserve_claim, session_id=self.session_id,
         )
@@ -35732,6 +35892,8 @@ class MainWindow(QMainWindow):
         self.dx_edit.clear()
         self.authorization_edit.clear()
         self.date_edit.setDate(QDate.currentDate())
+        if hasattr(self, "exemption_reason_edit"):
+            self.exemption_reason_edit.clear()
         self.sala_spin.setEnabled(True)
         self.coverage_combo.setCurrentText("Asegurado")
         self._set_receipt_read_only_mode(False)
@@ -35796,7 +35958,8 @@ class MainWindow(QMainWindow):
             )
             return False
         status = str(data.get("estado_facturacion") or BILLING_UNCLASSIFIED)
-        read_only = status not in (BILLING_PENDING, BILLING_UNCLASSIFIED)
+        direct_receipt = data.get("receipt_origin") == "SELF_PAY"
+        read_only = status not in (BILLING_PENDING, BILLING_UNCLASSIFIED) and not direct_receipt
         if read_only and not allow_read_only:
             QMessageBox.warning(
                 self, "Edición bloqueada",
@@ -35835,6 +35998,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel_edit.show()
         self.editing_recibo_id = recibo_id
         self.editing_recibo_numero = data["numero"]
+        self.service_type = str(data.get("service_type") or "EMERGENCIA").upper()
         if data.get("admission_atencion_id"):
             self._apply_admission_attention(
                 {
@@ -35842,6 +36006,7 @@ class MainWindow(QMainWindow):
                     "patient_id": data.get("admission_paciente_id"),
                     "name": data.get("nombre"),
                     "service_date": data.get("fecha"),
+                    "attention_type": self.service_type,
                     "nss_clean": data.get("admission_nss_snapshot"),
                     "cedula_clean": data.get("admission_cedula_snapshot"),
                     "ars": data.get("admission_ars_snapshot"),
@@ -35876,8 +36041,10 @@ class MainWindow(QMainWindow):
             self.btn_validate_admission.setText("Sin vínculo a atención")
             set_button_role(self.btn_validate_admission, "warning")
 
+        from self_pay_billing import PAYMENT_LABELS
+        status_text = PAYMENT_LABELS.get(data.get("payment_status"), billing_status_label(status))
         self.lbl_edit_mode.setText(
-            f"EDICIÓN: RECIBO N° {data['numero']} · {billing_status_label(status)} · "
+            f"EDICIÓN: RECIBO N° {data['numero']} · {status_text} · "
             f"Versión {int(data.get('revision_version') or 0)}"
         )
         self.btn_generate.setText("GUARDAR CAMBIOS DEL RECIBO (F5)")
@@ -35888,8 +36055,11 @@ class MainWindow(QMainWindow):
         self.date_edit.setDate(QDate.fromString(service_date, "yyyy-MM-dd"))
 
         coverage = data.get("tipo_cobertura") or ("NO_ASEGURADO" if not data.get("ars") else "ASEGURADO")
-        self.coverage_combo.setCurrentText("No asegurado" if coverage == "NO_ASEGURADO" else "Asegurado")
-        ars_name = data["ars"]
+        self.coverage_combo.setCurrentText(coverage_label(coverage))
+        if is_self_pay(coverage) and hasattr(self, "payment_combo"):
+            self.payment_combo.setCurrentIndex(self.payment_combo.findData(data.get("payment_status") or "PAGADO"))
+            self.exemption_reason_edit.setText(str(data.get("exemption_reason") or ""))
+        ars_name = tariff_ars(coverage, data["ars"])
         if ars_name in [self.ars_combo.itemText(i) for i in range(self.ars_combo.count())]:
             self.ars_combo.setCurrentText(ars_name)
         else:
@@ -35937,6 +36107,9 @@ class MainWindow(QMainWindow):
         return True
 
     def generate_pdf(self):
+        if getattr(self, "_pending_ars_correction", None):
+            QMessageBox.information(self, "Cambio de ARS", "Espere a que se cargue y recalcule la nueva tarifa.")
+            return
         self.mark_activity()
         if self.receipt_read_only:
             QMessageBox.information(
@@ -35945,10 +36118,20 @@ class MainWindow(QMainWindow):
                 "Este recibo está completo y se abrió en modo de solo consulta.",
             )
             return
+        self_pay = is_self_pay(form_coverage(self))
+        if self_pay:
+            from self_pay_billing import validate_payment
+            try:
+                validate_payment(form_coverage(self), self.payment_combo.currentData(), self.exemption_reason_edit.text())
+            except ValueError as exc:
+                FloatingToast(str(exc), self, is_error=True).show()
+                self.exemption_reason_edit.setFocus()
+                return
         if (
             self.editing_recibo_id is None
             and not self.current_admission_attention
             and can_bypass_patient_verification(self.current_user)
+            and not self_pay
         ):
             role = normalize_role(self.current_user.get("role"))
             self.current_verification_bypass = {
@@ -35957,7 +36140,7 @@ class MainWindow(QMainWindow):
                 "username": str(self.current_user.get("username") or ""),
                 "device": str(os.environ.get("COMPUTERNAME") or "ESTACION"),
             }
-        if self.editing_recibo_id is None and not self.current_admission_attention:
+        if self.editing_recibo_id is None and not self.current_admission_attention and not self_pay:
             if not (
                 self.current_verification_bypass
                 and can_bypass_patient_verification(self.current_user)
@@ -36106,7 +36289,7 @@ class MainWindow(QMainWindow):
             "date_str": date_str,
             "dx_raw": dx_raw,
             "ars_name": self.current_ars,
-            "coverage": "NO_ASEGURADO" if self.coverage_combo.currentText() == "No asegurado" else "ASEGURADO",
+            "coverage": coverage_code(self.coverage_combo.currentText()),
             "sala": sala,
             "grouped": grouped,
             "total_general": total_general,
@@ -36122,6 +36305,8 @@ class MainWindow(QMainWindow):
             "verification_bypass": copy.deepcopy(
                 self.current_verification_bypass
             ),
+            "payment_status": self.payment_combo.currentData() if self_pay else "",
+            "exemption_reason": self.exemption_reason_edit.text() if self_pay else "",
         })
 
     def _send_ctrl_p(self):
@@ -36360,6 +36545,35 @@ class MainWindow(QMainWindow):
         dialog.destroyed.connect(lambda: setattr(self, "_reports_dialog", None))
         self._reports_dialog = dialog
         dialog.show()
+
+    def open_self_pay_history(self):
+        from self_pay_history_dialog import SelfPayHistoryDialog
+        dialog = SelfPayHistoryDialog(
+            db_connect,
+            actor=str(self.current_user.get("full_name") or self.current_user["username"]),
+            logo=LOGO_PATH,
+            open_receipt=resolve_receipt_document_path,
+            edit_receipt=self.open_receipt_in_billing,
+            preview=self._preview_self_pay_report,
+            new_receipt=self.start_self_pay_receipt,
+            parent=self,
+        )
+        dialog.exec()
+
+    def start_self_pay_receipt(self, code):
+        if self.cart_table.rowCount() or self.name_edit.text().strip():
+            if QMessageBox.question(self, "Nuevo cobro", "¿Descartar el borrador actual e iniciar un nuevo cobro?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        self.reset_all()
+        self.coverage_combo.setCurrentText(coverage_label(code))
+        self.name_edit.setFocus()
+
+    def _preview_self_pay_report(self, path):
+        preview = ComparisonPdfDialog(str(path), self, dialog_title="Cobros directos", detail_text="Puede imprimir o guardar una copia de este documento.")
+        preview.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        preview.setWindowModality(Qt.WindowModality.WindowModal)
+        self._self_pay_preview = preview
+        preview.show()
 
     def open_receipts_history_dialog(self):
         self.mark_activity()
@@ -37921,6 +38135,18 @@ def run_report_exports_self_test(output_dir: str) -> int:
             "Autodiagnóstico",
             LOGO_PATH,
         )
+        from self_pay_billing import payment_summary
+        from self_pay_history_dialog import report_context, export_summary
+        direct_summary = payment_summary([
+            {"coverage": "EXTRANJERO", "payment_status": "PAGADO", "total": "560.00"},
+            {"coverage": "NO_ASEGURADO", "payment_status": "EXONERADO", "total": "460.00"},
+        ])
+        direct_filters = {"start": "2026-10-01", "end": "2026-10-03"}
+        renderer.render_pdf(
+            report_context(direct_summary, direct_filters, "Autodiagnóstico", LOGO_PATH),
+            os.path.join(output_dir, "cobros_directos.pdf"),
+        )
+        export_summary(os.path.join(output_dir, "cobros_directos.xlsx"), direct_summary, direct_filters)
         return 0
     except Exception as exc:
         write_runtime_log(f"Autodiagnóstico de reportes falló: {exc}")

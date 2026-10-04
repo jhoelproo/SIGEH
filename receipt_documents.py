@@ -342,6 +342,8 @@ def build_receipt_snapshot(
             "document_state": str(row["estado_documento"] or ""),
             "billing_status": str(row["estado_facturacion"] or ""),
             "authorization_number": str(row["numero_autorizacion"] or ""),
+            "payment_status": str(context.get("payment_status") or ""),
+            "exemption_reason": str(context.get("exemption_reason") or ""),
             "visible_user": visible_user,
             "hospital_line_1": str(
                 context.get("hospital_line_1") or "HOSPITAL PROVINCIAL"

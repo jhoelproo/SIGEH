@@ -59,6 +59,7 @@ def database(server):
             CREATE UNIQUE INDEX uq_admission_operational_transition
                 ON admission_operational_audit(transition_id) WHERE transition_id IS NOT NULL;
             CREATE TABLE admission_sync_events(turn_id BIGINT);
+            ALTER TABLE recibos ADD PRIMARY KEY(id);
             ALTER TABLE recibos ADD COLUMN ars TEXT DEFAULT 'FUTURO',
                 ADD COLUMN total NUMERIC(14,2) DEFAULT 0,
                 ADD COLUMN fecha TEXT DEFAULT '',ADD COLUMN autorizacion_at TEXT DEFAULT '',

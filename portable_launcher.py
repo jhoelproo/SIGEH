@@ -14,13 +14,30 @@ from pathlib import Path
 
 from database_config import (
     CANONICAL_DATABASE_KEY,
+    SEALED_DATABASE_FILE,
     describe_database_configuration,
     install_database_url_for_child,
     recover_database_url_from_existing_install,
+    write_sealed_database_url,
 )
 
 LAUNCHER_LOG_NAME = "lanzador_log.txt"
 _DATABASE_URI_CREDENTIALS = re.compile(r"(postgres(?:ql)?://)[^@\s]+@", re.IGNORECASE)
+
+
+def _persist_recovered_configuration(root: Path, database_url: str) -> None:
+    try:
+        write_sealed_database_url(root / SEALED_DATABASE_FILE, database_url)
+    except (OSError, RuntimeError, ValueError) as error:
+        _write_bootstrap_event(
+            root,
+            "CONFIG_PERSISTENCE",
+            status="FAIL",
+            error_code="CONFIGURATION_WRITE_FAILED",
+            error_type=type(error).__name__,
+        )
+        return
+    _write_bootstrap_event(root, "CONFIG_PERSISTENCE", status="PASS", error_code="")
 
 
 def portable_root() -> Path:
@@ -106,6 +123,7 @@ def main() -> int:
                 root, environment=environment
             )
             if database_url:
+                _persist_recovered_configuration(root, database_url)
                 environment[CANONICAL_DATABASE_KEY] = database_url
                 description = describe_database_configuration(
                     root, environment=environment

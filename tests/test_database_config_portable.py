@@ -1,5 +1,9 @@
 from pathlib import Path
 
+import pytest
+
+import database_config
+
 from database_config import (
     BUNDLED_DATABASE_FILE,
     CANONICAL_DATABASE_KEY,
@@ -18,6 +22,48 @@ from database_config import (
 )
 
 
+@pytest.mark.parametrize("failure_point", ["fsync", "replace"])
+def test_sealed_write_failure_preserves_previous_configuration(
+    tmp_path, monkeypatch, failure_point
+):
+    target = tmp_path / SEALED_DATABASE_FILE
+    previous = "postgresql://synthetic:previous@central.example/hospital"
+    write_sealed_database_url(target, previous)
+    original = target.read_bytes()
+
+    def fail(*_args):
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(database_config.os, failure_point, fail)
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        write_sealed_database_url(
+            target, "postgresql://synthetic:replacement@central.example/hospital"
+        )
+    assert target.read_bytes() == original
+    assert read_sealed_database_url(target) == previous
+    assert list(tmp_path.glob(".database-*")) == []
+
+
+def test_sealed_write_rejects_empty_configuration_without_changing_file(tmp_path):
+    target = tmp_path / SEALED_DATABASE_FILE
+    target.write_bytes(b"original")
+    with pytest.raises(ValueError, match="vacía"):
+        write_sealed_database_url(target, "   ")
+    assert target.read_bytes() == b"original"
+
+
+def test_sealed_write_encryption_failure_does_not_create_temporary_file(
+    tmp_path, monkeypatch
+):
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("synthetic encryption failure")
+
+    monkeypatch.setattr(database_config, "_dpapi", fail)
+    with pytest.raises(RuntimeError, match="synthetic encryption failure"):
+        write_sealed_database_url(tmp_path / SEALED_DATABASE_FILE, "postgresql://test")
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_portable_bundle_resolves_without_env_or_local_dotenv(tmp_path: Path):
     value = "postgresql://portable-user:portable-pass@central.example/hospital"
     write_bundled_database_url(tmp_path / BUNDLED_DATABASE_FILE, value)
@@ -25,6 +71,22 @@ def test_portable_bundle_resolves_without_env_or_local_dotenv(tmp_path: Path):
     assert resolve_database_url(tmp_path, environment={}) == value
     assert CANONICAL_DATABASE_KEY in configured_database_keys(tmp_path)
     assert value.encode("utf-8") not in (tmp_path / BUNDLED_DATABASE_FILE).read_bytes()
+
+
+def test_internal_sealed_configuration_survives_portable_layout(tmp_path: Path):
+    internal = tmp_path / "_internal"
+    internal.mkdir()
+    value = "postgresql://synthetic:secret@central.example/hospital"
+    write_sealed_database_url(internal / SEALED_DATABASE_FILE, value)
+    assert resolve_database_url(tmp_path, environment={}) == value
+
+
+def test_internal_env_configuration_survives_portable_layout(tmp_path: Path):
+    internal = tmp_path / "_internal"
+    internal.mkdir()
+    value = "postgresql://synthetic:secret@central.example/hospital"
+    (internal / ".env").write_text(f"DATABASE_URL={value}\n", encoding="utf-8")
+    assert resolve_database_url(tmp_path, environment={}) == value
 
 
 def test_onedir_bundle_resolves_from_sibling_internal_directory(tmp_path: Path):

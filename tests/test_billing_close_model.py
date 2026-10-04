@@ -172,6 +172,35 @@ def test_close_before_start_is_invalid():
         )
 
 
+def test_direct_payments_do_not_mix_with_insurance_or_exempt_revenue():
+    result = snapshot(
+        [admission("foreign", turn=3)],
+        [
+            receipt(1, total="100.00", authorization="1234"),
+            receipt(2, "foreign", total="460.00", self_pay_coverage="EXTRANJERO", payment_status="PAGADO"),
+            receipt(3, total="560.00", self_pay_coverage="NO_ASEGURADO", payment_status="EXONERADO"),
+        ],
+    )
+    assert result["receipt_count"] == 1 and result["amount"] == "100.00"
+    assert result["authorized"] == 1 and result["linked_current"] == 0
+    assert result["current_admissions"] == 0 and result["total_pending"] == 0
+    foreign, uninsured = result["self_pay"]
+    assert foreign["paid_count"] == 1 and foreign["collected"] == "460.00"
+    assert uninsured["exempt_count"] == 1 and uninsured["collected"] == "0.00"
+    assert uninsured["exempt_amount"] == "560.00"
+
+
+def test_direct_payment_turn_start_inclusive_and_end_exclusive():
+    result = snapshot(receipts=[
+        receipt(1, created_at="2026-09-25T07:59:59-04:00", total=100, self_pay_coverage="EXTRANJERO", payment_status="PAGADO"),
+        receipt(2, created_at="2026-09-25T08:00:00-04:00", total="5.99", self_pay_coverage="EXTRANJERO", payment_status="PAGADO"),
+        receipt(3, created_at="2026-09-26T08:00:00-04:00", total=200, self_pay_coverage="EXTRANJERO", payment_status="PAGADO"),
+    ])
+    assert result["self_pay"][0]["collected"] == "5.99"
+    assert result["self_pay"][0]["count"] == 1
+    assert result["receipt_count"] == 0
+
+
 def test_snapshot_log_contains_counts_without_patient_data(caplog):
     from billing_close_report import log_snapshot
 
@@ -182,3 +211,14 @@ def test_snapshot_log_contains_counts_without_patient_data(caplog):
     assert '"receipt_count": 1' in caplog.text
     assert "PRIVATE NAME" not in caplog.text
     assert "private-id" not in caplog.text
+
+
+def test_direct_payment_close_excel_uses_frozen_separate_amounts():
+    from billing_close_report import spreadsheet_summary
+    frozen=snapshot(receipts=[receipt(1,total="460.00",self_pay_coverage="EXTRANJERO",payment_status="PAGADO"),receipt(2,total="560.00",self_pay_coverage="NO_ASEGURADO",payment_status="EXONERADO")])
+    result=spreadsheet_summary(frozen)
+    assert result["Extranjero: recibos pagados"]==1
+    assert result["Extranjero: recaudado"]=="460.00"
+    assert result["No asegurado: recaudado"]=="0.00"
+    assert result["No asegurado: valor exonerado"]=="560.00"
+    assert result["No asegurado: recibos exonerados"]==1

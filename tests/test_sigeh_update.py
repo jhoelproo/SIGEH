@@ -51,7 +51,7 @@ def _release(repository=GITHUB_REPOSITORY, version="1.1.2"):
 
 def test_product_and_channel_are_sigeh_only():
     assert PRODUCT_ID == "SIGEH"
-    assert APP_VERSION == "1.2.6"
+    assert APP_VERSION == "1.2.7"
     assert LATEST_RELEASE_API.endswith(f"/{GITHUB_REPOSITORY}/releases/latest")
     assert "Hospital-Contreras-Facturacion1" not in LATEST_RELEASE_API
 
@@ -67,7 +67,7 @@ def test_release_parser_accepts_complete_sigeh_release():
     assert release.version == "1.1.2"
     assert release.archive_name == "SIGEH-1.1.2-windows-x64.zip"
     assert not is_newer(release.version, APP_VERSION)
-    assert is_newer("1.2.7", APP_VERSION)
+    assert is_newer("1.2.8", APP_VERSION)
     assert is_newer(APP_VERSION, "1.1.2")
     assert not is_newer(APP_VERSION, APP_VERSION)
 
@@ -209,6 +209,48 @@ def test_release_rejects_nonstable_and_invalid_manifest(monkeypatch):
         resolve_release_payload(release)
 
 
+def test_update_preserves_env_configuration_in_both_install_locations(tmp_path):
+    backup = tmp_path / "backup"
+    install = tmp_path / "install"
+    for relative in (Path(".env"), Path("_internal") / ".env"):
+        source = backup / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("DATABASE_URL=postgresql://synthetic\n", encoding="utf-8")
+    install.mkdir()
+    merge_preserved(backup, install)
+    for relative in (Path(".env"), Path("_internal") / ".env"):
+        assert (install / relative).read_bytes() == (backup / relative).read_bytes()
+
+
+@pytest.mark.parametrize(
+    "relative,writer_name",
+    [
+        (Path("database_url.bundle"), "write_bundled_database_url"),
+        (Path("_internal/database_url.bundle"), "write_bundled_database_url"),
+        (Path("database_url.protected"), "write_sealed_database_url"),
+        (Path("_internal/database_url.protected"), "write_sealed_database_url"),
+    ],
+)
+def test_private_configuration_remains_usable_after_two_updates(
+    tmp_path, relative, writer_name
+):
+    import database_config
+
+    previous = tmp_path / "configured"
+    target = previous / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    expected = "postgresql://synthetic:secret@central.example/hospital"
+    getattr(database_config, writer_name)(target, expected)
+    original_bytes = target.read_bytes()
+    for version in ("first-update", "second-update"):
+        current = tmp_path / version
+        current.mkdir()
+        merge_preserved(previous, current)
+        assert database_config.resolve_database_url(current, environment={}) == expected
+        assert (current / relative).read_bytes() == original_bytes
+        previous = current
+
+
 def test_onedir_update_preserves_local_data_and_private_config(tmp_path):
     backup = tmp_path / "backup"
     install = tmp_path / "install"
@@ -236,6 +278,11 @@ def test_onedir_update_replaces_program_and_preserves_local_state(
     (install / "_internal" / "data").mkdir(parents=True)
     (install / "_internal" / "data" / "pacientes.db").write_bytes(b"history")
     (install / "_internal" / "database_url.bundle").write_bytes(b"private")
+    configured_url = "postgresql://synthetic:secret@central.example/hospital"
+    (install / ".env").write_text(f"DATABASE_URL={configured_url}\n", encoding="utf-8")
+    (install / "_internal" / ".env").write_text(
+        f"DATABASE_URL={configured_url}\n", encoding="utf-8"
+    )
     (install / "old.txt").write_text("old", encoding="utf-8")
     (payload / "_internal").mkdir(parents=True)
     for executable in ("CALCULOS_QT.exe", "SIGEH.exe", "SIGEH_Updater.exe"):
@@ -262,6 +309,12 @@ def test_onedir_update_replaces_program_and_preserves_local_state(
     assert (install / "CALCULOS_QT.exe").read_bytes() == b"new"
     assert (install / "_internal" / "data" / "pacientes.db").read_bytes() == b"history"
     assert (install / "_internal" / "database_url.bundle").read_bytes() == b"private"
+    from database_config import resolve_database_url
+
+    assert resolve_database_url(install, environment={}) == configured_url
+    assert (install / "_internal" / ".env").read_bytes() == (
+        install / ".env"
+    ).read_bytes()
     assert not (install / "old.txt").exists()
 
 

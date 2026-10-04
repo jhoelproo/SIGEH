@@ -194,6 +194,7 @@ def test_receipt_save_revalidates_uuid_and_preserves_claim_token(monkeypatch, ca
     attention = selected_attention()
     window = Mock(
         receipt_read_only=False,
+        _pending_ars_correction=None,
         editing_recibo_id=None,
         current_admission_attention=attention.snapshot(),
         current_user={},

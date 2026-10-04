@@ -1,8 +1,9 @@
 """Capture the canonical closure dataset in the handoff transaction."""
 
 from uuid import UUID
+from self_pay_billing import SCHEMA as SELF_PAY_SCHEMA
 
-SCHEMA = r"""
+SCHEMA = SELF_PAY_SCHEMA + r"""
 CREATE TABLE IF NOT EXISTS billing_reporting_policy(
  singleton SMALLINT PRIMARY KEY CHECK(singleton=1),
  baseline_at TIMESTAMPTZ NOT NULL DEFAULT '2026-09-23T00:00:00-04:00',
@@ -73,7 +74,8 @@ BEGIN
                      WHERE s.operational_source_id=source AND i.turn_id=p.turn_id
                        AND i.ended_at<=end_at)))
  ), receipts AS MATERIALIZED (
-   SELECT r.id,r.ars,r.total,
+   SELECT r.id,r.ars,r.total,COALESCE(sp.coverage,'') AS self_pay_coverage,
+          COALESCE(sp.payment_status,'') AS payment_status,sp.paid_at,
           COALESCE(NULLIF(r.created_at,''),NULLIF(r.fecha,''))::TIMESTAMPTZ AS created_at,
           CASE WHEN COALESCE(NULLIF(r.autorizacion_at,''),NULLIF(r.created_at,''))::TIMESTAMPTZ<end_at
                THEN r.numero_autorizacion ELSE '' END AS authorization,
@@ -86,6 +88,7 @@ BEGIN
                     OR UPPER(COALESCE(linked.canonical_ars,'')) IN
                        ('SIN SEGURO','SENASA SUBSIDIADO','BANCO CENTRAL','YUNEN'))) AS attention_excluded
    FROM recibos r
+   LEFT JOIN receipt_self_pay sp ON sp.receipt_id=r.id
    LEFT JOIN LATERAL (
      SELECT p.global_attention_id,p.is_deleted,p.source_status,p.service_type,
             p.coverage_status,p.canonical_ars
@@ -101,13 +104,15 @@ BEGIN
      AND UPPER(COALESCE(r.estado_facturacion,'')) NOT IN ('ANULADO','CANCELADO','INVALIDO','CANCELLED')
      AND COALESCE(NULLIF(r.created_at,''),NULLIF(r.fecha,''))::TIMESTAMPTZ<end_at
      AND (COALESCE(NULLIF(r.created_at,''),NULLIF(r.fecha,''))::TIMESTAMPTZ>=start_at
+          OR (sp.payment_status='PAGADO' AND sp.paid_at>=start_at AND sp.paid_at<end_at)
           OR linked.global_attention_id::TEXT IN (SELECT id FROM admissions))
  ) SELECT jsonb_build_object(
      'source',source,'turn',old_turn,'previous_turn',previous_turn,
      'transition_id',NEW.transition_id,'started_at',start_at,'closed_at',end_at,
      'baseline',baseline,
      'canonical_receipt_count',(SELECT COUNT(*) FROM receipts
-                               WHERE created_at>=start_at AND NOT attention_excluded),
+                               WHERE created_at>=start_at AND NOT attention_excluded
+                                 AND self_pay_coverage=''),
      'admissions',COALESCE((SELECT jsonb_agg(to_jsonb(a)) FROM admissions a),'[]'::jsonb),
      'receipts',COALESCE((SELECT jsonb_agg(to_jsonb(r)) FROM receipts r),'[]'::jsonb)
    ) INTO captured;

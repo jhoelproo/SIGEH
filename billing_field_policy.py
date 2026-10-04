@@ -15,6 +15,10 @@ def room_price(value) -> Decimal:
     return price
 
 
+def _can_identify_patient(*, validated, auxiliary, self_pay):
+    return not validated and (not auxiliary or self_pay)
+
+
 def editable_billing_fields(
     *,
     admin: bool,
@@ -22,17 +26,20 @@ def editable_billing_fields(
     validated: bool,
     read_only: bool,
     editing: bool = False,
+    self_pay: bool = False,
 ) -> dict:
-    can_identify = not validated and not auxiliary
+    can_identify = _can_identify_patient(
+        validated=validated, auxiliary=auxiliary, self_pay=self_pay
+    )
     identity_editable = can_identify or (admin and editing)
     insurance_editable = can_identify and not editing
     fields = {
         "name_edit": identity_editable,
         "date_edit": identity_editable,
-        "dx_edit": validated or not auxiliary,
-        "ars_combo": insurance_editable,
+        "dx_edit": validated or not auxiliary or self_pay,
+        "ars_combo": (insurance_editable or (admin and editing)) and not self_pay,
         "coverage_combo": insurance_editable,
-        "sala_spin": admin,
+        "sala_spin": admin and not self_pay,
     }
     return dict.fromkeys(fields, False) if read_only else fields
 

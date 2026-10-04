@@ -22,6 +22,7 @@ def close_database(server):
             ALTER TABLE admission_operational_audit ADD COLUMN transition_id UUID UNIQUE;
             INSERT INTO admission_operational_sessions(operational_source_id)
             VALUES('11111111-1111-4111-8111-111111111111');
+            ALTER TABLE recibos ADD PRIMARY KEY(id);
             ALTER TABLE recibos ADD COLUMN ars TEXT DEFAULT 'FUTURO',
                 ADD COLUMN total NUMERIC(14,2) DEFAULT 0,
                 ADD COLUMN fecha TEXT DEFAULT '',
@@ -108,6 +109,34 @@ def test_administrative_correction_without_rollover_has_no_close(
     with close_database() as con:
         commit_handoff(con, str(uuid4()), "ADMIN_TURN_OVERRIDE", new_turn)
         assert load_close_snapshot(con, pg.SOURCE, 11) is None
+
+
+def test_direct_payment_section_is_frozen_and_keeps_insurance_totals(close_database):
+    from self_pay_billing import save_payment
+
+    with close_database() as con:
+        con.execute("""INSERT INTO recibos(id,created_at,total,numero_autorizacion) VALUES
+            (1,'2026-09-24T10:00:00-04',100,'1234'),
+            (2,'2026-09-24T11:00:00-04',5.99,''),
+            (3,'2026-09-24T12:00:00-04',460,''),
+            (4,'2026-09-23T12:00:00-04',999,'')""")
+        save_payment(con, 2, "EXTRANJERO", "PAGADO", "", "actor")
+        save_payment(con, 3, "NO_ASEGURADO", "EXONERADO", "Motivo válido", "actor")
+        save_payment(con, 4, "EXTRANJERO", "PAGADO", "", "actor")
+        con.execute(
+            "UPDATE receipt_self_pay p SET paid_at=r.created_at::TIMESTAMPTZ FROM recibos r WHERE r.id=p.receipt_id AND p.payment_status='PAGADO'"
+        )
+        commit_handoff(con, str(uuid4()))
+        frozen = load_close_snapshot(con, pg.SOURCE, 11)
+        assert frozen["receipt_count"] == 1 and frozen["amount"] == "100.00"
+        foreign, uninsured = frozen["self_pay"]
+        assert foreign["count"] == 1 and foreign["collected"] == "5.99"
+        assert (
+            uninsured["exempt_amount"] == "460.00" and uninsured["collected"] == "0.00"
+        )
+    with close_database() as con:
+        save_payment(con, 3, "NO_ASEGURADO", "PAGADO", "", "otro")
+        assert load_close_snapshot(con, pg.SOURCE, 11) == frozen
 
 
 @pytest.mark.parametrize(
@@ -215,3 +244,29 @@ def test_missing_new_capture_is_error_but_legacy_source_is_allowed(close_databas
             load_close_snapshot(con, pg.SOURCE, 11, closed_at="2000-01-01T00:00:00-04")
             is None
         )
+
+
+def test_pending_and_prior_turn_payment_are_captured_separately(close_database):
+    from self_pay_billing import save_payment
+
+    with close_database() as con:
+        con.execute(
+            "INSERT INTO recibos(id,created_at,total) VALUES(1,'2026-09-23T10:00:00-04',560),(2,'2026-09-24T10:00:00-04',460)"
+        )
+        save_payment(con, 1, "EXTRANJERO", "PENDIENTE_PAGO", "", "actor")
+        save_payment(con, 1, "EXTRANJERO", "PAGADO", "", "actor")
+        con.execute(
+            "UPDATE receipt_self_pay SET paid_at='2026-09-24T11:00:00-04' WHERE receipt_id=1"
+        )
+        save_payment(con, 2, "NO_ASEGURADO", "PENDIENTE_PAGO", "", "actor")
+        commit_handoff(con, str(uuid4()))
+        frozen = load_close_snapshot(con, pg.SOURCE, 11)
+        foreign, uninsured = frozen["self_pay"]
+        assert foreign["collected"] == "560.00" and foreign["pending_count"] == 0
+        assert (
+            uninsured["pending_amount"] == "460.00" and uninsured["collected"] == "0.00"
+        )
+        assert frozen["receipt_count"] == 0
+    with close_database() as con:
+        save_payment(con, 2, "NO_ASEGURADO", "PAGADO", "", "actor")
+        assert load_close_snapshot(con, pg.SOURCE, 11) == frozen

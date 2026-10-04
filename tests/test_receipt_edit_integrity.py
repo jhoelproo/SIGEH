@@ -25,13 +25,13 @@ def test_receipt_header_correction_preserves_other_admission_guards(editable):
 
 
 @pytest.mark.parametrize("validated", [False, True])
-def test_admin_edit_unlocks_header_but_not_insurance(validated):
+def test_admin_edit_unlocks_header_and_ars_but_not_coverage(validated):
     fields = editable_billing_fields(
         admin=True, auxiliary=False, validated=validated, read_only=False, editing=True
     )
     assert fields["name_edit"] and fields["date_edit"] and fields["dx_edit"]
     assert fields["sala_spin"]
-    assert not fields["ars_combo"] and not fields["coverage_combo"]
+    assert fields["ars_combo"] and not fields["coverage_combo"]
 
 
 @pytest.mark.parametrize("date", ["2026-09-13", "13/09/2026", "13-09-2026"])

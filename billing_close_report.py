@@ -102,4 +102,13 @@ def spreadsheet_summary(data):
         "Recibos históricos sin vínculo": "historical_billed",
         "Históricos sin vínculo autorizados": "historical_authorized",
     }
-    return {label: data[key] for label, key in labels.items()}
+    result = {label: data[key] for label, key in labels.items()}
+    for row in data.get("self_pay", []):
+        prefix = row["label"]
+        result[f"{prefix}: recibos pagados"] = row["paid_count"]
+        result[f"{prefix}: recaudado"] = row["collected"]
+        result[f"{prefix}: recibos exonerados"] = row["exempt_count"]
+        result[f"{prefix}: valor exonerado"] = row["exempt_amount"]
+        result[f"{prefix}: pendientes de pago"] = row.get("pending_count", 0)
+        result[f"{prefix}: importe pendiente"] = row.get("pending_amount", "0.00")
+    return result

@@ -2,7 +2,7 @@ import copy
 import os
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -226,6 +226,36 @@ class MonthlyArsFormStateTests(unittest.TestCase):
             search.assert_not_called()
             self.page.search_candidates_button.click()
             search.assert_called_once_with()
+
+    def test_custom_service_range_displays_all_manual_receipt_candidates(self):
+        self._select_id(1)
+        self.page.candidate_date_from.setDate(app.QDate(2026, 8, 1))
+        self.page.candidate_date_to.setDate(app.QDate(2026, 8, 28))
+        candidates = [
+            {"recibo_id": index, "total_snapshot": 100.0} for index in range(1, 12)
+        ]
+        with (
+            patch.object(
+                app, "obtener_candidatos_listado_ars", return_value=candidates
+            ) as query,
+            patch.object(
+                self.page,
+                "_start_monthly_worker",
+                side_effect=lambda operation, completed, _failed: completed(
+                    operation()
+                ),
+            ),
+        ):
+            self.page.search_candidates_button.click()
+        self.assertEqual(query.call_args.kwargs["date_from"], "2026-08-01")
+        self.assertEqual(query.call_args.kwargs["date_to"], "2026-08-28")
+        self.assertEqual(self.page.current_batch["period_month"], 7)
+        self.assertEqual(len(self.page.available_receipts), 11)
+        self.assertIn(
+            "11 recibo(s) encontrado(s)", self.page.patients_loading_label.text()
+        )
+        self.assertEqual(self.page.add_all_receipts_button.text(), "Agregar todo (11)")
+        self.assertTrue(self.page.add_all_receipts_button.isEnabled())
 
     def test_create_dialog_excludes_only_normalized_senasa_subsidiado(self):
         ars = [

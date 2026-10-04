@@ -23,6 +23,8 @@ PRESERVE_NAMES = ("recibos", "reportes", "respaldos")
 PRESERVE_FILES = ("lanzador_log.txt", "pdf_performance.log")
 PRESERVE_RELATIVE_DIRECTORIES = (Path("_internal") / "data",)
 PRESERVE_RELATIVE_FILES = (
+    Path(".env"),
+    Path("_internal") / ".env",
     Path("database_url.protected"),
     Path("database_url.bundle"),
     Path("_internal") / "database_url.protected",

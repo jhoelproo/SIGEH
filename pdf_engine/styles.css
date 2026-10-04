@@ -888,3 +888,8 @@ body {
   display: none !important;
 }
 
+
+.payment-pending .authorization-line b {
+  white-space: normal;
+  line-height: 1.12;
+}

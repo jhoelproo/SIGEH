@@ -7,9 +7,14 @@
 /*__INLINE_CSS__*/
   </style>
 </head>
-<body class="document-{{ estado_documento|lower }}">
+<body class="document-{{ estado_documento|lower }}{% if payment_status == "PENDIENTE_PAGO" %} payment-pending{% endif %}">
   <main class="page">
-    {% if estado_documento == "PRELIMINAR" %}
+    {% if payment_status %}
+    <section class="document-state-banner {{ "preliminary-banner" if payment_status == "PENDIENTE_PAGO" else "ready-banner" }}">
+      <b>RECIBO DE COBRO · {{ "PENDIENTE DE PAGO" if payment_status == "PENDIENTE_PAGO" else payment_status }}</b>
+      <span>{% if payment_status == "PENDIENTE_PAGO" %}No acredita pago · {% endif %}Tarifa de SENASA Contributivo.</span>
+    </section>
+    {% elif estado_documento == "PRELIMINAR" %}
     <div class="preliminary-watermark" aria-hidden="true">PRELIMINAR</div>
     <section class="document-state-banner preliminary-banner">
       <b>VERSIÓN PRELIMINAR</b>
@@ -53,12 +58,20 @@
           <div class="receipt-date-label">Fecha:</div>
           <div class="receipt-date-value">{{ fecha_display }}</div>
           <div class="authorization-line">
-            Autorización: <b>{{ numero_autorizacion or "PENDIENTE" }}</b>
+            {% if payment_status %}
+            Estado de cobro: <b>{{ "PENDIENTE DE PAGO" if payment_status == "PENDIENTE_PAGO" else payment_status }}</b>
+            {% if exemption_reason %}<br>Motivo: {{ exemption_reason }}{% endif %}
+            {% else %}Autorización: <b>{{ numero_autorizacion or "PENDIENTE" }}</b>{% endif %}
           </div>
         </div>
       </aside>
     </header>
 
+    {% if payment_status == "PENDIENTE_PAGO" %}
+    <section class="document-state-banner preliminary-banner">
+      <b>Importe pendiente: {{ total_general|money }}</b><span>Importe cobrado: RD$ 0.00</span>
+    </section>
+    {% endif %}
     <!-- ================= DATOS DEL PACIENTE ================= -->
     <section class="patient-card">
       <div class="section-heading patient-heading">

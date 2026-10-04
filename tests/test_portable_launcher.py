@@ -1,7 +1,14 @@
 import json
 
+import pytest
+
 import portable_launcher
-from database_config import BUNDLED_DATABASE_FILE, write_bundled_database_url
+from database_config import (
+    BUNDLED_DATABASE_FILE,
+    SEALED_DATABASE_FILE,
+    read_sealed_database_url,
+    write_bundled_database_url,
+)
 
 
 def test_launcher_uses_bundled_database_configuration_without_env_file(
@@ -96,6 +103,42 @@ def test_launcher_recovers_existing_install_for_direct_download(tmp_path, monkey
     assert captured["env"]["DATABASE_URL"] == "postgresql://recovered"
 
 
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError])
+def test_recovery_persistence_failure_does_not_block_launch_or_expose_credentials(
+    tmp_path, monkeypatch, error_type
+):
+    (tmp_path / "CALCULOS_QT.exe").write_bytes(b"synthetic")
+    (tmp_path / "_internal").mkdir()
+    secret = "postgresql://synthetic:never-log-this@central.example/hospital"
+    monkeypatch.setattr(portable_launcher, "portable_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        portable_launcher, "install_database_url_for_child", lambda *_args, **_kw: ""
+    )
+    monkeypatch.setattr(
+        portable_launcher,
+        "recover_database_url_from_existing_install",
+        lambda *_args, **_kw: secret,
+    )
+
+    def fail(*_args):
+        raise error_type(secret)
+
+    monkeypatch.setattr(portable_launcher, "write_sealed_database_url", fail)
+    captured = {}
+    monkeypatch.setattr(
+        portable_launcher.subprocess,
+        "Popen",
+        lambda command, **kwargs: captured.update(command=command, **kwargs),
+    )
+    assert portable_launcher.main() == 0
+    assert captured["env"]["DATABASE_URL"] == secret
+    log = (tmp_path / "lanzador_log.txt").read_text(encoding="utf-8")
+    assert "CONFIGURATION_WRITE_FAILED" in log
+    assert error_type.__name__ in log
+    assert secret not in log
+    assert "never-log-this" not in log
+
+
 def test_launcher_recovers_real_bundle_from_versioned_previous_install(
     tmp_path, monkeypatch
 ):
@@ -120,6 +163,11 @@ def test_launcher_recovers_real_bundle_from_versioned_previous_install(
     assert portable_launcher.main() == 0
     assert captured["env"]["DATABASE_URL"] == expected
     assert captured["command"] == [str(downloaded / "CALCULOS_QT.exe")]
+    assert read_sealed_database_url(downloaded / SEALED_DATABASE_FILE) == expected
+    (previous / BUNDLED_DATABASE_FILE).unlink()
+    captured.clear()
+    assert portable_launcher.main() == 0
+    assert captured["env"]["DATABASE_URL"] == expected
 
 
 def test_self_test_validates_install_without_launching(tmp_path, monkeypatch):

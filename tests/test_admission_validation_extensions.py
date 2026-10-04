@@ -441,7 +441,9 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
         finally:
             dialog.close()
 
-    def test_available_batch_query_filters_deleted_and_invoiced_receipts(self):
+    def test_available_batch_query_includes_invoiced_and_excludes_assigned_receipts(
+        self,
+    ):
         connection = _Connection()
         rows = app._query_available_receipts_for_batch(
             connection,
@@ -452,7 +454,11 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
         self.assertEqual(rows, [])
         sql, _params = connection.calls[-1]
         self.assertIn("r.is_deleted=0", sql)
-        self.assertIn("r.estado_facturacion IN ('PENDIENTE','SIN_CLASIFICAR')", sql)
+        self.assertIn(
+            "r.estado_facturacion IN ('PENDIENTE','SIN_CLASIFICAR','FACTURADO')", sql
+        )
+        self.assertIn("COALESCE(r.tipo_cobertura,'ASEGURADO')='ASEGURADO'", sql)
+        self.assertIn("COALESCE(r.receipt_origin,'')<>'SELF_PAY'", sql)
         self.assertIn("NOT EXISTS", sql)
 
     def test_migration_is_idempotent_and_preserves_clinical_rows(self):
