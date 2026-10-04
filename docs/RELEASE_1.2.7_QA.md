@@ -48,7 +48,11 @@ Cuatro pasadas PASS: funcionalidad implementada comprobada, regresión completa 
 
 ## QUALITY GATES
 
-Funcionalidad del release, unitarias/integración específica, regresión completa, cobertura, límites, formato/lint/tipos/análisis estático diferencial, complejidad documentada, duplicación, seguridad, build, smoke y QA final del release: PASS. Prueba opcional de capacidad real: N/A — requiere entorno explícito y no se necesita para validar actualización. Validación con datos reales del hospital: N/A — no se realiza QA destructivo ni se simulan pagos reales. Publicación: NO VERIFICADO hasta completar GitHub.
+Funcionalidad del release, unitarias/integración específica, regresión completa, cobertura, límites, formato/lint/tipos/análisis estático diferencial, complejidad documentada, duplicación, seguridad, build, smoke y QA final del release: PASS. Prueba opcional de capacidad real: N/A — requiere entorno explícito y no se necesita para validar actualización. Validación con datos reales del hospital: N/A — no se realiza QA destructivo ni se simulan pagos reales. Publicación y canal de actualización: PASS, verificación remota realizada.
+
+## PUBLICACIÓN
+
+Publicado el 2026-10-04T15:20:58Z: https://github.com/jhoelproo/SIGEH/releases/tag/v1.2.7. Tag sobre e49fa10cc57078d869f7a63dfd724ac7fbaa2915. Cuatro assets remotos completos, tamaños y SHA-256 idénticos a los archivos locales validados. Publicado como estable y latest después de comprobar todos los assets del draft. La API pública, consultada mediante sigeh_update, devuelve 1.2.7 y valida manifest/checksum remotos. Detecta actualización desde 1.2.6 y rechaza volver a instalar la misma 1.2.7. Evidencia: output/release-127-draft-verification.json y release-127-publication-verification.json.
 
 ## PROBLEMAS PENDIENTES
 
