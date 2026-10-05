@@ -9587,22 +9587,33 @@ def get_monthly_billing_batch(batch_id: int):
 
 
 def _query_monthly_batch_receipts(con, batch_id: int, included: bool = True):
+    from receipt_list_consistency import effective_list_entry
+
     rows = con.execute(
         """SELECT br.*, COALESCE(r.numero::text,'') AS numero,
                    COALESCE(r.nombre,br.patient_snapshot) AS nombre,
                    COALESCE(r.fecha,br.service_date_snapshot) AS fecha,
-                   r.tipo_cobertura,
+                   r.tipo_cobertura, b.status AS batch_status,
+                   r.numero_autorizacion AS receipt_authorization,
+                   r.autorizacion_at AS receipt_authorization_at,
+                   r.admission_nss_snapshot AS receipt_nss,
+                   r.admission_cedula_snapshot AS receipt_cedula,
+                   r.specialty_snapshot AS receipt_specialty,
+                   (SELECT v.created_at FROM recibo_document_versions v
+                    WHERE v.recibo_id=r.id AND v.is_current=TRUE LIMIT 1)
+                       AS receipt_edited_at,
                    r.estado_facturacion, r.estado_facturacion_at,
                    COALESCE(r.admission_atencion_id,br.admission_attention_id)
                        AS admission_atencion_id
            FROM billing_batch_receipts br
+           JOIN billing_batches b ON b.id=br.batch_id
            LEFT JOIN recibos r ON r.id=br.recibo_id
            WHERE br.batch_id=%s AND br.included=%s
            ORDER BY br.billing_date_snapshot, r.numero NULLS LAST,
                     br.admission_attention_id""",
         (int(batch_id), 1 if included else 0),
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [effective_list_entry(row) for row in rows]
 
 
 def list_monthly_batch_receipts(batch_id: int, included: bool = True):
@@ -10400,76 +10411,122 @@ def update_monthly_batch_receipt_export_data(
 ) -> None:
     if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
         raise PermissionError("Tu rol no puede corregir listados mensuales.")
-    document_type = str(document_type or "").strip().upper()
-    if document_type not in {"NSS", "CÉDULA", "CEDULA"}:
-        raise ValueError("Selecciona NSS o CÉDULA.")
-    document_type = "CÉDULA" if document_type in {"CÉDULA", "CEDULA"} else "NSS"
-    document_number = str(document_number or "").strip()
-    authorization = str(authorization or "").strip()
-    specialty = str(specialty or "").strip() or "EMERGENCIOLOGÍA"
-    if not document_number:
-        raise ValueError("Escribe el NSS o la cédula.")
-    if len(document_number) > 24:
-        raise ValueError("El NSS o la cédula no puede exceder 24 caracteres.")
-    if not authorization:
-        raise ValueError("Escribe el número de autorización.")
-    if len(authorization) > 40:
-        raise ValueError("La autorización no puede exceder 40 caracteres.")
+    from receipt_list_consistency import normalize_list_metadata
+
+    document_type, document_number, authorization, specialty = normalize_list_metadata(
+        document_type, document_number, authorization, specialty
+    )
+
+    from receipt_list_consistency import (
+        lock_pending_batches,
+        lock_receipt,
+        sync_pending_lists,
+        write_receipt_metadata,
+    )
 
     username = str((user or {}).get("username") or "Sistema")
     stamp = now_str()
     with db_connect() as con:
+        receipt = lock_receipt(con, receipt_id)
+        lock_pending_batches(con, receipt_id)
         row = con.execute(
             """SELECT b.status, br.included
                FROM billing_batches b
                JOIN billing_batch_receipts br ON br.batch_id=b.id
                WHERE b.id=%s AND br.recibo_id=%s
-               FOR UPDATE""",
+               FOR UPDATE OF b,br""",
             (int(batch_id), int(receipt_id)),
         ).fetchone()
         if not row or not int(row["included"] or 0):
             raise ValueError("El recibo no está incluido en el expediente.")
         if not batch_is_editable(row["status"]):
             raise ValueError("Solo se pueden corregir expedientes pendientes.")
-        con.execute(
-            """UPDATE billing_batch_receipts SET
-                   document_type_snapshot=%s,
-                   document_number_snapshot=%s,
-                   authorization_snapshot=%s,
-                   specialty_snapshot=%s,
-                   nss_snapshot=CASE WHEN %s='NSS' THEN %s ELSE nss_snapshot END,
-                   cedula_snapshot=CASE WHEN %s='CÉDULA' THEN %s ELSE cedula_snapshot END,
-                   last_edited_at=%s, last_edited_by=%s
-               WHERE batch_id=%s AND recibo_id=%s""",
-            (
-                document_type, document_number, authorization, specialty,
-                document_type, document_number,
-                document_type, document_number,
-                stamp, username, int(batch_id), int(receipt_id),
-            ),
+        changes = {
+            "numero_autorizacion": authorization,
+            "specialty_snapshot": specialty,
+            "admission_nss_snapshot"
+            if document_type == "NSS"
+            else "admission_cedula_snapshot": document_number,
+        }
+        write_receipt_metadata(
+            con, receipt, changes, username, stamp, _receipt_metadata_policy
         )
-        con.execute(
-            """UPDATE billing_batches SET updated_at=%s, updated_by=%s WHERE id=%s""",
-            (stamp, username, int(batch_id)),
+        sync_pending_lists(con, receipt_id, username, stamp, document_type)
+        _snapshot_corrected_receipt(con, receipt_id, username)
+
+
+def _receipt_metadata_policy(receipt, authorization):
+    if receipt.get("verification_bypassed"):
+        return classify_privileged_bypass_authorization(authorization)
+    state = (
+        DOCUMENT_READY
+        if billing_is_ready_for_audit(
+            patient_validated=bool(receipt.get("admission_atencion_id")),
+            authorization=authorization,
         )
-        con.execute(
-            """INSERT INTO billing_batch_events(
-                   batch_id, recibo_id, event_type, performed_at,
-                   performed_by, details
-               ) VALUES(%s,%s,'IDENTIFICACION_ENVIO_CORREGIDA',%s,%s,%s)""",
-            (
-                int(batch_id), int(receipt_id), stamp, username,
-                json.dumps(
-                    {
-                        "document_type": document_type,
-                        "document_number": document_number,
-                        "authorization": authorization,
-                        "specialty": specialty,
-                    },
-                    ensure_ascii=False,
-                ),
-            ),
+        else DOCUMENT_PRELIMINARY
+    )
+    return state, AUTH_REVIEW_NOT_APPLICABLE, ""
+
+
+def _snapshot_corrected_receipt(con, receipt_id, username):
+    row = con.execute(
+        """SELECT snapshot_jsonb FROM recibo_document_versions
+           WHERE recibo_id=%s AND is_current=TRUE""",
+        (int(receipt_id),),
+    ).fetchone()
+    context = dict((row["snapshot_jsonb"] or {}).get("document") or {}) if row else {}
+    return save_receipt_document_snapshot(
+        con, receipt_id, username, document_context=context
+    )
+
+
+def update_receipt_authorization(
+    receipt_id, authorization, user, *, expected_authorization
+):
+    from receipt_list_consistency import (
+        lock_receipt,
+        restore_legacy_list_identity,
+        sync_pending_lists,
+        validate_authorization,
+        write_receipt_metadata,
+    )
+
+    user, username = _require_receipt_permission(
+        user, PERMISSION_EDIT_PENDING, "Tu rol no puede editar la autorización."
+    )
+    authorization = validate_authorization(authorization)
+    with db_connect() as con:
+        receipt = lock_receipt(con, receipt_id)
+        if receipt["estado_facturacion"] not in (BILLING_PENDING, BILLING_UNCLASSIFIED):
+            raise ValueError(
+                "Reabre el recibo pendiente antes de cambiar la autorización."
+            )
+        if is_self_pay(receipt["tipo_cobertura"]):
+            raise ValueError(
+                "Los recibos de pago directo no requieren autorización de ARS."
+            )
+        if str(receipt["numero_autorizacion"] or "") != str(
+            expected_authorization or ""
+        ):
+            raise ValueError(
+                "La autorización cambió en otra pantalla. Actualiza el historial."
+            )
+        if str(receipt["numero_autorizacion"] or "") == authorization:
+            return int(receipt_id)
+        stamp = now_str()
+        receipt = restore_legacy_list_identity(con, receipt_id, receipt)
+        write_receipt_metadata(
+            con,
+            receipt,
+            {"numero_autorizacion": authorization},
+            username,
+            stamp,
+            _receipt_metadata_policy,
         )
+        sync_pending_lists(con, receipt_id, username, stamp)
+        _snapshot_corrected_receipt(con, receipt_id, username)
+    return int(receipt_id)
 
 
 def monthly_batch_export_problems(batch_id: int) -> list[str]:
@@ -11145,6 +11202,8 @@ def save_receipt_with_items(
                     admission_values[10] = corrected["coverage_status"]
                     admission_values[11] = corrected["readiness"]
             has_new_attention = admission_values[0] is not None
+            from receipt_list_consistency import restore_legacy_list_identity
+            current = restore_legacy_list_identity(con, recibo_id, dict(current))
             effective_attention_id = (
                 current["admission_atencion_id"] or admission_values[0]
             )
@@ -11553,6 +11612,10 @@ def save_receipt_with_items(
             save_payment(con, saved_id, coverage, payment_status, exemption_reason, username)
             con.execute("UPDATE recibos SET receipt_origin='SELF_PAY',estado_facturacion='NO_FACTURADO' WHERE id=%s", (saved_id,))
             document_context = {**dict(document_context or {}), "payment_status": payment_status, "exemption_reason": exemption_reason}
+
+        if editing:
+            from receipt_list_consistency import sync_pending_lists
+            sync_pending_lists(con, saved_id, str(username or "Sistema"), now_str())
 
         document_version = save_receipt_document_snapshot(
             con,
@@ -12046,10 +12109,22 @@ def list_action_history(
     return [dict(row) for row in rows]
 
 def _receipt_history_filter_sql(
-    *, patient_or_receipt="", nss="", cedula="", ars="", username="",
-    billing_status=BILLING_ALL, flow_filter="all", assignment_filter=AUDIT_ASSIGNMENT_ALL,
-    current_username="", date_from="", date_to="", user_mode="include",
-    usernames=None, include_excluded_ars=False,
+    *,
+    patient_or_receipt="",
+    nss="",
+    cedula="",
+    ars="",
+    username="",
+    billing_status=BILLING_ALL,
+    flow_filter="all",
+    assignment_filter=AUDIT_ASSIGNMENT_ALL,
+    current_username="",
+    date_from="",
+    date_to="",
+    user_mode="include",
+    usernames=None,
+    include_excluded_ars=False,
+    sort_order="recent",
 ):
     clauses = ["r.is_deleted=0", "COALESCE(r.receipt_origin,'')<>'SELF_PAY'"]
     if not include_excluded_ars:
@@ -12062,6 +12137,12 @@ def _receipt_history_filter_sql(
         if text_value.isdigit():
             clauses[-1] = f"({clauses[-1]} OR CAST(r.numero AS TEXT) LIKE %s)"
             params.append(f"%{text_value}%")
+            clauses[-1] = (
+                "("
+                + clauses[-1]
+                + " OR r.admission_nss_snapshot LIKE %s OR r.admission_cedula_snapshot LIKE %s)"
+            )
+            params.extend((f"%{text_value}%", f"%{text_value}%"))
     for column, value in (
         ("r.admission_nss_snapshot", nss),
         ("r.admission_cedula_snapshot", cedula),
@@ -12082,24 +12163,29 @@ def _receipt_history_filter_sql(
     ]
     if selected_users:
         if str(user_mode or "include").lower() == "exclude":
-            clauses.append(
-                "NOT (LOWER(BTRIM(COALESCE(r.username,'')))=ANY(%s))"
-            )
+            clauses.append("NOT (LOWER(BTRIM(COALESCE(r.username,'')))=ANY(%s))")
         else:
-            clauses.append(
-                "LOWER(BTRIM(COALESCE(r.username,'')))=ANY(%s)"
-            )
+            clauses.append("LOWER(BTRIM(COALESCE(r.username,'')))=ANY(%s)")
         params.append(selected_users)
+    if flow_filter == "ready":
+        clauses.append(
+            "r.estado_documento=%s AND r.estado_facturacion IN ('PENDIENTE','SIN_CLASIFICAR')"
+        )
+        params.append(DOCUMENT_READY)
     if billing_status and billing_status != BILLING_ALL:
         clauses.append("COALESCE(r.estado_facturacion, %s)=%s")
         params.extend((BILLING_UNCLASSIFIED, str(billing_status)))
     if assignment_filter == AUDIT_ASSIGNMENT_UNASSIGNED:
-        clauses.append("NULLIF(BTRIM(COALESCE(r.auditoria_asignada_a, '')), '') IS NULL")
+        clauses.append(
+            "NULLIF(BTRIM(COALESCE(r.auditoria_asignada_a, '')), '') IS NULL"
+        )
     elif assignment_filter == AUDIT_ASSIGNMENT_MINE:
         clauses.append("r.auditoria_asignada_a=%s")
         params.append(str(current_username or ""))
     elif assignment_filter == AUDIT_ASSIGNMENT_OTHERS:
-        clauses.append("NULLIF(BTRIM(COALESCE(r.auditoria_asignada_a, '')), '') IS NOT NULL")
+        clauses.append(
+            "NULLIF(BTRIM(COALESCE(r.auditoria_asignada_a, '')), '') IS NOT NULL"
+        )
         if current_username:
             clauses.append("r.auditoria_asignada_a<>%s")
             params.append(str(current_username))
@@ -12114,11 +12200,17 @@ def _receipt_history_filter_sql(
 
 def list_receipts_history_rows(*, _connection=None, limit=100, offset=0, **filters):
     where_sql, params = _receipt_history_filter_sql(**filters)
+    order = {
+        "recent": "r.id DESC",
+        "service_recent": "r.fecha DESC NULLS LAST,r.id DESC",
+        "service_oldest": "r.fecha ASC NULLS LAST,r.id DESC",
+        "total": "r.total DESC,r.id DESC",
+    }.get(filters.get("sort_order"), "r.id DESC")
     query = f"""SELECT r.id, r.numero, r.nombre, r.fecha, r.ars, r.tipo_cobertura,
                        r.total, r.username, r.created_at, r.pdf_filename, r.is_backdated,
                        r.estado_facturacion, r.estado_facturacion_at,
                        r.estado_facturacion_por, r.referencia_facturacion,
-                       r.numero_autorizacion, r.estado_documento,
+                       r.numero_autorizacion, r.estado_documento,r.admission_nss_snapshot,
                        r.auditoria_asignada_a,
                        CASE WHEN r.estado_facturacion IN ('PENDIENTE','SIN_CLASIFICAR')
                             THEN GREATEST(0, CURRENT_DATE-NULLIF(r.created_at,'')::timestamp::date)
@@ -12128,11 +12220,13 @@ def list_receipts_history_rows(*, _connection=None, limit=100, offset=0, **filte
                        r.review_status,r.review_reason
                 FROM recibos r
                 WHERE {where_sql}
-                ORDER BY r.id DESC
+                ORDER BY {order}
                 LIMIT %s OFFSET %s"""
     query_params = params + (max(1, min(int(limit), 250)), max(0, int(offset)))
     if _connection is not None:
-        return [dict(row) for row in _connection.execute(query, query_params).fetchall()]
+        return [
+            dict(row) for row in _connection.execute(query, query_params).fetchall()
+        ]
     with db_connect() as con:
         return [dict(row) for row in con.execute(query, query_params).fetchall()]
 
@@ -15919,8 +16013,10 @@ def _receipt_snapshot_render_data(document_record):
         "numero": header.get("receipt_number"),
         "fecha": header.get("service_date"),
         "paciente": patient.get("name"),
+        "nss": patient.get("nss"),
         "diagnostico": header.get("diagnosis"),
-        "ars": header.get("ars") or (
+        "ars": header.get("ars")
+        or (
             coverage_label(str(header.get("coverage"))).upper()
             if is_self_pay(str(header.get("coverage")))
             else "N/A"
@@ -19128,13 +19224,6 @@ class LoginDialog(QDialog):
         if status != "OK":
             self._show_login_error("No fue posible iniciar la sesión.")
             return
-        if data.get("recovered_same_device"):
-            QMessageBox.information(
-                self,
-                "Sesión recuperada",
-                "Se encontró una sesión anterior de este usuario en esta "
-                "computadora. Se recuperará el acceso.",
-            )
         self.lbl_error.hide()
         self.user = dict(data.get("user") or {})
         self.session_id = str(data.get("session_id") or "")
@@ -22969,7 +23058,7 @@ class LegacyMonthlyBillingListsPage(QWidget):
 
 
 class MonthlyReceiptEditorDialog(QDialog):
-    """Corrige únicamente la fotografía destinada al expediente de la ARS."""
+    """Corrige los datos compartidos entre el recibo y el expediente pendiente."""
 
     def __init__(self, receipt: dict, parent=None):
         super().__init__(parent)
@@ -22978,15 +23067,17 @@ class MonthlyReceiptEditorDialog(QDialog):
         root = QVBoxLayout(self)
 
         patient = QLabel(
-            f"<b>{receipt.get('patient_snapshot') or receipt.get('nombre') or ''}</b><br>"
+            f"{receipt.get('patient_snapshot') or receipt.get('nombre') or ''}\n"
             f"Recibo {receipt.get('numero') or ''}"
         )
+        patient.setTextFormat(Qt.TextFormat.PlainText)
         patient.setWordWrap(True)
+        patient.setObjectName("DesignValue")
         root.addWidget(patient)
 
         hint = QLabel(
-            "La corrección se guarda en este expediente y queda registrada en "
-            "el historial. No sobrescribe silenciosamente la atención original."
+            "El NSS, la autorización y la especialidad se actualizan también "
+            "en el recibo y sus listados pendientes. La corrección queda registrada."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(
@@ -22995,37 +23086,41 @@ class MonthlyReceiptEditorDialog(QDialog):
         )
         root.addWidget(hint)
 
-        form = QFormLayout()
+        from workspace_design import workspace_styles, title
+
+        self.setStyleSheet(
+            workspace_styles(bool(getattr(parent, "_monthly_design_dark", False)))
+        )
+        root.insertWidget(0, title("Corregir datos para el envío"))
+        form = QGridLayout()
         self.document_type = QComboBox()
         self.document_type.addItems(["NSS", "CÉDULA"])
-        current_type = str(
-            receipt.get("document_type_snapshot") or "NSS"
-        ).upper()
+        current_type = str(receipt.get("document_type_snapshot") or "NSS").upper()
         self.document_type.setCurrentText(
             "CÉDULA" if current_type in {"CÉDULA", "CEDULA"} else "NSS"
         )
         self.document_number = QLineEdit(
             str(receipt.get("document_number_snapshot") or "")
         )
-        self.document_number.setPlaceholderText(
-            "Número que aparecerá en el listado"
-        )
-        self.authorization = QLineEdit(
-            str(receipt.get("authorization_snapshot") or "")
-        )
+        self.document_number.setPlaceholderText("Número que aparecerá en el listado")
+        self.authorization = QLineEdit(str(receipt.get("authorization_snapshot") or ""))
         self.authorization.setPlaceholderText("Número de autorización")
         self.specialty = QLineEdit(
             str(receipt.get("specialty_snapshot") or "EMERGENCIOLOGÍA")
         )
-        form.addRow("Tipo de documento:", self.document_type)
-        form.addRow("NSS / cédula:", self.document_number)
-        form.addRow("Autorización:", self.authorization)
-        form.addRow("Especialidad:", self.specialty)
+        for row, column, caption, control in (
+            (0, 0, "Tipo de documento", self.document_type),
+            (0, 1, "Autorización", self.authorization),
+            (2, 0, "NSS / cédula", self.document_number),
+            (2, 1, "Especialidad", self.specialty),
+        ):
+            form.addWidget(QLabel(caption), row, column)
+            form.addWidget(control, row + 1, column)
+        self.document_number.setMaxLength(24)
+        self.authorization.setMaxLength(40)
         root.addLayout(form)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Cancel | QDialogButtonBox.Save
-        )
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
         buttons.button(QDialogButtonBox.Save).setText("Guardar corrección")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -23519,6 +23614,8 @@ class MonthlyBillingListsPage(QWidget):
             lambda: self.load_batches_async(self.current_batch_id)
         )
         self._reset_configuration_form()
+        from monthly_workspace_design import MonthlyWorkspace
+        self.monthly_workspace = MonthlyWorkspace(self)
         self.load_batches_async()
         parent_window = self.parentWidget()
         while parent_window is not None and not hasattr(parent_window, "is_dark_mode"):
@@ -23536,36 +23633,39 @@ class MonthlyBillingListsPage(QWidget):
             + modern_module_stylesheet(bool(is_dark))
             + f"""
             QTabWidget#MonthlySectionTabs::pane {{
-                border: 1px solid {tokens['border']}; border-radius: 10px;
-                top: -1px; background: {tokens['input_bg']};
+                border: 1px solid {tokens["border"]}; border-radius: 10px;
+                top: -1px; background: {tokens["input_bg"]};
             }}
             QTabWidget#MonthlySectionTabs QTabBar::tab {{
                 min-height: 26px; padding: 10px 18px; margin: 0 4px 0 0;
-                border: 1px solid {tokens['border']}; border-radius: 8px 8px 0 0;
-                background: {tokens['alt_bg']}; color: {tokens['text']}; font-weight: 800;
+                border: 1px solid {tokens["border"]}; border-radius: 8px 8px 0 0;
+                background: {tokens["alt_bg"]}; color: {tokens["text"]}; font-weight: 800;
             }}
             QTabWidget#MonthlySectionTabs QTabBar::tab:selected {{
-                background: {tokens['input_bg']}; color: {tokens['title_color']};
-                border-bottom: 3px solid {tokens['title_color']};
+                background: {tokens["input_bg"]}; color: {tokens["title_color"]};
+                border-bottom: 3px solid {tokens["title_color"]};
             }}
             QTabWidget#MonthlySectionTabs QTabBar::tab:!selected:hover {{
-                background: {tokens['sel_bg']}; color: {tokens['sel_text']};
+                background: {tokens["sel_bg"]}; color: {tokens["sel_text"]};
             }}
             QTableWidget#MonthlySavedTable {{ border-radius: 9px; }}
             QTabWidget#MonthlyWorkflowSteps::pane {{
-                background: {tokens['input_bg']}; border: 1px solid {tokens['border']}; border-radius: 9px;
+                background: {tokens["input_bg"]}; border: 1px solid {tokens["border"]}; border-radius: 9px;
             }}
             QTabWidget#MonthlyWorkflowSteps QTabBar::tab {{
                 padding: 8px 14px; min-width: 110px; font-weight: 800;
             }}
             QWidget#MonthlySavedFilters {{
-                background: {tokens['input_bg']}; border: 1px solid {tokens['border']}; border-radius: 10px;
+                background: {tokens["input_bg"]}; border: 1px solid {tokens["border"]}; border-radius: 10px;
             }}
             QSplitter#MonthlyMainSplitter::handle {{
-                background: {tokens['border']}; margin: 0 3px;
+                background: {tokens["border"]}; margin: 0 3px;
             }}
             """
         )
+        from monthly_workspace_design import apply_monthly_design_theme
+
+        apply_monthly_design_theme(self, is_dark)
 
     def apply_layout_profile(self, snapshot):
         compact = snapshot.applied_profile in (PROFILE_VERY_COMPACT, PROFILE_COMPACT)
@@ -24179,6 +24279,9 @@ class MonthlyBillingListsPage(QWidget):
         return page
 
     def _filter_patients(self, text):
+        if hasattr(self, "monthly_workspace"):
+            self.monthly_workspace.filter_rows(text)
+            return
         filter_table_widget(self.patients, text)
         self._update_patient_actions()
 
@@ -24193,6 +24296,8 @@ class MonthlyBillingListsPage(QWidget):
         self.remove_receipt_button.setToolTip(
             "Retirar los seleccionados solo del listado; conservar recibos e historial."
         )
+        if hasattr(self, "monthly_workspace"):
+            self.monthly_workspace.update_details()
 
     def _patients_context_menu(self):
         menu = QMenu(self)
@@ -24569,6 +24674,8 @@ class MonthlyBillingListsPage(QWidget):
             f"<span style='color:#A32121'>{len(receipts) - complete} por revisar</span> · "
             f"<b>RD$ {total:,.2f}</b>"
         )
+        if hasattr(self, "monthly_workspace"):
+            self.monthly_workspace.filled(receipts)
 
     def _candidate_date_bounds(self):
         mode = self.candidate_date_filter.currentData()
@@ -25842,6 +25949,7 @@ class ReceiptHistoryDialog(QDialog):
         row.setContentsMargins(10, 8, 10, 8)
         self.btn_open_receipt = QPushButton("Abrir PDF")
         self.btn_edit_receipt = QPushButton("Editar recibo")
+        self.btn_authorization = QPushButton("Autorización")
         self.btn_validate_receipt = QPushButton("Confirmar facturado")
         self.btn_not_invoiced = QPushButton("No facturado")
         self.btn_reopen_receipt = QPushButton("Reabrir")
@@ -25877,6 +25985,7 @@ class ReceiptHistoryDialog(QDialog):
 
         row.addWidget(self.btn_open_receipt)
         row.addWidget(self.btn_edit_receipt)
+        row.addWidget(self.btn_authorization)
         row.addWidget(self.btn_delete_receipt)
         row.addWidget(self.btn_select_visible)
         row.addWidget(self.btn_bulk_invoice)
@@ -25888,6 +25997,7 @@ class ReceiptHistoryDialog(QDialog):
 
         self.btn_open_receipt.clicked.connect(self.open_selected_receipt)
         self.btn_edit_receipt.clicked.connect(self.edit_selected_receipt)
+        self.btn_authorization.clicked.connect(self.edit_selected_authorization)
         self.btn_validate_receipt.clicked.connect(lambda: self.change_selected_status(BILLING_INVOICED))
         self.btn_not_invoiced.clicked.connect(lambda: self.change_selected_status(BILLING_NOT_INVOICED))
         self.btn_reopen_receipt.clicked.connect(lambda: self.change_selected_status(BILLING_PENDING))
@@ -25924,6 +26034,7 @@ class ReceiptHistoryDialog(QDialog):
 
         set_button_role(self.btn_open_receipt, 'info')
         set_button_role(self.btn_edit_receipt, 'info')
+        set_button_role(self.btn_authorization, 'info')
         set_button_role(self.btn_validate_receipt, 'success')
         set_button_role(self.btn_not_invoiced, 'danger')
         set_button_role(self.btn_reopen_receipt, 'warning')
@@ -25939,6 +26050,8 @@ class ReceiptHistoryDialog(QDialog):
 
         if hasattr(self.main_window, "theme_toggled"):
             self.main_window.theme_toggled.connect(self.apply_history_theme)
+        from receipt_history_design import ReceiptHistoryWorkspace
+        self.history_workspace = ReceiptHistoryWorkspace(self, sys.modules[__name__])
         self.apply_history_theme(
             bool(getattr(self.main_window, "is_dark_mode", False))
         )
@@ -26075,6 +26188,9 @@ class ReceiptHistoryDialog(QDialog):
             """
         )
         self._refresh_history_row_colors(bool(is_dark))
+        from receipt_history_design import apply_history_design_theme
+
+        apply_history_design_theme(self, is_dark)
 
     def _refresh_history_row_colors(self, is_dark):
         for row in range(self.table.rowCount()):
@@ -26198,6 +26314,8 @@ class ReceiptHistoryDialog(QDialog):
             self.load_rows(reset=True)
 
     def clear_filters(self, reload=True):
+        if hasattr(self, "history_workspace"):
+            self.history_workspace.flow = "all"
         self._loading_filters = True
         try:
             self.search_edit.clear()
@@ -26234,50 +26352,86 @@ class ReceiptHistoryDialog(QDialog):
             return None
 
     def _update_action_state(self):
+        from receipt_authorization_dialog import can_edit_authorization
+
+        self.btn_authorization.setEnabled(
+            can_edit_authorization(
+                self._selected_receipt(),
+                self.main_window.current_user,
+                sys.modules[__name__],
+            )
+        )
         receipt = self._selected_receipt()
         status = str((receipt or {}).get("estado_facturacion") or BILLING_UNCLASSIFIED)
-        document_state = str((receipt or {}).get("estado_documento") or DOCUMENT_PRELIMINARY)
+        document_state = str(
+            (receipt or {}).get("estado_documento") or DOCUMENT_PRELIMINARY
+        )
         user = self.main_window.current_user
         editable = status in (BILLING_PENDING, BILLING_UNCLASSIFIED)
         self.btn_edit_receipt.setEnabled(
-            bool(receipt and editable and user_has_permission(user, PERMISSION_EDIT_PENDING))
+            bool(
+                receipt
+                and editable
+                and user_has_permission(user, PERMISSION_EDIT_PENDING)
+            )
         )
         self.btn_validate_receipt.setEnabled(
-            bool(receipt and status in (BILLING_PENDING, BILLING_UNCLASSIFIED)
-                 and document_state == DOCUMENT_READY
-                 and user_has_permission(user, PERMISSION_VALIDATE_RECEIPT))
+            bool(
+                receipt
+                and status in (BILLING_PENDING, BILLING_UNCLASSIFIED)
+                and document_state == DOCUMENT_READY
+                and user_has_permission(user, PERMISSION_VALIDATE_RECEIPT)
+            )
         )
         self.btn_validate_receipt.setToolTip(
             "Requiere documento listo para auditoría y número de autorización."
-            if document_state != DOCUMENT_READY else
-            "Revisar la lista de auditoría y confirmar la facturación."
+            if document_state != DOCUMENT_READY
+            else "Revisar la lista de auditoría y confirmar la facturación."
         )
         self.btn_not_invoiced.setEnabled(
-            bool(receipt and status in (BILLING_PENDING, BILLING_UNCLASSIFIED)
-                 and user_has_permission(user, PERMISSION_MARK_NOT_INVOICED))
+            bool(
+                receipt
+                and status in (BILLING_PENDING, BILLING_UNCLASSIFIED)
+                and user_has_permission(user, PERMISSION_MARK_NOT_INVOICED)
+            )
         )
         self.btn_reopen_receipt.setEnabled(
-            bool(receipt and status in (BILLING_INVOICED, BILLING_NOT_INVOICED)
-                 and user_has_permission(user, PERMISSION_REOPEN_RECEIPT))
+            bool(
+                receipt
+                and status in (BILLING_INVOICED, BILLING_NOT_INVOICED)
+                and user_has_permission(user, PERMISSION_REOPEN_RECEIPT)
+            )
         )
         self.btn_billing_history.setEnabled(
             bool(receipt and user_has_permission(user, PERMISSION_VIEW_BILLING_AUDIT))
         )
         assignee = str((receipt or {}).get("auditoria_asignada_a") or "")
-        can_release = bool(assignee and (assignee == user.get("username") or is_administrator(user)))
+        can_release = bool(
+            assignee and (assignee == user.get("username") or is_administrator(user))
+        )
         self.btn_assign_audit.setText("Liberar" if assignee else "Asignarme")
         self.btn_assign_audit.setEnabled(
-            bool(receipt and editable and user_has_permission(user, PERMISSION_VIEW_BILLING_AUDIT)
-                 and document_state == DOCUMENT_READY
-                 and (not assignee or can_release))
+            bool(
+                receipt
+                and editable
+                and user_has_permission(user, PERMISSION_VIEW_BILLING_AUDIT)
+                and document_state == DOCUMENT_READY
+                and (not assignee or can_release)
+            )
         )
         self.btn_delete_receipt.setEnabled(
-            bool(receipt and not self._deletion_in_progress
-                 and user_has_permission(user, PERMISSION_DELETE_PENDING))
+            bool(
+                receipt
+                and not self._deletion_in_progress
+                and user_has_permission(user, PERMISSION_DELETE_PENDING)
+            )
         )
         self.btn_delete_selected.setEnabled(
-            bool(not self._deletion_in_progress and self.table.selectionModel().selectedRows()
-                 and user_has_permission(user, PERMISSION_DELETE_PENDING))
+            bool(
+                not self._deletion_in_progress
+                and self.table.selectionModel().selectedRows()
+                and user_has_permission(user, PERMISSION_DELETE_PENDING)
+            )
         )
         self.btn_bulk_invoice.setEnabled(
             bool(
@@ -26287,22 +26441,12 @@ class ReceiptHistoryDialog(QDialog):
             )
         )
         self.btn_open_receipt.setEnabled(bool(receipt))
-        self.action_validate_receipt.setEnabled(
-            self.btn_validate_receipt.isEnabled()
-        )
-        self.action_not_invoiced.setEnabled(
-            self.btn_not_invoiced.isEnabled()
-        )
-        self.action_reopen_receipt.setEnabled(
-            self.btn_reopen_receipt.isEnabled()
-        )
-        self.action_billing_history.setEnabled(
-            self.btn_billing_history.isEnabled()
-        )
+        self.action_validate_receipt.setEnabled(self.btn_validate_receipt.isEnabled())
+        self.action_not_invoiced.setEnabled(self.btn_not_invoiced.isEnabled())
+        self.action_reopen_receipt.setEnabled(self.btn_reopen_receipt.isEnabled())
+        self.action_billing_history.setEnabled(self.btn_billing_history.isEnabled())
         self.action_assign_audit.setText(self.btn_assign_audit.text())
-        self.action_assign_audit.setEnabled(
-            self.btn_assign_audit.isEnabled()
-        )
+        self.action_assign_audit.setEnabled(self.btn_assign_audit.isEnabled())
         self._update_link_action(user, receipt)
         self.btn_more_actions.setEnabled(
             self._is_high_history_role()
@@ -26318,6 +26462,8 @@ class ReceiptHistoryDialog(QDialog):
                 )
             )
         )
+        if hasattr(self, "history_workspace"):
+            self.history_workspace.update_details()
 
     def mark_selected_as_invoiced(self):
         user = self.main_window.current_user
@@ -26496,16 +26642,17 @@ class ReceiptHistoryDialog(QDialog):
 
     def show_context_menu(self, pos):
         row = self.table.rowAt(pos.y())
-        if row < 0: return
+        if row < 0:
+            return
         self.table.selectRow(row)
-        
+
         menu = QMenu(self)
         a_open = QAction("📄 Abrir PDF", self)
         a_edit = QAction("✏️ Editar Recibo", self)
-        
+
         a_open.triggered.connect(self.open_selected_receipt)
         a_edit.triggered.connect(self.edit_selected_receipt)
-        
+
         menu.addAction(a_open)
         receipt = self._selected_receipt() or {}
         status = receipt.get("estado_facturacion") or BILLING_UNCLASSIFIED
@@ -26514,21 +26661,41 @@ class ReceiptHistoryDialog(QDialog):
             self.main_window.current_user, PERMISSION_EDIT_PENDING
         ):
             menu.addAction(a_edit)
+        if self.btn_authorization.isEnabled():
+            menu.addAction("Registrar autorización…", self.edit_selected_authorization)
         menu.addSeparator()
         transitions = [
-            ("Confirmar como facturado", BILLING_INVOICED, PERMISSION_VALIDATE_RECEIPT,
-             status in (BILLING_PENDING, BILLING_UNCLASSIFIED)
-             and document_state == DOCUMENT_READY),
-            ("Marcar como no facturado", BILLING_NOT_INVOICED, PERMISSION_MARK_NOT_INVOICED,
-             status in (BILLING_PENDING, BILLING_UNCLASSIFIED)),
-            ("Reabrir para corrección", BILLING_PENDING, PERMISSION_REOPEN_RECEIPT,
-             status in (BILLING_INVOICED, BILLING_NOT_INVOICED)),
+            (
+                "Confirmar como facturado",
+                BILLING_INVOICED,
+                PERMISSION_VALIDATE_RECEIPT,
+                status in (BILLING_PENDING, BILLING_UNCLASSIFIED)
+                and document_state == DOCUMENT_READY,
+            ),
+            (
+                "Marcar como no facturado",
+                BILLING_NOT_INVOICED,
+                PERMISSION_MARK_NOT_INVOICED,
+                status in (BILLING_PENDING, BILLING_UNCLASSIFIED),
+            ),
+            (
+                "Reabrir para corrección",
+                BILLING_PENDING,
+                PERMISSION_REOPEN_RECEIPT,
+                status in (BILLING_INVOICED, BILLING_NOT_INVOICED),
+            ),
         ]
         for label, target, permission, valid in transitions:
             if valid and user_has_permission(self.main_window.current_user, permission):
                 action = menu.addAction(label)
-                action.triggered.connect(lambda _checked=False, value=target: self.change_selected_status(value))
-        if user_has_permission(self.main_window.current_user, PERMISSION_VIEW_BILLING_AUDIT):
+                action.triggered.connect(
+                    lambda _checked=False, value=target: self.change_selected_status(
+                        value
+                    )
+                )
+        if user_has_permission(
+            self.main_window.current_user, PERMISSION_VIEW_BILLING_AUDIT
+        ):
             history_action = menu.addAction("Ver historial de validación")
             history_action.triggered.connect(self.show_billing_history)
             if (
@@ -26537,8 +26704,10 @@ class ReceiptHistoryDialog(QDialog):
             ):
                 assignee = str(receipt.get("auditoria_asignada_a") or "")
                 current_username = self.main_window.current_user.get("username", "")
-                if not assignee or assignee == current_username or is_administrator(
-                    self.main_window.current_user
+                if (
+                    not assignee
+                    or assignee == current_username
+                    or is_administrator(self.main_window.current_user)
                 ):
                     assign_action = menu.addAction(
                         "Liberar de mi cola" if assignee else "Asignarme para revisión"
@@ -26555,7 +26724,7 @@ class ReceiptHistoryDialog(QDialog):
             menu.addSeparator()
             menu.addAction(a_del)
             menu.addAction(a_del_sel)
-            
+
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def delete_selected_receipts(self):
@@ -26654,16 +26823,27 @@ class ReceiptHistoryDialog(QDialog):
         pdf_filename = row_data.get("pdf_filename") or ""
         pdf_path = os.path.join(PDFS_DIR, pdf_filename) if pdf_filename else ""
         is_backdated = row_data.get("is_backdated", 0)
-        display_ars = "SIN SEGURO" if row_data.get("tipo_cobertura") == "NO_ASEGURADO" else row_data.get("ars", "")
+        display_ars = (
+            "SIN SEGURO"
+            if row_data.get("tipo_cobertura") == "NO_ASEGURADO"
+            else row_data.get("ars", "")
+        )
         values = [
-            row_data.get("id", ""), row_data.get("numero", ""), row_data.get("nombre", ""),
-            row_data.get("fecha", ""), "⏱️ Alterno" if is_backdated else "✅ Principal",
-            row_data.get("created_at", ""), display_ars,
-            f"RD$ {float(row_data.get('total', 0.0)):,.2f}", row_data.get("username", ""),
-            billing_status_label(status), row_data.get("auditoria_asignada_a") or "",
+            row_data.get("id", ""),
+            row_data.get("numero", ""),
+            row_data.get("nombre", ""),
+            row_data.get("fecha", ""),
+            "⏱️ Alterno" if is_backdated else "✅ Principal",
+            row_data.get("created_at", ""),
+            display_ars,
+            f"RD$ {float(row_data.get('total', 0.0)):,.2f}",
+            row_data.get("username", ""),
+            billing_status_label(status),
+            row_data.get("auditoria_asignada_a") or "",
             f"{int(row_data.get('auditoria_antiguedad_dias') or 0)} días",
             f"{audit_risk_label(row_data.get('auditoria_riesgo', 0))} ({int(row_data.get('auditoria_riesgo') or 0)})",
-            row_data.get("estado_facturacion_por") or "", row_data.get("estado_facturacion_at") or "",
+            row_data.get("estado_facturacion_por") or "",
+            row_data.get("estado_facturacion_at") or "",
             row_data.get("referencia_facturacion") or "",
             (
                 "Sin vínculo a atención · "
@@ -26677,22 +26857,30 @@ class ReceiptHistoryDialog(QDialog):
                 if row_data.get("review_status") == AUTH_REVIEW_PENDING
                 else ""
             ),
-            row_data.get("numero_autorizacion") or "", pdf_path,
+            row_data.get("numero_autorizacion") or "",
+            pdf_path,
         ]
         foreground, background = receipt_history_palette(
-            status, row_data.get("estado_documento"), bool(getattr(self.main_window, "is_dark_mode", False)),
+            status,
+            row_data.get("estado_documento"),
+            bool(getattr(self.main_window, "is_dark_mode", False)),
         )
         for column, value in enumerate(values):
             item = QTableWidgetItem(str(value))
             item.setToolTip(str(value))
-            item.setForeground(QColor(foreground)); item.setBackground(QColor(background))
+            item.setForeground(QColor(foreground))
+            item.setBackground(QColor(background))
             if column in (9, 16, 12):
-                font = item.font(); font.setBold(True); item.setFont(font)
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
             if column == 7:
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             elif column in (0, 1, 3, 4, 5, 11, 14):
                 item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, column, item)
+        if hasattr(self, "history_workspace"):
+            self.history_workspace.row_added(row)
 
     def _history_filter_values(self):
         document_value = self.document_edit.text()
@@ -26704,6 +26892,12 @@ class ReceiptHistoryDialog(QDialog):
         if ars.casefold() == "todas las ars":
             ars = ""
         return {
+            "sort_order": self.history_workspace.sort
+            if hasattr(self, "history_workspace")
+            else "recent",
+            "flow_filter": self.history_workspace.flow
+            if hasattr(self, "history_workspace")
+            else "all",
             "patient_or_receipt": self.search_edit.text(),
             "nss": document_value if document_type == "nss" else "",
             "cedula": document_value if document_type == "cedula" else "",
@@ -26751,16 +26945,12 @@ class ReceiptHistoryDialog(QDialog):
         if self._is_high_history_role():
             if errors.get("metrics"):
                 self.billing_summary.setText("VALIDACIÓN\nNo disponible")
-                self.billing_totals_summary.setText(
-                    "FACTURACIÓN\nNo disponible"
-                )
+                self.billing_totals_summary.setText("FACTURACIÓN\nNo disponible")
                 self.historical_summary.setText("HISTÓRICO\nNo disponible")
                 self.audit_queue_summary.setText(
                     "No se pudo actualizar la cola de auditoría."
                 )
-                write_runtime_log(
-                    "Historial de recibos: métricas no disponibles"
-                )
+                write_runtime_log("Historial de recibos: métricas no disponibles")
             else:
                 summary = payload.get("summary") or {}
                 pending = summary.get(BILLING_PENDING, {})
@@ -26793,7 +26983,11 @@ class ReceiptHistoryDialog(QDialog):
                 )
         options = payload.get("filters")
         if options:
-            selected_ars = self.ars_combo.currentText() if self.ars_combo.currentIndex() > 0 else ""
+            selected_ars = (
+                self.ars_combo.currentText()
+                if self.ars_combo.currentIndex() > 0
+                else ""
+            )
             self._loading_filters = True
             try:
                 self.user_filter.set_values(
@@ -26810,9 +27004,9 @@ class ReceiptHistoryDialog(QDialog):
                 self._loading_filters = False
             self._update_filter_summary()
         elif errors.get("filters"):
-            write_runtime_log(
-                "Historial de recibos: filtros no disponibles"
-            )
+            write_runtime_log("Historial de recibos: filtros no disponibles")
+        if hasattr(self, "history_workspace"):
+            self.history_workspace.metrics_loaded(payload)
 
     def _on_history_metrics_failed(self, generation, message):
         if generation == self._query_generation:
@@ -26943,6 +27137,11 @@ class ReceiptHistoryDialog(QDialog):
         self._receipt_document_worker = None
         if worker is not None:
             worker.deleteLater()
+
+    def edit_selected_authorization(self):
+        from receipt_authorization_dialog import open_receipt_authorization
+
+        open_receipt_authorization(self, sys.modules[__name__])
 
     def edit_selected_receipt(self):
         row = self.table.currentRow()
@@ -33565,6 +33764,8 @@ class MainWindow(QMainWindow):
             
         self.cart_table.itemDoubleClicked.connect(self.remove_current_cart_selection)
         QTimer.singleShot(0, self._update_responsive_ui)
+        from billing_workspace_design import install_billing_design
+        install_billing_design(self, sys.modules[__name__])
         self._update_document_flow_ui()
 
     def resizeEvent(self, event):
@@ -34008,6 +34209,9 @@ class MainWindow(QMainWindow):
                 (catalog_min, receipt_min),
             )
             self._active_layout_profile = profile
+
+        from billing_workspace_design import fit_billing_design
+        fit_billing_design(self)
 
         if self.monthly_lists_page is not None:
             self.monthly_lists_page.apply_layout_profile(snapshot)
@@ -34628,6 +34832,9 @@ class MainWindow(QMainWindow):
         set_button_role(self.btn_generate, 'report', is_dark=is_dark)
         set_button_role(self.btn_reset, 'neutral', is_dark=is_dark)
         set_button_role(self.btn_cancel_edit, 'info', is_dark=is_dark)
+        from billing_workspace_design import apply_billing_action_accents
+
+        apply_billing_action_accents(self, is_dark)
 
     def mark_activity(self):
         self.last_activity = datetime.now(); self.warned_idle = False
@@ -35101,7 +35308,9 @@ class MainWindow(QMainWindow):
     def _fill_list(self, widget: QListWidget, items: dict, term: str) -> int:
         widget.clear()
         count = 0
-        category = next((cat for cat, lst in self.source_lists.items() if lst is widget), None)
+        category = next(
+            (cat for cat, lst in self.source_lists.items() if lst is widget), None
+        )
         term_norm = remove_accents(term)
         favorites = {
             item_name
@@ -35117,9 +35326,12 @@ class MainWindow(QMainWindow):
             ),
         )
         for name, price in ordered_items:
-            if term_norm and term_norm not in remove_accents(name): continue
-            effective_price = get_effective_price(category, price) if category else float(price)
-            
+            if term_norm and term_norm not in remove_accents(name):
+                continue
+            effective_price = (
+                get_effective_price(category, price) if category else float(price)
+            )
+
             it = QListWidgetItem(str(name))
             it.setData(Qt.UserRole, (name, effective_price))
             it.setData(CATALOG_CATEGORY_ROLE, category)
@@ -35130,15 +35342,17 @@ class MainWindow(QMainWindow):
                 if is_favorite
                 else "Pulsa la estrella para colocarlo entre los más usados."
             )
-            
+
             it.setToolTip(f"{name}\nRD$ {float(effective_price):,.2f}")
             font = it.font()
             font.setPointSize(self.catalog_font_size)
             font.setBold(True)
             it.setFont(font)
-            
+
             widget.addItem(it)
             count += 1
+        if hasattr(self, "catalog_workspace"):
+            self.catalog_workspace.filled(widget)
         return count
 
     def show_catalog_context_menu(self, pos, category):
@@ -35670,12 +35884,14 @@ class MainWindow(QMainWindow):
             self.ars_combo.setEnabled(False)
 
     def _update_document_flow_ui(self):
+        from billing_workspace_design import update_billing_summary
+
+        update_billing_summary(self)
         MainWindow._apply_billing_field_policy(self)
         low_height = bool(getattr(self, "_low_height_mode", False))
         patient_validated = bool(self.current_admission_attention)
-        privileged_unlinked = (
-            not patient_validated
-            and can_bypass_patient_verification(self.current_user)
+        privileged_unlinked = not patient_validated and can_bypass_patient_verification(
+            self.current_user
         )
         state, ready, hint = billing_readiness_presentation(
             patient_validated=patient_validated,
@@ -35685,7 +35901,11 @@ class MainWindow(QMainWindow):
             editing=getattr(self, "editing_recibo_id", None) is not None,
         )
         if is_self_pay(form_coverage(self)):
-            state, ready, hint = "ready", True, "COBRO DIRECTO · Tarifa SENASA Contributivo. No requiere autorización ni verificación."
+            state, ready, hint = (
+                "ready",
+                True,
+                "COBRO DIRECTO · Tarifa SENASA Contributivo. No requiere autorización ni verificación.",
+            )
         self.document_flow_hint.setProperty("state", state)
         self.document_flow_hint.setText(hint)
         self.document_flow_hint.style().unpolish(self.document_flow_hint)
@@ -35693,7 +35913,9 @@ class MainWindow(QMainWindow):
         if is_self_pay(form_coverage(self)):
             self.btn_validate_admission.hide()
             self.authorization_edit.setEnabled(False)
-            self.exemption_reason_edit.setVisible(self.payment_combo.currentData() == "EXONERADO")
+            self.exemption_reason_edit.setVisible(
+                self.payment_combo.currentData() == "EXONERADO"
+            )
             if not self.editing_recibo_id:
                 self.btn_generate.setText("GUARDAR RECIBO DE COBRO (F5)")
             return
@@ -35701,7 +35923,8 @@ class MainWindow(QMainWindow):
             self.btn_validate_admission.show()
         if not self.editing_recibo_id:
             self.btn_generate.setText(
-                "GUARDAR PARA AUDITORÍA (F5)" if ready
+                "GUARDAR PARA AUDITORÍA (F5)"
+                if ready
                 else "GUARDAR E IMPRIMIR PRELIMINAR (F5)"
             )
 
@@ -35867,32 +36090,40 @@ class MainWindow(QMainWindow):
         total = money(0)
         medicamentos_sub = money(0)
         materiales_sub = money(0)
-        
+
         for r in range(self.cart_table.rowCount()):
             cat = self.cart_table.item(r, 0).text()
-            sub = money(self.cart_table.item(r, 4).text().replace('$', '').replace(',', ''))
+            sub = money(
+                self.cart_table.item(r, 4).text().replace("$", "").replace(",", "")
+            )
             total += sub
             if "Medicamentos" in cat:
                 medicamentos_sub += sub
             elif "Materiales" in cat:
                 materiales_sub += sub
-        
+
         total += money(self.sala_spin.value())
-        
+
         txt = f"Total: RD$ {total:,.2f}"
         self.lbl_total.setText(txt)
         self.lbl_sub_medicamentos.setText(f"Medicamentos: RD$ {medicamentos_sub:,.2f}")
         self.lbl_sub_materiales.setText(f"Materiales: RD$ {materiales_sub:,.2f}")
+        from billing_workspace_design import update_billing_summary
+
+        update_billing_summary(self)
 
     def reset_all(self, *, preserve_claim=None):
+        self.receipt_identity_nss = ""
         self._pending_ars_correction = None
         schedule_replaced_admission_claim_release(
-            self.current_admission_attention, preserve_claim, session_id=self.session_id,
+            self.current_admission_attention,
+            preserve_claim,
+            session_id=self.session_id,
         )
         self.mark_activity()
         self.search.clear()
         self.qty.setValue(1)
-        self.locked_ars = None # LIBERAR ARS AL LIMPIAR
+        self.locked_ars = None  # LIBERAR ARS AL LIMPIAR
         self._honorarium_prompted_ars.clear()
         self.guantes_auto_added = False
         self.bajante_cateter_auto_added = False
@@ -36080,6 +36311,7 @@ class MainWindow(QMainWindow):
         )
         self.btn_generate.setText("GUARDAR CAMBIOS DEL RECIBO (F5)")
 
+        self.receipt_identity_nss = str(data.get("admission_nss_snapshot") or "")
         self.name_edit.setText(data["nombre"])
         self.dx_edit.setText(data["dx"])
         self.authorization_edit.setText(data.get("numero_autorizacion") or "")

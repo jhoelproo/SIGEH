@@ -335,21 +335,40 @@ class ReceiptPDFRenderer:
 
     def _prepare_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         prepared = {
-            "hospital_line_1": clean_text(data.get("hospital_line_1"), "HOSPITAL PROVINCIAL"),
-            "hospital_line_2": clean_text(data.get("hospital_line_2"), "DR. ÁNGEL CONTRERAS MEJÍA"),
-            "document_title": clean_text(data.get("document_title"), "DETALLE DE FACTURACIÓN DE EMERGENCIA"),
-            "numero": clean_text(data.get("numero") or data.get("recibo") or data.get("recibo_number"), ""),
+            "hospital_line_1": clean_text(
+                data.get("hospital_line_1"), "HOSPITAL PROVINCIAL"
+            ),
+            "hospital_line_2": clean_text(
+                data.get("hospital_line_2"), "DR. ÁNGEL CONTRERAS MEJÍA"
+            ),
+            "document_title": clean_text(
+                data.get("document_title"), "DETALLE DE FACTURACIÓN DE EMERGENCIA"
+            ),
+            "numero": clean_text(
+                data.get("numero") or data.get("recibo") or data.get("recibo_number"),
+                "",
+            ),
             "fecha": clean_text(data.get("fecha"), datetime.now().strftime("%Y-%m-%d")),
             "fecha_display": _format_date(data.get("fecha")),
             "paciente": clean_text(data.get("paciente") or data.get("nombre"), "N/A"),
+            "nss": clean_text(
+                data.get("nss") or data.get("admission_nss_snapshot"), ""
+            ),
             "dx": clean_text(data.get("dx") or data.get("diagnostico"), "N/A"),
             "ars": clean_text(data.get("ars"), "N/A"),
             "sala": _as_float(data.get("sala") or data.get("costo_sala")),
-            "categorias": self._normalize_categories(data.get("categorias") or data.get("items_por_categoria")),
+            "categorias": self._normalize_categories(
+                data.get("categorias") or data.get("items_por_categoria")
+            ),
             "total_general": _as_float(data.get("total_general") or data.get("total")),
             "total_letras": clean_text(data.get("total_letras"), ""),
-            "usuario": clean_text(data.get("usuario") or data.get("auxiliar"), "Administrador del sistema"),
-            "generado": clean_text(data.get("generado") or data.get("generated_at"), datetime.now().strftime("%d/%m/%Y  %I:%M %p")),
+            "usuario": clean_text(
+                data.get("usuario") or data.get("auxiliar"), "Administrador del sistema"
+            ),
+            "generado": clean_text(
+                data.get("generado") or data.get("generated_at"),
+                datetime.now().strftime("%d/%m/%Y  %I:%M %p"),
+            ),
             "numero_autorizacion": clean_text(data.get("numero_autorizacion"), ""),
             "estado_documento": clean_text(data.get("estado_documento"), "PRELIMINAR"),
             "payment_status": clean_text(data.get("payment_status"), ""),

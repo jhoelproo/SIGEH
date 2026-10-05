@@ -893,3 +893,32 @@ body {
   white-space: normal;
   line-height: 1.12;
 }
+
+.patient-identifier {
+  display: flex;
+  align-items: baseline;
+  gap: 1.2mm;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 1.4mm;
+  padding: 1mm 2mm;
+  border: .22mm solid #8eb7ec;
+  border-left: 1mm solid var(--blue-mid);
+  border-radius: 1mm;
+  background: #e7f1ff;
+  color: var(--blue);
+  font-size: 8.5pt;
+  font-weight: 700;
+  line-height: 1.15;
+  text-align: left;
+}
+
+.patient-identifier b {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.patient-identifier span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
