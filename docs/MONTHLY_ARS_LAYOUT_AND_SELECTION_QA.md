@@ -87,10 +87,14 @@ Cuatro pasadas finales: funcionalidad PASS (logo, posiciones, menú, selección 
 | Regresión completa y QA final | PASS |
 | Capacidad opcional de PostgreSQL real | N/A — requiere entorno explícito y no valida este ajuste |
 | Impresión física en el hospital | N/A — requiere su impresora; se valida el motor de Excel/PDF |
-| Publicación de un nuevo release | N/A — este ajuste se prepara localmente |
+| Publicación de un nuevo release | PASS — incluido en 1.2.8 y canal público verificado |
+
+## PUBLICACIÓN
+
+El ajuste se incluye en SIGEH 1.2.8, publicado como estable/latest el 2026-10-05T12:32:11Z: https://github.com/jhoelproo/SIGEH/releases/tag/v1.2.8. La regresión completa se ejecutó nuevamente con 1.2.8: 2123 comprobaciones PASS, cero fallos y una omisión opcional. Paquete limpio, seis comprobaciones del ZIP, actualización desde 1.2.7 y segundo ciclo con 1.2.8: PASS. El canal público y los cuatro assets se verificaron. La evidencia específica de esa versión está en `RELEASE_1.2.8_QA.md`; este informe conserva los resultados de la validación funcional local anterior.
 
 ## PROBLEMAS PENDIENTES
 
-No quedan problemas pendientes en el alcance implementado. La impresión física no se ha ejecutado. Los cambios se aplican a nuevas exportaciones; no modifican Excel emitidos previamente. Este trabajo prepara el ajuste local y no publica un release adicional.
+No quedan problemas pendientes en el alcance implementado. La impresión física no se ha ejecutado. Los cambios se aplican a nuevas exportaciones; no modifican Excel emitidos previamente. La versión 1.2.8 está disponible para actualización; no se afirma que ya esté instalada en las estaciones del hospital.
 
 **ESTADO FINAL: APROBADO PARA ENTREGA**
