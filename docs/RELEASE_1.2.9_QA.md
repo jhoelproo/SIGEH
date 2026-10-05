@@ -64,6 +64,12 @@ Los tres comandos terminaron con salida 0: PASS. Se comprobó correspondencia de
 
 Evidencia del paquete: `output/release-129-package-validation.json`; fuentes finales: `release-129-final-fingerprint.json`. Los artefactos de `output/` son evidencia local y no forman parte del paquete público.
 
+### Publicación verificada
+
+Publicada como estable y Latest el 5 de octubre de 2026 a las 15:56:47, hora de Bolivia (19:56:47 UTC): https://github.com/jhoelproo/SIGEH/releases/tag/v1.2.9. Tag y commit fuente verificados: `28faa76f480de895305fb391e65d223b24f5a92f`. Los cuatro assets remotos coinciden por tamaño y SHA-256 con los archivos aprobados localmente. Se validaron primero como borrador y después de publicar.
+
+El canal público del lanzador devuelve 1.2.9, el manifest y checksum remotos coinciden, la actualización desde 1.2.8 se reconoce y la misma versión 1.2.9 no provoca reinstalación. Evidencia: `output/release-129-draft-verification.json` y `release-129-publication-verification.json`.
+
 ## QUALITY GATES
 
 | Gate | Estado |
@@ -73,14 +79,14 @@ Evidencia del paquete: `output/release-129-package-validation.json`; fuentes fin
 | Coverage, formatter, lint, tipos, análisis estático | PASS |
 | Complejidad y duplicación, con alcance/excepciones anteriores | PASS |
 | Build, smoke, paquete, actualización, seguridad y QA visual | PASS |
-| Canal público y assets remotos | NO VERIFICADO, publicación pendiente |
+| Canal público, tag y assets remotos | PASS |
 | Prueba optativa de capacidad contra una base real | N/A, ajena al cambio y no habilitada contra producción |
 | Instalación en hospital e impresión física | NO VERIFICADO, sin acceso a esas estaciones/impresora |
 
-Cuatro pasadas: funcionalidad PASS; regresión global PASS; clean code PASS; QA local PASS. La aprobación final de entrega requiere verificar la publicación. Las fuentes siguen idénticas al fingerprint después de todas las comprobaciones.
+Cuatro pasadas: funcionalidad PASS; regresión global PASS; clean code PASS; QA y publicación PASS. Las fuentes siguen idénticas al fingerprint después de todas las comprobaciones.
 
 ## PROBLEMAS PENDIENTES
 
-Pendiente publicar/verificar el canal estable. Deuda técnica y advertencias heredadas documentadas; instalación efectiva en hospital e impresión física no comprobadas. La publicación no confirma que las estaciones ya estén actualizadas.
+No quedan fallos detectados del cambio ni pasos pendientes de publicación. Deuda técnica y advertencias heredadas documentadas; instalación efectiva en hospital e impresión física no comprobadas. La publicación no confirma que las estaciones ya estén actualizadas.
 
-ESTADO FINAL: NO APROBADO PARA ENTREGA (verificación de publicación pendiente; código y paquete aprobados).
+ESTADO FINAL: APROBADO PARA ENTREGA.
