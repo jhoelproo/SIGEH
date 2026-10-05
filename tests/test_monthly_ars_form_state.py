@@ -2,11 +2,12 @@ import copy
 import os
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QAbstractItemView, QDialog
+from PySide6.QtCore import QItemSelectionModel
 
 import CALCULOS_QT as app
 
@@ -103,6 +104,229 @@ class MonthlyArsFormStateTests(unittest.TestCase):
         self.assertTrue(self.page.invoice_date.isEnabled())
         self.assertEqual(self.page.invoice_date.date().toString("dd-MM-yyyy"), "20-07-2026")
         self.assertTrue(self.page.save_configuration_button.isEnabled())
+
+    def _load_test_patients(self):
+        rows = [
+            {
+                "recibo_id": index,
+                "patient_snapshot": f"PACIENTE {index}",
+                "total_snapshot": 100,
+                "service_date_snapshot": "2026-07-20",
+            }
+            for index in range(1, 4)
+        ]
+        self.page._apply_batch_workspace(
+            {"batch": self._get(1), "receipts": rows, "available": []}
+        )
+        return rows
+
+    def test_patients_support_multiple_selection_and_safe_button_states(self):
+        self._select_id(1)
+        self._load_test_patients()
+        self.assertEqual(
+            self.page.patients.selectionMode(), QAbstractItemView.ExtendedSelection
+        )
+        self.assertFalse(self.page.remove_receipt_button.isEnabled())
+
+        self.page.patients.selectRow(0)
+        self.assertTrue(self.page.edit_patient_button.isEnabled())
+        self.page.patients.selectionModel().select(
+            self.page.patients.model().index(1, 0),
+            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+        )
+        self.assertEqual(len(self.page._selected_receipts()), 2)
+        self.assertFalse(self.page.edit_patient_button.isEnabled())
+        self.assertTrue(self.page.remove_receipt_button.isEnabled())
+        self.assertIn("2", self.page.remove_receipt_button.text())
+        self.page._set_patients_loading(True)
+        self.assertFalse(self.page.remove_receipt_button.isEnabled())
+
+
+    def _select_two_patients(self):
+        self.page.patients.selectRow(0)
+        self.page.patients.selectionModel().select(
+            self.page.patients.model().index(1, 0),
+            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+        )
+
+    def test_filtered_out_rows_are_not_removed_or_edited(self):
+        self._select_id(1)
+        self._load_test_patients()
+        self._select_two_patients()
+        self.page.patient_search.setText("PACIENTE 1")
+        self.assertEqual([r["recibo_id"] for r in self.page._selected_receipts()], [1])
+        self.assertTrue(self.page.edit_patient_button.isEnabled())
+        self.page.patients.clearSelection()
+        self.assertIsNone(self.page._selected_receipt())
+        self.page._reset_configuration_form()
+        self.assertEqual(self.page._selected_receipts(), [])
+
+    def test_context_menu_delegates_actions_and_preserves_multiple_selection(self):
+        self._select_id(1)
+        self._load_test_patients()
+        self._select_two_patients()
+        with patch.object(
+            app.QInputDialog, "getText", return_value=("", False)
+        ) as prompt:
+            menu = self.page._patients_context_menu()
+            menu.actions()[-1].trigger()
+            prompt.assert_called_once()
+        self.assertFalse(menu.actions()[0].isEnabled())
+        self.assertTrue(menu.actions()[-1].isEnabled())
+        menu.deleteLater()
+        self.page.steps.setCurrentIndex(1)
+        self.page.resize(1400, 800)
+        self.page.show()
+        self.qt_app.processEvents()
+        with patch.object(
+            self.page, "_patients_context_menu", return_value=MagicMock()
+        ):
+            position = self.page.patients.visualItemRect(
+                self.page.patients.item(0, 5)
+            ).center()
+            self.page._show_patients_context_menu(position)
+            self.assertEqual(len(self.page._selected_receipts()), 2)
+            position = self.page.patients.visualItemRect(
+                self.page.patients.item(2, 5)
+            ).center()
+            self.page._show_patients_context_menu(position)
+            self.assertEqual(
+                [r["recibo_id"] for r in self.page._selected_receipts()], [3]
+            )
+            self.page._show_patients_context_menu(app.QPoint(-1, -1))
+        self.page._set_patients_loading(True)
+        menu = self.page._patients_context_menu()
+        self.assertFalse(menu.actions()[-1].isEnabled())
+        menu.deleteLater()
+
+    def test_read_only_batch_and_role_block_direct_patient_actions(self):
+        self._select_id(1)
+        self._load_test_patients()
+        self.page.patients.selectRow(0)
+        self.page.current_user = {}
+        self.page._update_patient_actions()
+        with (
+            patch.object(app.QInputDialog, "getText") as prompt,
+            patch.object(app, "MonthlyReceiptEditorDialog") as editor,
+        ):
+            self.page.remove_selected_receipt()
+            self.page.edit_selected_patient()
+            prompt.assert_not_called()
+            editor.assert_not_called()
+        self.assertFalse(self.page.remove_receipt_button.isEnabled())
+
+    def test_edit_single_patient_cancel_success_error_and_unbilled_attention(self):
+        self._select_id(1)
+        self._load_test_patients()
+        with patch.object(app, "FloatingToast", _Toast):
+            self.page.edit_selected_patient()
+            self._select_two_patients()
+            self.page.edit_selected_patient()
+            self.page.patients.selectRow(0)
+            with (
+                patch.object(app, "MonthlyReceiptEditorDialog") as editor,
+                patch.object(app, "update_monthly_batch_receipt_export_data") as update,
+                patch.object(self.page, "load_selected_batch") as reload,
+                patch.object(app.QMessageBox, "critical") as error,
+            ):
+                editor.return_value.exec.return_value = QDialog.Rejected
+                self.page.edit_selected_patient()
+                update.assert_not_called()
+                editor.return_value.exec.return_value = QDialog.Accepted
+                editor.return_value.values.return_value = {"nss": "123456789"}
+                self.page.edit_selected_patient()
+                reload.assert_called_once()
+                update.side_effect = ValueError("No se guardó")
+                self.page.edit_selected_patient()
+                error.assert_called_once()
+            admission = {
+                "admission_source_instance_id": "SRC",
+                "admission_attention_id": 9,
+                "patient_snapshot": "ATENCIÓN QA",
+                "total_snapshot": 0,
+            }
+            self.page._apply_batch_workspace(
+                {"batch": self._get(1), "receipts": [admission], "available": []}
+            )
+            self.page.patients.selectRow(0)
+            self.assertFalse(self.page.edit_patient_button.isEnabled())
+            self.page.edit_selected_patient()
+        self.page.current_user = {"role": app.ROLE_ADMIN}
+        self.page.current_batch["status"] = app.BATCH_CLOSED
+        self.page._update_patient_actions()
+        self.assertFalse(self.page.remove_receipt_button.isEnabled())
+
+    def test_bulk_remove_submits_all_selected_once_and_refreshes_workspace(self):
+        self._select_id(1)
+        self._load_test_patients()
+        self._select_two_patients()
+        callbacks = []
+        with (
+            patch.object(
+                app.QInputDialog, "getText", return_value=("  Duplicado  ", True)
+            ),
+            patch.object(
+                self.page,
+                "_start_monthly_worker",
+                side_effect=lambda *args: callbacks.extend(args),
+            ),
+            patch.object(app, "remove_selected_entries_from_monthly_batch") as remove,
+            patch.object(app, "FloatingToast", _Toast),
+        ):
+            self.page.remove_selected_receipt()
+            self.assertTrue(self.page._patients_loading)
+            self.page.remove_selected_receipt()
+            self.assertEqual(len(callbacks), 3)
+            workspace = callbacks[0]()
+            self.assertEqual([r["recibo_id"] for r in remove.call_args.args[1]], [1, 2])
+            self.assertEqual(remove.call_args.args[-1], "Duplicado")
+            callbacks[1](workspace)
+            self.assertFalse(self.page._patients_loading)
+            self.assertEqual(self.page.current_receipts, [])
+            callbacks[1](workspace)
+            self.page._batch_load_token += 1
+            callbacks[1](workspace)
+            with patch.object(app.QMessageBox, "critical") as error:
+                callbacks[2]("Stale failure")
+                error.assert_not_called()
+
+    def test_bulk_remove_cancel_empty_reason_invalid_dates_and_error(self):
+        self._select_id(1)
+        self._load_test_patients()
+        self.page.patients.selectRow(0)
+        with (
+            patch.object(self.page, "_start_monthly_worker") as worker,
+            patch.object(app.QMessageBox, "warning") as warning,
+        ):
+            for result in (("", False), ("  ", True)):
+                with patch.object(app.QInputDialog, "getText", return_value=result):
+                    self.page.remove_selected_receipt()
+            self.assertEqual(warning.call_count, 1)
+            with (
+                patch.object(app.QInputDialog, "getText", return_value=("x", True)),
+                patch.object(
+                    self.page,
+                    "_candidate_date_bounds",
+                    side_effect=ValueError("Fechas inválidas"),
+                ),
+            ):
+                self.page.remove_selected_receipt()
+            self.assertEqual(warning.call_count, 2)
+            worker.assert_not_called()
+        callbacks = []
+        with (
+            patch.object(app.QInputDialog, "getText", return_value=("x", True)),
+            patch.object(
+                self.page,
+                "_start_monthly_worker",
+                side_effect=lambda *args: callbacks.extend(args),
+            ),
+        ):
+            self.page.remove_selected_receipt()
+        with patch.object(app.QMessageBox, "critical") as error:
+            callbacks[2]("No se guardó")
+            error.assert_called_once()
+            self.assertFalse(self.page._patients_loading)
 
     def test_new_batch_becomes_selected_and_editable(self):
         original_dialog = app.CreateMonthlyBatchDialog

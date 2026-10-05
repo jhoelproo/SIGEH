@@ -20,6 +20,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from contextlib import contextmanager, nullcontext, suppress
 from types import SimpleNamespace
+from monthly_batch_removal import remove_batch_entries
 from receipt_uuid import (
     receipt_admission_uuid,
     receipt_persistence_diagnostics,
@@ -10167,44 +10168,35 @@ def add_admission_candidates_to_monthly_batch(
     return len(requested)
 
 
+def remove_selected_entries_from_monthly_batch(
+    batch_id: int,
+    entries: list[dict],
+    user: dict,
+    reason: str,
+) -> int:
+    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
+        raise PermissionError("Tu rol no puede editar listados mensuales.")
+    with db_connect() as con:
+        return remove_batch_entries(
+            con,
+            batch_id,
+            entries,
+            username=str((user or {}).get("username") or "Sistema"),
+            stamp=now_str(),
+            reason=reason,
+            is_editable=batch_is_editable,
+        )
+
+
 def remove_receipt_from_monthly_batch(
     batch_id: int,
     receipt_id: int,
     user: dict,
     reason: str,
 ):
-    username = str((user or {}).get("username") or "Sistema")
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede editar listados mensuales.")
-    reason = str(reason or "").strip()
-    if not reason:
-        raise ValueError("Indica por qué se retira el recibo del listado.")
-    stamp = now_str()
-    with db_connect() as con:
-        locked_batch = con.execute(
-            "SELECT status FROM billing_batches WHERE id=%s FOR UPDATE",
-            (int(batch_id),),
-        ).fetchone()
-        if not locked_batch or not batch_is_editable(locked_batch["status"]):
-            raise ValueError("El listado no está disponible para edición.")
-        updated = con.execute(
-            """UPDATE billing_batch_receipts
-               SET included=0, removed_at=%s, removed_by=%s, removal_reason=%s
-               WHERE batch_id=%s AND recibo_id=%s AND included=1""",
-            (stamp, username, reason, int(batch_id), int(receipt_id)),
-        )
-        if updated.rowcount != 1:
-            raise ValueError("El recibo ya no está incluido en este listado.")
-        con.execute(
-            """UPDATE billing_batches SET updated_at=%s, updated_by=%s WHERE id=%s""",
-            (stamp, username, int(batch_id)),
-        )
-        con.execute(
-            """INSERT INTO billing_batch_events(
-                   batch_id, recibo_id, event_type, performed_at, performed_by, details
-               ) VALUES(%s,%s,'RECIBO_RETIRADO',%s,%s,%s)""",
-            (int(batch_id), int(receipt_id), stamp, username, reason),
-        )
+    remove_selected_entries_from_monthly_batch(
+        batch_id, [{"recibo_id": receipt_id}], user, reason
+    )
 
 
 def remove_admission_candidate_from_monthly_batch(
@@ -10214,48 +10206,17 @@ def remove_admission_candidate_from_monthly_batch(
     user: dict,
     reason: str,
 ):
-    username = str((user or {}).get("username") or "Sistema")
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede editar listados mensuales.")
-    reason = str(reason or "").strip()
-    if not reason:
-        raise ValueError("Indica por qué se retira la atención del listado.")
-    stamp = now_str()
-    with db_connect() as con:
-        locked = con.execute(
-            "SELECT status FROM billing_batches WHERE id=%s FOR UPDATE",
-            (int(batch_id),),
-        ).fetchone()
-        if not locked or not batch_is_editable(locked["status"]):
-            raise ValueError("El listado no está disponible para edición.")
-        updated = con.execute(
-            """UPDATE billing_batch_receipts
-               SET included=0,removed_at=%s,removed_by=%s,removal_reason=%s
-               WHERE batch_id=%s AND admission_source_instance_id=%s
-                 AND admission_attention_id=%s AND included=1""",
-            (
-                stamp, username, reason, int(batch_id),
-                str(source_instance_id or "LEGACY"), int(attention_id),
-            ),
-        )
-        if updated.rowcount != 1:
-            raise ValueError("La atención ya no está incluida en este listado.")
-        con.execute(
-            "UPDATE billing_batches SET updated_at=%s,updated_by=%s WHERE id=%s",
-            (stamp, username, int(batch_id)),
-        )
-        con.execute(
-            """INSERT INTO billing_batch_events(
-                   batch_id,recibo_id,event_type,performed_at,performed_by,details
-               ) VALUES(%s,NULL,'ADMISION_RETIRADA',%s,%s,%s)""",
-            (
-                int(batch_id), stamp, username,
-                json.dumps({
-                    "source_instance_id": str(source_instance_id or "LEGACY"),
-                    "attention_id": int(attention_id), "reason": reason,
-                }, ensure_ascii=False),
-            ),
-        )
+    remove_selected_entries_from_monthly_batch(
+        batch_id,
+        [
+            {
+                "admission_source_instance_id": source_instance_id,
+                "admission_attention_id": attention_id,
+            }
+        ],
+        user,
+        reason,
+    )
 
 
 def delete_monthly_billing_batch(batch_id: int, user: dict) -> dict:
@@ -23410,6 +23371,7 @@ class MonthlyBillingListsPage(QWidget):
         self._monthly_workers = set()
         self._batch_load_token = 0
         self._batches_load_pending = False
+        self._patients_loading = False
         self.setObjectName("MonthlyBillingListsPage")
 
         root = QVBoxLayout(self)
@@ -23493,9 +23455,7 @@ class MonthlyBillingListsPage(QWidget):
         self.batches.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeToContents
         )
-        self.batches.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.Stretch
-        )
+        self.batches.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.batches.setColumnWidth(3, 75)
         self.batches.setColumnWidth(4, 90)
         nav.addWidget(self.batches, 1)
@@ -24094,9 +24054,7 @@ class MonthlyBillingListsPage(QWidget):
         self.patient_search.setPlaceholderText(
             "Buscar paciente, NSS, cédula, recibo o autorización..."
         )
-        self.patient_search.textChanged.connect(
-            lambda text: filter_table_widget(self.patients, text)
-        )
+        self.patient_search.textChanged.connect(self._filter_patients)
         self.patient_metrics = QLabel()
         top.addWidget(self.patient_search, 1)
         top.addWidget(self.patient_metrics)
@@ -24147,21 +24105,36 @@ class MonthlyBillingListsPage(QWidget):
         self.patients = QTableWidget(0, 10)
         self.patients.setHorizontalHeaderLabels(
             [
-                "ID", "Estado", "Recibo", "Tipo doc.", "NSS / cédula",
-                "Paciente", "Fecha servicio", "Autorización",
-                "Especialidad", "Valor",
+                "ID",
+                "Estado",
+                "Recibo",
+                "Tipo doc.",
+                "NSS / cédula",
+                "Paciente",
+                "Fecha servicio",
+                "Autorización",
+                "Especialidad",
+                "Valor",
             ]
         )
         self.patients.setColumnHidden(0, True)
         self.patients.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.patients.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.patients.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.patients.horizontalHeader().setSectionResizeMode(
-            5, QHeaderView.Stretch
+        self.patients.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.patients.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.patients.customContextMenuRequested.connect(
+            self._show_patients_context_menu
         )
+        self.patients.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.patients.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         for column, width in {
-            1: 85, 2: 75, 3: 85, 4: 135, 6: 105,
-            7: 125, 8: 150, 9: 110,
+            1: 85,
+            2: 75,
+            3: 85,
+            4: 135,
+            6: 105,
+            7: 125,
+            8: 150,
+            9: 110,
         }.items():
             self.patients.setColumnWidth(column, width)
         self.patients.doubleClicked.connect(self.edit_selected_patient)
@@ -24188,15 +24161,14 @@ class MonthlyBillingListsPage(QWidget):
         self.add_receipt_button.clicked.connect(self.add_available_receipt)
         self.add_all_receipts_button.clicked.connect(self.add_all_available_receipts)
         self.remove_receipt_button.clicked.connect(self.remove_selected_receipt)
+        self.patients.itemSelectionChanged.connect(self._update_patient_actions)
         self.candidate_date_filter.currentIndexChanged.connect(
             self._candidate_filter_changed
         )
         self.candidate_date_from.dateChanged.connect(
             self._candidate_custom_date_changed
         )
-        self.candidate_date_to.dateChanged.connect(
-            self._candidate_custom_date_changed
-        )
+        self.candidate_date_to.dateChanged.connect(self._candidate_custom_date_changed)
         actions.addWidget(self.edit_patient_button)
         actions.addWidget(self.add_receipt_button)
         actions.addWidget(self.add_all_receipts_button)
@@ -24205,6 +24177,61 @@ class MonthlyBillingListsPage(QWidget):
         actions.addWidget(self.remove_receipt_button)
         layout.addLayout(actions)
         return page
+
+    def _filter_patients(self, text):
+        filter_table_widget(self.patients, text)
+        self._update_patient_actions()
+
+    def _update_patient_actions(self):
+        selected = self._selected_receipts()
+        editable = self._is_current_batch_editable() and not self._patients_loading
+        self.edit_patient_button.setEnabled(
+            editable and len(selected) == 1 and bool(selected[0].get("recibo_id"))
+        )
+        self.remove_receipt_button.setEnabled(editable and bool(selected))
+        self.remove_receipt_button.setText(f"Retirar ({len(selected)})")
+        self.remove_receipt_button.setToolTip(
+            "Retirar los seleccionados solo del listado; conservar recibos e historial."
+        )
+
+    def _patients_context_menu(self):
+        menu = QMenu(self)
+        for button in (
+            self.edit_patient_button,
+            self.search_candidates_button,
+            self.add_receipt_button,
+            self.add_all_receipts_button,
+        ):
+            action = menu.addAction(button.text())
+            action.setEnabled(button.isEnabled())
+            action.triggered.connect(button.click)
+        menu.addSeparator()
+        select_all = menu.addAction("Seleccionar todos los visibles")
+        select_all.setEnabled(
+            bool(self.current_receipts) and not self._patients_loading
+        )
+        select_all.triggered.connect(self.patients.selectAll)
+        clear = menu.addAction("Limpiar selección")
+        clear.setEnabled(bool(self._selected_receipts()) and not self._patients_loading)
+        clear.triggered.connect(self.patients.clearSelection)
+        menu.addSeparator()
+        remove = menu.addAction(
+            f"Retirar seleccionados ({len(self._selected_receipts())})"
+        )
+        remove.setEnabled(self.remove_receipt_button.isEnabled())
+        remove.triggered.connect(self.remove_receipt_button.click)
+        return menu
+
+    def _show_patients_context_menu(self, position):
+        index = self.patients.indexAt(position)
+        if (
+            index.isValid()
+            and not self.patients.item(index.row(), index.column()).isSelected()
+        ):
+            self.patients.selectRow(index.row())
+        menu = self._patients_context_menu()
+        menu.exec(self.patients.viewport().mapToGlobal(position))
+        menu.deleteLater()
 
     def _build_export_tab(self):
         page = QWidget()
@@ -24408,6 +24435,7 @@ class MonthlyBillingListsPage(QWidget):
             self.current_batch_id
             and self.current_batch
             and batch_is_editable(self.current_batch)
+            and user_has_permission(self.current_user, PERMISSION_MANAGE_BILLING_LISTS)
         )
 
     def _update_configuration_save_state(self, *_args):
@@ -24508,13 +24536,10 @@ class MonthlyBillingListsPage(QWidget):
             if not problems:
                 complete += 1
             temporary = not data.get("recibo_id") and data.get("admission_attention_id")
-            status = "POR REVISAR" if temporary else ("LISTO" if not problems else "REVISAR")
-            entry_key = (
-                f"R:{int(data['recibo_id'])}"
-                if data.get("recibo_id")
-                else f"A:{data.get('admission_source_instance_id') or 'LEGACY'}:"
-                     f"{int(data.get('admission_attention_id') or 0)}"
+            status = (
+                "POR REVISAR" if temporary else ("LISTO" if not problems else "REVISAR")
             )
+            entry_key = monthly_batch_candidate_key(data)
             values = [
                 entry_key,
                 status,
@@ -24530,9 +24555,7 @@ class MonthlyBillingListsPage(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 if column == 1:
-                    item.setForeground(
-                        QColor("#0B6B45" if not problems else "#A32121")
-                    )
+                    item.setForeground(QColor("#0B6B45" if not problems else "#A32121"))
                     item.setToolTip(
                         "Registro completo"
                         if not problems
@@ -24604,6 +24627,8 @@ class MonthlyBillingListsPage(QWidget):
         return worker
 
     def _set_patients_loading(self, loading: bool, text="Cargando pacientes…"):
+        self._patients_loading = loading
+        self._update_patient_actions()
         self.patients_loading_label.setText(text)
         self.patients_loading_label.setVisible(loading)
         if loading:
@@ -24910,26 +24935,28 @@ class MonthlyBillingListsPage(QWidget):
             failed,
         )
 
+    def _selected_receipts(self):
+        if not self.current_batch_id:
+            return []
+        keys = {
+            self.patients.item(index.row(), 0).text()
+            for index in self.patients.selectionModel().selectedRows()
+            if not self.patients.isRowHidden(index.row())
+            and self.patients.item(index.row(), 0) is not None
+        }
+        return [
+            receipt
+            for receipt in self.current_receipts
+            if monthly_batch_candidate_key(receipt) in keys
+        ]
+
     def _selected_receipt(self):
-        row = self.patients.currentRow()
-        if row < 0 or not self.current_batch_id:
-            return None
-        entry_key = self.patients.item(row, 0).text()
-        return next(
-            (
-                receipt
-                for receipt in self.current_receipts
-                if (
-                    (f"R:{int(receipt['recibo_id'])}" if receipt.get("recibo_id") else
-                     f"A:{receipt.get('admission_source_instance_id') or 'LEGACY'}:"
-                     f"{int(receipt.get('admission_attention_id') or 0)}")
-                    == entry_key
-                )
-            ),
-            None,
-        )
+        selected = self._selected_receipts()
+        return selected[0] if len(selected) == 1 else None
 
     def edit_selected_patient(self, _index=None):
+        if not self._is_current_batch_editable() or self._patients_loading:
+            return
         receipt = self._selected_receipt()
         if not receipt:
             FloatingToast("Selecciona un paciente", self, is_error=True).show()
@@ -24956,15 +24983,27 @@ class MonthlyBillingListsPage(QWidget):
             QMessageBox.critical(self, "Corregir datos", str(exc))
 
     def remove_selected_receipt(self):
-        receipt = self._selected_receipt()
-        if not receipt:
+        receipts = self._selected_receipts()
+        if (
+            not receipts
+            or not self._is_current_batch_editable()
+            or self._patients_loading
+        ):
             return
+        count = len(receipts)
         reason, accepted = QInputDialog.getText(
             self,
-            "Retirar del expediente",
-            "Motivo del retiro (quedará registrado):",
+            f"Retirar {count} paciente(s) del expediente",
+            "Solo se retirarán del listado de esta ARS; los recibos y datos "
+            "del historial se conservarán.\nMotivo del retiro (quedará registrado):",
         )
         if not accepted:
+            return
+        reason = reason.strip()
+        if not reason:
+            QMessageBox.warning(
+                self, "Retirar pacientes", "Indica el motivo del retiro."
+            )
             return
         try:
             date_from, date_to = self._candidate_date_bounds()
@@ -24972,24 +25011,14 @@ class MonthlyBillingListsPage(QWidget):
             QMessageBox.warning(self, "Filtro de fechas", str(exc))
             return
         batch_id = int(self.current_batch_id)
-        receipt_id = int(receipt["recibo_id"]) if receipt.get("recibo_id") else None
         self._batch_load_token += 1
         token = self._batch_load_token
-        self._set_patients_loading(True, "Retirando paciente…")
+        self._set_patients_loading(True, f"Retirando {count} paciente(s)…")
 
         def operation():
-            if receipt_id is not None:
-                remove_receipt_from_monthly_batch(
-                    batch_id, receipt_id, self.current_user, reason
-                )
-            else:
-                remove_admission_candidate_from_monthly_batch(
-                    batch_id,
-                    receipt.get("admission_source_instance_id") or "LEGACY",
-                    int(receipt.get("admission_attention_id") or 0),
-                    self.current_user,
-                    reason,
-                )
+            remove_selected_entries_from_monthly_batch(
+                batch_id, receipts, self.current_user, reason
+            )
             return load_monthly_batch_workspace(
                 batch_id, date_from=date_from, date_to=date_to
             )
@@ -24997,12 +25026,14 @@ class MonthlyBillingListsPage(QWidget):
         def completed(workspace):
             if token == self._batch_load_token and batch_id == self.current_batch_id:
                 self._apply_batch_workspace(workspace)
-                FloatingToast("Paciente retirado del expediente", self).show()
+                FloatingToast(
+                    f"{count} paciente(s) retirado(s) del expediente", self
+                ).show()
 
         def failed(message):
             if token == self._batch_load_token:
                 self._set_patients_loading(False)
-            QMessageBox.critical(self, "Retirar paciente", message)
+                QMessageBox.critical(self, "Retirar pacientes", message)
 
         self._start_monthly_worker(operation, completed, failed)
 

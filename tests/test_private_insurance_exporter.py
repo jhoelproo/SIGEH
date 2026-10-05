@@ -1,10 +1,14 @@
 import tempfile
 import unittest
+import zipfile
+from xml.etree import ElementTree
 from pathlib import Path
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from PIL import Image
 
 from private_insurance_exporter import (
+    _add_logo,
     create_private_ars_workbook,
     safe_export_filename,
     validate_export_payload,
@@ -114,6 +118,78 @@ class PrivateInsuranceExporterTests(unittest.TestCase):
             safe_export_filename("ARS Futuro / Privado", 2026, 6),
             "LISTADO_EMERGENCIAS_ARS_FUTURO_PRIVADO_2026_06.xlsx",
         )
+
+    def test_logo_uses_reference_crop_without_changing_original_image(self):
+        logo = Path(__file__).resolve().parents[1] / "assets" / "logo.jpg"
+        namespaces = {
+            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+            "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "cropped.xlsx"
+            create_private_ars_workbook(
+                output, self.batch, self.receipts, logo_path=logo
+            )
+            with zipfile.ZipFile(output) as archive:
+                for index, size in enumerate(((1026, 125), (1064, 147)), start=1):
+                    drawing = ElementTree.fromstring(
+                        archive.read(f"xl/drawings/drawing{index}.xml")
+                    )
+                    crop = drawing.find(".//a:srcRect", namespaces)
+                    self.assertIsNotNone(
+                        crop, "El encabezado debe recortar los bordes blancos"
+                    )
+                    self.assertGreater(int(crop.attrib["t"]), 30000)
+                    geometry = drawing.find(".//a:prstGeom", namespaces)
+                    self.assertIsNotNone(
+                        geometry, "Excel necesita la geometría para imprimir el logo"
+                    )
+                    self.assertEqual(geometry.attrib["prst"], "rect")
+                    extent = drawing.find("xdr:oneCellAnchor/xdr:ext", namespaces)
+                    self.assertEqual(int(extent.attrib["cx"]), size[0] * 9525)
+                    self.assertEqual(int(extent.attrib["cy"]), size[1] * 9525)
+                media = [
+                    name for name in archive.namelist() if name.startswith("xl/media/")
+                ]
+                expected = (logo.parent / "logo_excel.png").read_bytes()
+                self.assertTrue(all(archive.read(name) == expected for name in media))
+
+    def test_invoice_signature_and_print_area_match_reference_positions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "reference-layout.xlsx"
+            create_private_ars_workbook(output, self.batch, self.receipts)
+            workbook = load_workbook(output)
+            try:
+                invoice = workbook["Factura Global"]
+                self.assertEqual(invoice["B25"].value, self.batch["director_name"])
+                self.assertEqual(invoice["B26"].value, "DIRECTORA")
+                self.assertEqual(invoice["B27"].value, self.batch["provider_name"])
+                self.assertEqual(invoice.column_dimensions["E"].width, 13)
+                self.assertEqual(invoice.column_dimensions["F"].width, 13)
+                self.assertIn("$A$1:$F$29", str(invoice.print_area))
+                self.assertEqual(invoice.page_setup.fitToHeight, 1)
+            finally:
+                workbook.close()
+
+    def test_missing_logo_is_optional_and_custom_logo_keeps_its_aspect_ratio(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sheet = Workbook().active
+            path = Path(temp) / "custom.png"
+            _add_logo(sheet, path, "A1", 350, max_height=100)
+            self.assertEqual(len(sheet._images), 0)
+            Image.new("RGB", (100, 50), "white").save(path)
+            _add_logo(sheet, path, "A1", 350, max_height=100, crop=(1, 1, 1, 1))
+            self.assertEqual(
+                (sheet._images[0].width, sheet._images[0].height), (200, 100)
+            )
+            _add_logo(sheet, path, "A1", 100)
+            self.assertEqual(
+                (sheet._images[1].width, sheet._images[1].height), (100, 50)
+            )
+            _add_logo(sheet, path, "A1", 100, max_height=80)
+            self.assertEqual(
+                (sheet._images[2].width, sheet._images[2].height), (100, 50)
+            )
 
 
 if __name__ == "__main__":

@@ -18,8 +18,14 @@ from typing import Any, Iterable
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.drawing.fill import Blip, BlipFillProperties, RelativeRect
+from openpyxl.drawing.geometry import PresetGeometry2D
+from openpyxl.drawing.picture import PictureFrame
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+from openpyxl.drawing.xdr import XDRPositiveSize2D
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.units import pixels_to_EMU
 
 
 BLUE = "075985"
@@ -34,6 +40,11 @@ RED = "D71920"
 
 THIN_BLACK = Side(style="thin", color=BLACK)
 MEDIUM_BLUE = Side(style="medium", color=BLUE)
+
+# DrawingML percentages and display sizes from the supplied MONUMENTAL template.
+RELATION_LOGO_CROP = (8148, 30159, 3859, 13492)
+INVOICE_LOGO_CROP = (7143, 32414, 4464, 15172)
+INSTITUTIONAL_LOGO_SIZE = (1024, 441)
 
 
 def _text(value: Any) -> str:
@@ -139,6 +150,7 @@ def _add_logo(
     width: int,
     *,
     max_height: int | None = None,
+    crop: tuple[int, int, int, int] | None = None,
 ) -> None:
     if not logo_path:
         return
@@ -149,6 +161,24 @@ def _add_logo(
     if excel_png.is_file():
         path = excel_png
     image = ExcelImage(str(path))
+    if crop and (image.width, image.height) == INSTITUTIONAL_LOGO_SIZE:
+        picture = PictureFrame(
+            blipFill=BlipFillProperties(
+                blip=Blip(),
+                srcRect=RelativeRect(l=crop[0], t=crop[1], r=crop[2], b=crop[3]),
+            )
+        )
+        picture.spPr.prstGeom = PresetGeometry2D(prst="rect")
+        picture.spPr.ln = None
+        image.anchor = OneCellAnchor(
+            _from=AnchorMarker(col=0, row=0),
+            ext=XDRPositiveSize2D(
+                cx=pixels_to_EMU(width), cy=pixels_to_EMU(max_height)
+            ),
+            pic=picture,
+        )
+        sheet.add_image(image)
+        return
     ratio = float(image.height or 1) / float(image.width or 1)
     image.width = width
     image.height = max(45, int(width * ratio))
@@ -197,7 +227,7 @@ def _write_relation_sheet(
         sheet.column_dimensions[get_column_letter(index)].width = width
     for row in range(1, 7):
         sheet.row_dimensions[row].height = 18
-    _add_logo(sheet, logo_path, "A1", 260, max_height=105)
+    _add_logo(sheet, logo_path, "A1", 1026, max_height=125, crop=RELATION_LOGO_CROP)
 
     sheet.merge_cells("F7:H12")
     sheet["F7"] = (
@@ -232,8 +262,13 @@ def _write_relation_sheet(
     sheet["D12"].alignment = Alignment(horizontal="center", vertical="center")
 
     headers = (
-        "NO.", "TIPO DOC.\nNSS / CÉDULA", "NOMBRE DEL PACIENTE", "FECHA",
-        "NO. DE AUTORIZACIÓN", "VALOR RECLAMADO", "ESPECIALIDAD MÉDICA",
+        "NO.",
+        "TIPO DOC.\nNSS / CÉDULA",
+        "NOMBRE DEL PACIENTE",
+        "FECHA",
+        "NO. DE AUTORIZACIÓN",
+        "VALOR RECLAMADO",
+        "ESPECIALIDAD MÉDICA",
     )
     header_row = 14
     sheet.row_dimensions[13].height = 21
@@ -241,7 +276,9 @@ def _write_relation_sheet(
     for column, header in enumerate(headers, start=1):
         cell = sheet.cell(header_row, column, header)
         cell.font = Font(name="Arial", bold=True, size=10)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
         cell.border = Border(
             left=THIN_BLACK, right=THIN_BLACK, top=THIN_BLACK, bottom=THIN_BLACK
         )
@@ -271,7 +308,8 @@ def _write_relation_sheet(
             )
             cell.alignment = Alignment(
                 horizontal="left" if column in (2, 3, 7) else "center",
-                vertical="center", wrap_text=True,
+                vertical="center",
+                wrap_text=True,
             )
         sheet.cell(row, 4).number_format = "dd-mm-yyyy"
         sheet.cell(row, 5).font = Font(name="Arial", size=10, color=RED)
@@ -286,9 +324,7 @@ def _write_relation_sheet(
     sheet.cell(total_row, 6, f"=SUM(F{first_data_row}:F{last_data_row})")
     for column in range(1, 8):
         cell = sheet.cell(total_row, column)
-        cell.font = Font(
-            name="Arial", bold=True, color=RED if column == 5 else BLACK
-        )
+        cell.font = Font(name="Arial", bold=True, color=RED if column == 5 else BLACK)
         cell.border = Border(
             left=THIN_BLACK, right=THIN_BLACK, top=THIN_BLACK, bottom=THIN_BLACK
         )
@@ -308,11 +344,11 @@ def _write_global_invoice_sheet(
 ) -> None:
     _configure_page(sheet, landscape=False)
     sheet.title = "Factura Global"
-    for index, width in enumerate((38.71, 41.29, 53, 22, 22, 22), start=1):
+    for index, width in enumerate((38.71, 41.29, 53, 22, 13, 13), start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
-    for row in range(1, 34):
+    for row in range(1, 30):
         sheet.row_dimensions[row].height = 23.25
-    _add_logo(sheet, logo_path, "A1", 350, max_height=145)
+    _add_logo(sheet, logo_path, "A1", 1064, max_height=147, crop=INVOICE_LOGO_CROP)
 
     sheet.merge_cells("A6:C6")
     sheet["A6"] = _text(batch.get("provider_name")).upper()
@@ -335,7 +371,9 @@ def _write_global_invoice_sheet(
     sheet["A10"].fill = PatternFill("solid", fgColor="FFFF00")
 
     sheet.merge_cells("A12:B12")
-    sheet["A12"] = f"ARS {_text(batch.get('ars_display_name') or batch.get('ars')).upper()}"
+    sheet["A12"] = (
+        f"ARS {_text(batch.get('ars_display_name') or batch.get('ars')).upper()}"
+    )
     sheet["A12"].font = Font(name="Arial", size=14, bold=True)
     sheet["A13"] = f"RNC: {_text(batch.get('ars_rnc'))}"
     sheet["A14"] = _text(batch.get("ars_address")).upper()
@@ -372,14 +410,12 @@ def _write_global_invoice_sheet(
             sheet.cell(row, column).fill = PatternFill("solid", fgColor=fill)
             sheet.cell(row, column).alignment = Alignment(horizontal="center")
 
-    sheet["B30"] = "____________________________________________"
-    sheet["B30"].alignment = Alignment(horizontal="center")
-    sheet.merge_cells("A31:C31")
-    sheet["A31"] = _text(batch.get("director_name")).upper()
-    sheet["B32"] = _text(batch.get("director_title") or "DIRECTORA").upper()
-    sheet.merge_cells("A33:C33")
-    sheet["A33"] = _text(batch.get("provider_name")).upper()
-    for cell_ref in ("A31", "B32", "A33"):
+    sheet["B24"] = "____________________________________________"
+    sheet["B24"].alignment = Alignment(horizontal="center")
+    sheet["B25"] = _text(batch.get("director_name")).upper()
+    sheet["B26"] = _text(batch.get("director_title") or "DIRECTORA").upper()
+    sheet["B27"] = _text(batch.get("provider_name")).upper()
+    for cell_ref in ("B25", "B26", "B27"):
         sheet[cell_ref].font = Font(name="Arial", bold=True, size=11)
         sheet[cell_ref].alignment = Alignment(horizontal="center")
 
@@ -391,7 +427,8 @@ def _write_global_invoice_sheet(
         sheet["B19:C22"],
         Border(left=THIN_BLACK, right=THIN_BLACK, top=THIN_BLACK, bottom=THIN_BLACK),
     )
-    sheet.print_area = "A1:F33"
+    sheet.print_area = "A1:F29"
+    sheet.page_setup.fitToHeight = 1
 
 
 def create_private_ars_workbook(
