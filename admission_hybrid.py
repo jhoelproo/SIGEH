@@ -1157,8 +1157,6 @@ CREATE TABLE IF NOT EXISTS admission_sync_events(
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_admission_sync_events_cursor
-  ON admission_sync_events(sequence);
 CREATE INDEX IF NOT EXISTS idx_admission_sync_events_entity
   ON admission_sync_events(entity_type, entity_uuid, resulting_version);
 CREATE TABLE IF NOT EXISTS admission_replication_event_floors(
@@ -1256,8 +1254,6 @@ CREATE INDEX IF NOT EXISTS idx_admission_projection_active_turn
   ON admission_attention_projection(turn_id,source_status,is_deleted);
 CREATE INDEX IF NOT EXISTS idx_admission_projection_global_deleted
   ON admission_attention_projection(global_attention_id,is_deleted,server_revision);
-CREATE INDEX IF NOT EXISTS idx_admission_sync_events_event_uuid
-  ON admission_sync_events(event_uuid);
 CREATE INDEX IF NOT EXISTS idx_admission_sync_events_entity_revision
   ON admission_sync_events(entity_uuid,resulting_version DESC);
 CREATE TABLE IF NOT EXISTS admission_central_seeds(

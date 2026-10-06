@@ -34,6 +34,8 @@ class _Connection:
                 f"SQL esperaba {compact.count('%s')} parametros y recibio {len(params)}"
             )
         self.calls.append((compact, params))
+        if "AS snapshot_fingerprint" in compact:
+            return _Cursor([{"snapshot_fingerprint": str(self.rows)}])
         return _Cursor(self.rows)
 
 

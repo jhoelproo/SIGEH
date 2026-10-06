@@ -88,8 +88,6 @@ CREATE TABLE IF NOT EXISTS admission_patient_directory_events(
   payload_json JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_admission_patient_directory_events_cursor
-  ON admission_patient_directory_events(sequence);
 CREATE INDEX IF NOT EXISTS idx_admission_patient_directory_events_patient
   ON admission_patient_directory_events(global_patient_id,server_revision);
 CREATE TABLE IF NOT EXISTS admission_replication_event_floors(

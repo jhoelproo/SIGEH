@@ -36,6 +36,8 @@ class _Connection:
                 f"SQL expected {compact.count('%s')} params; got {len(params)}"
             )
         self.calls.append((compact, params))
+        if "AS snapshot_fingerprint" in compact:
+            return _Cursor([{"snapshot_fingerprint": str(self.rows)}])
         return _Cursor(self.rows)
 
 
@@ -228,7 +230,8 @@ class BillingAdmissionTurnHistoryTests(unittest.TestCase):
             )
         self.assertEqual(len(first), 1)
         self.assertEqual(len(typed), 1)
-        self.assertEqual(len(connection.calls), 1)
+        self.assertEqual(len(connection.calls), 2)
+        self.assertIn("AS snapshot_fingerprint", connection.calls[0][0])
 
     def test_history_is_visible_to_billing_roles_but_access_matrix_decides_use(self):
         for role in (

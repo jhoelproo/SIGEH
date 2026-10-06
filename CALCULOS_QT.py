@@ -44,6 +44,7 @@ from admission_billing_consistency import (
     normalized_name_sql,
 )
 from billing_inheritance_scope import inherited_attention_sql
+from query_snapshot_cache import QuerySnapshotCache
 from database_capacity import (
     DEFAULT_DATABASE_LIMIT_BYTES,
     DatabaseCapacityAnalyzer,
@@ -5871,11 +5872,18 @@ class CentralAdmissionReader:
 class BillingAdmissionQueryService:
     """Canonical read service shared by the selector and Admission history."""
 
-    def __init__(self, repository=None, central_reader=None):
+    def __init__(self, repository=None, central_reader=None, snapshot_cache=None):
         # Retained only for call compatibility. Central Billing reads must not
         # depend on a station's local SQLite replica.
         self.repository = repository
         self.central_reader = central_reader or CentralAdmissionReader()
+        self.snapshot_cache = snapshot_cache
+
+    def _fetch_candidate_rows(self, sql, params, **options):
+        reader = self.central_reader.fetch_all
+        if self.snapshot_cache is not None:
+            return self.snapshot_cache.fetch(reader, sql, params, **options)
+        return reader(sql, params, **options)
 
     def current_shift(self) -> dict:
         context = self.central_reader.current_operational_context()
@@ -5943,7 +5951,7 @@ class BillingAdmissionQueryService:
         receipt_identity = admission_receipt_identity_sql("r", "p")
         inherited_scope = inherited_attention_sql("p", "cs", "inheritance")
         started = perf_counter()
-        rows, timings = self.central_reader.fetch_all(
+        rows, timings = self._fetch_candidate_rows(
                 f"""WITH current_shift AS (
                        {CURRENT_OPERATIONAL_SHIFT_SQL}
                    )
@@ -6344,9 +6352,12 @@ def list_projected_current_and_previous_billable_attentions(
     offset: int = 0,
     repository=None,
     current_user=None,
+    snapshot_cache=None,
 ):
     """Compatibility wrapper for the canonical operational queue."""
-    return BillingAdmissionQueryService(repository).get_operational_candidates(
+    return BillingAdmissionQueryService(
+        repository, snapshot_cache=snapshot_cache
+    ).get_operational_candidates(
         identifier,
         session_id=session_id,
         turn_filter=turn_filter,
@@ -6567,12 +6578,14 @@ def diagnose_billing_admission_queue(
 _ADMISSION_VALIDATION_CACHE_LOCK = threading.Lock()
 _ADMISSION_VALIDATION_CACHE: dict[tuple, tuple[float, tuple[AdmissionAttention, ...]]] = {}
 _ADMISSION_VALIDATION_CACHE_TTL_SECONDS = 1.5
+_BILLING_CANDIDATES_SNAPSHOT_CACHE = QuerySnapshotCache()
 
 
 def invalidate_admission_validation_cache() -> None:
     """Drop the short-lived UI search snapshot after an eligibility mutation."""
     with _ADMISSION_VALIDATION_CACHE_LOCK:
         _ADMISSION_VALIDATION_CACHE.clear()
+        _BILLING_CANDIDATES_SNAPSHOT_CACHE.clear()
 
 
 def _validation_cache_key(
@@ -6668,6 +6681,7 @@ def load_admission_validation_attentions(
         offset=offset,
         repository=repository,
         current_user=user,
+        snapshot_cache=_BILLING_CANDIDATES_SNAPSHOT_CACHE,
     )
 
     unique = {}
