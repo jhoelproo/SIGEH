@@ -37,6 +37,7 @@ FORBIDDEN_RELEASE_NAMES = {
     ".env",
     "database_url.bundle",
     "database_url.protected",
+    "lanzador_log.txt",
 }
 FORBIDDEN_RELEASE_SUFFIXES = (".log", ".tmp", ".pyc", ".pyo")
 FORBIDDEN_RELEASE_DIRECTORIES = {"__pycache__"}

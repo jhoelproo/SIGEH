@@ -68,6 +68,24 @@ def test_release_rejects_python_cache_artifacts(tmp_path: Path):
         )
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    ("lanzador_log.txt", "_internal/lanzador_log.txt", "_internal/LANZADOR_LOG.TXT"),
+)
+def test_release_rejects_launcher_logs(tmp_path: Path, relative_path: str):
+    dist = _write_distribution(tmp_path / "dist")
+    updater = tmp_path / "updater.exe"
+    updater.write_bytes(b"updater")
+    runtime_log = dist / relative_path
+    runtime_log.write_text("synthetic launcher diagnostic", encoding="utf-8")
+    release = tmp_path / "release"
+
+    with pytest.raises(ValueError, match="archivos runtime"):
+        prepare_release(dist, updater, release, version="1.2.10")
+
+    assert not release.exists()
+
+
 def test_internal_release_injects_bootstrap_only_into_private_archive(tmp_path: Path):
     dist = _write_distribution(tmp_path / "dist")
     updater = tmp_path / "updater.exe"
