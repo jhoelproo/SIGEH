@@ -465,7 +465,7 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
         self.assertEqual(rows[0]["document_number_snapshot"], "123456789")
         self.assertEqual(rows[0]["authorization_snapshot"], "AUT-E2E-001")
         self.assertEqual(rows[0]["service_date_snapshot"], "2026-07-20")
-        self.assertIsNone(rows[0]["specialty_snapshot"])
+        self.assertEqual(rows[0]["specialty_snapshot"], "EMERGENCIOLOGÍA")
 
         with app.db_connect() as connection:
             connection.execute(

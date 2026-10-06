@@ -15,16 +15,20 @@ def normalized_document_type(value):
     return "NSS" if kind == "NSS" else "CÉDULA"
 
 
-def required_list_text(value, maximum, missing, too_long):
+def required_list_text(value, maximum, missing, too_long, *, allow_empty=False):
     text = str(value or "").strip()
-    if not text:
+    if not text and not allow_empty:
         raise ValueError(missing)
     if len(text) > maximum:
         raise ValueError(too_long)
     return text
 
 
-def normalize_list_metadata(kind, number, authorization, specialty):
+def normalize_list_metadata(
+    kind, number, authorization, specialty, *, allow_incomplete=False
+):
+    from billing_specialties import normalized_specialty
+
     return (
         normalized_document_type(kind),
         required_list_text(
@@ -32,14 +36,16 @@ def normalize_list_metadata(kind, number, authorization, specialty):
             24,
             "Escribe el NSS o la cédula.",
             "El NSS o la cédula no puede exceder 24 caracteres.",
+            allow_empty=allow_incomplete,
         ),
         required_list_text(
             authorization,
             40,
             "Escribe el número de autorización.",
             "La autorización no puede exceder 40 caracteres.",
+            allow_empty=allow_incomplete,
         ),
-        str(specialty or "").strip() or "EMERGENCIOLOGÍA",
+        normalized_specialty(specialty) or "EMERGENCIOLOGÍA",
     )
 
 
@@ -72,6 +78,10 @@ def effective_list_entry(row):
     entry = dict(row)
     if entry.get("batch_status") not in EDITABLE_BATCHES or not entry.get("recibo_id"):
         return entry
+    if entry.get("receipt_name"):
+        entry["patient_snapshot"] = entry["receipt_name"]
+        entry["nombre"] = entry["receipt_name"]
+    _recover_linked_specialty(entry)
     for field, current in (
         ("nss_snapshot", "receipt_nss"),
         ("cedula_snapshot", "receipt_cedula"),
@@ -96,12 +106,24 @@ def effective_list_entry(row):
     return entry
 
 
+def _recover_linked_specialty(entry):
+    if entry.get("receipt_specialty") or not entry.get("linked_admission_specialty"):
+        return
+    from admission_specialty import resolve_specialty
+    from billing_specialties import normalized_specialty
+
+    recovered = resolve_specialty(entry["linked_admission_specialty"])
+    if recovered:
+        entry["receipt_specialty"] = normalized_specialty(recovered)
+
+
 def lock_receipt(connection, receipt_id):
     row = connection.execute(
         """SELECT id,numero,nombre,estado_facturacion,revision_version,total,ars,
                   tipo_cobertura,numero_autorizacion,admission_nss_snapshot,
                   admission_cedula_snapshot,specialty_snapshot,verification_bypassed,
-                  admission_atencion_id,estado_documento,review_status,review_reason
+                  admission_atencion_id,estado_documento,review_status,review_reason,
+                  fecha,username,admission_global_attention_id,admission_source_instance_id
            FROM recibos WHERE id=%s AND COALESCE(is_deleted,0)=0 FOR UPDATE""",
         (int(receipt_id),),
     ).fetchone()
@@ -160,6 +182,7 @@ def sync_pending_lists(connection, receipt_id, actor, stamp, document_type=None)
     lock_pending_batches(connection, receipt_id)
     rows = connection.execute(
         """UPDATE billing_batch_receipts br SET
+               patient_snapshot=r.nombre,
                nss_snapshot=r.admission_nss_snapshot,
                cedula_snapshot=r.admission_cedula_snapshot,
                authorization_snapshot=r.numero_autorizacion,
@@ -185,7 +208,7 @@ def sync_pending_lists(connection, receipt_id, actor, stamp, document_type=None)
                 receipt_id,
                 stamp,
                 actor,
-                "NSS, identificación y autorización",
+                "Nombre, NSS, identificación, autorización y especialidad",
             ),
         )
     if rows:
@@ -200,6 +223,7 @@ def write_receipt_metadata(connection, current, changes, actor, stamp, policy):
     values = {
         key: changes.get(key, current.get(key))
         for key in (
+            "nombre",
             "numero_autorizacion",
             "admission_nss_snapshot",
             "admission_cedula_snapshot",
@@ -208,7 +232,7 @@ def write_receipt_metadata(connection, current, changes, actor, stamp, policy):
     }
     state, review, reason = policy(current, values["numero_autorizacion"])
     connection.execute(
-        """UPDATE recibos SET numero_autorizacion=%s,admission_nss_snapshot=%s,
+        """UPDATE recibos SET nombre=%s,numero_autorizacion=%s,admission_nss_snapshot=%s,
                admission_cedula_snapshot=%s,specialty_snapshot=%s,
                autorizacion_at=CASE WHEN numero_autorizacion IS DISTINCT FROM %s
                    THEN %s ELSE autorizacion_at END,

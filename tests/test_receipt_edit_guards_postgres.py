@@ -8,6 +8,7 @@ import CALCULOS_QT as app
 from tests.test_inherited_receipt_save import GLOBAL, USER, inherited as inherited
 from tests.test_receipt_optional_uuid_postgres import receipts as receipts, save
 from tests.test_billing_consistency_postgres import server as server
+from tests.test_receipt_ars_correction_postgres import linked as linked
 
 
 def linked_save(attention, **changes):
@@ -19,8 +20,8 @@ def linked_save(attention, **changes):
     )
 
 
-def test_admin_corrects_receipt_header_without_changing_admission(inherited):
-    receipt_id = linked_save(inherited)
+def test_admin_corrects_linked_name_without_changing_admission_service_date(linked):
+    receipt_id, attention, patient_id = linked
     with app.db_connect() as con:
         original = dict(
             con.execute(
@@ -28,7 +29,7 @@ def test_admin_corrects_receipt_header_without_changing_admission(inherited):
             ).fetchone()
         )
     linked_save(
-        inherited,
+        attention,
         recibo_id=receipt_id,
         nombre="CORRECCION SINTETICA",
         fecha="2026-09-13",
@@ -42,9 +43,14 @@ def test_admin_corrects_receipt_header_without_changing_admission(inherited):
                 "SELECT patient_name,service_date FROM admission_attention_projection LIMIT 1"
             ).fetchone()
         )
+        patient_name = con.execute(
+            "SELECT patient_name FROM admission_patient_directory WHERE global_patient_id=%s",
+            (patient_id,),
+        ).fetchone()[0]
     assert receipt["nombre"] == "CORRECCION SINTETICA"
     assert receipt["fecha"] == "2026-09-13"
-    assert admission == original
+    assert admission == {**original, "patient_name": "CORRECCION SINTETICA"}
+    assert patient_name == receipt["nombre"]
 
 
 def test_foreign_claim_blocks_edit_but_does_not_delete_receipt(inherited):

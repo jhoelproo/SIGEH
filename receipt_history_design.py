@@ -69,6 +69,11 @@ class ReceiptHistoryWorkspace:
         self.install_table_details()
         self.install_sorting()
         self.compact_action_bar()
+        from receipt_history_focus import ReceiptSearchFocus
+
+        self.search_focus = ReceiptSearchFocus(history)
+        self.sort_combo.activated.connect(self.search_focus.restore)
+        self.search_focus.watch_popup(self.sort_combo)
         root.setSpacing(5)
         for label in (
             history.billing_summary,
@@ -174,6 +179,7 @@ class ReceiptHistoryWorkspace:
             combo.setCurrentIndex(index)
             combo.blockSignals(False)
         self.history.load_rows(reset=True)
+        self.search_focus.restore()
 
     def install_table_details(self):
         h = self.history
@@ -199,7 +205,7 @@ class ReceiptHistoryWorkspace:
         root = h.layout()
         index = root.indexOf(h.table)
         root.removeWidget(h.table)
-        split = QSplitter(Qt.Horizontal)
+        split = QSplitter(Qt.Orientation.Horizontal)
         split.setChildrenCollapsible(False)
         split.addWidget(h.table)
         split.addWidget(self.details)
@@ -230,6 +236,7 @@ class ReceiptHistoryWorkspace:
         layout.addWidget(QLabel("Recibos guardados"), 1)
         layout.addWidget(QLabel("Ordenar por:"))
         combo = QComboBox()
+        self.sort_combo = combo
         combo.addItem("Más recientes", "recent")
         combo.addItem("Fecha de servicio · Más recientes", "service_recent")
         combo.addItem("Fecha de servicio · Más antiguos", "service_oldest")

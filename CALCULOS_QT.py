@@ -16,7 +16,6 @@ import traceback
 import uuid
 import tempfile
 import logging
-import unicodedata
 from dataclasses import dataclass, field
 from contextlib import contextmanager, nullcontext, suppress
 from types import SimpleNamespace
@@ -9591,14 +9590,30 @@ def _query_monthly_batch_receipts(con, batch_id: int, included: bool = True):
 
     rows = con.execute(
         """SELECT br.*, COALESCE(r.numero::text,'') AS numero,
-                   COALESCE(r.nombre,br.patient_snapshot) AS nombre,
+                   CASE WHEN b.status IN ('PENDIENTE','BORRADOR')
+                        THEN COALESCE(r.nombre,br.patient_snapshot)
+                        ELSE br.patient_snapshot END AS nombre,
                    COALESCE(r.fecha,br.service_date_snapshot) AS fecha,
                    r.tipo_cobertura, b.status AS batch_status,
+                   r.nombre AS receipt_name,
                    r.numero_autorizacion AS receipt_authorization,
                    r.autorizacion_at AS receipt_authorization_at,
                    r.admission_nss_snapshot AS receipt_nss,
                    r.admission_cedula_snapshot AS receipt_cedula,
                    r.specialty_snapshot AS receipt_specialty,
+                   CASE WHEN NULLIF(TRIM(COALESCE(r.specialty_snapshot,'')),'') IS NULL
+                   THEN (SELECT jsonb_build_object('specialty',p.specialty,
+                         'latest_payload_json',jsonb_build_object(
+                             'specialty',p.latest_payload_json->>'specialty',
+                             'detail_sheet',p.latest_payload_json->>'detail_sheet',
+                             'hoja',p.latest_payload_json->>'hoja',
+                             'hoja_normalizada',p.latest_payload_json->>'hoja_normalizada'))
+                    FROM admission_attention_projection p
+                    WHERE p.global_attention_id=r.admission_global_attention_id
+                       OR (r.admission_global_attention_id IS NULL
+                           AND p.attention_id=r.admission_atencion_id
+                           AND p.source_instance_id=COALESCE(r.admission_source_instance_id,'LEGACY'))
+                    LIMIT 1) END AS linked_admission_specialty,
                    (SELECT v.created_at FROM recibo_document_versions v
                     WHERE v.recibo_id=r.id AND v.is_current=TRUE LIMIT 1)
                        AS receipt_edited_at,
@@ -10408,14 +10423,29 @@ def update_monthly_batch_receipt_export_data(
     authorization: str,
     specialty: str,
     user: dict,
+    patient_name: str | None = None,
+    expected_patient_name: str | None = None,
 ) -> None:
     if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
         raise PermissionError("Tu rol no puede corregir listados mensuales.")
     from receipt_list_consistency import normalize_list_metadata
 
     document_type, document_number, authorization, specialty = normalize_list_metadata(
-        document_type, document_number, authorization, specialty
+        document_type,
+        document_number,
+        authorization,
+        specialty,
+        allow_incomplete=patient_name is not None,
     )
+    from receipt_patient_correction import (
+        correct_linked_name,
+        lock_name_attention,
+        optional_patient_name,
+        require_expected_name,
+        update_name_key,
+    )
+
+    patient_name = optional_patient_name(patient_name)
 
     from receipt_list_consistency import (
         lock_pending_batches,
@@ -10427,6 +10457,7 @@ def update_monthly_batch_receipt_export_data(
     username = str((user or {}).get("username") or "Sistema")
     stamp = now_str()
     with db_connect() as con:
+        attention = lock_name_attention(con, receipt_id, patient_name)
         receipt = lock_receipt(con, receipt_id)
         lock_pending_batches(con, receipt_id)
         row = con.execute(
@@ -10441,6 +10472,7 @@ def update_monthly_batch_receipt_export_data(
             raise ValueError("El recibo no está incluido en el expediente.")
         if not batch_is_editable(row["status"]):
             raise ValueError("Solo se pueden corregir expedientes pendientes.")
+        require_expected_name(receipt, expected_patient_name)
         changes = {
             "numero_autorizacion": authorization,
             "specialty_snapshot": specialty,
@@ -10448,6 +10480,16 @@ def update_monthly_batch_receipt_export_data(
             if document_type == "NSS"
             else "admission_cedula_snapshot": document_number,
         }
+        if patient_name is not None:
+            update_name_key(
+                con,
+                {**receipt, **changes},
+                patient_name,
+                username,
+                _guard_active_receipt_duplicate,
+            )
+            correct_linked_name(con, receipt, attention, patient_name, user)
+            changes["nombre"] = patient_name
         write_receipt_metadata(
             con, receipt, changes, username, stamp, _receipt_metadata_policy
         )
@@ -11119,6 +11161,15 @@ def save_receipt_with_items(
         write_runtime_log, bypass=bypass_data,
         global_id=admission_values[15], source_id=admission_values[8],
     ), db_connect() as con:
+        from receipt_patient_correction import (
+            correct_linked_name,
+            lock_name_attention,
+            normalized_patient_name,
+        )
+        name_attention = None
+        if editing:
+            nombre = normalized_patient_name(nombre)
+            name_attention = lock_name_attention(con, recibo_id, nombre)
         if self_pay:
             from self_pay_billing import validate_tariffs, validate_amounts
             validate_amounts(sala, item_rows, total)
@@ -11160,6 +11211,7 @@ def save_receipt_with_items(
                           tipo_cobertura, numero_autorizacion, estado_documento, service_type,
                           admission_atencion_id, admission_global_attention_id, admission_nss_snapshot,
                           admission_cedula_snapshot, admission_source_instance_id,
+                          specialty_snapshot,
                           verification_bypassed, verification_bypass_role,
                           verification_bypass_device, receipt_origin,
                           EXISTS(
@@ -11190,6 +11242,16 @@ def save_receipt_with_items(
                     f"El recibo está {BILLING_STATUS_LABELS.get(current_status, current_status).lower()} y no puede editarse. "
                     "Debe reabrirse como pendiente antes de modificarlo."
                 )
+            corrected_name = correct_linked_name(
+                con,
+                {**current, "id": int(recibo_id)},
+                name_attention,
+                nombre,
+                actor_user,
+            )
+            if corrected_name:
+                admission_values[7] = corrected_name["source_updated_at"]
+                admission_values[9] = corrected_name["snapshot_hash"]
             if str(current["ars"] or "").strip().casefold() != str(ars or "").strip().casefold():
                 from receipt_ars_correction import require_current_tariff, correct_linked_insurer
                 service_type = str(current["service_type"] or service_type)
@@ -11204,6 +11266,8 @@ def save_receipt_with_items(
             has_new_attention = admission_values[0] is not None
             from receipt_list_consistency import restore_legacy_list_identity
             current = restore_legacy_list_identity(con, recibo_id, dict(current))
+            if current.get("admission_atencion_id") and current.get("specialty_snapshot"):
+                admission_values[13] = current["specialty_snapshot"]
             effective_attention_id = (
                 current["admission_atencion_id"] or admission_values[0]
             )
@@ -11220,7 +11284,7 @@ def save_receipt_with_items(
                 if str(admission_values[8] or "").strip()
                 else current["admission_source_instance_id"]
             )
-            _guard_active_receipt_duplicate(
+            corrected_key = _guard_active_receipt_duplicate(
                 con, nombre=nombre, fecha=fecha, username=username,
                 attention_id=effective_attention_id, nss=effective_nss,
                 cedula=effective_cedula, source_instance_id=effective_source,
@@ -11230,6 +11294,8 @@ def save_receipt_with_items(
                 """UPDATE recibos
                    SET nombre=%s, fecha=%s, dx=%s, ars=%s, tipo_cobertura=%s, sala=%s, total=%s,
                        is_backdated=%s, revision_version=revision_version+1,
+                       dedup_key=CASE WHEN nombre IS DISTINCT FROM %s
+                           THEN %s ELSE dedup_key END,
                        numero_autorizacion=%s,
                        autorizacion_at=CASE
                            WHEN COALESCE(numero_autorizacion,'')<>%s THEN %s
@@ -11276,7 +11342,8 @@ def save_receipt_with_items(
                      OR (%s AND estado_facturacion='NO_FACTURADO'))""",
                 (
                     nombre or "", fecha or "", dx or "", ars or "", coverage,
-                    float(sala), float(total), int(is_backdated), authorization_number,
+                    float(sala), float(total), int(is_backdated), nombre,
+                    corrected_key or None, authorization_number,
                     authorization_number, authorization_changed_at,
                     authorization_number, authorization_actor,
                     document_state, review_status, review_reason or None,
@@ -23065,10 +23132,12 @@ class MonthlyReceiptEditorDialog(QDialog):
         self.setWindowTitle("Corregir datos para el envío")
         self.setMinimumWidth(540)
         root = QVBoxLayout(self)
+        self._original_patient_name = str(
+            receipt.get("patient_snapshot") or receipt.get("nombre") or ""
+        )
 
         patient = QLabel(
-            f"{receipt.get('patient_snapshot') or receipt.get('nombre') or ''}\n"
-            f"Recibo {receipt.get('numero') or ''}"
+            f"{self._original_patient_name}\nRecibo {receipt.get('numero') or ''}"
         )
         patient.setTextFormat(Qt.TextFormat.PlainText)
         patient.setWordWrap(True)
@@ -23076,8 +23145,9 @@ class MonthlyReceiptEditorDialog(QDialog):
         root.addWidget(patient)
 
         hint = QLabel(
-            "El NSS, la autorización y la especialidad se actualizan también "
-            "en el recibo y sus listados pendientes. La corrección queda registrada."
+            "El nombre, el NSS, la autorización y la especialidad se actualizan "
+            "en el recibo y sus listados pendientes. Si está vinculado, el nombre "
+            "también se corrige en Admisión. La corrección queda registrada."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(
@@ -23105,14 +23175,26 @@ class MonthlyReceiptEditorDialog(QDialog):
         self.document_number.setPlaceholderText("Número que aparecerá en el listado")
         self.authorization = QLineEdit(str(receipt.get("authorization_snapshot") or ""))
         self.authorization.setPlaceholderText("Número de autorización")
-        self.specialty = QLineEdit(
-            str(receipt.get("specialty_snapshot") or "EMERGENCIOLOGÍA")
+        from billing_specialties import (
+            SpecialtyComboBox,
+            normalized_specialty,
+            specialty_values,
+        )
+
+        self._normalize_specialty = normalized_specialty
+        self.patient_name = QLineEdit(self._original_patient_name)
+        self.patient_name.setMaxLength(160)
+        form.addWidget(QLabel("Nombre del paciente"), 0, 0, 1, 2)
+        form.addWidget(self.patient_name, 1, 0, 1, 2)
+        choices = specialty_values(getattr(parent, "current_receipts", ()))
+        self.specialty = SpecialtyComboBox(
+            receipt.get("specialty_snapshot") or "EMERGENCIOLOGÍA", choices
         )
         for row, column, caption, control in (
-            (0, 0, "Tipo de documento", self.document_type),
-            (0, 1, "Autorización", self.authorization),
-            (2, 0, "NSS / cédula", self.document_number),
-            (2, 1, "Especialidad", self.specialty),
+            (2, 0, "Tipo de documento", self.document_type),
+            (2, 1, "Autorización", self.authorization),
+            (4, 0, "NSS / cédula", self.document_number),
+            (4, 1, "Especialidad", self.specialty),
         ):
             form.addWidget(QLabel(caption), row, column)
             form.addWidget(control, row + 1, column)
@@ -23131,7 +23213,9 @@ class MonthlyReceiptEditorDialog(QDialog):
             "document_type": self.document_type.currentText(),
             "document_number": self.document_number.text().strip(),
             "authorization": self.authorization.text().strip(),
-            "specialty": self.specialty.text().strip(),
+            "specialty": self._normalize_specialty(self.specialty.currentText()),
+            "patient_name": self.patient_name.text().strip(),
+            "expected_patient_name": self._original_patient_name,
         }
 
 
@@ -23154,77 +23238,26 @@ def monthly_batch_candidate_key(candidate: dict) -> str:
     return ""
 
 
-def normalize_monthly_candidate_name(value) -> str:
-    normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
-    without_accents = "".join(
-        char for char in normalized if not unicodedata.combining(char)
-    )
-    return " ".join(without_accents.split())
-
-
-def normalize_monthly_candidate_document(value) -> str:
-    return re.sub(r"\D+", "", str(value or ""))
-
-
 def filter_monthly_batch_candidates(
     candidates,
     search_mode: str = "ALL",
     term: str = "",
 ) -> tuple[list[dict], str | None]:
     """Filter already loaded ARS candidates without changing eligibility."""
-    normalized_mode = str(search_mode or "ALL").upper()
-    normalized_term = str(term or "").strip()
-    if not normalized_term:
-        return list(candidates), None
+    from monthly_candidate_search import filter_candidates
 
-    if normalized_mode == "NAME" or (
-        normalized_mode == "ALL" and not normalize_monthly_candidate_document(normalized_term)
-    ):
-        words = normalize_monthly_candidate_name(normalized_term).split()
-        return [
-            candidate for candidate in candidates
-            if all(
-                word in normalize_monthly_candidate_name(candidate.get("nombre"))
-                for word in words
-            )
-        ], None
-
-    document_term = normalize_monthly_candidate_document(normalized_term)
-    if len(document_term) < 4:
-        return [], "Escriba al menos 4 dígitos."
-    fields = (
-        ("nss_snapshot",)
-        if normalized_mode == "NSS"
-        else ("cedula_snapshot",)
-        if normalized_mode == "CEDULA"
-        else ("nss_snapshot", "cedula_snapshot")
-    )
-    exact_matches = [
-        candidate for candidate in candidates
-        if any(
-            normalize_monthly_candidate_document(candidate.get(field)) == document_term
-            for field in fields
-        )
-    ]
-    if exact_matches:
-        return exact_matches, None
-    return [
-        candidate for candidate in candidates
-        if any(
-            document_term in normalize_monthly_candidate_document(candidate.get(field))
-            for field in fields
-        )
-    ], None
+    return filter_candidates(candidates, search_mode, term)
 
 
 class MonthlyBatchCandidateSelectionDialog(QDialog):
     """Local candidate finder with selection persisted by candidate_key."""
 
     SEARCH_MODES = (
-        ("Todos", "ALL", "Nombre, NSS o cédula"),
+        ("Todos", "ALL", "Nombre, recibo, NSS o cédula"),
         ("Nombre", "NAME", "Nombre del paciente"),
         ("NSS", "NSS", "Número de NSS"),
         ("Cédula", "CEDULA", "Número de cédula"),
+        ("Recibo", "RECEIPT", "Número de recibo"),
     )
 
     def __init__(self, candidates, parent=None):
@@ -25085,6 +25118,11 @@ class MonthlyBillingListsPage(QWidget):
                 **dialog.values(),
             )
             self.load_selected_batch()
+            refresh_admission = getattr(
+                self.window(), "_refresh_admission_billing_views", None
+            )
+            if callable(refresh_admission):
+                refresh_admission()
             FloatingToast("Corrección guardada en el expediente", self).show()
         except Exception as exc:
             QMessageBox.critical(self, "Corregir datos", str(exc))
@@ -26918,11 +26956,15 @@ class ReceiptHistoryDialog(QDialog):
         }
 
     def _set_history_query_busy(self, busy):
+        if busy and hasattr(self, "history_workspace"):
+            self.history_workspace.search_focus.query_started()
         self.btn_search.setEnabled(not busy)
         self.btn_clear_filters.setEnabled(not busy)
         if busy:
             self.btn_previous_page.setEnabled(False)
             self.btn_next_page.setEnabled(False)
+        elif hasattr(self, "history_workspace"):
+            self.history_workspace.search_focus.query_completed()
 
     def _load_metrics_async(self, generation, include_filters=False):
         if self._metrics_worker is not None and self._metrics_worker.isRunning():
