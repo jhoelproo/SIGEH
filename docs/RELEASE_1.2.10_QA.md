@@ -52,6 +52,14 @@ QA funcional previo: 21 pruebas de interfaz nativa Windows aprobadas. Editor y b
 
 Evidencia: `output/release-1210-package-validation.json` y `output/release-1210-smoke.json`. Las pruebas usan datos sintéticos y configuración aislada; no se ejecutan operaciones destructivas contra producción. Un primer intento corrigió el import del runner local; otro detectó el log que fue retirado y cuya exclusión quedó probada. Se conservan sus logs de diagnóstico; la evidencia final corresponde a la repetición limpia.
 
+### Publicación verificada
+
+Publicada como estable y Latest el 6 de octubre de 2026 a las 04:51:16 UTC (00:51:16, Bolivia): https://github.com/jhoelproo/SIGEH/releases/tag/v1.2.10. Tag y commit fuente verificados: `a5830c67c6e967b8e5c7e9904b93f33031fd345f`. Los cuatro assets remotos coinciden por tamaño y SHA-256 con los archivos aprobados localmente, comprobados primero como borrador y de nuevo después de publicar.
+
+El canal público usado por el lanzador devuelve 1.2.10; manifest y checksum remotos coinciden. La actualización desde 1.2.9 se reconoce y la misma versión 1.2.10 no provoca reinstalación. Evidencia: `output/release-1210-draft-verification.json` y `output/release-1210-publication-verification.json`.
+
+Se congelaron y comprobaron 378 inputs rastreados de build antes de subir y publicar: `output/release-1210-final-fingerprint.json`. Este informe incorpora la comprobación remota posterior al commit fuente, sin modificar los ejecutables ni el ZIP.
+
 ## QUALITY GATES
 
 | Gate | Estado |
@@ -64,12 +72,15 @@ Evidencia: `output/release-1210-package-validation.json` y `output/release-1210-
 | Duplicación | PASS en módulos revisados, cero bloques detectados |
 | Seguridad funcional y QA de interfaz | PASS |
 | Build, smoke, paquete y actualización | PASS |
-| Canal público, tag y assets remotos | NO VERIFICADO: publicación pendiente |
+| Canal público, tag y assets remotos | PASS |
+| QA final | PASS |
 | Benchmark externo de capacidad | N/A: optativo y ajeno a este cambio |
 | Instalación efectiva en hospital e impresión física | NO VERIFICADO: sin acceso a esas estaciones/impresora |
 
 ## PROBLEMAS PENDIENTES
 
-Completar publicación y verificación remota. La deuda heredada del monolito se conserva y se identifica expresamente. Una publicación no confirma que las estaciones del hospital ya estén actualizadas.
+No quedan pasos de publicación ni defectos nuevos detectados en este alcance. La deuda heredada del monolito se conserva y se identifica expresamente. La instalación efectiva en las estaciones del hospital y la impresión física siguen sin verificarse; no son comprobaciones ejecutables desde este entorno ni requisitos de publicación del paquete. Una publicación no confirma que esas estaciones ya estén actualizadas.
 
-ESTADO FINAL: NO APROBADO PARA ENTREGA — publicación en preparación.
+Cuatro pasadas finales: funcionalidad PASS, verificando cada requisito y sus vínculos; regresiones PASS, con suite funcional previa inalterada y suite completa de publicación; clean code PASS, con análisis de nombres, duplicación, responsabilidades, errores y excepciones heredadas documentadas; QA PASS, con cobertura real, herramientas, build, interfaz, paquete, actualización y canal público.
+
+ESTADO FINAL: APROBADO PARA ENTREGA.
