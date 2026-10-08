@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import psycopg2.extras
+from receipt_document_state import billed_snapshot_needs_refresh, receipt_document_state
 
 
 STORAGE_LEGACY = "LEGACY_PDF"
@@ -245,6 +246,7 @@ def build_receipt_snapshot(
                   r.estado_facturacion,r.admission_atencion_id,
                   r.admission_paciente_id,r.admission_nss_snapshot,
                   r.admission_cedula_snapshot,r.admission_ars_snapshot,
+                  r.insurance_document_type,r.insurance_document_number,
                   r.admission_source_instance_id,r.turno_origen_id,
                   r.turno_procesamiento_id,r.herencia_estado,
                   r.revision_version,r.service_type,r.specialty_snapshot,
@@ -292,6 +294,9 @@ def build_receipt_snapshot(
     visible_user = str(
         row["visible_user"] or row["username"] or "Sistema"
     )
+    document_state = receipt_document_state(
+        row["estado_documento"], row["estado_facturacion"]
+    )
     snapshot = {
         "schema_version": RECEIPT_SNAPSHOT_SCHEMA_VERSION,
         "template_version": RECEIPT_TEMPLATE_VERSION,
@@ -307,7 +312,7 @@ def build_receipt_snapshot(
             "ars": str(row["ars"] or ""),
             "coverage": str(row["tipo_cobertura"] or ""),
             "authorization_number": str(row["numero_autorizacion"] or ""),
-            "document_state": str(row["estado_documento"] or ""),
+            "document_state": document_state,
             "billing_status": str(row["estado_facturacion"] or ""),
             "service_type": str(row["service_type"] or "EMERGENCIA"),
             "specialty": str(row["specialty_snapshot"] or ""),
@@ -319,6 +324,10 @@ def build_receipt_snapshot(
             "name": str(row["nombre"] or ""),
             "nss": str(row["admission_nss_snapshot"] or ""),
             "cedula": str(row["admission_cedula_snapshot"] or ""),
+            "insurance_document_type": str(row.get("insurance_document_type") or ""),
+            "insurance_document_number": str(
+                row.get("insurance_document_number") or ""
+            ),
             "admission_patient_id": (
                 int(row["admission_paciente_id"])
                 if row["admission_paciente_id"] is not None
@@ -339,7 +348,7 @@ def build_receipt_snapshot(
             "currency_label": "RD$",
         },
         "document": {
-            "document_state": str(row["estado_documento"] or ""),
+            "document_state": document_state,
             "billing_status": str(row["estado_facturacion"] or ""),
             "authorization_number": str(row["numero_autorizacion"] or ""),
             "payment_status": str(context.get("payment_status") or ""),
@@ -352,8 +361,7 @@ def build_receipt_snapshot(
                 context.get("hospital_line_2") or "DR. ÁNGEL CONTRERAS MEJÍA"
             ),
             "document_title": str(
-                context.get("document_title")
-                or "DETALLE DE FACTURACIÓN DE EMERGENCIA"
+                context.get("document_title") or "DETALLE DE FACTURACIÓN DE EMERGENCIA"
             ),
             "template_version": RECEIPT_TEMPLATE_VERSION,
             "schema_version": RECEIPT_SNAPSHOT_SCHEMA_VERSION,
@@ -513,6 +521,41 @@ def load_current_receipt_snapshot(connection, receipt_id: int) -> dict[str, Any]
         "storage_mode": str(row["document_storage_mode"] or STORAGE_LEGACY),
         "pdf_filename": str(row["pdf_filename"] or ""),
     }
+
+
+def refresh_billed_receipt_snapshot(connection, receipt, document_record):
+    """Append a final version for old billed receipts without rewriting history."""
+    if not billed_snapshot_needs_refresh(receipt, document_record):
+        return document_record
+    receipt_id = int(receipt["id"])
+    current = connection.execute(
+        """SELECT id,username,estado_facturacion FROM recibos
+           WHERE id=%s FOR UPDATE""",
+        (receipt_id,),
+    ).fetchone()
+    if not current:
+        raise SnapshotMissingError("El recibo no existe.")
+    if current["estado_facturacion"] != "FACTURADO":
+        return load_current_receipt_snapshot(connection, receipt_id)
+    try:
+        latest = load_current_receipt_snapshot(connection, receipt_id)
+    except SnapshotMissingError:
+        latest = document_record
+    if not billed_snapshot_needs_refresh(current, latest):
+        return latest
+    connection.execute(
+        "UPDATE recibos SET estado_documento='FINAL' WHERE id=%s",
+        (receipt_id,),
+    )
+    snapshot = latest.get("snapshot") or {}
+    context = dict(snapshot.get("document") or {})
+    saved = save_receipt_document_snapshot(
+        connection,
+        receipt_id,
+        str(current["username"] or "Sistema"),
+        document_context=context,
+    )
+    return {**document_record, **saved}
 
 
 def load_latest_receipt_snapshot(connection, receipt_id: int) -> dict[str, Any]:

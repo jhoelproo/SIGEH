@@ -1,18 +1,24 @@
 """Receipt-edit context derived from a centrally matched receipt only."""
 
+from admission_contract import READINESS_READY
+
 
 def apply_owned_receipt_context(row: dict, receipt_id: int | None) -> dict:
     result = dict(row)
     own = receipt_id is not None and row.get("linked_receipt_id") == receipt_id
     result["editing_own_receipt"] = own
+    result["allow_pending_receipt_correction"] = own and (
+        row.get("linked_billing_status") in {"PENDIENTE", "SIN_CLASIFICAR"}
+        and row.get("linked_document_status") != "FINAL"
+    )
     if not own:
         return result
     result["explicitly_inherited"] = bool(row.get("explicitly_inherited")) or (
         row.get("receipt_inheritance_state") == "HEREDADA_PROCESADA"
         and row.get("receipt_origin_turn") == row.get("turn_id")
     )
-    # Only this receipt's link is exempt from duplication, never its clinical,
-    # deletion, operational-scope or foreign-claim validation.
+    # Ownership exempts this link from duplication. Clinical status, deletion,
+    # operational scope and foreign claims remain subject to live validation.
     result["linked_receipt_id"] = None
     result["linked_billing_status"] = None
     result["linked_document_status"] = None
@@ -27,6 +33,10 @@ class AdmissionDataChanged(ValueError):
             + ", ".join(fields)
             + ". Revise y vuelva a validar la atención. El recibo no se guardó."
         )
+
+
+def admission_ready_for_receipt_correction(projection):
+    return bool(projection.get("readiness") == READINESS_READY or projection.get("allow_pending_receipt_correction"))
 
 
 def validate_admission_snapshot(snapshot: dict, projection: dict) -> None:
@@ -54,6 +64,26 @@ def validate_admission_snapshot(snapshot: dict, projection: dict) -> None:
 
 def normalize_snapshot_value(value) -> str:
     return " ".join(str(value or "").strip().upper().split())
+
+
+def reconcile_owned_identifiers(snapshot, projection, current_receipt):
+    """Accept saved identity corrections only when receipt and Admisión agree."""
+    result = dict(snapshot)
+    if not projection.get("allow_pending_receipt_correction"):
+        return result
+    for cached, projected, saved in (
+        ("nss_clean", "nss_snapshot", "admission_nss_snapshot"),
+        ("cedula_clean", "cedula_snapshot", "admission_cedula_snapshot"),
+    ):
+        if projected not in projection or saved not in current_receipt:
+            continue
+        if normalize_snapshot_value(projection[projected]) != normalize_snapshot_value(
+            current_receipt[saved]
+        ):
+            continue
+        if cached in result:
+            result[cached] = str(projection[projected] or "").strip()
+    return result
 
 
 def can_refresh_patient_in_draft(previous: dict, verified: dict) -> bool:

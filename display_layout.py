@@ -300,6 +300,11 @@ def should_expand_main_module_tabs(logical_width: int) -> bool:
     return int(logical_width or 0) >= 720
 
 
+def _bounded_viewport_dimension(viewport_size: int, screen_size: int) -> int:
+    """Use assigned geometry even before show; fall back when it is unavailable."""
+    return min(viewport_size, screen_size) if viewport_size > 0 else screen_size
+
+
 class DisplayLayoutManager(QObject):
     """Observa pantalla/DPI y aplica preferencias locales con debounce."""
 
@@ -549,6 +554,8 @@ class DisplayLayoutManager(QObject):
             width, height = geometry.width(), geometry.height()
             dpi = float(screen.logicalDotsPerInch() or 96.0)
             ratio = float(screen.devicePixelRatio() or 1.0)
+        width = _bounded_viewport_dimension(self.window.width(), width)
+        height = _bounded_viewport_dimension(self.window.height(), height)
         recommended = recommend_layout_profile(width, height, dpi, ratio)
         preferences = self.preferences()
         preview_profile = self.property("preview_profile")
@@ -655,7 +662,12 @@ class DisplayLayoutManager(QObject):
         x = min(max(frame.x(), available.left()), available.right() - width + 1)
         y = min(max(frame.y(), available.top()), available.bottom() - height + 1)
         if width != frame.width() or height != frame.height():
-            self.window.resize(width, height)
+            decoration_width = max(0, frame.width() - self.window.width())
+            decoration_height = max(0, frame.height() - self.window.height())
+            self.window.resize(
+                max(1, width - decoration_width),
+                max(1, height - decoration_height),
+            )
         if x != frame.x() or y != frame.y():
             self.window.move(x, y)
 

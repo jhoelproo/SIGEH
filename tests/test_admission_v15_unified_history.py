@@ -361,8 +361,8 @@ def test_this_turn_history_uses_central_source_and_turn_from_local_replica():
     assert "admission_attention_projection" in connection.query
     assert "p.operational_source_id::TEXT=%s" in connection.query
     assert "p.turn_id=%s" in connection.query
-    assert "COALESCE(p.device_local_sequence,0) ASC" in connection.query
-    assert "COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) ASC" in connection.query
+    assert "COALESCE(p.device_local_sequence,0) DESC" in connection.query
+    assert "COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) DESC" in connection.query
     assert connection.params[:2] == ("central-source", 316)
 
 

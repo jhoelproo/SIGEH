@@ -129,7 +129,6 @@ def test_current_turn_receipt_can_add_authorization(inherited):
         "UPDATE admission_attention_projection SET source_status='ANULADA'",
         "UPDATE admission_attention_projection SET service_type='URGENCIA'",
         "UPDATE admission_attention_projection SET is_deleted=TRUE",
-        "UPDATE admission_attention_projection SET readiness='INCOMPLETA'",
         "UPDATE admission_attention_projection SET canonical_ars='SENASA SUBSIDIADO'",
     ],
 )

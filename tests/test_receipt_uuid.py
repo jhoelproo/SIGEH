@@ -118,7 +118,7 @@ def test_worker_reports_safe_failure_and_no_success(monkeypatch, error):
             "date_str": "2026-09-05",
             "dx_raw": "PRIVATE DX",
             "ars_name": "FUTURO",
-            "sala": 0,
+            "sala": 100,
             "grouped": [],
             "total_general": 100,
             "editing_id": None,

@@ -112,13 +112,13 @@ def test_cannot_close_running_operation(qt, monkeypatch):
 @pytest.mark.parametrize("receipt,admin", [(None, True), ({"id": 1}, False)])
 def test_no_selection_or_nonadmin_cannot_open_picker(qt, receipt, admin):
     backend = SimpleNamespace(
-        is_administrator=lambda _: admin, AdmissionValidationDialog=Mock()
+        is_administrator=lambda _: admin, AdmissionHistoryDialog=Mock()
     )
     history = SimpleNamespace(
         main_window=SimpleNamespace(current_user={}), _selected_receipt=lambda: receipt
     )
     ui.open_receipt_link(history, backend)
-    backend.AdmissionValidationDialog.assert_not_called()
+    backend.AdmissionHistoryDialog.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -135,14 +135,14 @@ def test_picker_and_confirmation_control_refresh(
 ):
     picker = Mock()
     picker.exec.return_value = picker_result
-    picker.selected_attention.return_value = attention
+    picker.selected_for_billing.return_value = attention
     confirmation = Mock()
     confirmation.exec.return_value = confirm_result
     monkeypatch.setattr(ui, "LinkConfirmationDialog", Mock(return_value=confirmation))
     monkeypatch.setattr(QTimer, "singleShot", lambda _, callback: callback())
     backend = SimpleNamespace(
         is_administrator=lambda _: True,
-        AdmissionValidationDialog=Mock(return_value=picker),
+        AdmissionHistoryDialog=Mock(return_value=picker),
     )
     history = SimpleNamespace(
         main_window=SimpleNamespace(current_user={"username": "admin"}),
@@ -150,7 +150,11 @@ def test_picker_and_confirmation_control_refresh(
         load_rows=Mock(),
     )
     ui.open_receipt_link(history, backend)
-    picker.turn_filter_combo.setCurrentIndex.assert_called_once_with(1)
+    backend.AdmissionHistoryDialog.assert_called_once_with(
+        {"username": "admin"}, history, initial_search=False
+    )
+    picker.receipt_combo.addItem.assert_called_once_with("Sin recibo", "SIN_RECIBO")
+    picker.status_combo.addItem.assert_called_once_with("Sin facturación", "SIN_RECIBO")
     picker.cancel_inherited_button.hide.assert_called_once()
     if (
         picker_result == QDialog.Accepted
@@ -194,4 +198,38 @@ def test_real_history_action_permissions(qt, monkeypatch, role, linked, enabled)
         monkeypatch.setattr(ui, "open_receipt_link", opener)
         window.action_link_attention.trigger()
         opener.assert_called_once_with(window, app)
+    window.close()
+
+
+@pytest.mark.parametrize(
+    "identifiers,expected",
+    [
+        (
+            {"admission_nss_snapshot": "00123", "admission_cedula_snapshot": "456"},
+            "00123",
+        ),
+        (
+            {"admission_nss_snapshot": "", "admission_cedula_snapshot": "001456"},
+            "001456",
+        ),
+        ({}, "PACIENTE"),
+    ],
+)
+def test_link_picker_uses_full_history_and_precise_identifiers(
+    qt, identifiers, expected
+):
+    import CALCULOS_QT as app
+
+    window = app.AdmissionHistoryDialog(
+        {"username": "admin", "role": app.ROLE_ADMIN}, initial_search=False
+    )
+    ui._restrict_link_picker(window, {"nombre": "PACIENTE", **identifiers})
+    assert window.search_edit.text() == expected
+    assert window.turn_combo.currentData() == "TODOS"
+    filters = window._filters()
+    assert filters["receipt_filter"] == "SIN_RECIBO"
+    assert filters["billing_status"] == "SIN_RECIBO"
+    assert not window.receipt_combo.isEnabled()
+    assert not window.status_combo.isEnabled()
+    assert window.receipt_combo.count() == window.status_combo.count() == 1
     window.close()

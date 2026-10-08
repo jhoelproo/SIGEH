@@ -72,8 +72,6 @@ class ReceiptHistoryWorkspace:
         from receipt_history_focus import ReceiptSearchFocus
 
         self.search_focus = ReceiptSearchFocus(history)
-        self.sort_combo.activated.connect(self.search_focus.restore)
-        self.search_focus.watch_popup(self.sort_combo)
         root.setSpacing(5)
         for label in (
             history.billing_summary,
@@ -83,6 +81,9 @@ class ReceiptHistoryWorkspace:
         ):
             label.setStyleSheet("padding:0;font-size:10pt;font-weight:700;")
         history.status_combo.currentIndexChanged.connect(self.manual_status_changed)
+        from receipt_history_responsive import ReceiptHistoryResponsive
+
+        self.small_screen = ReceiptHistoryResponsive(self, heading)
 
     def manual_status_changed(self):
         self.flow = "all"
@@ -109,11 +110,11 @@ class ReceiptHistoryWorkspace:
             (
                 ("Paciente, recibo o identificación", h.search_edit),
                 ("ARS", h.ars_combo),
-                ("Estado", h.status_combo),
+                (h.lbl_status_filter, h.status_combo),
                 ("Usuarios", h.user_filter),
             )
         ):
-            grid.addWidget(QLabel(caption), 0, column)
+            grid.addWidget(caption if isinstance(caption, QLabel) else QLabel(caption), 0, column)
             grid.addWidget(control, 1, column)
             control.show()
         grid.setColumnStretch(0, 3)
@@ -124,11 +125,19 @@ class ReceiptHistoryWorkspace:
         grid.setVerticalSpacing(4)
         grid.setContentsMargins(12, 14, 12, 6)
         grid.addWidget(h.period_filter, 2, 0, 1, 2)
-        grid.addWidget(h.assignment_combo, 2, 2)
+        assignment = QWidget()
+        self.assignment_filter = assignment
+        assignment_layout = QVBoxLayout(assignment)
+        assignment_layout.setContentsMargins(0, 0, 0, 0)
+        assignment_layout.setSpacing(4)
+        assignment_layout.addWidget(h.lbl_assignment_filter)
+        assignment_layout.addWidget(h.assignment_combo)
+        grid.addWidget(assignment, 2, 2)
         h.period_filter.show()
         h.assignment_combo.show()
         actions = QHBoxLayout()
         advanced = QPushButton("Filtros avanzados")
+        self.advanced_button = advanced
         advanced.setAutoDefault(False)
         actions.addWidget(h.btn_search)
         actions.addWidget(advanced)
@@ -137,10 +146,18 @@ class ReceiptHistoryWorkspace:
         h.btn_clear_filters.show()
         grid.addLayout(actions, 2, 3)
         self.advanced = QWidget()
-        advanced_layout = QHBoxLayout(self.advanced)
-        advanced_layout.addWidget(QLabel("Identificación:"))
-        advanced_layout.addWidget(h.document_type_combo)
-        advanced_layout.addWidget(h.document_edit, 1)
+        advanced_layout = QVBoxLayout(self.advanced)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        self.compact_filter_options = QWidget()
+        options = QHBoxLayout(self.compact_filter_options)
+        options.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.addWidget(self.compact_filter_options)
+        self.compact_filter_options.hide()
+        document_row = QHBoxLayout()
+        document_row.addWidget(QLabel("Identificación:"))
+        document_row.addWidget(h.document_type_combo)
+        document_row.addWidget(h.document_edit, 1)
+        advanced_layout.addLayout(document_row)
         h.document_type_combo.show()
         h.document_edit.show()
         grid.addWidget(self.advanced, 3, 0, 1, 4)
@@ -179,7 +196,6 @@ class ReceiptHistoryWorkspace:
             combo.setCurrentIndex(index)
             combo.blockSignals(False)
         self.history.load_rows(reset=True)
-        self.search_focus.restore()
 
     def install_table_details(self):
         h = self.history
@@ -309,6 +325,7 @@ def apply_history_design_theme(history, dark):
     history._history_design_dark = bool(dark)
     history.setStyleSheet(history.styleSheet() + workspace_styles(dark))
     controller = history.history_workspace
+    style_action(controller.advanced_button, "blue", dark, filled=False, compact=True)
     apply_metric_theme(history.metrics_widget, dark)
     history.table.setStyleSheet(table_styles(dark))
     controller.status_delegate.dark = bool(dark)

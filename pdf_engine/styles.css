@@ -864,6 +864,18 @@ body {
   text-overflow: clip;
 }
 
+.receipt-number.local-receipt-number {
+  font-size: 6pt;
+  letter-spacing: -0.2pt;
+}
+
+.local-request-reference {
+  margin-top: 8pt;
+  font-size: 7pt;
+  color: var(--blue);
+  text-align: center;
+}
+
 .field-icon.bed-icon {
   width: 9.2mm;
   height: 8.3mm;

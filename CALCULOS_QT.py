@@ -2975,6 +2975,11 @@ def db_init():
 
     with db_connect() as con:
         con.executescript(SCHEMA)
+        from receipt_command_sync import RECEIPT_SYNC_SCHEMA
+        con.executescript(RECEIPT_SYNC_SCHEMA)
+        from monthly_receipt_fields import ensure_receipt_insurance_schema
+
+        ensure_receipt_insurance_schema(con)
         apply_receipt_document_migration(con)
         apply_report_document_migration(con)
         _apply_action_history_migration(con)
@@ -4013,7 +4018,7 @@ def authenticate_user_for_login(username: str, password: str):
                 stage="LOGIN_AUTHENTICATION",
             )
         except Exception as exc:
-            if not is_temporary_connection_error(exc):
+            if is_database_read_only_error(exc) or not is_temporary_connection_error(exc):
                 raise
         else:
             if user:
@@ -5012,6 +5017,8 @@ def get_next_recibo_number() -> int:
 
 
 def _admission_values(attention) -> tuple:
+    from billing_specialties import receipt_specialty_snapshot
+
     if not attention:
         global_id = receipt_admission_uuid(None, write_runtime_log)
         return (
@@ -5040,7 +5047,7 @@ def _admission_values(attention) -> tuple:
         str(data.get("coverage_status") or ""),
         str(data.get("billing_readiness") or ""),
         str(data.get("attention_type") or data.get("service_type") or "EMERGENCIA"),
-        str(data.get("specialty") or ""),
+        receipt_specialty_snapshot(data.get("specialty")),
         str(data.get("admission_username") or ""),
         global_id,
     )
@@ -5080,6 +5087,7 @@ def get_receipt_for_admission_attention(
 
 
 def _billing_projection_denial(row: dict, user: dict, access: dict):
+    from billing_admission_edit import admission_ready_for_receipt_correction
     historical_denials = {
         "HISTORICAL_SOURCE_DENIED": "La atención no pertenece a la operación central vigente.",
         "HISTORICAL_TIME_DENIED": (
@@ -5092,7 +5100,7 @@ def _billing_projection_denial(row: dict, user: dict, access: dict):
     historical_reason = historical_denials.get(access["reason_code"])
     if historical_reason:
         return access["reason_code"], historical_reason
-    if str(row.get("readiness") or "") != READINESS_READY:
+    if not admission_ready_for_receipt_correction(row):
         return "NOT_READY", "La atención todavía no está lista para facturación."
     if not admission_ars_is_visible(row.get("canonical_ars")):
         ars_key = medication_ars_key(row.get("canonical_ars"))
@@ -9614,6 +9622,9 @@ def _query_monthly_batch_receipts(con, batch_id: int, included: bool = True):
                    r.autorizacion_at AS receipt_authorization_at,
                    r.admission_nss_snapshot AS receipt_nss,
                    r.admission_cedula_snapshot AS receipt_cedula,
+                   r.fecha AS receipt_service_date,
+                   r.insurance_document_type AS receipt_document_type,
+                   r.insurance_document_number AS receipt_document_number,
                    r.specialty_snapshot AS receipt_specialty,
                    CASE WHEN NULLIF(TRIM(COALESCE(r.specialty_snapshot,'')),'') IS NULL
                    THEN (SELECT jsonb_build_object('specialty',p.specialty,
@@ -9707,10 +9718,12 @@ def _query_available_receipts_for_batch(
     ars_expr = _batch_ars_expression("r")
     normalized_ars = normalize_monthly_ars_name(batch.get("ars"))
     rows = con.execute(
-            f"""SELECT r.id AS recibo_id, r.numero, r.nombre,
+        f"""SELECT r.id AS recibo_id, r.numero, r.nombre,
                        r.admission_nss_snapshot AS nss_snapshot,
                        r.admission_cedula_snapshot AS cedula_snapshot,
                        CASE
+                           WHEN NULLIF(TRIM(COALESCE(r.insurance_document_type,'')),'')
+                               IS NOT NULL THEN r.insurance_document_type
                            WHEN NULLIF(TRIM(COALESCE(r.admission_nss_snapshot,'')),'')
                                IS NOT NULL THEN 'NSS'
                            WHEN NULLIF(TRIM(COALESCE(r.admission_cedula_snapshot,'')),'')
@@ -9718,6 +9731,7 @@ def _query_available_receipts_for_batch(
                            ELSE NULL
                        END AS document_type_snapshot,
                        COALESCE(
+                           NULLIF(TRIM(COALESCE(r.insurance_document_number,'')),''),
                            NULLIF(TRIM(COALESCE(r.admission_nss_snapshot,'')),''),
                            NULLIF(TRIM(COALESCE(r.admission_cedula_snapshot,'')),'')
                        ) AS document_number_snapshot,
@@ -9768,11 +9782,14 @@ def _query_available_receipts_for_batch(
                          THEN LEFT(r.fecha,10)::date END DESC NULLS LAST,
                     r.id DESC
                 LIMIT %s""",
-            (
-                normalized_ars,
-                date_from, date_from, date_to, date_to,
-                int(limit),
-            ),
+        (
+            normalized_ars,
+            date_from,
+            date_from,
+            date_to,
+            date_to,
+            int(limit),
+        ),
     ).fetchall()
     result = []
     for raw in rows:
@@ -10439,6 +10456,8 @@ def update_monthly_batch_receipt_export_data(
     user: dict,
     patient_name: str | None = None,
     expected_patient_name: str | None = None,
+    service_date: str | None = None,
+    expected_service_date: str | None = None,
 ) -> None:
     if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
         raise PermissionError("Tu rol no puede corregir listados mensuales.")
@@ -10453,13 +10472,20 @@ def update_monthly_batch_receipt_export_data(
     )
     from receipt_patient_correction import (
         correct_linked_name,
-        lock_name_attention,
+        correct_linked_metadata,
+        lock_metadata_attention,
         optional_patient_name,
         require_expected_name,
-        update_name_key,
+        update_header_key,
+    )
+    from monthly_receipt_fields import (
+        monthly_metadata_changes,
+        optional_service_date,
+        require_expected_date,
     )
 
     patient_name = optional_patient_name(patient_name)
+    service_date = optional_service_date(service_date)
 
     from receipt_list_consistency import (
         lock_pending_batches,
@@ -10471,7 +10497,7 @@ def update_monthly_batch_receipt_export_data(
     username = str((user or {}).get("username") or "Sistema")
     stamp = now_str()
     with db_connect() as con:
-        attention = lock_name_attention(con, receipt_id, patient_name)
+        attention = lock_metadata_attention(con, receipt_id)
         receipt = lock_receipt(con, receipt_id)
         lock_pending_batches(con, receipt_id)
         row = con.execute(
@@ -10487,23 +10513,20 @@ def update_monthly_batch_receipt_export_data(
         if not batch_is_editable(row["status"]):
             raise ValueError("Solo se pueden corregir expedientes pendientes.")
         require_expected_name(receipt, expected_patient_name)
-        changes = {
-            "numero_autorizacion": authorization,
-            "specialty_snapshot": specialty,
-            "admission_nss_snapshot"
-            if document_type == "NSS"
-            else "admission_cedula_snapshot": document_number,
-        }
+        require_expected_date(receipt, expected_service_date)
+        changes = monthly_metadata_changes(
+            receipt,
+            document_type=document_type,
+            document_number=document_number,
+            authorization=authorization,
+            specialty=specialty,
+            patient_name=patient_name,
+            service_date=service_date,
+        )
+        update_header_key(con, receipt, changes, username, _guard_active_receipt_duplicate)
         if patient_name is not None:
-            update_name_key(
-                con,
-                {**receipt, **changes},
-                patient_name,
-                username,
-                _guard_active_receipt_duplicate,
-            )
             correct_linked_name(con, receipt, attention, patient_name, user)
-            changes["nombre"] = patient_name
+        correct_linked_metadata(con, receipt, attention, changes, user, stamp)
         write_receipt_metadata(
             con, receipt, changes, username, stamp, _receipt_metadata_policy
         )
@@ -10512,6 +10535,12 @@ def update_monthly_batch_receipt_export_data(
 
 
 def _receipt_metadata_policy(receipt, authorization):
+    if receipt.get("estado_facturacion") == BILLING_INVOICED:
+        return (
+            DOCUMENT_FINAL,
+            receipt.get("review_status") or AUTH_REVIEW_NOT_APPLICABLE,
+            receipt.get("review_reason") or "",
+        )
     if receipt.get("verification_bypassed"):
         return classify_privileged_bypass_authorization(authorization)
     state = (
@@ -10882,15 +10911,11 @@ def _lock_and_validate_admission_processing(
             result.get("reason_code"), result.get("reason"),
         )
     row = result["_projection"]
+    processing = _owned_receipt_processing(con, row, receipt_id, data)
+    if processing is not None:
+        return processing
     from billing_admission_edit import validate_admission_snapshot
     validate_admission_snapshot(data, row)
-    if row.get("editing_own_receipt"):
-        return {
-            "turno_origen_id": row["receipt_origin_turn"],
-            "turno_procesamiento_id": row["receipt_processing_turn"],
-            "herencia_estado": row["receipt_inheritance_state"],
-            "already_linked": True,
-        }
     claim = con.execute(
         """SELECT session_id,expires_at
            FROM admission_billing_claims
@@ -10915,6 +10940,45 @@ def _lock_and_validate_admission_processing(
         ),
         "already_linked": False,
     }
+
+
+def _owned_receipt_processing(con, projection, receipt_id, snapshot):
+    if not projection.get("editing_own_receipt"):
+        return None
+    from billing_admission_edit import (
+        reconcile_owned_identifiers,
+        validate_admission_snapshot,
+    )
+
+    current = con.execute(
+        "SELECT admission_nss_snapshot,admission_cedula_snapshot FROM recibos WHERE id=%s FOR UPDATE",
+        (receipt_id,),
+    ).fetchone()
+    current = dict(current or {})
+    snapshot = reconcile_owned_identifiers(snapshot, projection, current)
+    validate_admission_snapshot(snapshot, projection)
+    return {
+        "turno_origen_id": projection["receipt_origin_turn"],
+        "turno_procesamiento_id": projection["receipt_processing_turn"],
+        "herencia_estado": projection["receipt_inheritance_state"],
+        "already_linked": True,
+        "shared_identifiers": [
+            current.get("admission_nss_snapshot"),
+            current.get("admission_cedula_snapshot"),
+        ],
+    }
+
+
+def _apply_shared_admission_identifiers(values, processing):
+    if processing and processing.get("shared_identifiers") is not None:
+        values[2:4] = processing["shared_identifiers"]
+
+
+def _apply_corrected_admission_metadata(values, corrected):
+    if corrected:
+        values[7] = corrected["source_updated_at"]
+        values[9] = corrected["snapshot_hash"]
+
 
 def normalize_receipt_identity(value) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).upper()
@@ -11028,6 +11092,17 @@ def update_recibo_db(recibo_id: int, nombre: str, fecha: str, dx: str, ars: str,
         con.execute("DELETE FROM recibo_items WHERE recibo_id=%s", (recibo_id,))
 
 
+def _receipt_service_type(admission_attention):
+    service_type = str(
+        (admission_attention or {}).get("attention_type", "")
+        if isinstance(admission_attention, dict)
+        else getattr(admission_attention, "attention_type", "")
+    ).upper() or "EMERGENCIA"
+    if service_type not in ("EMERGENCIA", "CONSULTA"):
+        service_type = "EMERGENCIA"
+    return service_type
+
+
 def save_receipt_with_items(
     recibo_id,
     numero,
@@ -11050,6 +11125,8 @@ def save_receipt_with_items(
     verification_bypass=None,
     payment_status="",
     exemption_reason="",
+    local_request_id="",
+    local_request_hash="",
 ):
     """Guarda cabecera, ítems, historial y snapshot con un solo commit."""
     from receipt_edit_integrity import receipt_service_date, require_same_insurance
@@ -11120,7 +11197,7 @@ def save_receipt_with_items(
                     "Tu rol no puede facturar pacientes sin seguro."
                 )
         readiness = str(attention_data.get("billing_readiness") or "")
-        if readiness and readiness != READINESS_READY:
+        if readiness and readiness != READINESS_READY and recibo_id is None:
             reasons = list(attention_data.get("readiness_reasons") or ())
             raise ValueError(
                 "La atención todavía no está completa para Facturación."
@@ -11162,28 +11239,28 @@ def save_receipt_with_items(
         review_status, review_reason = AUTH_REVIEW_NOT_APPLICABLE, ""
     authorization_changed_at = now_str() if authorization_number else None
     authorization_actor = (username or "Sistema") if authorization_number else None
-    service_type = str(
-        (admission_attention or {}).get("attention_type", "")
-        if isinstance(admission_attention, dict)
-        else getattr(admission_attention, "attention_type", "")
-    ).upper() or "EMERGENCIA"
-    if service_type not in ("EMERGENCIA", "CONSULTA"):
-        service_type = "EMERGENCIA"
+    service_type = _receipt_service_type(admission_attention)
     if admission_attention:
         admission_values[6] = str(username or "Sistema")
     with receipt_persistence_diagnostics(
         write_runtime_log, bypass=bypass_data,
         global_id=admission_values[15], source_id=admission_values[8],
     ), db_connect() as con:
+        if local_request_id:
+            from receipt_command_sync import lock_receipt_request
+            confirmed = lock_receipt_request(con, local_request_id, local_request_hash, str(username))
+            if confirmed is not None:
+                return confirmed[0]
         from receipt_patient_correction import (
             correct_linked_name,
-            lock_name_attention,
+            correct_edited_receipt_metadata,
+            lock_metadata_attention,
             normalized_patient_name,
         )
         name_attention = None
         if editing:
             nombre = normalized_patient_name(nombre)
-            name_attention = lock_name_attention(con, recibo_id, nombre)
+            name_attention = lock_metadata_attention(con, recibo_id)
         if self_pay:
             from self_pay_billing import validate_tariffs, validate_amounts
             validate_amounts(sala, item_rows, total)
@@ -11195,6 +11272,7 @@ def save_receipt_with_items(
             receipt_id=recibo_id,
             user_context=actor_user,
         )
+        _apply_shared_admission_identifiers(admission_values, admission_processing)
         if admission_attention and not (editing and is_administrator(actor_user)):
             from billing_admission_edit import validate_admission_snapshot
             validate_admission_snapshot(
@@ -11263,9 +11341,7 @@ def save_receipt_with_items(
                 nombre,
                 actor_user,
             )
-            if corrected_name:
-                admission_values[7] = corrected_name["source_updated_at"]
-                admission_values[9] = corrected_name["snapshot_hash"]
+            _apply_corrected_admission_metadata(admission_values, corrected_name)
             if str(current["ars"] or "").strip().casefold() != str(ars or "").strip().casefold():
                 from receipt_ars_correction import require_current_tariff, correct_linked_insurer
                 service_type = str(current["service_type"] or service_type)
@@ -11280,6 +11356,16 @@ def save_receipt_with_items(
             has_new_attention = admission_values[0] is not None
             from receipt_list_consistency import restore_legacy_list_identity
             current = restore_legacy_list_identity(con, recibo_id, dict(current))
+            corrected_metadata = correct_edited_receipt_metadata(
+                con,
+                {**current, "id": int(recibo_id)},
+                name_attention,
+                fecha,
+                authorization_number,
+                actor_user,
+                now_str(),
+            )
+            _apply_corrected_admission_metadata(admission_values, corrected_metadata)
             if current.get("admission_atencion_id") and current.get("specialty_snapshot"):
                 admission_values[13] = current["specialty_snapshot"]
             effective_attention_id = (
@@ -11723,6 +11809,10 @@ def save_receipt_with_items(
                 now_str(),
             ),
         )
+
+        if local_request_id:
+            from receipt_command_sync import confirm_receipt_request
+            confirm_receipt_request(con, local_request_id, local_request_hash, saved_id)
 
     return saved_id
 
@@ -16092,9 +16182,12 @@ def _receipt_snapshot_render_data(document_record):
         "hospital_line_2": document.get("hospital_line_2"),
         "document_title": document.get("document_title"),
         "numero": header.get("receipt_number"),
+        "estado_facturacion": header.get("billing_status"),
         "fecha": header.get("service_date"),
         "paciente": patient.get("name"),
         "nss": patient.get("nss"),
+        "insurance_document_type": patient.get("insurance_document_type"),
+        "insurance_document_number": patient.get("insurance_document_number"),
         "diagnostico": header.get("diagnosis"),
         "ars": header.get("ars")
         or (
@@ -16281,6 +16374,9 @@ def resolve_receipt_document(receipt_id, action="open", renderer=None):
         ):
             try:
                 document = loader(con, receipt.receipt_id)
+                from receipt_documents import refresh_billed_receipt_snapshot
+
+                document = refresh_billed_receipt_snapshot(con, raw, document)
                 path = render_receipt_snapshot_pdf(document, renderer=renderer)
                 write_runtime_log(
                     f"Recibo documento accion={action} id={receipt.receipt_id} origen={origin}"
@@ -16289,12 +16385,20 @@ def resolve_receipt_document(receipt_id, action="open", renderer=None):
             except SnapshotHashError as exc:
                 # An integrity failure is not equivalent to an absent legacy
                 # representation and must never be hidden by a fallback.
-                if receipt.storage_mode != STORAGE_HYBRID:
+                if receipt.storage_mode != STORAGE_HYBRID or receipt.billing_status == BILLING_INVOICED:
                     raise
                 attempts.append((origin, type(exc).__name__))
             except Exception as exc:
                 attempts.append((origin, type(exc).__name__))
 
+        if receipt.billing_status == BILLING_INVOICED:
+            document = _structured_receipt_document(con, receipt)
+            return render_receipt_snapshot_pdf(document, renderer=renderer)
+
+    return _resolve_legacy_receipt_document(receipt, action, renderer, attempts)
+
+
+def _resolve_legacy_receipt_document(receipt, action, renderer, attempts):
     try:
         path = _legacy_receipt_pdf_path(receipt)
         write_runtime_log(
@@ -16843,13 +16947,123 @@ class PDFWorkerSignals(QObject):
     sync_requested = Signal(int, str, str)
 
 
+def _local_receipt_actor(job):
+    username = str(job["current_user"]["username"])
+    actor = get_user(username)
+    if not actor or not actor.get("is_active", 1) or not user_has_permission(actor, PERMISSION_EDIT_PENDING):
+        raise PermissionError("El usuario ya no puede registrar recibos.")
+    return actor
+
+
+def _local_receipt_attention(job, actor, session_id):
+    username = str(actor["username"])
+    attention = job.get("admission_attention")
+    if attention:
+        verified = claim_projected_billable_attention(
+            int(attention["attention_id"]), str(attention["source_instance_id"]),
+            username=username, session_id=session_id, current_user=actor,
+            global_attention_id=str(attention.get("global_attention_id") or ""),
+        )
+        if verified is None:
+            raise ValueError("La atención local necesita revisión en Admisión.")
+        attention = verified.snapshot()
+    return attention
+
+
+def publish_local_receipt_command(job, request_id, digest, *, session_id=""):
+    from receipt_command_sync import find_confirmed_request
+    actor = _local_receipt_actor(job)
+    username = str(actor["username"])
+    with db_connect() as con:
+        confirmed = find_confirmed_request(con, request_id, digest, username)
+    if confirmed is not None:
+        return confirmed
+    attention = _local_receipt_attention(job, actor, session_id)
+    number = get_next_recibo_number()
+    receipt_id = save_receipt_with_items(
+        None, number, job["patient"], job["date_str"], job["dx_raw"],
+        job["ars_name"], job["sala"], job["total_general"], "", username,
+        job.get("is_backdated") or 0, now_str(), job["grouped"],
+        coverage=job.get("coverage") or "ASEGURADO",
+        authorization_number=job.get("authorization_number") or "",
+        admission_attention=attention, admission_session_id=session_id,
+        document_context={"visible_user": actor.get("full_name") or username},
+        verification_bypass=job.get("verification_bypass"),
+        payment_status=job.get("payment_status") or "",
+        exemption_reason=job.get("exemption_reason") or "",
+        local_request_id=request_id, local_request_hash=digest,
+    )
+    with db_connect() as con:
+        confirmed = find_confirmed_request(con, request_id, digest, username)
+    if confirmed is None or confirmed[0] != receipt_id:
+        raise RuntimeError("No se pudo verificar la confirmación del recibo local.")
+    return confirmed
+
+
+def local_billing_startup(username):
+    from receipt_continuity import local_catalog_startup
+    try:
+        return local_catalog_startup(username)
+    except Exception as exc:
+        write_runtime_log(f"LOCAL_CATALOG_READ_FAILED error_type={type(exc).__name__}")
+        return {}
+
+
+def prepare_local_billing_catalog(startup_data, current_user):
+    from receipt_continuity import remember_startup_catalog
+    if bool(current_user.get("_offline_login")):
+        for name, tariff in startup_data.get("local_tariffs", {}).items():
+            ARS_RUNTIME_CACHE.put(name, tariff)
+        markup = startup_data.get("local_medication_markup")
+        if markup is not None:
+            update_medication_markup_cache(markup["percent"], markup["version"])
+    else:
+        try:
+            remember_startup_catalog(startup_data, str(current_user.get("username") or ""))
+        except Exception as exc:
+            write_runtime_log(f"LOCAL_CATALOG_CACHE_FAILED error_type={type(exc).__name__}")
+    return list(startup_data.get("local_tariffs", {}))
+
+
+def query_final_receipt_attention(attention, current_user, session_id, receipt_id, *, global_attention_id, central_available=True):
+    if not central_available:
+        raise ConnectionError("connection refused: central retry deferred")
+    from receipt_edit_integrity import receipt_validation_snapshot
+    attention_id = attention.get("attention_id") or attention.get("admission_atencion_id")
+    return get_projected_billable_attention(
+        int(attention_id), str(attention.get("source_instance_id") or "LEGACY"),
+        current_user=current_user, global_attention_id=global_attention_id,
+        session_id=session_id, receipt_id=receipt_id,
+        expected_snapshot=receipt_validation_snapshot(
+            attention, editable_header=(receipt_id is not None and is_administrator(current_user)),
+        ),
+        explain_denial=True,
+    )
+
+
+def local_receipt_saved_message(message, number):
+    if str(message).startswith("__LOCAL_RECEIPT_SAVED__:"):
+        return "Recibo local guardado · pendiente de sincronización"
+    return f"Recibo N° {number} guardado correctamente"
+
+
 class PDFDatabaseWorker(threading.Thread):
-    def __init__(self):
+    def __init__(self, username="", session_id=""):
         super().__init__(name="PDFEngineThread", daemon=True)
         self.signals = PDFWorkerSignals()
         self.jobs = queue.Queue()
         self._running = True
         self.renderer = None
+        self.username = str(username)
+        self.session_id = str(session_id)
+        self._local_sync = None
+        self._local_backup_schedule = None
+        from network_retry import NetworkRetryGate
+        self._local_retry_gate = NetworkRetryGate()
+
+    @property
+    def can_contact_central(self):
+        return self._local_retry_gate.ready
 
     def warm_up(self):
         started = perf_counter()
@@ -16876,7 +17090,11 @@ class PDFDatabaseWorker(threading.Thread):
         self.warm_up()
         try:
             while self._running:
-                job = self.jobs.get()
+                try:
+                    job = self.jobs.get(timeout=10)
+                except queue.Empty:
+                    self._synchronize_local_receipts()
+                    continue
                 if job is None:
                     break
                 self.process(job)
@@ -16884,6 +17102,54 @@ class PDFDatabaseWorker(threading.Thread):
             if self.renderer is not None:
                 self.renderer.close()
                 self.renderer = None
+
+    def _synchronize_local_receipts(self):
+        if not self.username:
+            return
+        try:
+            from local_receipts import LocalReceiptSynchronizer
+            from receipt_continuity import local_receipt_store
+            from admission_source.emergency_core.backup import BackupManager, DailyBackupSchedule
+            store = local_receipt_store()
+            if self._local_backup_schedule is None:
+                self._local_backup_schedule = DailyBackupSchedule(
+                    BackupManager(store.path, store.path.parent / "backups"),
+                )
+            self._local_backup_schedule.run_due()
+            if self._local_sync is None:
+                self._local_sync = LocalReceiptSynchronizer(
+                    store,
+                    lambda job, identity, digest: publish_local_receipt_command(
+                        job, identity, digest, session_id=self.session_id,
+                    ),
+                    is_temporary_connection_error,
+                    retry_gate=self._local_retry_gate,
+                )
+            self._local_sync.run(self.username)
+        except Exception as exc:
+            write_runtime_log(f"LOCAL_RECEIPT_SYNC_FAILED error_type={type(exc).__name__}")
+
+    def _save_local_receipt(self, job, request_id):
+        from receipt_continuity import local_receipt_store, render_local_receipt
+        from admission_source.emergency_core.backup import BackupManager
+        store = local_receipt_store()
+        try:
+            BackupManager(store.path, store.path.parent / "backups").create("recibo_local")
+        except Exception as exc:
+            write_runtime_log(f"LOCAL_RECEIPT_BACKUP_FAILED error_type={type(exc).__name__}")
+        try:
+            if self.renderer is None:
+                from pdf_engine import ReceiptPDFRenderer
+                self.renderer = ReceiptPDFRenderer()
+            pdf_path = render_local_receipt(job, request_id, self.renderer)
+        except Exception as exc:
+            pdf_path = ""
+            write_runtime_log(f"LOCAL_RECEIPT_RENDER_FAILED error_type={type(exc).__name__}")
+        self.signals.finished_signal.emit(
+            True,
+            ("__LOCAL_RECEIPT_REOPENED__:" if job.get("reopen_local_request") else "__LOCAL_RECEIPT_SAVED__:") + request_id,
+            pdf_path, 0,
+        )
 
     def _legacy_process_disabled(self, job):
         self.patient = job["patient"]
@@ -17185,6 +17451,69 @@ class PDFDatabaseWorker(threading.Thread):
             write_runtime_log(f"Error generando PDF: {e}")
             self.signals.finished_signal.emit(False, str(e), "", 0)
 
+    def _prepare_local_job(self, job):
+        if job.get("reopen_local_request"):
+            self._save_local_receipt(job, job["reopen_local_request"])
+            return "", "", True
+        if job.get("editing_id") is not None:
+            return "", "", False
+        from receipt_continuity import local_receipt_store
+        from local_receipts import receipt_command
+        identity = local_receipt_store().enqueue(job)
+        _payload, digest = receipt_command(job)
+        if not self.can_contact_central or job["current_user"].get("_offline_login") or job.get("force_local"):
+            self._save_local_receipt(job, identity)
+            return identity, digest, True
+        return identity, digest, False
+
+    def _confirm_local_command(self, identity, receipt_id, number):
+        self._local_retry_gate.succeeded()
+        if identity:
+            from receipt_continuity import local_receipt_store
+            local_receipt_store().confirm(identity, receipt_id, int(number))
+
+    def _handle_local_failure(self, job, identity, error):
+        if not identity:
+            return False
+        from receipt_continuity import local_receipt_store
+        if is_temporary_connection_error(error):
+            self._local_retry_gate.failed(error)
+            self._save_local_receipt(job, identity)
+            return True
+        local_receipt_store().record_failure(identity, error, review=True)
+        return False
+
+    def _render_saved_receipt(self, receipt_id):
+        with db_connect() as con:
+            stored_receipt = con.execute(
+                """SELECT id,estado_facturacion,document_storage_mode,pdf_filename
+                   FROM recibos WHERE id=%s""",
+                (receipt_id,),
+            ).fetchone()
+            storage_mode = str(
+                stored_receipt["document_storage_mode"]
+                or STORAGE_LEGACY
+            )
+            direct_document = (
+                load_current_receipt_snapshot(con, receipt_id)
+                if storage_mode == STORAGE_LEGACY
+                else None
+            )
+            if direct_document is not None:
+                from receipt_documents import refresh_billed_receipt_snapshot
+
+                direct_document = refresh_billed_receipt_snapshot(con, stored_receipt, direct_document)
+        pdf_path = (
+            render_receipt_snapshot_pdf(
+                direct_document, renderer=self.renderer
+            )
+            if direct_document is not None
+            else resolve_receipt_document_path(
+                receipt_id, renderer=self.renderer
+            )
+        )
+        return pdf_path, storage_mode
+
     def process(self, job):
         """Guarda el snapshot y reconstruye una copia temporal para abrir/imprimir."""
         patient = job["patient"]
@@ -17195,12 +17524,17 @@ class PDFDatabaseWorker(threading.Thread):
         room = job["sala"]
         grouped = job["grouped"]
         total = job["total_general"]
-        editing_id = job["editing_id"]
-        editing_number = job["editing_num"]
+        editing_id = job.get("editing_id")
+        editing_number = job.get("editing_num")
         current_user = job["current_user"]
         authorization = str(job.get("authorization_number") or "").strip()
         total_started = perf_counter()
+        local_request_id = ""
+        local_request_hash = ""
         try:
+            local_request_id, local_request_hash, handled = self._prepare_local_job(job)
+            if handled:
+                return
             generated_at = now_str()
             if editing_id is not None:
                 try:
@@ -17248,34 +17582,14 @@ class PDFDatabaseWorker(threading.Thread):
                 verification_bypass=job.get("verification_bypass"),
                 payment_status=str(job.get("payment_status") or ""),
                 exemption_reason=str(job.get("exemption_reason") or ""),
+                local_request_id=local_request_id,
+                local_request_hash=local_request_hash,
             )
+            self._confirm_local_command(local_request_id, receipt_id, receipt_number)
             database_elapsed = perf_counter() - database_started
             try:
                 render_started = perf_counter()
-                with db_connect() as con:
-                    stored_receipt = con.execute(
-                        """SELECT document_storage_mode,pdf_filename
-                           FROM recibos WHERE id=%s""",
-                        (receipt_id,),
-                    ).fetchone()
-                    storage_mode = str(
-                        stored_receipt["document_storage_mode"]
-                        or STORAGE_LEGACY
-                    )
-                    direct_document = (
-                        load_current_receipt_snapshot(con, receipt_id)
-                        if storage_mode == STORAGE_LEGACY
-                        else None
-                    )
-                pdf_path = (
-                    render_receipt_snapshot_pdf(
-                        direct_document, renderer=self.renderer
-                    )
-                    if direct_document is not None
-                    else resolve_receipt_document_path(
-                        receipt_id, renderer=self.renderer
-                    )
-                )
+                pdf_path, storage_mode = self._render_saved_receipt(receipt_id)
                 if storage_mode in (STORAGE_LEGACY, STORAGE_HYBRID):
                     legacy_filename = f"recibo_{int(receipt_number)}.pdf"
                     legacy_path = stable_storage_path(
@@ -17320,10 +17634,12 @@ class PDFDatabaseWorker(threading.Thread):
                 True, "Éxito", pdf_path, int(receipt_number)
             )
         except AdmissionAttentionUnavailableError as exc:
+            self._handle_local_failure(job, local_request_id, exc)
             self.signals.finished_signal.emit(
                 False, "__ADMISSION_UNAVAILABLE__:" + str(exc), "", 0
             )
         except DuplicateReceiptError as exc:
+            self._handle_local_failure(job, local_request_id, exc)
             payload = {"message": str(exc), "receipt": exc.receipt}
             self.signals.finished_signal.emit(
                 False,
@@ -17333,6 +17649,8 @@ class PDFDatabaseWorker(threading.Thread):
                 0,
             )
         except Exception as exc:
+            if self._handle_local_failure(job, local_request_id, exc):
+                return
             write_runtime_log(
                 "RECEIPT_WORKER_FAILED operation=SAVE_RECEIPT "
                 f"exception_type={type(exc).__name__}"
@@ -19064,9 +19382,7 @@ class LoginAuthenticationWorker(QThread):
                 )
             startup_data = (
                 {
-                    "universal": {cat: {} for cat in UNIVERSAL_CATEGORIES},
-                    "preferences": {"theme": "claro"},
-                    "catalog_favorites": set(),
+                    **local_billing_startup(user["username"]),
                     "local_admission_ready": local_admission_ready,
                 }
                 if bool(user.get("_offline_login"))
@@ -23149,6 +23465,9 @@ class MonthlyReceiptEditorDialog(QDialog):
         self._original_patient_name = str(
             receipt.get("patient_snapshot") or receipt.get("nombre") or ""
         )
+        from monthly_receipt_fields import receipt_service_date_snapshot
+
+        self._original_service_date = receipt_service_date_snapshot(receipt)
 
         patient = QLabel(
             f"{self._original_patient_name}\nRecibo {receipt.get('numero') or ''}"
@@ -23159,9 +23478,9 @@ class MonthlyReceiptEditorDialog(QDialog):
         root.addWidget(patient)
 
         hint = QLabel(
-            "El nombre, el NSS, la autorización y la especialidad se actualizan "
-            "en el recibo y sus listados pendientes. Si está vinculado, el nombre "
-            "también se corrige en Admisión. La corrección queda registrada."
+            "El nombre, la fecha, la identificación, la autorización y la especialidad "
+            "se actualizan en el recibo y sus listados pendientes. Si está vinculado, "
+            "también se corrigen en Admisión. La corrección queda registrada."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(
@@ -23177,12 +23496,11 @@ class MonthlyReceiptEditorDialog(QDialog):
         )
         root.insertWidget(0, title("Corregir datos para el envío"))
         form = QGridLayout()
+        from monthly_receipt_fields import list_document_options, normalize_document_type
         self.document_type = QComboBox()
-        self.document_type.addItems(["NSS", "CÉDULA"])
+        self.document_type.addItems(list_document_options(receipt.get("ars_snapshot") or receipt.get("ars")))
         current_type = str(receipt.get("document_type_snapshot") or "NSS").upper()
-        self.document_type.setCurrentText(
-            "CÉDULA" if current_type in {"CÉDULA", "CEDULA"} else "NSS"
-        )
+        self.document_type.setCurrentText(normalize_document_type(current_type))
         self.document_number = QLineEdit(
             str(receipt.get("document_number_snapshot") or "")
         )
@@ -23204,14 +23522,17 @@ class MonthlyReceiptEditorDialog(QDialog):
         self.specialty = SpecialtyComboBox(
             receipt.get("specialty_snapshot") or "EMERGENCIOLOGÍA", choices
         )
+        self._install_service_date()
+        self.document_label = QLabel(self.document_type.currentText())
+        self.document_type.currentTextChanged.connect(self.document_label.setText)
         for row, column, caption, control in (
             (2, 0, "Tipo de documento", self.document_type),
             (2, 1, "Autorización", self.authorization),
-            (4, 0, "NSS / cédula", self.document_number),
+            (4, 0, self.document_label, self.document_number),
             (4, 1, "Especialidad", self.specialty),
+            (6, 0, "Fecha de servicio", self.service_date),
         ):
-            form.addWidget(QLabel(caption), row, column)
-            form.addWidget(control, row + 1, column)
+            self._add_correction_control(form, row, column, caption, control)
         self.document_number.setMaxLength(24)
         self.authorization.setMaxLength(40)
         root.addLayout(form)
@@ -23222,6 +23543,21 @@ class MonthlyReceiptEditorDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
+    def _install_service_date(self):
+        initial_date = QDate.fromString(self._original_service_date[:10], "yyyy-MM-dd")
+        self.service_date = QDateEdit(
+            initial_date if initial_date.isValid() else QDate.currentDate()
+        )
+        self.service_date.setCalendarPopup(True)
+        self.service_date.setDisplayFormat("dd-MM-yyyy")
+
+    @staticmethod
+    def _add_correction_control(form, row, column, caption, control):
+        form.addWidget(
+            caption if isinstance(caption, QLabel) else QLabel(caption), row, column
+        )
+        form.addWidget(control, row + 1, column)
+
     def values(self) -> dict:
         return {
             "document_type": self.document_type.currentText(),
@@ -23230,6 +23566,8 @@ class MonthlyReceiptEditorDialog(QDialog):
             "specialty": self._normalize_specialty(self.specialty.currentText()),
             "patient_name": self.patient_name.text().strip(),
             "expected_patient_name": self._original_patient_name,
+            "service_date": self.service_date.date().toString("yyyy-MM-dd"),
+            "expected_service_date": self._original_service_date or None,
         }
 
 
@@ -26030,7 +26368,7 @@ class ReceiptHistoryDialog(QDialog):
         )
         self.action_assign_audit = self.more_actions_menu.addAction("Asignarme")
         self.action_link_attention = self.more_actions_menu.addAction(
-            "Vincular a atención heredada…"
+            "Vincular a atención de Admisión…"
         )
         self.action_link_attention.triggered.connect(self.link_selected_attention)
         self.btn_more_actions.setMenu(self.more_actions_menu)
@@ -26970,15 +27308,11 @@ class ReceiptHistoryDialog(QDialog):
         }
 
     def _set_history_query_busy(self, busy):
-        if busy and hasattr(self, "history_workspace"):
-            self.history_workspace.search_focus.query_started()
         self.btn_search.setEnabled(not busy)
         self.btn_clear_filters.setEnabled(not busy)
         if busy:
             self.btn_previous_page.setEnabled(False)
             self.btn_next_page.setEnabled(False)
-        elif hasattr(self, "history_workspace"):
-            self.history_workspace.search_focus.query_completed()
 
     def _load_metrics_async(self, generation, include_filters=False):
         if self._metrics_worker is not None and self._metrics_worker.isRunning():
@@ -31459,7 +31793,7 @@ class AdmissionHistoryDialog(QDialog):
         if getattr(self, "_cancellation_worker", None) is None:
             super().done(result)
 
-    def __init__(self, current_user=None, parent=None):
+    def __init__(self, current_user=None, parent=None, *, initial_search=True):
         requested_user = dict(current_user or {})
         if not can_access_billing_admission_history(requested_user):
             raise PermissionError(
@@ -31667,7 +32001,11 @@ class AdmissionHistoryDialog(QDialog):
         self._update_date_enabled(False)
         self._update_action_state()
         APP_ICONS.register_scope(self)
-        QTimer.singleShot(0, self.search)
+        self._schedule_initial_search(initial_search)
+
+    def _schedule_initial_search(self, enabled):
+        if enabled:
+            QTimer.singleShot(0, self.search)
 
     def _update_date_enabled(self, enabled):
         self.date_from.setEnabled(bool(enabled))
@@ -31920,7 +32258,7 @@ class AdmissionHistoryDialog(QDialog):
         self.use_button.setEnabled(False)
         self.loading_label.setText("Validando atención…")
         parent = self.parentWidget()
-        session_id = str(getattr(parent, "session_id", "") or "")
+        session_id = str(getattr(self, "session_id", "") or getattr(parent, "session_id", "") or "")
         worker = AdmissionHistoryEligibilityWorker(
             data,
             self.current_user,
@@ -32997,6 +33335,7 @@ class MainWindow(QMainWindow):
         startup_data = dict(startup_data or {})
         self._pending_ars_correction: dict[str, str] | None = None
         self.offline_login = bool(current_user.get("_offline_login"))
+        self._local_tariff_names = prepare_local_billing_catalog(startup_data, current_user)
         self.setWindowTitle(APP_TITLE)
         self.setMinimumSize(800, 600) 
         self.current_ars = ""
@@ -33093,6 +33432,9 @@ class MainWindow(QMainWindow):
         self.on_ars_changed(self.ars_combo.currentText())
         self.refresh_picker()
         self.display_layout.start()
+        self._configure_offline_modules()
+
+    def _configure_offline_modules(self):
         if self.offline_login:
             for index in range(self.module_tabs.count()):
                 self.module_tabs.setTabEnabled(
@@ -33100,6 +33442,8 @@ class MainWindow(QMainWindow):
                     self.emergency_module_index is not None
                     and index == self.emergency_module_index,
                 )
+            if self.billing_module_index is not None and can_bypass_patient_verification(self.current_user) and self._local_tariff_names:
+                self.module_tabs.setTabEnabled(self.billing_module_index, True)
             if self.emergency_module_index is not None:
                 self.module_tabs.setCurrentIndex(self.emergency_module_index)
 
@@ -33109,6 +33453,7 @@ class MainWindow(QMainWindow):
             return
         self._deferred_services_started = True
         if self.offline_login:
+            self._start_pdf_services()
             return
         self._start_pdf_services()
         worker = StartupMaintenanceWorker(
@@ -33136,7 +33481,9 @@ class MainWindow(QMainWindow):
         self.pdf_sync_worker = PDFStorageSyncWorker(self)
         self.pdf_sync_worker.start()
 
-        self.pdf_worker = PDFDatabaseWorker()
+        self.pdf_worker = PDFDatabaseWorker(
+            self.current_user.get("username", ""), self.session_id,
+        )
         self.pdf_worker.signals.finished_signal.connect(self.on_pdf_generated)
         self.pdf_worker.signals.sync_requested.connect(self.pdf_sync_worker.enqueue)
         self.pdf_worker.start()
@@ -33238,11 +33585,8 @@ class MainWindow(QMainWindow):
             capacity_action = advanced_menu.addAction(
                 "Capacidad de base de datos"
             )
-            admission_import_action = None
-            if user_is_admin(self.current_user):
-                admission_import_action = advanced_menu.addAction(
-                    "Actualizar base de datos de Admisión"
-                )
+            local_receipts_action = advanced_menu.addAction("Recibos locales pendientes")
+            local_receipts_action.triggered.connect(self.open_local_receipts_dialog)
             honorarium_settings_action = advanced_menu.addAction(
                 "Honorarios por ARS"
             )
@@ -33251,10 +33595,6 @@ class MainWindow(QMainWindow):
             capacity_action.triggered.connect(
                 self.open_database_capacity_dialog
             )
-            if admission_import_action is not None:
-                admission_import_action.triggered.connect(
-                    self.open_admission_database_import
-                )
             honorarium_settings_action.triggered.connect(
                 self.open_ars_honorarium_settings
             )
@@ -33446,7 +33786,7 @@ class MainWindow(QMainWindow):
         self.dx_edit = QLineEdit(); self.dx_edit.setPlaceholderText("Diagnóstico (DX)")
 
         self.ars_combo = QComboBox(); self.ars_combo.addItems(
-            [] if self.offline_login else ars_list()
+            self._local_tariff_names if self.offline_login else ars_list()
         )
         self.coverage_combo = QComboBox()
         self.coverage_combo.addItems(list(COVERAGE_LABELS.values()))
@@ -35773,6 +36113,11 @@ class MainWindow(QMainWindow):
     def _on_ars_runtime_loaded(self, ars_name: str, data, elapsed_ms: float):
         self._ars_runtime_worker = None
         ARS_RUNTIME_CACHE.put(ars_name, dict(data or {}))
+        from receipt_continuity import remember_tariff
+        try:
+            remember_tariff(ars_name, dict(data or {}))
+        except Exception as exc:
+            write_runtime_log(f"LOCAL_TARIFF_CACHE_FAILED error_type={type(exc).__name__}")
         if ars_name == self.current_ars:
             self._apply_ars_runtime_data(ars_name, dict(data or {}))
         write_runtime_log(
@@ -35974,6 +36319,9 @@ class MainWindow(QMainWindow):
             )
             if not self.editing_recibo_id:
                 self.btn_generate.setText("GUARDAR RECIBO DE COBRO (F5)")
+            if getattr(self, "offline_login", False):
+                self.document_flow_hint.setText("SIN CONEXIÓN · Recibo local pendiente de validación central.")
+                self.btn_generate.setText("GUARDAR RECIBO LOCAL (F5)")
             return
         if hasattr(self, "btn_validate_admission"):
             self.btn_validate_admission.show()
@@ -35983,6 +36331,9 @@ class MainWindow(QMainWindow):
                 if ready
                 else "GUARDAR E IMPRIMIR PRELIMINAR (F5)"
             )
+        if getattr(self, "offline_login", False):
+            self.document_flow_hint.setText("SIN CONEXIÓN · Los recibos se guardan localmente y quedan pendientes de validación central.")
+            self.btn_generate.setText("GUARDAR RECIBO LOCAL (F5)")
 
     def _coverage_conflicts_with_cart(self, coverage):
         if not hasattr(self, "current_ars"):
@@ -36429,6 +36780,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_pending_ars_correction", None):
             QMessageBox.information(self, "Cambio de ARS", "Espere a que se cargue y recalcule la nueva tarifa.")
             return
+        force_local = False
         self.mark_activity()
         if self.receipt_read_only:
             QMessageBox.information(
@@ -36472,29 +36824,12 @@ class MainWindow(QMainWindow):
                 self.btn_validate_admission.setFocus()
                 return
         if self.current_admission_attention:
-            attention_id = (
-                self.current_admission_attention.get("attention_id")
-                or self.current_admission_attention.get("admission_atencion_id")
-            )
             try:
-                from receipt_edit_integrity import receipt_validation_snapshot
-                live_attention = get_projected_billable_attention(
-                    int(attention_id),
-                    str(
-                        self.current_admission_attention.get("source_instance_id")
-                        or "LEGACY"
-                    ),
-                    current_user=self.current_user,
-                    global_attention_id=str(
-                        self.current_admission_attention.get("global_attention_id") or ""
-                    ),
-                    session_id=self.session_id,
-                    receipt_id=self.editing_recibo_id,
-                    expected_snapshot=receipt_validation_snapshot(
-                        self.current_admission_attention,
-                        editable_header=(self.editing_recibo_id is not None and is_administrator(self.current_user)),
-                    ),
-                    explain_denial=True,
+                live_attention = query_final_receipt_attention(
+                    self.current_admission_attention, self.current_user,
+                    self.session_id, self.editing_recibo_id,
+                    global_attention_id=str(self.current_admission_attention.get("global_attention_id") or ""),
+                    central_available=getattr(getattr(self, "pdf_worker", None), "can_contact_central", True),
                 )
             except ValueError as exc:
                 QMessageBox.warning(self, "Verificar Admisión", str(exc))
@@ -36504,40 +36839,42 @@ class MainWindow(QMainWindow):
                 )
                 return
             except Exception as exc:
-                QMessageBox.critical(
-                    self,
-                    "Verificar Admisión",
-                    "No se pudo verificar la atención central. "
-                    "El recibo permanece pendiente y no se guardó.",
+                if self.editing_recibo_id is None and is_temporary_connection_error(exc):
+                    force_local = True
+                else:
+                    QMessageBox.critical(
+                        self, "Verificar Admisión",
+                        "No se pudo verificar la atención central. El recibo no se guardó.",
+                    )
+                    write_runtime_log(f"BILLING_FINAL_ELIGIBILITY query_failed exception_type={type(exc).__name__}")
+                    return
+            if not force_local:
+                if not live_attention:
+                    schedule_admission_claim_release(
+                        self.current_admission_attention, session_id=self.session_id,
+                    )
+                    QMessageBox.warning(
+                        self,
+                        "Atención excluida",
+                        "La atención fue anulada, cambió a Urgencia o dejó de estar "
+                        "disponible. El recibo no se guardó.",
+                    )
+                    return
+                claim_time = self.current_admission_attention.get("billing_claim_acquired_at", "")
+                self.current_admission_attention = live_attention.snapshot()
+                self.current_admission_attention["billing_claim_acquired_at"] = claim_time
+                live_ars = str(
+                    self.current_admission_attention.get("canonical_ars")
+                    or self.current_admission_attention.get("ars")
+                    or ""
                 )
-                write_runtime_log(f"BILLING_FINAL_ELIGIBILITY query_failed exception_type={type(exc).__name__}")
-                return
-            if not live_attention:
-                schedule_admission_claim_release(
-                    self.current_admission_attention, session_id=self.session_id,
-                )
-                QMessageBox.warning(
-                    self,
-                    "Atención excluida",
-                    "La atención fue anulada, cambió a Urgencia o dejó de estar "
-                    "disponible. El recibo no se guardó.",
-                )
-                return
-            claim_time = self.current_admission_attention.get("billing_claim_acquired_at", "")
-            self.current_admission_attention = live_attention.snapshot()
-            self.current_admission_attention["billing_claim_acquired_at"] = claim_time
-            live_ars = str(
-                self.current_admission_attention.get("canonical_ars")
-                or self.current_admission_attention.get("ars")
-                or ""
-            )
-            if live_ars and not medication_ars_is_selectable(live_ars):
-                QMessageBox.information(
-                    self,
-                    "Facturación de medicamentos",
-                    "SENASA SUBSIDIADO no se factura en este módulo.",
-                )
-                return
+                if live_ars and not medication_ars_is_selectable(live_ars):
+                    QMessageBox.information(
+                        self,
+                        "Facturación de medicamentos",
+                        "SENASA SUBSIDIADO no se factura en este módulo.",
+                    )
+                    return
         patient = self.name_edit.text().strip()
         if not patient:
             FloatingToast("❌ El nombre del paciente es obligatorio", self, is_error=True).show()
@@ -36604,6 +36941,7 @@ class MainWindow(QMainWindow):
         self.btn_generate.setText("⏳ Generando y guardando...")
 
         self.pdf_worker.submit({
+            "force_local": force_local,
             "patient": patient,
             "date_str": date_str,
             "dx_raw": dx_raw,
@@ -36670,7 +37008,18 @@ class MainWindow(QMainWindow):
             except Exception as e2:
                 print(f"[PDF] Error al abrir PDF (fallback): {e2}")
 
+    def _handle_local_receipt_reopen(self, message, pdf_path):
+        if str(message).startswith("__LOCAL_RECEIPT_REOPENED__:"):
+            if pdf_path:
+                self._open_pdf_after_generation(pdf_path)
+            else:
+                QMessageBox.warning(self, "Recibo local", "La copia PDF no pudo generarse; los datos se conservan.")
+            return True
+        return False
+
     def on_pdf_generated(self, success, message, pdf_path, recibo_number):
+        if self._handle_local_receipt_reopen(message, pdf_path):
+            return
         selected_date_before_reset = self.date_edit.date()
 
         self.btn_generate.setEnabled(True)
@@ -36679,7 +37028,11 @@ class MainWindow(QMainWindow):
         if success:
             self.reset_all()
             self.date_edit.setDate(selected_date_before_reset)
-            FloatingToast(f"Recibo N° {recibo_number} guardado correctamente", self).show()
+            local_saved = str(message).startswith("__LOCAL_RECEIPT_SAVED__:")
+            saved_message = local_receipt_saved_message(message, recibo_number)
+            FloatingToast(saved_message, self).show()
+            if local_saved and not pdf_path:
+                QMessageBox.warning(self, "Recibo local guardado", "Los datos están guardados localmente, pero la copia PDF no pudo generarse. Puede recuperarla desde Recibos locales.")
             if str(message).startswith("__RECEIPT_SAVED_RENDER_ERROR__:"):
                 QMessageBox.warning(
                     self,
@@ -36815,33 +37168,6 @@ class MainWindow(QMainWindow):
             return
         DatabaseCapacityDialog(self).exec()
 
-    def open_admission_database_import(self):
-        if not user_is_admin(self.current_user):
-            QMessageBox.warning(
-                self,
-                "Acceso denegado",
-                "Solo Administrador puede actualizar la base central de Admisión.",
-            )
-            return
-        manager = getattr(self, "_admission_import_task_manager", None)
-        if manager is None:
-            manager = AdmissionDatabaseImportTaskManager(
-                self.current_user,
-                getattr(self, "device_id", ""),
-                self,
-            )
-            self._admission_import_task_manager = manager
-        else:
-            manager.set_context(self.current_user, getattr(self, "device_id", ""))
-        manager.recover_durable_task()
-        dialog = AdmissionDatabaseImportDialog(
-            self.current_user,
-            getattr(self, "device_id", ""),
-            self,
-            task_manager=manager,
-        )
-        dialog.exec()
-
     def open_ars_honorarium_settings(self):
         self.mark_activity()
         ARSHonorariumSettingsDialog(self.current_user, self).exec()
@@ -36896,7 +37222,14 @@ class MainWindow(QMainWindow):
 
     def open_receipts_history_dialog(self):
         self.mark_activity()
+        if self.offline_login:
+            self.open_local_receipts_dialog()
+            return
         ReceiptHistoryDialog(main_window=self, parent=self).exec()
+
+    def open_local_receipts_dialog(self):
+        from local_receipts_dialog import LocalReceiptsDialog
+        LocalReceiptsDialog(self).exec()
 
     def _switch_main_module(self, index: int):
         switch_started = perf_counter()
@@ -37171,6 +37504,14 @@ class MainWindow(QMainWindow):
             data.get("medication_markup_percent", DEFAULT_MEDICATION_MARKUP_PERCENT),
             data.get("medication_markup_version", 0),
         )
+        from receipt_continuity import local_receipt_store
+        try:
+            local_receipt_store().cache("medication_markup", {
+                "percent": get_medication_markup_percent(),
+                "version": int(data.get("medication_markup_version") or 0),
+            })
+        except Exception as exc:
+            write_runtime_log(f"LOCAL_PRICING_CACHE_FAILED error_type={type(exc).__name__}")
         HONORARIUM_PROMPT_SETTINGS.update(data.get("honorarium_settings") or [])
         write_runtime_log(f"SessionHealth background_ms={elapsed_ms:.1f}")
         if not data.get("alive") and not self._logout_finalizing:

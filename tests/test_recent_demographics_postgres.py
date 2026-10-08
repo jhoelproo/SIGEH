@@ -86,6 +86,7 @@ def demographic_database(server):
                 patient_name TEXT, cedula_snapshot TEXT,nss_snapshot TEXT,canonical_ars TEXT,
                 coverage_status TEXT,readiness TEXT,readiness_reasons TEXT,
                 snapshot_hash TEXT,source_updated_at TEXT,
+                service_date TEXT,specialty TEXT,authorization_snapshot TEXT,
                 source_instance_id TEXT DEFAULT 'ORIGINAL', attention_id INT,
                 operational_session_id UUID, operational_source_id UUID,
                 generation INT DEFAULT 3, turn_id INT DEFAULT 10);

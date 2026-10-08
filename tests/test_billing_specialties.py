@@ -1,15 +1,16 @@
-"""Specialty completion does not lose saved custom values or admission names."""
+"""Only approved specialties can be saved; matching ignores accents."""
 
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QComboBox
 
 from billing_specialties import (
     SpecialtyComboBox,
     normalized_specialty,
+    receipt_specialty_snapshot,
     specialty_matches,
     specialty_options,
 )
@@ -24,15 +25,12 @@ from receipt_patient_correction import normalized_patient_name
         ("PEDIATRIA", "PEDIATRÍA"),
         ("  ginecología ", "GINECOLOGÍA"),
         ("emergenciologia", "EMERGENCIOLOGÍA"),
-        ("general", "GENERAL"),
+        ("general", "EMERGENCIOLOGÍA"),
         ("gineco", "GINECOLOGÍA"),
         ("pe", "PEDIATRÍA"),
         ("pediatra", "PEDIATRÍA"),
-        ("NEUROLOGÍA", "NEUROLOGÍA"),
-        ("P", "P"),
         ("", ""),
         (None, ""),
-        ("x" * 100, "X" * 100),
     ],
 )
 def test_specialty_values_preserve_known_custom_empty_and_boundary(value, expected):
@@ -44,22 +42,77 @@ def test_specialty_too_long_is_rejected():
         normalized_specialty("x" * 101)
 
 
-def test_options_deduplicate_accents_and_keep_custom_specialties():
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("GENERAL", "EMERGENCIOLOGÍA"),
+        ("  general ", "EMERGENCIOLOGÍA"),
+        ("EMERGENCIOLOGIA", "EMERGENCIOLOGÍA"),
+        ("PEDIATRIA", "PEDIATRÍA"),
+        ("ginecologia", "GINECOLOGÍA"),
+        ("NEUROLOGÍA", "NEUROLOGÍA"),
+        ("  Especialidad histórica ", "  Especialidad histórica "),
+        ("gineco", "gineco"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_new_receipt_snapshot_canonicalizes_known_admission_specialty(value, expected):
+    import CALCULOS_QT as app
+
+    attention = {
+        "attention_id": 1,
+        "patient_id": 2,
+        "specialty": value,
+        "snapshot_hash": "original-admission-hash",
+    }
+    values = app._admission_values(attention)
+    assert values[13] == expected
+    assert values[9] == "original-admission-hash"
+    assert attention["specialty"] == value
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("GENERAL", "EMERGENCIOLOGÍA"),
+        ("EMERGENCIOLOGÍA", "EMERGENCIOLOGÍA"),
+        (" pediatría ", "PEDIATRÍA"),
+        ("GINECOLOGIA", "GINECOLOGÍA"),
+        ("NEUROLOGÍA", "NEUROLOGÍA"),
+        ("pediatra", "pediatra"),
+        (None, ""),
+    ],
+)
+def test_admission_snapshot_normalization_preserves_explicit_legacy_values(
+    value, expected
+):
+    assert receipt_specialty_snapshot(value) == expected
+
+
+def test_options_only_include_the_three_approved_specialties():
     assert specialty_options(["PEDIATRIA", "neurología", "NEUROLOGIA", None, ""]) == [
         "EMERGENCIOLOGÍA",
         "PEDIATRÍA",
         "GINECOLOGÍA",
-        "GENERAL",
-        "NEUROLOGÍA",
     ]
     assert specialty_matches("") == specialty_options()
     assert specialty_matches("pedia") == ["PEDIATRÍA"]
     assert specialty_matches("zzzz") == []
+    assert specialty_matches("general") == ["EMERGENCIOLOGÍA"]
+
+
+@pytest.mark.parametrize("value", ["NEUROLOGÍA", "P", "x" * 100])
+def test_unapproved_specialty_cannot_be_saved(value):
+    with pytest.raises(ValueError, match="especialidad"):
+        normalized_specialty(value)
 
 
 def test_specialty_combo_completion_and_reopening_preserve_saved_values():
     application = QApplication.instance() or QApplication([])
     combo = SpecialtyComboBox("NEUROLOGÍA", ["GENERAL", "CARDIOLOGÍA"])
+    assert combo.count() == 3
+    assert combo.insertPolicy() == QComboBox.InsertPolicy.NoInsert
     combo.lineEdit().setText("gineco")
     combo.lineEdit().textEdited.emit("gineco")
     assert combo.completer().model().stringList() == ["GINECOLOGÍA"]
@@ -68,6 +121,11 @@ def test_specialty_combo_completion_and_reopening_preserve_saved_values():
     reopened = SpecialtyComboBox(combo.currentText())
     assert reopened.currentText() == "GINECOLOGÍA"
     assert SpecialtyComboBox().currentText() == "EMERGENCIOLOGÍA"
+    combo.setEditText("NEUROLOGÍA")
+    combo.lineEdit().editingFinished.emit()
+    assert combo.count() == 3
+    with pytest.raises(ValueError):
+        normalized_specialty(combo.currentText())
     combo.close()
     reopened.close()
     application.processEvents()

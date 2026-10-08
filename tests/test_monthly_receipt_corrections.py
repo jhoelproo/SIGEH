@@ -131,7 +131,7 @@ def test_clear_history_filters_returns_focus_and_accepts_typing(history, qt):
 
 
 @pytest.mark.parametrize("control", ["ars_combo", "status_combo", "assignment_combo"])
-def test_history_filter_selection_returns_focus_to_search(history, qt, control):
+def test_history_filter_selection_keeps_focus_until_search_is_clicked(history, qt, control):
     combo = getattr(history, control)
     if combo.count() < 2:
         combo.addItem("FUTURO", "FUTURO")
@@ -139,13 +139,14 @@ def test_history_filter_selection_returns_focus_to_search(history, qt, control):
     combo.setCurrentIndex(1)
     combo.activated.emit(1)
     qt.processEvents()
-    assert history.search_edit.hasFocus()
+    assert combo.hasFocus()
+    QTest.mouseClick(history.search_edit, Qt.LeftButton)
     QTest.keyClicks(history.search_edit, "990834")
     assert history.search_edit.text() == "990834"
 
 
 @pytest.mark.parametrize("control", ["ars_combo", "status_combo", "assignment_combo"])
-def test_cancelled_filter_popup_restores_search_across_repeated_queries(
+def test_cancelled_filter_popup_allows_clicking_search_across_repeated_queries(
     history, qt, control
 ):
     combo = getattr(history, control)
@@ -158,6 +159,7 @@ def test_cancelled_filter_popup_restores_search_across_repeated_queries(
         assert QTest.qWaitForWindowExposed(combo.view().window())
         combo.hidePopup()
         qt.processEvents()
+        QTest.mouseClick(history.search_edit, Qt.LeftButton)
         assert history.search_edit.hasFocus()
         history.search_edit.clear()
         QTest.keyClicks(history.search_edit, number)
@@ -178,12 +180,13 @@ def test_query_completion_preserves_focus_in_advanced_document_field(history, qt
     assert history.document_edit.hasFocus()
 
 
-def test_query_completion_returns_focus_from_search_button(history, qt):
+def test_query_completion_keeps_manually_selected_focus(history, qt):
     history.btn_search.setFocus()
     history._set_history_query_busy(True)
+    history.assignment_combo.setFocus()
     history._set_history_query_busy(False)
     qt.processEvents()
-    assert history.search_edit.hasFocus()
+    assert history.assignment_combo.hasFocus()
     assert history.search_edit.isEnabled()
     assert history.btn_search.isEnabled()
 
@@ -203,7 +206,7 @@ def test_focus_restoration_respects_modal_and_closed_history(history, qt):
     assert not history.isVisible()
 
 
-def test_custom_period_keeps_date_focus_but_fixed_period_returns_to_search(history, qt):
+def test_custom_and_fixed_periods_keep_manually_selected_date_focus(history, qt):
     period = history.period_filter
     period.period_combo.setCurrentText("Personalizado")
     period.date_from.setFocus()
@@ -213,10 +216,10 @@ def test_custom_period_keeps_date_focus_but_fixed_period_returns_to_search(histo
     period.period_combo.setCurrentText("Hoy")
     period.period_combo.activated.emit(period.period_combo.currentIndex())
     qt.processEvents()
-    assert history.search_edit.hasFocus()
+    assert period.date_from.hasFocus()
 
 
-def test_open_popup_does_not_lose_its_focus_then_period_close_restores_search(
+def test_open_and_closed_popups_do_not_override_deliberate_focus(
     history, qt
 ):
     combo = history.period_filter.period_combo
@@ -229,22 +232,23 @@ def test_open_popup_does_not_lose_its_focus_then_period_close_restores_search(
     assert not history.search_edit.hasFocus()
     combo.hidePopup()
     qt.processEvents()
-    assert history.search_edit.hasFocus()
+    assert not history.search_edit.hasFocus()
 
 
-def test_manual_query_completion_and_error_both_restore_search(
+def test_query_completion_and_error_leave_filter_focus_unchanged(
     history, qt, monkeypatch
 ):
-    history.btn_clear_filters.setFocus()
-    history.history_workspace.search_focus.query_completed()
+    history.assignment_combo.setFocus()
+    history._set_history_query_busy(False)
     qt.processEvents()
-    assert history.search_edit.hasFocus()
+    assert history.assignment_combo.hasFocus()
     monkeypatch.setattr(app, "write_runtime_log", lambda *_args: None)
     history.btn_search.setFocus()
     history._set_history_query_busy(True)
+    history.assignment_combo.setFocus()
     history._on_history_query_failed(history._query_generation, "FALLO SINTETICO")
     qt.processEvents()
-    assert history.search_edit.hasFocus()
+    assert history.assignment_combo.hasFocus()
     assert history.btn_search.isEnabled()
     assert "FALLO SINTETICO" in history.lbl_query_error.text()
 

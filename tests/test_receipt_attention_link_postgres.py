@@ -82,7 +82,6 @@ def test_audit_failure_rolls_back_entire_link(inherited, monkeypatch):
     [
         "UPDATE admission_attention_projection SET source_status='ANULADA'",
         "UPDATE admission_attention_projection SET is_deleted=TRUE",
-        "UPDATE admission_attention_projection SET turn_id=3950",
         "UPDATE admission_attention_projection SET patient_name='OTRO PACIENTE'",
         "UPDATE admission_attention_projection SET canonical_ars='OTRA ARS'",
         "UPDATE admission_billing_claims SET session_id='OTHER',station_id='OTHER',claimed_by='OTHER'",
@@ -150,3 +149,38 @@ def test_uninsured_receipt_with_empty_ars_can_link(inherited):
         )
     assert link(identity, inherited) == identity
     assert read_receipt(identity)["tipo_cobertura"] == "NO_ASEGURADO"
+
+
+@pytest.mark.parametrize("turn", [3950, 123])
+def test_admin_can_link_unbilled_current_or_historical_attention(inherited, turn):
+    identity = save()
+    with app.db_connect() as con:
+        con.execute("DELETE FROM admission_shift_inheritances")
+        con.execute("UPDATE admission_attention_projection SET turn_id=%s", (turn,))
+    assert link(identity, inherited) == identity
+    after = read_receipt(identity)
+    assert after["admission_atencion_id"] == inherited.attention_id
+    assert after["turno_origen_id"] == turn
+    assert after["herencia_estado"] != "HEREDADA_PROCESADA"
+    with app.db_connect() as con:
+        assert (
+            con.execute("SELECT COUNT(*) FROM admission_shift_inheritances").fetchone()[
+                0
+            ]
+            == 0
+        )
+
+
+def test_historical_attention_with_another_billed_receipt_cannot_link(inherited):
+    first = save()
+    with app.db_connect() as con:
+        con.execute("DELETE FROM admission_shift_inheritances")
+        con.execute("UPDATE admission_attention_projection SET turn_id=123")
+        con.execute(
+            "UPDATE recibos SET admission_atencion_id=372,admission_source_instance_id='ORIGIN',estado_facturacion=%s WHERE id=%s",
+            (app.BILLING_INVOICED, first),
+        )
+    second = save(numero=2, fecha="2026-09-06")
+    with pytest.raises(ValueError):
+        link(second, inherited)
+    assert read_receipt(second)["admission_atencion_id"] is None

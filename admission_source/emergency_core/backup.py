@@ -10,13 +10,37 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
+from time import monotonic
 
 from .io_utils import ConfigError, atomic_write_json, load_json_file
 
 
 class BackupError(RuntimeError):
     """Raised when backup creation or validation fails."""
+
+
+class DailyBackupSchedule:
+    """Check for a verified daily copy in a worker, including offline days."""
+
+    CHECK_INTERVAL_SECONDS = 3600
+    FAILURE_RETRY_SECONDS = 60
+
+    def __init__(
+        self, manager: BackupManager, *, clock: Callable[[], float] = monotonic
+    ) -> None:
+        self.manager = manager
+        self._clock = clock
+        self._check_at = 0.0
+
+    def run_due(self) -> Path | None:
+        now = self._clock()
+        if now < self._check_at:
+            return None
+        self._check_at = now + self.FAILURE_RETRY_SECONDS
+        result = self.manager.ensure_daily()
+        self._check_at = now + self.CHECK_INTERVAL_SECONDS
+        return result
 
 
 def _sha256(path: Path) -> str:
@@ -113,7 +137,6 @@ class BackupManager:
             raise
 
     def ensure_daily(self) -> Path | None:
-        self.prune()
         today = datetime.now().date().isoformat()
         for folder in self.list_backups():
             try:
@@ -121,6 +144,11 @@ class BackupManager:
             except BackupError:
                 continue
             if manifest.get("reason") == "respaldo_diario" and str(manifest.get("created_at", "")).startswith(today):
+                try:
+                    self.verify(folder)
+                except BackupError:
+                    continue
+                self.prune()
                 return None
         return self.create("respaldo_diario")
 

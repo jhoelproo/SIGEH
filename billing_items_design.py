@@ -322,14 +322,14 @@ class BillingItemsPresentation(QObject):
     def fit_catalog(self):
         tabs = self.window.tabs
         tabs.setFont(QFont("Segoe UI", 8))
-        tabs.setElideMode(
-            Qt.ElideNone if self.window.catalog_panel.width() >= 430 else Qt.ElideRight
-        )
         for index in range(tabs.count()):
             name = tabs.tabToolTip(index)
             if name:
                 tabs.setTabText(index, name)
         tabs.setStyleSheet(category_tabs_styles(self.dark))
+        from billing_responsive import fit_category_tabs
+
+        fit_category_tabs(tabs)
 
     def refresh_rows(self):
         table = self.window.cart_table
@@ -365,6 +365,9 @@ class BillingItemsPresentation(QObject):
             table.setRowHeight(row, 52)
         self.refresh_rows()
         self.fit_catalog()
+        from billing_responsive import fit_receipt_item_column
+
+        fit_receipt_item_column(table)
 
     def eventFilter(self, watched, event):
         if event.type() in (QEvent.Resize, QEvent.Show) and not self.pending_resize:

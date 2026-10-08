@@ -164,13 +164,19 @@ def fit_billing_design(window):
     window.header_subtitle.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
     window.catalog_workspace.sort.setMaximumWidth(140 if compact else 190)
     window.cart_table.parentWidget().setMinimumWidth(0)
-    window.catalog_panel.setMinimumWidth(270 if compact else 350)
-    window.receipt_panel.setMinimumWidth(540 if compact else 580)
+    small = window.width() < 1450
+    window.catalog_panel.setMinimumWidth(360 if small else 350)
+    window.receipt_panel.setMinimumWidth(410 if small else 580)
     if compact:
         _fit_compact_billing(window)
+    else:
+        window.nav_widget.setFixedWidth(188)
+        window.billing_group.setMinimumWidth(260)
+        window.patient_scroll.setMinimumWidth(285)
+        window.patient_scroll.setMaximumWidth(410)
     _fit_cart_summary(window, compact)
     available = window.main_split.width()
-    catalog_width = max(270, min(int(available * 0.48), available - 540))
+    catalog_width = int(available * 0.48)
     window.main_split.setHandleWidth(10)
     window.main_split.setSizes([catalog_width, available - catalog_width])
     window.items_presentation.fit()
@@ -179,6 +185,9 @@ def fit_billing_design(window):
     window.lbl_total.setWordWrap(True)
     window.catalog_workspace.counter.setWordWrap(True)
     _fit_catalog_actions(window, compact)
+    from billing_responsive import fit_billing_navigation
+
+    fit_billing_navigation(window)
 
 
 def _fit_catalog_actions(window, compact):
@@ -187,9 +196,12 @@ def _fit_catalog_actions(window, compact):
 
 
 def _fit_compact_billing(window):
-    window.patient_scroll.setMinimumWidth(285)
-    window.patient_scroll.setMaximumWidth(315)
-    window.nav_widget.setFixedWidth(158)
+    small = window.width() < 1450
+    patient_width = 240 if small else 285
+    window.billing_group.setMinimumWidth(patient_width - 20)
+    window.patient_scroll.setMinimumWidth(patient_width)
+    window.patient_scroll.setMaximumWidth(patient_width if small else 315)
+    window.nav_widget.setFixedWidth(110 if small else 158)
     window.header_title.setStyleSheet("font-size:17pt;font-weight:800;")
     window.lbl_user_top.setMaximumWidth(220)
     window.lbl_user_top.setWordWrap(False)
@@ -207,11 +219,14 @@ def _fit_compact_billing(window):
         window.bottom_layout.removeWidget(control)
     window.lbl_edit_mode.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
     window.lbl_edit_mode.setWordWrap(True)
-    window.bottom_layout.addWidget(window.lbl_edit_mode, 0, 0, 1, 5)
-    window.bottom_layout.addWidget(window.btn_cancel_edit, 1, 0)
-    window.bottom_layout.addWidget(window.btn_reset, 1, 1)
-    window.bottom_layout.addWidget(window.btn_generate, 1, 2, 1, 3)
-    window.bottom_widget.setMinimumHeight(98)
+    editing = bool(window.lbl_edit_mode.text().strip())
+    if editing:
+        window.bottom_layout.addWidget(window.lbl_edit_mode, 0, 0, 1, 5)
+    row = int(editing)
+    window.bottom_layout.addWidget(window.btn_cancel_edit, row, 0)
+    window.bottom_layout.addWidget(window.btn_reset, row, 1)
+    window.bottom_layout.addWidget(window.btn_generate, row, 2, 1, 3)
+    window.bottom_widget.setMinimumHeight(76 if editing else 48)
 
 
 def _fit_cart_summary(window, compact):

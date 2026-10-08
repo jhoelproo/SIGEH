@@ -9,7 +9,11 @@
 </head>
 <body class="document-{{ estado_documento|lower }}{% if payment_status == "PENDIENTE_PAGO" %} payment-pending{% endif %}">
   <main class="page">
-    {% if payment_status %}
+    {% if estado_documento == "FINAL" %}
+    <section class="document-state-banner final-banner">
+      <b>DOCUMENTO FINAL VALIDADO</b>
+    </section>
+    {% elif payment_status and not local_request_id %}
     <section class="document-state-banner {{ "preliminary-banner" if payment_status == "PENDIENTE_PAGO" else "ready-banner" }}">
       <b>RECIBO DE COBRO · {{ "PENDIENTE DE PAGO" if payment_status == "PENDIENTE_PAGO" else payment_status }}</b>
       <span>{% if payment_status == "PENDIENTE_PAGO" %}No acredita pago · {% endif %}Tarifa de SENASA Contributivo.</span>
@@ -18,16 +22,12 @@
     <div class="preliminary-watermark" aria-hidden="true">PRELIMINAR</div>
     <section class="document-state-banner preliminary-banner">
       <b>VERSIÓN PRELIMINAR</b>
-      <span>Documento editable para revisión. No representa facturación confirmada.</span>
+      <span>{% if local_request_id %}PENDIENTE DE SINCRONIZACIÓN · {% endif %}Documento editable para revisión. No representa facturación confirmada.</span>
     </section>
     {% elif estado_documento == "LISTO_AUDITORIA" %}
     <section class="document-state-banner ready-banner">
       <b>DOCUMENTO COMPLETO</b>
       <span>Listo para auditoría{% if numero_autorizacion %} · Autorización registrada{% endif %}.</span>
-    </section>
-    {% elif estado_documento == "FINAL" %}
-    <section class="document-state-banner final-banner">
-      <b>DOCUMENTO FINAL VALIDADO</b>
     </section>
     {% endif %}
 
@@ -54,7 +54,7 @@
           </svg>
         </div>
         <div class="receipt-copy">
-          <div class="receipt-number">RECIBO #{{ numero }}</div>
+          <div class="receipt-number{% if local_request_id %} local-receipt-number{% endif %}">RECIBO #{{ numero }}</div>
           <div class="receipt-date-label">Fecha:</div>
           <div class="receipt-date-value">{{ fecha_display }}</div>
           <div class="authorization-line">
@@ -96,7 +96,7 @@
             <div class="field-copy">
               <div class="field-label">Paciente:</div>
               <div class="field-value strong">{{ paciente }}</div>
-              <div class="patient-identifier"><b>NSS:</b> <span>{{ nss or "NO REGISTRADO" }}</span></div>
+              <div class="patient-identifier"><b>{{ identity_label }}:</b> <span>{{ identity_number or "NO REGISTRADO" }}</span></div>
             </div>
           </div>
 
@@ -313,6 +313,9 @@
     </section>
 
 
+    {% if local_request_id %}
+    <div class="local-request-reference">Identificador local: {{ local_request_id }} · Pendiente de confirmación central</div>
+    {% endif %}
   </main>
 </body>
 </html>

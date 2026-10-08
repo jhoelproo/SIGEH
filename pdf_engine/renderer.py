@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from receipt_document_state import receipt_document_state
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_FILE = BASE_DIR / "template.html"
@@ -106,6 +107,21 @@ def clean_text(value: Any, default: str = "") -> str:
         return default
     text = str(value).strip()
     return text if text else default
+
+
+def _patient_document(data):
+    from monthly_receipt_fields import ALTERNATE_DOCUMENT_TYPES, normalize_document_type
+
+    try:
+        document_type = normalize_document_type(
+            data.get("insurance_document_type") or "NSS"
+        )
+    except ValueError:
+        document_type = "NSS"
+    number = clean_text(data.get("insurance_document_number"))
+    if document_type in ALTERNATE_DOCUMENT_TYPES and number:
+        return document_type, number
+    return "NSS", clean_text(data.get("nss") or data.get("admission_nss_snapshot"))
 
 
 def _format_date(value: Any) -> str:
@@ -334,6 +350,7 @@ class ReceiptPDFRenderer:
         return normalized
 
     def _prepare_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        identity_label, identity_number = _patient_document(data)
         prepared = {
             "hospital_line_1": clean_text(
                 data.get("hospital_line_1"), "HOSPITAL PROVINCIAL"
@@ -344,6 +361,7 @@ class ReceiptPDFRenderer:
             "document_title": clean_text(
                 data.get("document_title"), "DETALLE DE FACTURACIÓN DE EMERGENCIA"
             ),
+            "local_request_id": clean_text(data.get("local_request_id"), ""),
             "numero": clean_text(
                 data.get("numero") or data.get("recibo") or data.get("recibo_number"),
                 "",
@@ -354,6 +372,8 @@ class ReceiptPDFRenderer:
             "nss": clean_text(
                 data.get("nss") or data.get("admission_nss_snapshot"), ""
             ),
+            "identity_label": identity_label,
+            "identity_number": identity_number,
             "dx": clean_text(data.get("dx") or data.get("diagnostico"), "N/A"),
             "ars": clean_text(data.get("ars"), "N/A"),
             "sala": _as_float(data.get("sala") or data.get("costo_sala")),
@@ -370,7 +390,11 @@ class ReceiptPDFRenderer:
                 datetime.now().strftime("%d/%m/%Y  %I:%M %p"),
             ),
             "numero_autorizacion": clean_text(data.get("numero_autorizacion"), ""),
-            "estado_documento": clean_text(data.get("estado_documento"), "PRELIMINAR"),
+            "estado_documento": receipt_document_state(
+                data.get("estado_documento"),
+                data.get("estado_facturacion"),
+                local_request_id=data.get("local_request_id"),
+            ),
             "payment_status": clean_text(data.get("payment_status"), ""),
             "exemption_reason": clean_text(data.get("exemption_reason"), ""),
             "logo_url": self._logo_data_url(data.get("logo_path")),

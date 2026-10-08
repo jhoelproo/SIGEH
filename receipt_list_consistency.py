@@ -9,10 +9,9 @@ HOSPITAL_TIMEZONE = timezone(timedelta(hours=-4))
 
 
 def normalized_document_type(value):
-    kind = str(value or "").strip().upper()
-    if kind not in {"NSS", "CÉDULA", "CEDULA"}:
-        raise ValueError("Selecciona NSS o CÉDULA.")
-    return "NSS" if kind == "NSS" else "CÉDULA"
+    from monthly_receipt_fields import normalize_document_type
+
+    return normalize_document_type(value)
 
 
 def required_list_text(value, maximum, missing, too_long, *, allow_empty=False):
@@ -34,8 +33,8 @@ def normalize_list_metadata(
         required_list_text(
             number,
             24,
-            "Escribe el NSS o la cédula.",
-            "El NSS o la cédula no puede exceder 24 caracteres.",
+            "Escribe el NSS, la cédula o la identificación de la ARS.",
+            "La identificación no puede exceder 24 caracteres.",
             allow_empty=allow_incomplete,
         ),
         required_list_text(
@@ -88,21 +87,22 @@ def effective_list_entry(row):
         ("specialty_snapshot", "receipt_specialty"),
     ):
         entry[field] = _current_value(entry, field, current, "receipt_edited_at")
+    for field, current in (
+        ("service_date_snapshot", "receipt_service_date"),
+        ("document_type_snapshot", "receipt_document_type"),
+        ("document_number_snapshot", "receipt_document_number"),
+    ):
+        if current in entry and entry[current] is not None:
+            entry[field] = _current_value(entry, field, current, "receipt_edited_at")
     entry["authorization_snapshot"] = _current_value(
         entry,
         "authorization_snapshot",
         "receipt_authorization",
         "receipt_authorization_at",
     )
-    kind = str(entry.get("document_type_snapshot") or "NSS")
-    document = (
-        entry["cedula_snapshot"]
-        if kind in {"CÉDULA", "CEDULA"}
-        else entry["nss_snapshot"]
-    )
-    entry["document_number_snapshot"] = document or entry.get(
-        "document_number_snapshot"
-    )
+    from monthly_receipt_fields import displayed_list_document
+
+    entry["document_number_snapshot"] = displayed_list_document(entry)
     return entry
 
 
@@ -114,7 +114,10 @@ def _recover_linked_specialty(entry):
 
     recovered = resolve_specialty(entry["linked_admission_specialty"])
     if recovered:
-        entry["receipt_specialty"] = normalized_specialty(recovered)
+        try:
+            entry["receipt_specialty"] = normalized_specialty(recovered)
+        except ValueError:
+            entry["receipt_specialty"] = recovered
 
 
 def lock_receipt(connection, receipt_id):
@@ -123,7 +126,8 @@ def lock_receipt(connection, receipt_id):
                   tipo_cobertura,numero_autorizacion,admission_nss_snapshot,
                   admission_cedula_snapshot,specialty_snapshot,verification_bypassed,
                   admission_atencion_id,estado_documento,review_status,review_reason,
-                  fecha,username,admission_global_attention_id,admission_source_instance_id
+                  fecha,username,admission_global_attention_id,admission_source_instance_id,
+                  insurance_document_type,insurance_document_number
            FROM recibos WHERE id=%s AND COALESCE(is_deleted,0)=0 FOR UPDATE""",
         (int(receipt_id),),
     ).fetchone()
@@ -187,16 +191,20 @@ def sync_pending_lists(connection, receipt_id, actor, stamp, document_type=None)
                cedula_snapshot=r.admission_cedula_snapshot,
                authorization_snapshot=r.numero_autorizacion,
                specialty_snapshot=r.specialty_snapshot,
-               document_type_snapshot=COALESCE(%s,br.document_type_snapshot,'NSS'),
+               service_date_snapshot=r.fecha,
+               document_type_snapshot=COALESCE(%s,r.insurance_document_type,br.document_type_snapshot,'NSS'),
                document_number_snapshot=CASE
-                   WHEN COALESCE(%s,br.document_type_snapshot,'NSS') IN ('CÉDULA','CEDULA')
-                   THEN r.admission_cedula_snapshot ELSE r.admission_nss_snapshot END,
+                   WHEN COALESCE(%s,r.insurance_document_type,br.document_type_snapshot,'NSS') IN ('CÉDULA','CEDULA')
+                   THEN r.admission_cedula_snapshot
+                   WHEN COALESCE(%s,r.insurance_document_type,br.document_type_snapshot,'NSS')='NSS'
+                   THEN r.admission_nss_snapshot
+                   ELSE r.insurance_document_number END,
                last_edited_at=%s,last_edited_by=%s
            FROM recibos r,billing_batches b
            WHERE r.id=%s AND br.recibo_id=r.id AND br.batch_id=b.id
              AND br.included=1 AND b.status IN ('PENDIENTE','BORRADOR')
            RETURNING br.batch_id""",
-        (document_type, document_type, stamp, actor, int(receipt_id)),
+        (document_type, document_type, document_type, stamp, actor, int(receipt_id)),
     ).fetchall()
     for row in rows:
         connection.execute(
@@ -208,7 +216,7 @@ def sync_pending_lists(connection, receipt_id, actor, stamp, document_type=None)
                 receipt_id,
                 stamp,
                 actor,
-                "Nombre, NSS, identificación, autorización y especialidad",
+                "Nombre, fecha de servicio, identificación, autorización y especialidad",
             ),
         )
     if rows:
@@ -228,12 +236,16 @@ def write_receipt_metadata(connection, current, changes, actor, stamp, policy):
             "admission_nss_snapshot",
             "admission_cedula_snapshot",
             "specialty_snapshot",
+            "fecha",
+            "insurance_document_type",
+            "insurance_document_number",
         )
     }
     state, review, reason = policy(current, values["numero_autorizacion"])
     connection.execute(
         """UPDATE recibos SET nombre=%s,numero_autorizacion=%s,admission_nss_snapshot=%s,
                admission_cedula_snapshot=%s,specialty_snapshot=%s,
+               fecha=%s,insurance_document_type=%s,insurance_document_number=%s,
                autorizacion_at=CASE WHEN numero_autorizacion IS DISTINCT FROM %s
                    THEN %s ELSE autorizacion_at END,
                autorizacion_por=CASE WHEN numero_autorizacion IS DISTINCT FROM %s

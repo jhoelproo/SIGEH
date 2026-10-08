@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QComboBox, QCompleter, QLineEdit
 
 from monthly_candidate_search import normalized_name
 
-SPECIALTIES = ("EMERGENCIOLOGÍA", "PEDIATRÍA", "GINECOLOGÍA", "GENERAL")
+SPECIALTIES = ("EMERGENCIOLOGÍA", "PEDIATRÍA", "GINECOLOGÍA")
 MAX_SPECIALTY_LENGTH = 100
 MIN_COMPLETION_LENGTH = 2
 MIN_CORRECTION_SIMILARITY = 0.8
@@ -20,19 +20,22 @@ def specialty_values(receipts):
 
 
 def specialty_options(values=()):
-    options = dict.fromkeys(normalized_name(value) for value in SPECIALTIES)
-    choices = list(SPECIALTIES)
-    for value in values:
-        text = str(value or "").strip().upper()
-        key = normalized_name(text)
-        if key and key not in options:
-            choices.append(text)
-            options[key] = None
-    return choices
+    return list(SPECIALTIES)
+
+
+def receipt_specialty_snapshot(value: object) -> str:
+    """Canonicalize known Admission values while retaining explicit legacy data."""
+    text = str(value or "")
+    key = normalized_name(text)
+    if key == "general":
+        return SPECIALTIES[0]
+    return next((item for item in SPECIALTIES if normalized_name(item) == key), text)
 
 
 def specialty_matches(value, choices=SPECIALTIES):
     key = normalized_name(value)
+    if key == "general":
+        return [SPECIALTIES[0]]
     if not key:
         return list(choices)
     scores = [
@@ -51,7 +54,11 @@ def normalized_specialty(value):
     if len(text) > MAX_SPECIALTY_LENGTH:
         raise ValueError("La especialidad no puede exceder 100 caracteres.")
     key = normalized_name(text)
-    return _known_specialty(key) or _correct_specialty_typo(text, key)
+    if not key:
+        return ""
+    if key == "general":
+        return SPECIALTIES[0]
+    return _known_specialty(key) or _correct_specialty_typo(key)
 
 
 def _known_specialty(key):
@@ -64,7 +71,7 @@ def _known_specialty(key):
     return None
 
 
-def _correct_specialty_typo(text, key):
+def _correct_specialty_typo(key):
     scores = sorted(
         (
             (SequenceMatcher(None, key, normalized_name(item)).ratio(), item)
@@ -78,16 +85,22 @@ def _correct_specialty_typo(text, key):
         and best[0] - runner_up[0] >= MIN_CORRECTION_MARGIN
     ):
         return best[1]
-    return text
+    raise ValueError(
+        "Selecciona una especialidad: EMERGENCIOLOGÍA, GINECOLOGÍA o PEDIATRÍA."
+    )
 
 
 class SpecialtyComboBox(QComboBox):
     def __init__(self, value="", choices=(), parent=None):
         super().__init__(parent)
         self.setEditable(True)
-        self.setInsertPolicy(QComboBox.InsertAtBottom)
+        self.setInsertPolicy(QComboBox.NoInsert)
         self.addItems(specialty_options([*choices, value]))
-        self.setCurrentText(normalized_specialty(value) or SPECIALTIES[0])
+        try:
+            initial = normalized_specialty(value) or SPECIALTIES[0]
+        except ValueError:
+            initial = str(value or "")
+        self.setCurrentText(initial)
         line_edit = cast(QLineEdit, self.lineEdit())
         line_edit.setMaxLength(MAX_SPECIALTY_LENGTH)
         self._completion_model = QStringListModel(self)
@@ -103,4 +116,8 @@ class SpecialtyComboBox(QComboBox):
         self._completion_model.setStringList(specialty_matches(text, choices))
 
     def _normalize_text(self):
-        self.setEditText(normalized_specialty(self.currentText()))
+        try:
+            value = normalized_specialty(self.currentText())
+        except ValueError:
+            return
+        self.setEditText(value)

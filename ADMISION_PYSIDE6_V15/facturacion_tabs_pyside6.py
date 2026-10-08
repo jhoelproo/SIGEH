@@ -2147,20 +2147,15 @@ class DatabaseManager:
             if paciente_id is None and not (nombre_limpio and len(telefono_limpio) == 10):
                 return None
 
-            if dia_operativo_id is None and turno_id is not None:
-                turno = conn.execute("SELECT dia_operativo_id FROM turnos WHERE id=?", (int(turno_id),)).fetchone()
-                dia_operativo_id = int(turno[0]) if turno else None
+            from admission_visit_dates import (
+                attention_in_interval,
+                duplicate_date_values,
+            )
 
-            parametros = []
-            if dia_operativo_id is not None:
-                rango_sql = "dia_operativo_id = ?"
-                parametros.append(int(dia_operativo_id))
-            else:
-                rango_sql = "datetime(created_at) >= datetime(?) AND datetime(created_at) < datetime(?)"
-                parametros.extend([
-                    inicio_turno.strftime("%Y-%m-%d %H:%M:%S"),
-                    fin_turno.strftime("%Y-%m-%d %H:%M:%S"),
-                ])
+            date_values = duplicate_date_values(inicio_turno, fin_turno)
+            parametros = list(date_values)
+            placeholders = ",".join("?" for _ in date_values)
+            rango_sql = f"fecha IN ({placeholders})"
 
             if paciente_id is not None:
                 identidad_sql = "paciente_id = ?"
@@ -2172,10 +2167,13 @@ class DatabaseManager:
             sql = f'''
                 SELECT * FROM atenciones
                 WHERE estado='ACTIVA' AND {identidad_sql} AND {rango_sql}
-                ORDER BY id DESC LIMIT 1
+                ORDER BY id DESC
             '''
-            fila = conn.execute(sql, parametros).fetchone()
-        return dict(fila) if fila else None
+            for fila in conn.execute(sql, parametros):
+                attention = dict(fila)
+                if attention_in_interval(attention, inicio_turno, fin_turno):
+                    return attention
+        return None
 
     def buscar_paciente(self, cedula):
         cedula_limpia = re.sub(r"\D", "", (cedula or ""))
@@ -2435,7 +2433,12 @@ class DatabaseManager:
             cur = conn.cursor()
             contexto = self.obtener_contexto_turno(turno_cfg, conn=conn)
             turno_id = contexto["turno_id"]
-            dia_operativo_id = contexto["dia_operativo_id"]
+            from admission_visit_dates import clinical_day_id, visit_moment
+
+            inicio, fin = obtener_rango_turno_efectivo(turno_cfg)
+            dia_operativo_id = clinical_day_id(
+                conn, contexto["dia_operativo_id"], inicio, fin, visit_moment(datos)
+            )
             nss_clean = re.sub(r"\D", "", nss)
             cedula_clean = re.sub(r"\D", "", cedula)
             telefono = (datos.get('Teléfono', '') or '').strip()
@@ -3597,7 +3600,9 @@ class DatabaseManager:
         modo = (modo or "Todos").strip()
         ars = (ars or "").strip()
         especialidad = (especialidad or "").strip().upper()
-        fecha_obj = parse_fecha_ddmmyyyy(fecha_txt) if fecha_txt else None
+        from admission_visit_dates import date_variants
+
+        fecha_obj = fecha_txt if fecha_txt else None
 
         where = ["estado='ACTIVA'"]
         params = []
@@ -3623,11 +3628,9 @@ class DatabaseManager:
             )
             params.append(fecha_base_operativa_actual().isoformat())
 
-        if modo == "Por fecha" and fecha_obj:
-            where.append(
-                "dia_operativo_id=(SELECT id FROM dias_operativos WHERE fecha_base=? LIMIT 1)"
-            )
-            params.append(fecha_obj.isoformat())
+        if modo == "Por fecha":
+            where.append("fecha IN (?,?,?)")
+            params.extend(date_variants(fecha_obj))
 
         if modo == "Por especialidad" and especialidad and especialidad != "(TODAS)":
             where.append("UPPER(IFNULL(hoja,'')) = ?")
@@ -12025,11 +12028,16 @@ class App:
         ):
             return None
 
-        turno_cfg = cargar_turno_config()
+        turno_cfg = self._generation_turn_config()
         if not turno_cfg:
             return None
 
         inicio_turno, fin_turno = obtener_rango_turno_efectivo(turno_cfg)
+        from admission_visit_dates import duplicate_interval, visit_moment
+
+        inicio_turno, fin_turno = duplicate_interval(
+            inicio_turno, fin_turno, visit_moment(datos)
+        )
         contexto = self.db.obtener_contexto_turno(turno_cfg)
         return self.db.buscar_atencion_en_turno(
             nss,
@@ -12089,7 +12097,8 @@ class App:
             command=lambda: elegir("reingreso"),
         ).pack(side="left", padx=(0, 8))
         tb.Button(botones, text="Cancelar", command=lambda: elegir("cancelar")).pack(side="right")
-        win.protocol("WM_DELETE_WINDOW", lambda: elegir("cancelar"))
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.deiconify()
         win.wait_window()
         return resultado["accion"]
 
@@ -13088,6 +13097,11 @@ class App:
             _actualizar_visibilidad_filtros()
             _programar_busqueda_filtro()
 
+        def _seleccionar_ayer():
+            ayer = datetime.now().date() - timedelta(days=1)
+            fecha_filtro.insert(0, ayer.strftime("%d/%m/%Y"))
+            _seleccionar_filtro_simple("Por fecha")
+
         def _seleccionar_ars_filtro(valor):
             filtro_rapido_var.set("Por ARS")
             ars_filtro_var.set(valor)
@@ -13123,6 +13137,7 @@ class App:
                 filtro_menu.add_separator()
                 filtro_menu.add_command(label="Todos", command=lambda: _seleccionar_filtro_simple("Todos"))
                 filtro_menu.add_command(label="Hoy", command=lambda: _seleccionar_filtro_simple("Hoy"))
+                filtro_menu.add_command(label="Ayer", command=_seleccionar_ayer)
                 filtro_menu.add_command(label="Sin seguro", command=lambda: _seleccionar_filtro_simple("Sin seguro"))
                 filtro_menu.add_separator()
 
@@ -13381,7 +13396,10 @@ class App:
                         "limite": limit,
                         "offset": page_state["offset"],
                     }
-                if cache_only:
+                retry_gate = getattr(
+                    getattr(self.db, "_runtime", None), "_network_retry_gate", None
+                )
+                if cache_only or not getattr(retry_gate, "ready", True):
                     cache_reader = getattr(self.db, "list_history_cache_local", None)
                     if callable(cache_reader):
                         return cache_reader(method_name, **method_values)
@@ -13395,12 +13413,16 @@ class App:
             )
 
         history_refresh_gate = None
+        manual_search_pending = False
 
         def _start_history_refresh(_reason, done):
+            nonlocal manual_search_pending
+            query_central = manual_search_pending
+            manual_search_pending = False
             cargar_pagina(
                 reset=True,
                 completion=done,
-                cache_only=True,
+                cache_only=not query_central,
                 show_loading=False,
             )
 
@@ -13414,6 +13436,8 @@ class App:
         )
 
         def request_history_refresh(reason="manual", *, immediate=False):
+            nonlocal manual_search_pending
+            manual_search_pending = manual_search_pending or reason == "manual_search"
             return history_refresh_gate.request(reason, immediate=immediate)
 
         self.request_history_refresh = request_history_refresh
@@ -13428,8 +13452,8 @@ class App:
                 pass
 
         try:
-            fecha_filtro.bind("<<DateEntrySelected>>", lambda e: buscar())
-            fecha_filtro.bind("<Return>", lambda e: buscar())
+            fecha_filtro.calendarWidget().clicked.connect(lambda _date: buscar())
+            fecha_filtro.editingFinished.connect(buscar)
         except Exception:
             pass
         tree.bind("<MouseWheel>", _al_mover_scroll)

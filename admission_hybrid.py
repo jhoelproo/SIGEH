@@ -8,6 +8,7 @@ usados por las dos interfaces de Admisi\u00f3n y probados sin una ventana abiert
 from __future__ import annotations
 
 from admission_specialty import resolve_specialty
+from network_retry import is_service_restriction, raise_service_restriction
 
 import hashlib
 import json
@@ -863,6 +864,23 @@ class SyncEvent:
         )
 
 
+def _remote_reentry_fields(connection, payload, patient_id, clinical_day):
+    from admission_reentry import local_reentry_fields
+
+    try:
+        return local_reentry_fields(connection, payload, patient_id, clinical_day)
+    except ValueError as exc:
+        raise SyncConflict(str(exc)) from exc
+
+
+def _remote_visit_metadata(connection, payload, patient_id, configured_day_id):
+    from admission_visit_dates import remote_clinical_day_id
+
+    clinical_day = remote_clinical_day_id(connection, configured_day_id, payload)
+    reentry = _remote_reentry_fields(connection, payload, patient_id, clinical_day)
+    return clinical_day, reentry
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -996,6 +1014,8 @@ def select_effective_turn_interval(
 
 def is_temporary_connection_error(exc: BaseException) -> bool:
     """No confunde una configuraci\u00f3n ausente con una ca\u00edda transitoria."""
+    if is_service_restriction(exc):
+        return True
     text = str(exc or "").casefold()
     temporary_tokens = (
         "connection refused", "could not connect", "timeout", "timed out",
@@ -1817,6 +1837,12 @@ class OfflineAdmissionStore:
             self._add_column(con, "pacientes", "origin_device_id", "TEXT")
             self._add_column(con, "atenciones", "global_attention_id", "TEXT")
             self._add_column(con, "atenciones", "global_patient_id", "TEXT")
+            self._add_column(
+                con, "atenciones", "es_reingreso", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._add_column(con, "atenciones", "atencion_origen_id", "INTEGER")
+            self._add_column(con, "atenciones", "motivo_reingreso", "TEXT")
+            self._add_column(con, "atenciones", "autorizado_por", "TEXT")
             self._add_column(con, "atenciones", "version", "INTEGER NOT NULL DEFAULT 1")
             self._add_column(con, "atenciones", "origin_device_id", "TEXT")
             self._add_column(con, "atenciones", "operational_source_id", "TEXT")
@@ -2042,6 +2068,12 @@ class OfflineAdmissionStore:
                               'ars',a.ars,'nss',a.nss,'detail_sheet',a.hoja,
                               'service_date',a.fecha,'service_time',a.hora,
                               'service_type',a.tipo_atencion,
+                              'is_reentry',a.es_reingreso,
+                              'reentry_origin_global_attention_id',(
+                                  SELECT original.global_attention_id FROM atenciones original
+                                  WHERE original.id=a.atencion_origen_id),
+                              'reentry_reason',a.motivo_reingreso,
+                              'reentry_authorized_by',a.autorizado_por,
                               'source_status',a.estado,'version',a.version,
                               'source_instance_id',COALESCE(
                                   (SELECT valor FROM app_metadata
@@ -2073,7 +2105,8 @@ class OfflineAdmissionStore:
             END;
             CREATE TRIGGER trg_admission_sync_attention_update
             AFTER UPDATE OF nombre,sexo,edad_num,unidad,cedula,telefono,direccion,nacionalidad,
-                            ars,hoja,fecha,hora,tipo_atencion,estado,nss,turno_id
+                            ars,hoja,fecha,hora,tipo_atencion,estado,nss,turno_id,
+                            es_reingreso,atencion_origen_id,motivo_reingreso,autorizado_por
             ON atenciones
             WHEN EXISTS (SELECT 1 FROM sync_runtime_context WHERE singleton=1)
              AND NOT EXISTS (SELECT 1 FROM sync_apply_context WHERE singleton=1)
@@ -2138,6 +2171,12 @@ class OfflineAdmissionStore:
                               'ars',a.ars,'nss',a.nss,'detail_sheet',a.hoja,
                               'service_date',a.fecha,'service_time',a.hora,
                               'service_type',a.tipo_atencion,
+                              'is_reentry',a.es_reingreso,
+                              'reentry_origin_global_attention_id',(
+                                  SELECT original.global_attention_id FROM atenciones original
+                                  WHERE original.id=a.atencion_origen_id),
+                              'reentry_reason',a.motivo_reingreso,
+                              'reentry_authorized_by',a.autorizado_por,
                               'source_status',a.estado,'version',a.version,
                               'source_instance_id',COALESCE(
                                   (SELECT valor FROM app_metadata
@@ -2430,7 +2469,10 @@ class OfflineAdmissionStore:
                 event_turn_id=runtime["operational_turn_id"],
                 existing_turn_id=data.get("turno_id"),
             )
+            from admission_reentry import reentry_payload
+
             payload = {
+                **reentry_payload(con, data),
                 "event_type": "DETAIL_SHEET_GENERATED",
                 "attention_id": int(data.get("id") or 0),
                 "global_attention_id": str(data.get("global_attention_id") or ""),
@@ -2682,7 +2724,10 @@ class OfflineAdmissionStore:
                     generation=int(runtime["generation"]),
                 )
                 is_deleted = bool(data.get("is_deleted"))
+                from admission_reentry import reentry_payload
+
                 payload = {
+                    **reentry_payload(con, data),
                     "event_type": (
                         "ATTENTION_DELETED" if is_deleted else "ATTENTION_RECONCILED"
                     ),
@@ -3079,6 +3124,8 @@ class OfflineAdmissionStore:
                    WHERE REPLACE(LOWER(COALESCE(global_patient_id,'')),'-','')=
                          REPLACE(LOWER(?),'-','')
                      AND COALESCE(operational_turn_id,turno_id)=?
+                     AND dia_operativo_id=?
+                     AND COALESCE(es_reingreso,0)=0 AND ?=0
                      AND UPPER(TRIM(COALESCE(nombre,'')))=UPPER(TRIM(?))
                      AND COALESCE(is_deleted,0)=0
                    ORDER BY id
@@ -3088,6 +3135,8 @@ class OfflineAdmissionStore:
                     _as_int_or_none(values.get("operational_turn_id"))
                     or _as_int_or_none(values.get("turno_id"))
                     or 0,
+                    int(operational_day_id),
+                    values.get("es_reingreso", 0),
                     str(values.get("nombre") or ""),
                 ),
             ).fetchall()
@@ -3202,7 +3251,7 @@ class OfflineAdmissionStore:
             if not attention_columns or not patient_columns:
                 raise SyncConflict("La base local de Admisión no está inicializada.")
             existing = con.execute(
-                """SELECT id,version,server_revision,sync_state,is_deleted FROM atenciones
+                """SELECT id,version,server_revision,sync_state,is_deleted,dia_operativo_id FROM atenciones
                    WHERE REPLACE(LOWER(global_attention_id),'-','')=
                          REPLACE(LOWER(?),'-','')
                       OR id=(
@@ -3382,6 +3431,7 @@ class OfflineAdmissionStore:
 
                 if existing:
                     updates = {
+                        **_remote_reentry_fields(con, payload, patient_id, int(existing[5])),
                         "nombre": str(payload.get("name") or "SIN NOMBRE"),
                         "admission_username": str(payload.get("admission_username") or ""),
                         "sexo": str(payload.get("sex") or ""),
@@ -3457,11 +3507,15 @@ class OfflineAdmissionStore:
                         raise SyncConflict(
                             "No existe un turno local abierto para materializar la atención remota."
                         )
+                    clinical_day, reentry_fields = _remote_visit_metadata(
+                        con, payload, patient_id, int(turn[1])
+                    )
                     self._insert_remote_attention_or_alias(
                         con,
                         {
+                            **reentry_fields,
                             "paciente_id": patient_id,
-                            "dia_operativo_id": int(turn[1]),
+                            "dia_operativo_id": clinical_day,
                             "turno_id": int(turn[0]),
                             "nss": str(payload.get("nss") or ""),
                             "nombre": str(payload.get("name") or "SIN NOMBRE"),
@@ -3528,7 +3582,7 @@ class OfflineAdmissionStore:
                         },
                         attention_columns,
                         entity_uuid,
-                        int(turn[1]),
+                        clinical_day,
                         patient_id,
                     )
                 if is_restore:
@@ -3699,6 +3753,11 @@ class OfflineAdmissionStore:
                         """INSERT OR IGNORE INTO sync_applied_events(event_uuid,applied_at)
                            VALUES(?,?)""",
                         (event_uuid, _timestamp()),
+                    )
+                    con.execute(
+                        """UPDATE sync_conflicts SET resolved_at=?,resolution='MATERIALIZATION_RETRIED'
+                           WHERE event_uuid=? AND resolved_at IS NULL""",
+                        (_timestamp(), event_uuid),
                     )
                     applied += 1
                     OPERATIONAL_LOG.info(
@@ -3969,14 +4028,14 @@ class OfflineAdmissionStore:
         inserted: int,
     ) -> int:
         if target_id or seed_id:
-            con.execute(
+            reactivated = con.execute(
                 """UPDATE sync_outbox
                       SET sync_status='PENDING',sent_at=NULL,last_error=NULL
-                    WHERE event_uuid=?""",
+                    WHERE event_uuid=? AND sync_status<>'PENDING'""",
                 (event_uuid,),
             )
         if target_id:
-            return 1
+            return int(bool(inserted or reactivated.rowcount))
         if seed_id:
             con.execute(
                 """INSERT OR IGNORE INTO sync_seed_entities(
@@ -9150,6 +9209,7 @@ class AdmissionSyncService:
         try:
             uploaded = self.cloud.push_events(events)
         except Exception as exc:  # noqa: BLE001 - límite de transporte externo
+            raise_service_restriction(exc)
             if is_temporary_connection_error(exc):
                 for event in events:
                     self.store.mark_retry(event.event_uuid, exc)
@@ -9201,6 +9261,7 @@ class AdmissionSyncService:
                 )
                 result["conflicts"] += 1
             except Exception as exc:
+                raise_service_restriction(exc)
                 if is_temporary_connection_error(exc):
                     self.store.mark_retry(event.event_uuid, exc)
                     OPERATIONAL_LOG.warning(

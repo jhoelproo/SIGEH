@@ -51,10 +51,13 @@ def test_loading_inactive_catalog_does_not_change_current_page(catalog):
     assert other.itemWidget(other.item(0)) is not None
 
 
-def test_receipt_columns_fill_the_card_without_shrinking_quantity(billing):
+def test_receipt_columns_fill_the_card_without_shrinking_quantity(billing, qt):
     billing.resize(1680, 950)
-    fit_billing_design(billing)
     table = billing.cart_table
+    table.resize(850, 300)
+    table.show()
+    qt.processEvents()
+    fit_billing_design(billing)
     assert table.horizontalHeader().sectionResizeMode(1) == QHeaderView.Stretch
     assert table.columnWidth(0) >= 96
     assert table.columnWidth(2) >= 84
@@ -207,11 +210,11 @@ def test_receipt_headers_and_summary_fit_the_available_width(billing, qt, width)
     billing.items_presentation.fit()
     qt.processEvents()
     table = billing.cart_table
-    assert table.horizontalScrollBar().maximum() == 0, (
-        table.viewport().width(),
-        table.horizontalHeader().length(),
-        [table.columnWidth(column) for column in range(6)],
-    )
+    if width < 650:
+        assert table.columnWidth(1) >= 180
+        assert table.horizontalScrollBar().maximum() > 0
+    else:
+        assert table.horizontalScrollBar().maximum() == 0
     assert table.horizontalHeader().visualIndex(1) == 0
     assert not billing.lbl_total.isHidden()
     assert not billing.lbl_sub_medicamentos.isHidden()

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from admission_v15_adapter import _HybridDatabaseProxy
 
 
-def test_current_turn_history_is_oldest_first_with_stable_identity_order():
+def test_current_turn_history_is_newest_first_with_stable_identity_order():
     proxy = object.__new__(_HybridDatabaseProxy)
     object.__setattr__(proxy, "_database", SimpleNamespace())
     object.__setattr__(proxy, "_runtime", SimpleNamespace(
@@ -54,4 +54,4 @@ def test_current_turn_history_is_oldest_first_with_stable_identity_order():
         offset=0,
     )
 
-    assert [row["id"] for row in rows] == [30, 31, 32, 33]
+    assert [row["id"] for row in rows] == [33, 32, 31, 30]

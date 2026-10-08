@@ -70,7 +70,24 @@ def correct_recent_attentions(connection, patient, *, edited_at):
     return count
 
 
-def _correct_snapshot(connection, row, patient, edited_at):
+def _snapshot_session(connection, event, row):
+    identity = str(event.get("operational_session_id") or "").strip()
+    if identity:
+        return identity
+    session = connection.execute(
+        """SELECT operational_session_id FROM admission_operational_sessions
+           WHERE operational_source_id=%s::UUID
+           ORDER BY updated_at DESC,operational_session_id DESC LIMIT 1""",
+        (row.get("operational_source_id"),),
+    ).fetchone()
+    if not session:
+        raise ValueError(
+            "La atención heredada no tiene una sesión de origen identificada."
+        )
+    return str(session["operational_session_id"])
+
+
+def _correct_snapshot(connection, row, patient, edited_at, *, attention_patch=None):
     from admission_hybrid import AdmissionCloudRepository
     from admission_contract import (
         assess_coverage,
@@ -96,6 +113,9 @@ def _correct_snapshot(connection, row, patient, edited_at):
             payload[key] = row[key]
             event["origin_username" if key == "admission_username" else key] = row[key]
     payload.update(demographic_patch(patient))
+    payload.update(attention_patch or {})
+    event["operational_session_id"] = _snapshot_session(connection, event, row)
+    payload["operational_session_id"] = event["operational_session_id"]
     coverage = assess_coverage(payload["ars"], payload["nss"])
     readiness = assess_billing_readiness(
         name=payload["name"],
@@ -111,7 +131,7 @@ def _correct_snapshot(connection, row, patient, edited_at):
             NAMESPACE_URL,
             (
                 f"sigeh-patient-correction:{patient['global_patient_id']}:"
-                f"{patient['server_revision']}:{row['global_attention_id']}"
+                f"{patient['server_revision']}:{row['global_attention_id']}:{revision}"
             ),
         )
     )
@@ -121,7 +141,8 @@ def _correct_snapshot(connection, row, patient, edited_at):
                patient_name=%s,cedula_snapshot=%s,nss_snapshot=%s,canonical_ars=%s,
                latest_payload_json=%s::jsonb,server_revision=%s,version=%s,
                coverage_status=%s,readiness=%s,readiness_reasons=%s,
-               snapshot_hash=%s,source_updated_at=%s
+               snapshot_hash=%s,source_updated_at=%s,
+               service_date=%s,specialty=%s,authorization_snapshot=%s
            WHERE global_attention_id=%s::UUID""",
         (
             payload["name"],
@@ -136,6 +157,9 @@ def _correct_snapshot(connection, row, patient, edited_at):
             json.dumps(list(readiness.reasons), ensure_ascii=False),
             stable_snapshot_hash(json.loads(encoded)),
             str(edited_at),
+            payload.get("service_date") or row.get("service_date"),
+            payload.get("specialty") or row.get("specialty"),
+            payload.get("authorization", row.get("authorization_snapshot") or ""),
             row["global_attention_id"],
         ),
     )

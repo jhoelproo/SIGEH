@@ -31,7 +31,7 @@ class LinkWorker(QThread):
 class LinkConfirmationDialog(QDialog):
     def __init__(self, receipt, attention, user, backend, session_id, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Vincular recibo a una atención heredada")
+        self.setWindowTitle("Vincular recibo a una atención de Admisión")
         self.setMinimumWidth(540)
         self.worker = LinkWorker(
             receipt["id"], attention, user["username"], backend, session_id, self
@@ -99,24 +99,19 @@ def open_receipt_link(history, backend):
     if not receipt or not backend.is_administrator(user):
         return
     session_id = str(getattr(history.main_window, "session_id", "") or "")
-    picker = backend.AdmissionValidationDialog(user, session_id, history)
-    picker.setWindowTitle("Seleccionar atención heredada para vincular")
-    picker.turn_filter_combo.blockSignals(True)
-    picker.turn_filter_combo.setCurrentIndex(1)
-    picker.turn_filter_combo.blockSignals(False)
-    picker.turn_filter_combo.setEnabled(False)
-    picker.identifier_edit.setText(receipt["nombre"])
+    picker = backend.AdmissionHistoryDialog(user, history, initial_search=False)
+    picker.session_id = session_id
+    picker.setWindowTitle("Buscar atención sin recibo en el historial de Admisión")
+    _restrict_link_picker(picker, receipt)
     for button in (
-        picker.history_button,
-        picker.bypass_button,
-        picker.dismiss_button,
+        picker.open_receipt_button,
         picker.cancel_inherited_button,
     ):
         button.hide()
     QTimer.singleShot(0, picker.search)
     if picker.exec() != QDialog.DialogCode.Accepted:
         return
-    attention = picker.selected_attention()
+    attention = picker.selected_for_billing()
     if attention is None:
         return
     confirmation = LinkConfirmationDialog(
@@ -124,3 +119,22 @@ def open_receipt_link(history, backend):
     )
     if confirmation.exec() == QDialog.DialogCode.Accepted:
         history.load_rows(reset=False, refresh_metrics=True)
+
+
+def _restrict_link_picker(picker, receipt):
+    for combo, label, value in (
+        (picker.receipt_combo, "Sin recibo", "SIN_RECIBO"),
+        (picker.status_combo, "Sin facturación", "SIN_RECIBO"),
+    ):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(label, value)
+        combo.setEnabled(False)
+        combo.blockSignals(False)
+    picker.search_edit.setText(
+        str(
+            receipt.get("admission_nss_snapshot")
+            or receipt.get("admission_cedula_snapshot")
+            or receipt["nombre"]
+        )
+    )

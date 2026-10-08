@@ -20,7 +20,7 @@ def linked_save(attention, **changes):
     )
 
 
-def test_admin_corrects_linked_name_without_changing_admission_service_date(linked):
+def test_admin_corrects_linked_name_and_shared_service_date(linked):
     receipt_id, attention, patient_id = linked
     with app.db_connect() as con:
         original = dict(
@@ -49,7 +49,7 @@ def test_admin_corrects_linked_name_without_changing_admission_service_date(link
         ).fetchone()[0]
     assert receipt["nombre"] == "CORRECCION SINTETICA"
     assert receipt["fecha"] == "2026-09-13"
-    assert admission == {**original, "patient_name": "CORRECCION SINTETICA"}
+    assert admission == {**original, "patient_name": "CORRECCION SINTETICA", "service_date": "2026-09-13"}
     assert patient_name == receipt["nombre"]
 
 

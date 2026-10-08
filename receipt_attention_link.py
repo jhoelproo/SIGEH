@@ -64,6 +64,12 @@ def validate_matching_patient(receipt, attention):
 def _lock_attention(con, selection, backend, actor, session_id):
     source = str(selection["source_instance_id"])
     identity = int(selection["attention_id"])
+    global_id = str(selection.get("global_attention_id") or "")
+    if global_id:
+        con.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (f"admission-sync:attention:{global_id}",),
+        )
     con.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
         (f"admission-billing:{source}:{identity}",),
@@ -84,20 +90,28 @@ def _lock_attention(con, selection, backend, actor, session_id):
     )
     if not result.get("eligible"):
         raise ValueError(result.get("reason") or "La atención ya no está pendiente.")
-    if result.get("turn_scope") != "INHERITED":
-        raise ValueError("Selecciona una atención heredada pendiente.")
-    return dict(result["_projection"])
+    attention = dict(result["_projection"])
+    attention["link_turn_scope"] = result["turn_scope"]
+    return attention
 
 
 def _write_link(con, receipt_id, attention, actor, backend):
     source, identity = attention["source_instance_id"], attention["attention_id"]
+    scope = attention["link_turn_scope"]
+    inheritance_state = (
+        "HEREDADA_PROCESADA"
+        if scope == "INHERITED"
+        else "TURNO_ACTUAL_PROCESADA"
+        if scope == "CURRENT"
+        else "HISTORICA_PROCESADA"
+    )
     con.execute(
         """UPDATE recibos SET admission_atencion_id=%s,admission_paciente_id=%s,
            admission_global_attention_id=%s,admission_source_instance_id=%s,
            admission_nss_snapshot=%s,admission_cedula_snapshot=%s,admission_ars_snapshot=%s,
            admission_linked_at=%s,admission_linked_by=%s,admission_snapshot_hash=%s,
            admission_source_updated_at=%s,admission_coverage_status=%s,admission_readiness=%s,
-           turno_origen_id=%s,turno_procesamiento_id=%s,herencia_estado='HEREDADA_PROCESADA',
+           turno_origen_id=%s,turno_procesamiento_id=%s,herencia_estado=%s,
            herencia_procesada_at=%s,herencia_procesada_por=%s,
            revision_version=revision_version+1 WHERE id=%s""",
         (
@@ -116,6 +130,7 @@ def _write_link(con, receipt_id, attention, actor, backend):
             attention.get("readiness") or "",
             attention["turn_id"],
             attention["active_turn_id"],
+            inheritance_state,
             backend.now_str(),
             actor["username"],
             receipt_id,
@@ -126,16 +141,17 @@ def _write_link(con, receipt_id, attention, actor, backend):
            WHERE source_instance_id=%s AND attention_id=%s""",
         (receipt_id, source, identity),
     )
-    backend._upsert_admission_inheritance(
-        con,
-        source_instance_id=source,
-        attention_id=identity,
-        turno_origen_id=attention["turn_id"],
-        estado="COMPLETADA",
-        turno_procesamiento_id=attention["active_turn_id"],
-        processed_by=actor["username"],
-        receipt_id=receipt_id,
-    )
+    if scope == "INHERITED":
+        backend._upsert_admission_inheritance(
+            con,
+            source_instance_id=source,
+            attention_id=identity,
+            turno_origen_id=attention["turn_id"],
+            estado="COMPLETADA",
+            turno_procesamiento_id=attention["active_turn_id"],
+            processed_by=actor["username"],
+            receipt_id=receipt_id,
+        )
     backend._insert_action_history(
         con,
         actor["username"],

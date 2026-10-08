@@ -194,7 +194,7 @@ def test_missing_receipt_specialty_recovers_linked_admission_value(linked, speci
     expected = {
         "PEDIATRIA": "PEDIATRÍA",
         "GINECOLOGIA": "GINECOLOGÍA",
-        "GENERAL": "GENERAL",
+        "GENERAL": "EMERGENCIOLOGÍA",
     }[specialty]
     assert app.list_monthly_batch_receipts(pending)[0]["specialty_snapshot"] == expected
 

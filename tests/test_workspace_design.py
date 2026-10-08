@@ -497,6 +497,7 @@ def billing(qt):
     window.main_split = QSplitter()
     window.main_split.addWidget(window.catalog_panel)
     window.main_split.addWidget(window.receipt_panel)
+    QVBoxLayout(window.receipt_catalog_group).addWidget(window.main_split)
     window.bottom_widget = QWidget()
     window.bottom_layout = QGridLayout(window.bottom_widget)
     window.lbl_edit_mode = QLabel()
@@ -533,12 +534,12 @@ def test_billing_compact_and_wide_geometry_keep_actions_available(billing):
     fit_billing_design(SimpleNamespace())
     billing.resize(1366, 768)
     fit_billing_design(billing)
-    assert billing.patient_scroll.minimumWidth() >= 270
+    assert billing.patient_scroll.minimumWidth() == 240
     assert billing.bottom_layout.indexOf(billing.btn_generate) >= 0
     assert billing.catalog_workspace.sort.maximumWidth() == 140
     assert (
         billing.cart_table.horizontalHeader().sectionResizeMode(1)
-        == app.QHeaderView.Stretch
+        == app.QHeaderView.Interactive
     )
     assert billing.lbl_total.minimumHeight() == 54
     billing.resize(1680, 950)

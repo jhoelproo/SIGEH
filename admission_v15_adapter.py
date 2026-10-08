@@ -8,6 +8,8 @@ las dependencias que ya pertenecen a la aplicación principal.
 from __future__ import annotations
 
 from admission_specialty import with_resolved_specialty
+from admission_visit_dates import current_turn_mode, date_variants
+from network_retry import NetworkRetryGate
 
 import importlib
 import importlib.util
@@ -304,6 +306,8 @@ class _HybridAdmissionRuntime:
         self._last_mirrored_operational_revision = 0
         self._last_heartbeat_at = 0.0
         self._last_patient_pull_at = 0.0
+        self._network_retry_gate = NetworkRetryGate()
+        self._backup_schedule = None
         self.connection_supervisor = ConnectionSupervisor(
             self._probe_operational_snapshot,
             reset_pool=self._reset_host_database_pool,
@@ -1035,6 +1039,7 @@ class _HybridAdmissionRuntime:
             self._bound_database = database
             self.store = OfflineAdmissionStore(database.db_name)
             self.store.initialize()
+            self._configure_backup_schedule(database)
             # V15 uses the same local writer/outbox as the sync worker.  The
             # reference is local-only and does not make SQLite authoritative.
             database.hybrid_store = self.store
@@ -1860,23 +1865,14 @@ class _HybridAdmissionRuntime:
         with self._lock:
             if self.store is None or self.sync_service is None:
                 return self.state()
+            self._run_scheduled_backup()
+            if not self._network_retry_gate.ready:
+                return {**self.state(), "network_retry_deferred": True}
             try:
                 if self.offline:
                     self.connection_supervisor.recover()
-                previous_generation = (
-                    self.attachment.operational_session.generation
-                    if self.attachment is not None
-                    else None
-                )
-                previous_turn = (
-                    self.attachment.operational_session.turn_id
-                    if self.attachment is not None
-                    else None
-                )
-                previous_operational_revision = (
-                    self.attachment.operational_session.operational_revision
-                    if self.attachment is not None
-                    else None
+                previous_generation, previous_turn, previous_operational_revision = (
+                    self._attachment_revision()
                 )
                 self._attach_remote_if_needed()
                 if self.app_user_can_operate_admission:
@@ -2012,10 +2008,12 @@ class _HybridAdmissionRuntime:
                         else "Sincronizado."
                     )
                 )
+                self._network_retry_gate.succeeded()
                 return {**self.state(), **result}
             except Exception as exc:
                 if not self._temporary(exc):
                     raise
+                self._network_retry_gate.failed(exc)
                 self.connection_supervisor.mark_offline(exc)
                 cached = self.store.cached_attachment()
                 # A replica may lag or even contain an older turn. Once a
@@ -2047,6 +2045,26 @@ class _HybridAdmissionRuntime:
                     else "Conexión temporalmente no verificada · trabajando localmente"
                 )
                 return self.state()
+
+    def _configure_backup_schedule(self, database):
+        from admission_source.emergency_core.backup import DailyBackupSchedule
+        manager = getattr(database, "backup_manager", None)
+        self._backup_schedule = DailyBackupSchedule(manager) if manager is not None else None
+
+    def _attachment_revision(self):
+        if self.attachment is None:
+            return None, None, None
+        session = self.attachment.operational_session
+        return session.generation, session.turn_id, session.operational_revision
+
+    def _run_scheduled_backup(self) -> None:
+        schedule = self._backup_schedule
+        if schedule is None:
+            return
+        try:
+            schedule.run_due()
+        except Exception:
+            self.logger.exception("No se pudo verificar el respaldo local diario")
 
     def get_attention_by_global_id(
         self,
@@ -2492,7 +2510,7 @@ class _HybridDatabaseProxy:
         if method_name not in self._history_methods:
             raise ValueError(f"Método de historial local no permitido: {method_name}")
         mode = str(values.get("modo") or "Todos")
-        session = self._runtime.operational_session
+        session = getattr(self._runtime, "operational_session", None)
         if mode in {"Este turno", "Turno actual", "Por turno"}:
             turn_id = (
                 values.get("turno_id")
@@ -2525,7 +2543,7 @@ class _HybridDatabaseProxy:
                     if str(row.get("hoja") or row.get("specialty") or "").upper()
                     == specialty
                 ]
-            rows = sorted(rows, key=self._history_sort_key)
+            rows = sorted(rows, key=self._history_sort_key, reverse=current_turn_mode(mode))
             offset = max(0, int(values.get("offset") or 0))
             limit = max(1, min(int(values.get("limite") or 200), 500))
             return rows[offset:offset + limit]
@@ -2679,6 +2697,7 @@ class _HybridDatabaseProxy:
             return sorted(
                 local_method(*args, **kwargs) or [],
                 key=self._history_sort_key,
+                reverse=current_turn_mode(kwargs.get("modo")),
             )
 
         values = dict(kwargs or {})
@@ -2715,12 +2734,9 @@ class _HybridDatabaseProxy:
             where.append("p.coverage_status='UNINSURED_DECLARED'")
         if mode == "Hoy":
             where.append("p.service_date=CURRENT_DATE::TEXT")
-        if mode == "Por fecha" and values.get("fecha_txt"):
-            raw_date = str(values["fecha_txt"])
-            parts = re.findall(r"\d+", raw_date)
-            if len(parts) == 3:
-                where.append("p.service_date=%s")
-                params.append(f"{int(parts[2]):04d}-{int(parts[1]):02d}-{int(parts[0]):02d}")
+        if mode == "Por fecha":
+            where.append("p.service_date IN (%s,%s,%s)")
+            params.extend(date_variants(values.get("fecha_txt")))
         specialty = str(values.get("especialidad") or "").strip()
         if mode == "Por especialidad" and specialty and specialty != "(TODAS)":
             where.append("UPPER(COALESCE(p.specialty,''))=UPPER(%s)")
@@ -2738,6 +2754,7 @@ class _HybridDatabaseProxy:
 
         page_limit, page_offset, merge_offset = history_page_window(limit, offset, bool(pending_rows))
 
+        direction = "DESC" if current_turn_mode(mode) else "ASC"
         sql = f"""SELECT p.*,p.attention_id AS origin_attention_id,
                           p.attention_id AS id,p.service_date AS fecha,
                           p.service_time AS hora,p.patient_name AS nombre,
@@ -2761,14 +2778,14 @@ class _HybridDatabaseProxy:
                           AND e.entity_uuid=p.global_attention_id
                         ORDER BY e.sequence DESC LIMIT 1
                    ) latest ON TRUE
-                   WHERE {' AND '.join(where)}
+                   WHERE {" AND ".join(where)}
                    ORDER BY COALESCE(
                                 p.created_at_effective_utc,
                                 NULLIF(p.synced_at,'')::TIMESTAMPTZ
-                            ) ASC,
-                            COALESCE(p.origin_device_id,'') ASC,
-                            COALESCE(p.device_local_sequence,0) ASC,
-                            COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) ASC
+                            ) {direction},
+                            COALESCE(p.origin_device_id,'') {direction},
+                            COALESCE(p.device_local_sequence,0) {direction},
+                            COALESCE(p.global_attention_id::TEXT,p.attention_id::TEXT) {direction}
                    LIMIT %s OFFSET %s"""
         params.extend((page_limit, page_offset))
         with self._runtime.host.connection_factory() as con:
@@ -2833,7 +2850,11 @@ class _HybridDatabaseProxy:
             key = str(row.get("global_attention_id") or "").replace("-", "").lower()
             if key and key not in by_uuid:
                 by_uuid[key] = row
-        merged = sorted(by_uuid.values(), key=self._history_sort_key)
+        merged = sorted(
+            by_uuid.values(),
+            key=self._history_sort_key,
+            reverse=current_turn_mode(mode),
+        )
         result = merged[merge_offset:merge_offset + limit]
         if logger is not None:
             estimated_bytes = sum(
@@ -2905,6 +2926,7 @@ class _HybridDatabaseProxy:
         rows = sorted(
             self.list_history_cache_local(method_name, **values),
             key=self._history_sort_key,
+            reverse=current_turn_mode(values.get("modo")),
         )
         if logger is not None:
             logger.info(
