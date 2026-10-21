@@ -59,11 +59,11 @@ def test_local_root_falls_back_to_home(monkeypatch):
 def test_local_pdf_preserves_charges_nss_and_pending_status(isolated_local_store):
     job = receipt_job()
     job["admission_attention"] = {"nss_clean": "001234567890123456789"}
-    job["authorization_number"] = "AUT-DEMO"
+    job["authorization_number"] = "000123"
     identity = isolated_local_store.enqueue(job)
     data = local_receipt_pdf_data(job, identity)
     assert data["nss"] == "001234567890123456789"
-    assert data["numero_autorizacion"] == "AUT-DEMO"
+    assert data["numero_autorizacion"] == "000123"
     assert data["total_general"] == 510
     assert data["categorias"][0]["items"][0]["total"] == 10
     assert data["estado_documento"] == "PRELIMINAR"

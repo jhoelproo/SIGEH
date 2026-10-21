@@ -36,6 +36,8 @@ class ReceiptTrashAndDeduplicationTests(unittest.TestCase):
         app.db_init()
         self.admin = {"username": "admin.test", "role": app.ROLE_ADMIN}
         self.auditor = {"username": "audit.test", "role": app.ROLE_AUDIT}
+        for actor in (self.admin, self.auditor):
+            app.create_user(actor["username"], actor["username"], "synthetic-test-password", "Q", "A", actor["role"])
 
     def tearDown(self):
         if app.db_pool is not None:

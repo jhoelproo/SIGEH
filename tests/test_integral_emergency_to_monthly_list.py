@@ -383,7 +383,7 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
                 )
             ],
             "ASEGURADO",
-            "AUT-E2E-001",
+            "000001",
             ready,
             billing_session_id,
         )
@@ -463,7 +463,7 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
         self.assertEqual(float(rows[0]["total_snapshot"]), 300.0)
         self.assertEqual(rows[0]["document_type_snapshot"], "NSS")
         self.assertEqual(rows[0]["document_number_snapshot"], "123456789")
-        self.assertEqual(rows[0]["authorization_snapshot"], "AUT-E2E-001")
+        self.assertEqual(rows[0]["authorization_snapshot"], "000001")
         self.assertEqual(rows[0]["service_date_snapshot"], "2026-07-20")
         self.assertEqual(rows[0]["specialty_snapshot"], "EMERGENCIOLOGÍA")
 
@@ -513,7 +513,7 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
             receipt_id,
             document_type="CÉDULA",
             document_number="00100000011",
-            authorization="AUT-CORREGIDA-001",
+            authorization="000002",
             specialty="EMERGENCIOLOGÍA",
             user=actor,
         )
@@ -575,7 +575,7 @@ class IntegralEmergencyToMonthlyListTests(unittest.TestCase):
             )
             self.assertEqual(
                 workbook["Relación Emergencias"]["E15"].value,
-                "AUT-CORREGIDA-001",
+                "000002",
             )
             self.assertTrue(
                 str(workbook["Factura Global"]["C19"].value).startswith(

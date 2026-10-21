@@ -234,7 +234,7 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
     def test_bypass_authorization_controls_document_and_review_without_attention(self):
         scenarios = (
             ("123456", app.DOCUMENT_READY, app.AUTH_REVIEW_CLEAR, False),
-            ("ABC-123", app.DOCUMENT_READY, app.AUTH_REVIEW_PENDING, True),
+            ("1", app.DOCUMENT_READY, app.AUTH_REVIEW_PENDING, True),
             ("", app.DOCUMENT_PRELIMINARY, app.AUTH_REVIEW_NOT_APPLICABLE, False),
         )
         for authorization, document_state, review_status, flagged in scenarios:
@@ -351,7 +351,7 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
                 0,
                 "2026-08-01",
                 [],
-                authorization_number="ABC123",
+                authorization_number="0001",
             )
         self.assertEqual(saved_id, 77)
         update_params = next(
@@ -361,7 +361,7 @@ class AdmissionValidationExtensionTests(unittest.TestCase):
         )
         self.assertIn(app.DOCUMENT_READY, update_params)
         self.assertIn(app.AUTH_REVIEW_PENDING, update_params)
-        self.assertIn("INVALID_AUTHORIZATION_FORMAT", update_params)
+        self.assertIn("AUTHORIZATION_TOO_SHORT", update_params)
         self.assertTrue(
             any(
                 "BYPASS_RECEIPT_REVIEW_FLAGGED" in params

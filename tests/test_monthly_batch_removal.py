@@ -141,11 +141,16 @@ class MonthlyBatchRemovalTests(unittest.TestCase):
         with (
             patch.object(app, "db_connect") as connect,
             patch.object(app, "remove_batch_entries", return_value=1) as remove,
+            patch.object(
+                app,
+                "get_user",
+                return_value={"username": "admin", "role": app.ROLE_ADMIN},
+            ),
         ):
-            user = {"role": app.ROLE_ADMIN}
+            user = {"username": "admin", "role": app.ROLE_ADMIN}
             app.remove_receipt_from_monthly_batch(1, 7, user, "x")
             self.assertEqual(remove.call_args.args[2], [{"recibo_id": 7}])
-            self.assertEqual(remove.call_args.kwargs["username"], "Sistema")
+            self.assertEqual(remove.call_args.kwargs["username"], "admin")
             app.remove_admission_candidate_from_monthly_batch(1, "SRC", 9, user, "x")
             self.assertEqual(remove.call_args.args[2][0]["admission_attention_id"], 9)
             self.assertEqual(connect.return_value.__exit__.call_count, 2)

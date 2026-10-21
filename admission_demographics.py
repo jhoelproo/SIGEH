@@ -26,7 +26,7 @@ def lock_recent_attentions(connection, patient_id):
     rows = connection.execute(
         """SELECT global_attention_id FROM admission_attention_projection
            WHERE global_patient_id=%s::UUID AND global_attention_id IS NOT NULL
-             AND created_at_effective_utc BETWEEN NOW()-INTERVAL '7 days' AND NOW()
+             AND ((created_at_effective_utc BETWEEN NOW()-INTERVAL '7 days' AND NOW()) OR EXISTS (SELECT 1 FROM recibos r WHERE COALESCE(r.is_deleted,0)=0 AND (r.admission_global_attention_id=admission_attention_projection.global_attention_id OR (r.admission_global_attention_id IS NULL AND r.admission_atencion_id=admission_attention_projection.attention_id AND COALESCE(r.admission_source_instance_id,'LEGACY')=admission_attention_projection.source_instance_id))))
            ORDER BY global_attention_id""",
         (patient_id,),
     ).fetchall()
@@ -38,14 +38,14 @@ def lock_recent_attentions(connection, patient_id):
 
 
 def correct_recent_attentions(connection, patient, *, edited_at):
-    """Run inside the patient edit transaction; receipts are never modified."""
+    """Correct recent or explicitly linked attention snapshots in the patient transaction."""
     patient_id = patient["global_patient_id"]
     candidates = connection.execute(
         """SELECT global_attention_id FROM admission_attention_projection
            WHERE global_patient_id=%s::UUID
              AND global_attention_id IS NOT NULL
-             AND created_at_effective_utc BETWEEN %s::timestamptz-INTERVAL '7 days'
-                                             AND %s::timestamptz
+             AND ((created_at_effective_utc BETWEEN %s::timestamptz-INTERVAL '7 days'
+                                             AND %s::timestamptz) OR EXISTS (SELECT 1 FROM recibos r WHERE COALESCE(r.is_deleted,0)=0 AND (r.admission_global_attention_id=admission_attention_projection.global_attention_id OR (r.admission_global_attention_id IS NULL AND r.admission_atencion_id=admission_attention_projection.attention_id AND COALESCE(r.admission_source_instance_id,'LEGACY')=admission_attention_projection.source_instance_id))))
            ORDER BY global_attention_id""",
         (patient_id, edited_at, edited_at),
     ).fetchall()
@@ -59,8 +59,8 @@ def correct_recent_attentions(connection, patient, *, edited_at):
         row = connection.execute(
             """SELECT * FROM admission_attention_projection
                WHERE global_attention_id=%s::UUID AND global_patient_id=%s::UUID
-                 AND created_at_effective_utc BETWEEN %s::timestamptz-INTERVAL '7 days'
-                                                 AND %s::timestamptz
+                 AND ((created_at_effective_utc BETWEEN %s::timestamptz-INTERVAL '7 days'
+                                                 AND %s::timestamptz) OR EXISTS (SELECT 1 FROM recibos r WHERE COALESCE(r.is_deleted,0)=0 AND (r.admission_global_attention_id=admission_attention_projection.global_attention_id OR (r.admission_global_attention_id IS NULL AND r.admission_atencion_id=admission_attention_projection.attention_id AND COALESCE(r.admission_source_instance_id,'LEGACY')=admission_attention_projection.source_instance_id))))
                FOR UPDATE""",
             (identity, patient_id, edited_at, edited_at),
         ).fetchone()
@@ -112,11 +112,14 @@ def _correct_snapshot(connection, row, patient, edited_at, *, attention_patch=No
         if row.get(key) is not None:
             payload[key] = row[key]
             event["origin_username" if key == "admission_username" else key] = row[key]
+    _apply_authoritative_fields(payload, row)
+    previous_coverage = (payload.get("ars"), payload.get("nss"))
     payload.update(demographic_patch(patient))
     payload.update(attention_patch or {})
     event["operational_session_id"] = _snapshot_session(connection, event, row)
     payload["operational_session_id"] = event["operational_session_id"]
     coverage = assess_coverage(payload["ars"], payload["nss"])
+    coverage = _preserved_coverage(coverage, previous_coverage, payload, row)
     readiness = assess_billing_readiness(
         name=payload["name"],
         service_date=payload.get("service_date"),
@@ -192,3 +195,38 @@ def _correct_snapshot(connection, row, patient, edited_at, *, attention_patch=No
             event["device_local_sequence"],
         ),
     )
+
+
+def _apply_authoritative_fields(payload, row):
+    for source, target in (
+        ("patient_name", "name"),
+        ("canonical_ars", "ars"),
+        ("nss_snapshot", "nss"),
+        ("cedula_snapshot", "cedula"),
+        ("service_date", "service_date"),
+        ("service_type", "service_type"),
+    ):
+        if row.get(source) not in (None, ""):
+            payload[target] = row[source]
+
+
+def _preserved_coverage(coverage, previous, payload, row):
+    if previous != (payload.get("ars"), payload.get("nss")) or not row.get(
+        "coverage_status"
+    ):
+        return coverage
+    from admission_contract import CoverageAssessment
+
+    previous_assessment = CoverageAssessment(
+        row["coverage_status"], str(payload.get("ars") or ""), coverage.reason
+    )
+    return previous_assessment if previous_assessment.complete else coverage
+
+
+def changed_demographic_patch(patient, fields, changed):
+    keys = (
+        "global_patient_id",
+        "server_revision",
+        *(field for field, audit_name in fields if audit_name in changed),
+    )
+    return {key: patient[key] for key in keys}

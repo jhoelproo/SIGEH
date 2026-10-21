@@ -35,7 +35,7 @@ def test_snapshot_correction_handles_missing_and_existing_context(monkeypatch, r
     connection = Mock()
     connection.execute.return_value.fetchone.return_value = row
     save = Mock(return_value="snapshot")
-    monkeypatch.setattr(app, "save_receipt_document_snapshot", save)
+    monkeypatch.setattr("receipt_documents.save_receipt_document_snapshot", save)
     assert app._snapshot_corrected_receipt(connection, 1, "qa") == "snapshot"
     context = dict((row["snapshot_jsonb"] or {}).get("document") or {}) if row else {}
     save.assert_called_once_with(connection, 1, "qa", document_context=context)

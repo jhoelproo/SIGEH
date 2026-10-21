@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
+    QLineEdit,
     QTableWidget,
     QTableWidgetItem,
 )
@@ -40,6 +41,7 @@ def form():
         current_ars="NUEVA",
         locked_ars="APS",
         ars_combo=combo,
+        authorization_edit=QLineEdit("000123"),
         _pending_ars_correction={"previous": "APS", "target": "NUEVA"},
         cart_table=table,
         _cart_quantity_value=lambda index: 2,
@@ -72,6 +74,7 @@ def test_tariff_callback_recalculates_visible_cart_and_room(qt_application):
     assert window.sala_spin.value() == 460 and window.locked_ars == "NUEVA"
     assert window._pending_ars_correction is None
     window.update_totals.assert_called_once()
+    assert window.authorization_edit.text() == ""
 
 
 @pytest.mark.parametrize("data", [runtime(ars_id=0), runtime(catalogs={})])
@@ -85,6 +88,7 @@ def test_missing_tariff_reverts_without_partial_changes(
     assert window.cart_table.item(0, 3).text() == "$100.00"
     assert window.sala_spin.value() == 100 and window.locked_ars == "APS"
     window.update_totals.assert_not_called()
+    assert window.authorization_edit.text() == "000123"
 
 
 def test_stale_callback_does_not_apply(qt_application):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
@@ -11,6 +12,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from user_permissions import overrides_for
 
 OFFLINE_LOGIN_VALID_DAYS = 30
 PBKDF2_ITERATIONS = 240_000
@@ -57,6 +59,36 @@ class OfflineAuthCache:
                    )"""
             )
 
+            columns = {
+                row[1] for row in con.execute("PRAGMA table_info(offline_auth_cache)")
+            }
+            if "permission_overrides" not in columns:
+                con.execute(
+                    "ALTER TABLE offline_auth_cache ADD COLUMN permission_overrides TEXT NOT NULL DEFAULT '{}'"
+                )
+
+    def refresh_permissions(self, username, device_id, user):
+        self.initialize()
+        with sqlite3.connect(self.path) as con:
+            if not user.get("is_active", True):
+                con.execute(
+                    "DELETE FROM offline_auth_cache WHERE username=? AND device_id=?",
+                    (username, device_id),
+                )
+                return
+            con.execute(
+                """UPDATE offline_auth_cache SET role_snapshot=?,permission_overrides=?
+                   WHERE username=? AND device_id=? AND (role_snapshot<>? OR permission_overrides<>?)""",
+                (
+                    user["role"],
+                    json.dumps(overrides_for(user), sort_keys=True),
+                    username,
+                    device_id,
+                    user["role"],
+                    json.dumps(overrides_for(user), sort_keys=True),
+                ),
+            )
+
     def store_online_auth(
         self,
         user: Mapping[str, Any],
@@ -82,8 +114,8 @@ class OfflineAuthCache:
                 """INSERT INTO offline_auth_cache(
                        user_id,username,full_name,role_snapshot,password_verifier,
                        password_salt,verifier_iterations,device_id,
-                       last_online_auth_at,offline_valid_until
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                       last_online_auth_at,offline_valid_until,permission_overrides
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(username,device_id) DO UPDATE SET
                        user_id=excluded.user_id,full_name=excluded.full_name,
                        role_snapshot=excluded.role_snapshot,
@@ -91,7 +123,8 @@ class OfflineAuthCache:
                        password_salt=excluded.password_salt,
                        verifier_iterations=excluded.verifier_iterations,
                        last_online_auth_at=excluded.last_online_auth_at,
-                       offline_valid_until=excluded.offline_valid_until""",
+                       offline_valid_until=excluded.offline_valid_until,
+                        permission_overrides=excluded.permission_overrides""",
                 (
                     str(user.get("id", user.get("user_id", "")) or ""),
                     username,
@@ -103,6 +136,7 @@ class OfflineAuthCache:
                     str(device_id),
                     instant.isoformat(),
                     valid_until.isoformat(),
+                    json.dumps(overrides_for(user), sort_keys=True),
                 ),
             )
 
@@ -148,13 +182,17 @@ class OfflineAuthCache:
             "username": str(row["username"]),
             "full_name": str(row["full_name"]),
             "role": str(row["role_snapshot"]),
+            "permission_overrides": json.loads(str(row["permission_overrides"])),
             "is_active": 1,
             "_offline_login": True,
             "_offline_valid_until": str(row["offline_valid_until"]),
         }
 
     def list_valid_usernames(
-        self, device_id: str, *, now: datetime | None = None,
+        self,
+        device_id: str,
+        *,
+        now: datetime | None = None,
     ) -> list[str]:
         self.initialize()
         instant = now or _utc_now()

@@ -27,6 +27,9 @@ def normalize_list_metadata(
     kind, number, authorization, specialty, *, allow_incomplete=False
 ):
     from billing_specialties import normalized_specialty
+    from authorization_validation import numeric_authorization
+
+    authorization = numeric_authorization(authorization, allow_empty=allow_incomplete)
 
     return (
         normalized_document_type(kind),

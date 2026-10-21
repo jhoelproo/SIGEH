@@ -591,6 +591,12 @@ PERMISSION_MANAGE_TRASH = "receipt.manage_trash"
 PERMISSION_MANAGE_BILLING_LISTS = "billing_lists.manage"
 PERMISSION_VIEW_ADMISSION_QUEUE = "admission.view_queue"
 PERMISSION_VIEW_ADMISSION_RECONCILIATION = "admission.view_reconciliation"
+PERMISSION_MANAGE_USER_PERMISSIONS = "users.manage_permissions"
+PERMISSION_CHANGE_RECEIPT_ARS = "receipt.change_ars"
+PERMISSION_BYPASS_VERIFICATION = "receipt.bypass_verification"
+PERMISSION_VIEW_UNINSURED = "receipt.bill_uninsured"
+PERMISSION_CONFIRM_UNLINKED = "receipt.confirm_unlinked"
+
 
 BATCH_DRAFT = "BORRADOR"
 BATCH_PENDING = "PENDIENTE"
@@ -2993,6 +2999,9 @@ def db_init():
         _apply_admission_hybrid_migration(con)
         _apply_billing_admission_bridge_identity_migration(con)
         _apply_billing_bypass_authorization_review_migration(con)
+        from user_permissions import SCHEMA_SQL as permission_schema
+
+        con.execute(permission_schema)
         from self_pay_billing import install_schema as install_self_pay_schema
 
         install_self_pay_schema(con)
@@ -3544,7 +3553,7 @@ _BOOTSTRAP_REQUIRED_SCHEMA = {
         "global_attention_id",
         "classification",
     },
-    "users": {"id", "username", "role", "is_active"},
+    "users": {"id", "username", "role", "is_active", "permission_overrides"},
     "recibos": {
         "id",
         "numero",
@@ -4436,8 +4445,9 @@ def check_session_health(username: str, session_id: str) -> dict:
                       (SELECT row_to_json(operational) FROM operational) AS operational_context,
                       COALESCE((SELECT numeric_value FROM pricing),35.00) AS markup,
                       COALESCE((SELECT version FROM pricing),0) AS markup_version,
-                      (SELECT settings FROM honorarium_settings) AS honorarium_settings""",
-            (stamp, session_id, session_id, MEDICATION_MARKUP_SETTING_KEY),
+                      (SELECT settings FROM honorarium_settings) AS honorarium_settings,
+                       (SELECT jsonb_build_object('role',role,'is_active',is_active,'permission_overrides',permission_overrides) FROM users WHERE username=%s) AS permission_context""",
+            (stamp, session_id, session_id, MEDICATION_MARKUP_SETTING_KEY, username),
         ).fetchone()
     data = dict(row or {})
     operational_data = dict(data.get("operational_context") or {})
@@ -4449,6 +4459,7 @@ def check_session_health(username: str, session_id: str) -> dict:
             or operational_data.get("active_username") or ""
         ),
         "operational_context": operational_data,
+        "permission_context": data.get("permission_context"),
         "medication_markup_percent": (
             float(data.get("markup") or DEFAULT_MEDICATION_MARKUP_PERCENT)
         ),
@@ -9391,8 +9402,7 @@ def get_ars_billing_profile(ars: str) -> dict:
 
 
 def save_ars_billing_profile(ars: str, values: dict, user: dict) -> None:
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede editar perfiles de ARS.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede editar perfiles de ARS.")
     ars = require_medication_ars(ars)
     username = str((user or {}).get("username") or "Sistema")
     stamp = now_str()
@@ -9456,8 +9466,7 @@ def create_monthly_billing_batch(
 ):
     """Crea una fotografía editable de lo facturado hasta este instante."""
     username = str((user or {}).get("username") or "Sistema")
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede generar listados mensuales.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede generar listados mensuales.")
     ars = str(ars or "").strip()
     if not ars:
         raise ValueError("Selecciona la ARS o el renglón SIN SEGURO.")
@@ -9703,6 +9712,31 @@ def _file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _monthly_batch_confirmation_export(batch: dict, receipts: list[dict]) -> dict:
+    export_path = str(batch.get("last_export_path") or "").strip()
+    if not export_path or not os.path.isfile(export_path):
+        raise ValueError(
+            "Genera correctamente el Excel final antes de confirmar el envío."
+        )
+    signature = re.fullmatch(
+        r"([0-9a-f]{64}):([0-9a-f]{64})",
+        str(batch.get("last_export_signature") or ""),
+    )
+    if signature is None or not hmac.compare_digest(
+        signature[1], _monthly_batch_export_signature(batch, receipts)
+    ):
+        raise ValueError(
+            "El expediente cambió después de exportarse. Genera nuevamente el Excel final."
+        )
+    sent_file_sha256 = _file_sha256(export_path)
+    return {
+        "path": export_path,
+        "exported_file_sha256": signature[2],
+        "sent_file_sha256": sent_file_sha256,
+        "excel_modified": not hmac.compare_digest(signature[2], sent_file_sha256),
+    }
+
+
 def _query_available_receipts_for_batch(
     con,
     batch_id: int,
@@ -9901,8 +9935,7 @@ def add_receipts_to_monthly_batch(
     return_summary: bool = False,
 ):
     username = str((user or {}).get("username") or "Sistema")
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede editar listados mensuales.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede editar listados mensuales.")
     requested_ids = sorted({int(value) for value in receipt_ids})
     if not requested_ids:
         return 0
@@ -10123,8 +10156,7 @@ def add_admission_candidates_to_monthly_batch(
     requested = {str(value) for value in candidate_keys if str(value).startswith("A:")}
     if not requested:
         return 0
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede editar listados mensuales.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede editar listados mensuales.")
     batch = get_monthly_billing_batch(batch_id)
     if not batch or not batch_is_editable(batch):
         raise ValueError("El expediente ya no está disponible para edición.")
@@ -10231,8 +10263,7 @@ def remove_selected_entries_from_monthly_batch(
     user: dict,
     reason: str,
 ) -> int:
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede editar listados mensuales.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede editar listados mensuales.")
     with db_connect() as con:
         return remove_batch_entries(
             con,
@@ -10278,8 +10309,7 @@ def remove_admission_candidate_from_monthly_batch(
 
 def delete_monthly_billing_batch(batch_id: int, user: dict) -> dict:
     """Elimina solo un expediente pendiente y sus relaciones, en transacción."""
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede eliminar expedientes mensuales.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede eliminar expedientes mensuales.")
     with db_connect() as con:
         batch_row = con.execute(
             "SELECT * FROM billing_batches WHERE id=%s FOR UPDATE",
@@ -10326,8 +10356,7 @@ def update_monthly_batch_configuration(
     *,
     save_as_profile: bool = False,
 ) -> None:
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede editar listados mensuales.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede editar listados mensuales.")
     username = str((user or {}).get("username") or "Sistema")
     batch = get_monthly_billing_batch(batch_id)
     if not batch or not batch_is_editable(batch):
@@ -10459,8 +10488,7 @@ def update_monthly_batch_receipt_export_data(
     service_date: str | None = None,
     expected_service_date: str | None = None,
 ) -> None:
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede corregir listados mensuales.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede corregir listados mensuales.")
     from receipt_list_consistency import normalize_list_metadata
 
     document_type, document_number, authorization, specialty = normalize_list_metadata(
@@ -10555,16 +10583,9 @@ def _receipt_metadata_policy(receipt, authorization):
 
 
 def _snapshot_corrected_receipt(con, receipt_id, username):
-    row = con.execute(
-        """SELECT snapshot_jsonb FROM recibo_document_versions
-           WHERE recibo_id=%s AND is_current=TRUE""",
-        (int(receipt_id),),
-    ).fetchone()
-    context = dict((row["snapshot_jsonb"] or {}).get("document") or {}) if row else {}
-    return save_receipt_document_snapshot(
-        con, receipt_id, username, document_context=context
-    )
+    from receipt_documents import refresh_administrative_snapshot
 
+    return refresh_administrative_snapshot(con, receipt_id, username)
 
 def update_receipt_authorization(
     receipt_id, authorization, user, *, expected_authorization
@@ -10666,8 +10687,7 @@ def record_monthly_batch_export(batch_id: int, output_path: str, user: dict) -> 
 
 def confirm_monthly_batch_sent(batch_id: int, user: dict) -> dict:
     """Confirma el envío una sola vez, después de una exportación válida."""
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede confirmar listados enviados.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede confirmar listados enviados.")
     username = str((user or {}).get("username") or "Sistema")
     stamp = now_str()
     with db_connect() as con:
@@ -10686,19 +10706,7 @@ def confirm_monthly_batch_sent(batch_id: int, user: dict) -> dict:
         problems = validate_export_payload(batch, receipts)
         if problems:
             raise ValueError("Corrige los datos obligatorios antes de confirmar el envío.")
-        export_path = str(batch.get("last_export_path") or "").strip()
-        if not export_path or not os.path.isfile(export_path):
-            raise ValueError("Genera correctamente el Excel final antes de confirmar el envío.")
-        expected_signature = (
-            _monthly_batch_export_signature(batch, receipts)
-            + ":" + _file_sha256(export_path)
-        )
-        if not hmac.compare_digest(
-            str(batch.get("last_export_signature") or ""), expected_signature
-        ):
-            raise ValueError(
-                "El expediente cambió después de exportarse. Genera nuevamente el Excel final."
-            )
+        export_details = _monthly_batch_confirmation_export(batch, receipts)
         duplicate = con.execute(
             """SELECT br.recibo_id,br.admission_attention_id,other.batch_id
                FROM billing_batch_receipts br
@@ -10754,7 +10762,7 @@ def confirm_monthly_batch_sent(batch_id: int, user: dict) -> dict:
                 int(batch_id), stamp, username,
                 json.dumps(
                     {
-                        "path": export_path, "receipts": sent_count,
+                        **export_details, "receipts": sent_count,
                         "total": sent_total,
                         "invoice_number": str(batch.get("invoice_number") or ""),
                         "ncf": str(batch.get("ncf") or ""),
@@ -10787,8 +10795,7 @@ def update_monthly_batch_receipt_comprobante(
 ):
     """Actualiza el comprobante de un facturado sin reabrir sus montos."""
     username = str((user or {}).get("username") or "Sistema")
-    if not user_has_permission(user, PERMISSION_MANAGE_BILLING_LISTS):
-        raise PermissionError("Tu rol no puede editar comprobantes del listado.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_MANAGE_BILLING_LISTS, "Tu rol no puede editar comprobantes del listado.")
     value = str(comprobante or "").strip()
     if not value:
         raise ValueError("Escribe el número de comprobante o NCF.")
@@ -10951,11 +10958,13 @@ def _owned_receipt_processing(con, projection, receipt_id, snapshot):
     )
 
     current = con.execute(
-        "SELECT admission_nss_snapshot,admission_cedula_snapshot FROM recibos WHERE id=%s FOR UPDATE",
+        "SELECT admission_nss_snapshot,admission_cedula_snapshot,nombre,fecha FROM recibos WHERE id=%s FOR UPDATE",
         (receipt_id,),
     ).fetchone()
     current = dict(current or {})
     snapshot = reconcile_owned_identifiers(snapshot, projection, current)
+    snapshot.pop("canonical_ars", None)
+    snapshot.pop("ars", None)
     validate_admission_snapshot(snapshot, projection)
     return {
         "turno_origen_id": projection["receipt_origin_turn"],
@@ -11092,6 +11101,41 @@ def update_recibo_db(recibo_id: int, nombre: str, fecha: str, dx: str, ars: str,
         con.execute("DELETE FROM recibo_items WHERE recibo_id=%s", (recibo_id,))
 
 
+def _require_initial_attention_readiness(attention_data, recibo_id):
+    readiness = str(attention_data.get("billing_readiness") or "")
+    if (
+        readiness
+        and readiness != READINESS_READY
+        and recibo_id is None
+        and not attention_data.get("global_attention_id")
+    ):
+        reasons = list(attention_data.get("readiness_reasons") or ())
+        raise ValueError(
+            "La atención todavía no está completa para Facturación."
+            + ("\n- " + "\n- ".join(reasons) if reasons else "")
+        )
+
+
+def _room_price_after_insurer_change(con, receipt_id, ars, actor, previous_price):
+    old = con.execute(
+        "SELECT ars FROM recibos WHERE id=%s", (int(receipt_id),)
+    ).fetchone()
+    if (
+        old
+        and str(old["ars"] or "") != str(ars or "")
+        and user_has_permission(actor, PERMISSION_CHANGE_RECEIPT_ARS)
+    ):
+        return None
+    return previous_price
+
+
+def _require_receipt_editor(actor, receipt_id):
+    if receipt_id is not None and not user_has_permission(
+        actor, PERMISSION_EDIT_PENDING
+    ):
+        raise PermissionError("No tienes permiso para editar recibos pendientes.")
+
+
 def _receipt_service_type(admission_attention):
     service_type = str(
         (admission_attention or {}).get("attention_type", "")
@@ -11131,6 +11175,9 @@ def save_receipt_with_items(
     """Guarda cabecera, ítems, historial y snapshot con un solo commit."""
     from receipt_edit_integrity import receipt_service_date, require_same_insurance
     fecha = receipt_service_date(fecha)
+    from authorization_validation import numeric_authorization
+
+    authorization_number = numeric_authorization(authorization_number)
     self_pay = is_self_pay(coverage)
     tariff_name = tariff_ars(coverage, ars)
     if self_pay:
@@ -11150,6 +11197,7 @@ def save_receipt_with_items(
         "role": str(bypass_data.get("role") or ""),
     }
     actor_user = get_user(str(username or "")) or {"username": str(username or ""), "role": ""}
+    _require_receipt_editor(actor_user, recibo_id)
     if self_pay and normalize_role(actor_user.get("role")) not in ROLE_PERMISSIONS:
         raise PermissionError("El usuario no está autorizado para registrar cobros.")
     if bypass_data and not admission_attention:
@@ -11196,13 +11244,7 @@ def save_receipt_with_items(
                 raise PermissionError(
                     "Tu rol no puede facturar pacientes sin seguro."
                 )
-        readiness = str(attention_data.get("billing_readiness") or "")
-        if readiness and readiness != READINESS_READY and recibo_id is None:
-            reasons = list(attention_data.get("readiness_reasons") or ())
-            raise ValueError(
-                "La atención todavía no está completa para Facturación."
-                + ("\n- " + "\n- ".join(reasons) if reasons else "")
-            )
+        _require_initial_attention_readiness(attention_data, recibo_id)
     item_rows = []
     for categoria, items in grouped:
         item_ars = tariff_name if categoria in ARS_CATEGORIES else ""
@@ -11286,6 +11328,7 @@ def save_receipt_with_items(
                     "SELECT sala FROM recibos WHERE id=%s FOR UPDATE", (int(recibo_id),),
                 ).fetchone()
                 old_price = existing_price["sala"] if existing_price else None
+                old_price = _room_price_after_insurer_change(con, recibo_id, ars, actor_user, old_price)
             tariff = con.execute(
                 "SELECT sala_emergencia,consulta_price FROM ars WHERE nombre=%s AND is_active=1 FOR SHARE",
                 (tariff_name,),
@@ -11315,7 +11358,7 @@ def save_receipt_with_items(
             ).fetchone()
             if not current:
                 raise ValueError("El recibo que intentas editar ya no existe.")
-            require_same_insurance(ars, coverage, dict(current), admin=is_administrator(actor_user))
+            require_same_insurance(ars, coverage, dict(current), admin=user_has_permission(actor_user, PERMISSION_CHANGE_RECEIPT_ARS))
             from billing_field_policy import require_validated_header_edit
             require_validated_header_edit(
                 auxiliary=normalize_role(actor_user.get("role")) == ROLE_AUX and not self_pay,
@@ -11782,6 +11825,11 @@ def save_receipt_with_items(
 
         if editing:
             from receipt_list_consistency import sync_pending_lists
+
+            if str(current["ars"] or "") != str(ars or ""):
+                from receipt_ars_correction import detach_previous_insurer_batches
+
+                detach_previous_insurer_batches(con, saved_id, ars, str(username or "Sistema"), now_str())
             sync_pending_lists(con, saved_id, str(username or "Sistema"), now_str())
 
         document_version = save_receipt_document_snapshot(
@@ -11818,8 +11866,9 @@ def save_receipt_with_items(
 
 def _receipt_actor(actor):
     if isinstance(actor, dict):
-        return dict(actor)
-    username = str(actor or "").strip()
+        username = str(actor.get("username") or "").strip()
+    else:
+        username = str(actor or "").strip()
     return get_user(username) if username else None
 
 
@@ -13552,8 +13601,7 @@ def get_receipt_audit_preflight(recibo_id: int, actor=None) -> dict:
 
 def assign_receipt_for_audit(recibo_id: int, actor, release: bool = False):
     username, user = _actor_context(actor)
-    if not user_has_permission(user, PERMISSION_VIEW_BILLING_AUDIT):
-        raise PermissionError("Tu rol no puede gestionar la cola de auditoría.")
+    user, _permission_username = _require_receipt_permission(user, PERMISSION_VIEW_BILLING_AUDIT, "Tu rol no puede gestionar la cola de auditoría.")
     with db_connect() as con:
         row = con.execute(
             """SELECT id, numero, ars, total, estado_facturacion, revision_version,
@@ -15213,15 +15261,15 @@ def evaluate_admission_billing_access(
 
 
 def can_bypass_patient_verification(user: dict) -> bool:
-    return _is_privileged_billing_role(user)
+    return user_has_permission(user, PERMISSION_BYPASS_VERIFICATION)
 
 
 def can_confirm_unlinked_receipt(user: dict) -> bool:
-    return _is_privileged_billing_role(user)
+    return user_has_permission(user, PERMISSION_CONFIRM_UNLINKED)
 
 
 def can_view_uninsured_patients(user: dict) -> bool:
-    return _is_privileged_billing_role(user)
+    return user_has_permission(user, PERMISSION_VIEW_UNINSURED)
 
 def user_can_manage_sessions(user: dict) -> bool:
     return is_administrator(user)
@@ -15263,9 +15311,59 @@ ROLE_PERMISSIONS = {
 }
 
 
+for _role in (ROLE_ADMIN, ROLE_AUDIT):
+    ROLE_PERMISSIONS[_role].update(
+        (
+            PERMISSION_BYPASS_VERIFICATION,
+            PERMISSION_VIEW_UNINSURED,
+            PERMISSION_CONFIRM_UNLINKED,
+        )
+    )
+ROLE_PERMISSIONS[ROLE_ADMIN].update(
+    (PERMISSION_MANAGE_USER_PERMISSIONS, PERMISSION_CHANGE_RECEIPT_ARS)
+)
+
+PERMISSION_LABELS = {
+    PERMISSION_VALIDATE_RECEIPT: "Validar recibos",
+    PERMISSION_MARK_NOT_INVOICED: "Marcar no facturado",
+    PERMISSION_REOPEN_RECEIPT: "Reabrir recibos",
+    PERMISSION_VIEW_BILLING_AUDIT: "Ver auditoría de facturación",
+    PERMISSION_EDIT_PENDING: "Editar recibos pendientes",
+    PERMISSION_DELETE_PENDING: "Retirar recibos pendientes",
+    PERMISSION_MANAGE_TRASH: "Administrar papelera",
+    PERMISSION_MANAGE_BILLING_LISTS: "Administrar listados ARS",
+    PERMISSION_VIEW_ADMISSION_QUEUE: "Acceder a Admisión",
+    PERMISSION_VIEW_ADMISSION_RECONCILIATION: "Conciliar Admisión",
+    PERMISSION_MANAGE_USER_PERMISSIONS: "Administrar permisos individuales",
+    PERMISSION_CHANGE_RECEIPT_ARS: "Corregir ARS del recibo",
+    PERMISSION_BYPASS_VERIFICATION: "Omitir verificación de atención",
+    PERMISSION_VIEW_UNINSURED: "Facturar pacientes sin seguro",
+    PERMISSION_CONFIRM_UNLINKED: "Confirmar recibos sin vínculo",
+}
+
+
+def save_user_permission_overrides(username, values, actor, *, expected=None):
+    from user_permissions import save_overrides
+
+    with db_connect() as con:
+        return save_overrides(
+            con,
+            username,
+            values,
+            actor,
+            expected,
+            lambda current: user_has_permission(
+                current, PERMISSION_MANAGE_USER_PERMISSIONS
+            ),
+            PERMISSION_LABELS,
+        )
+
+
 def user_has_permission(user: dict, permission: str) -> bool:
+    from user_permissions import effective_permission
+
     role = normalize_role((user or {}).get("role"))
-    return permission in ROLE_PERMISSIONS.get(role, set())
+    return effective_permission(user, permission, ROLE_PERMISSIONS.get(role, set()))
 
 
 def main_module_labels_for_user(user: dict) -> tuple[str, ...]:
@@ -21211,6 +21309,13 @@ class UsersAdminDialog(QDialog):
         self.btn_add = QPushButton("Crear usuario")
         self.btn_toggle = QPushButton("Activar / Desactivar")
         self.btn_role = QPushButton("Cambiar rol")
+        self.btn_permissions = QPushButton("Permisos individuales")
+        set_button_role(self.btn_permissions, "info")
+        self.btn_permissions.clicked.connect(self.edit_permissions)
+        self.btn_permissions.setEnabled(
+            user_has_permission(self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS)
+        )
+        row.addWidget(self.btn_permissions)
         self.btn_reset = QPushButton("Restablecer contraseña")
         self.btn_remote_logout = QPushButton("Cerrar sesión remota")
         row.addWidget(self.btn_refresh); row.addWidget(self.btn_add); row.addWidget(self.btn_toggle); row.addWidget(self.btn_role); row.addWidget(self.btn_reset); row.addWidget(self.btn_remote_logout); row.addStretch(1)
@@ -21268,6 +21373,28 @@ class UsersAdminDialog(QDialog):
                     font.setBold(True)
                     item.setFont(font)
                 self.table.setItem(r, c, item)
+
+    def edit_permissions(self):
+        username = self._selected_username()
+        if not username:
+            return
+        user = get_user(username)
+        if not user:
+            return
+        from user_permissions_dialog import UserPermissionsDialog
+
+        dialog = UserPermissionsDialog(
+            user,
+            PERMISSION_LABELS,
+            ROLE_PERMISSIONS.get(normalize_role(user["role"]), set()),
+            lambda values, previous: save_user_permission_overrides(
+                username, values, self.current_user, expected=previous
+            ),
+            self,
+        )
+        if dialog.exec() == QDialog.Accepted:
+            self.current_user.update(get_user(self.current_user["username"]) or {})
+            self.btn_permissions.setEnabled(user_has_permission(self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS))
 
     def _selected_username(self):
         row = self.table.currentRow()
@@ -23534,7 +23661,9 @@ class MonthlyReceiptEditorDialog(QDialog):
         ):
             self._add_correction_control(form, row, column, caption, control)
         self.document_number.setMaxLength(24)
-        self.authorization.setMaxLength(40)
+        from authorization_validation import install_authorization_validator
+
+        install_authorization_validator(self.authorization)
         root.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
@@ -25828,6 +25957,9 @@ class MonthlyBillingListsPage(QWidget):
             f"Total: RD$ {total:,.2f}\n\n"
             f"NCF: {batch.get('ncf') or 'PENDIENTE'}\n"
             f"Número de factura: {batch.get('invoice_number') or 'PENDIENTE'}\n\n"
+            "Puedes confirmar aunque hayas editado el Excel generado.\n"
+            "Los cambios hechos en Excel no se importan al sistema. Se marcarán "
+            "como enviados los pacientes y los importes de este expediente.\n\n"
             "Esta confirmación congela la cantidad, el total y los datos fiscales.\n"
             "Al confirmar, el expediente quedará bloqueado y no podrá "
             "editarse, eliminarse, añadir ni retirar recibos desde esta pantalla.",
@@ -33559,7 +33691,7 @@ class MainWindow(QMainWindow):
         self.btn_preferences.clicked.connect(self.open_preferences_dialog)
         top_right_h.addWidget(self.btn_preferences)
         self.btn_advanced = None
-        if user_can_manage_sessions(self.current_user) or user_is_admin(self.current_user):
+        if user_can_manage_sessions(self.current_user) or user_has_permission(self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS):
             self.btn_advanced = QToolButton()
             self.btn_advanced.setText("Opciones avanzadas")
             self.btn_advanced.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -33799,6 +33931,9 @@ class MainWindow(QMainWindow):
         self.sala_spin = configure_decimal_spinbox(QDoubleSpinBox()); self.sala_spin.setRange(0, 1_000_000); self.sala_spin.setDecimals(2); self.sala_spin.setSingleStep(SALA_STEP)
         self.sala_spin.valueChanged.connect(lambda v: self.update_totals())
         self.authorization_edit = QLineEdit()
+        from authorization_validation import install_authorization_validator
+
+        install_authorization_validator(self.authorization_edit)
         self.authorization_edit.setPlaceholderText(
             "Obligatorio para completar la facturación."
         )
@@ -34085,29 +34220,7 @@ class MainWindow(QMainWindow):
         self.admission_page = None
         self.full_admission_page = None
         if self.emergency_module_index is not None:
-            self.emergency_workspace = EmergencyWorkspacePage(
-                self.current_user, self.session_id, self
-            )
-            self.admission_page = self.emergency_workspace.queue_page
-            self.full_admission_page = self.emergency_workspace.full_page
-            self.emergency_workspace.billing_requested.connect(
-                self._send_emergency_history_to_billing
-            )
-            self.emergency_workspace.attention_selected.connect(
-                self._use_admission_attention_from_module
-            )
-            self.emergency_workspace.shift_closure_ready.connect(
-                self.process_shift_closure_report
-            )
-            self.emergency_workspace.projection_changed.connect(
-                self._refresh_admission_billing_views
-            )
-            self.emergency_workspace.shift_changed.connect(
-                self._refresh_admission_billing_views
-            )
-            self.theme_toggled.connect(self.emergency_workspace.apply_theme)
-            self.emergency_workspace.apply_theme(self.is_dark_mode)
-            self.main_module_stack.addWidget(self.emergency_workspace)
+            self._ensure_emergency_workspace()
 
         self.monthly_lists_page = None
         if self.monthly_lists_module_index is not None and not self.offline_login:
@@ -35972,7 +36085,7 @@ class MainWindow(QMainWindow):
             return
         admin_correction = (
             getattr(self, "editing_recibo_id", None) is not None
-            and is_administrator(self.current_user)
+            and user_has_permission(self.current_user, PERMISSION_CHANGE_RECEIPT_ARS)
             and not is_self_pay(form_coverage(self))
             and not getattr(self, "receipt_read_only", False)
         )
@@ -36079,6 +36192,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Cambio de ARS", str(exc))
                 return
             self._pending_ars_correction = None
+            self.authorization_edit.clear()
         price_key = (
             "consulta_price" if self.service_type == "CONSULTA"
             else "sala_emergencia"
@@ -36281,8 +36395,39 @@ class MainWindow(QMainWindow):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(editable)
-        if is_self_pay(form_coverage(self)):
-            self.ars_combo.setEnabled(False)
+        MainWindow._apply_receipt_edit_permissions(self)
+
+    def _apply_receipt_edit_permissions(self):
+        if getattr(self, "editing_recibo_id", None) is None:
+            return
+        editable = user_has_permission(self.current_user, PERMISSION_EDIT_PENDING)
+        insurance_control = getattr(self, "ars_combo", None)
+        if insurance_control is not None:
+            insurance_control.setEnabled(
+                editable
+                and user_has_permission(
+                    self.current_user, PERMISSION_CHANGE_RECEIPT_ARS
+                )
+                and not is_self_pay(form_coverage(self))
+                and not getattr(self, "receipt_read_only", False)
+            )
+        MainWindow._update_receipt_edit_controls(self, editable)
+
+    def _update_receipt_edit_controls(self, editable):
+        for name in ("btn_generate", "authorization_edit", "btn_add"):
+            control = getattr(self, name, None)
+            if control is None:
+                continue
+            previous = control.property("permissionPriorEnabled")
+            if not editable:
+                if previous is None:
+                    control.setProperty("permissionPriorEnabled", control.isEnabled())
+                control.setEnabled(False)
+            elif previous is not None:
+                control.setEnabled(
+                    bool(previous) and not getattr(self, "receipt_read_only", False)
+                )
+                control.setProperty("permissionPriorEnabled", None)
 
     def _update_document_flow_ui(self):
         from billing_workspace_design import update_billing_summary
@@ -37231,6 +37376,68 @@ class MainWindow(QMainWindow):
         from local_receipts_dialog import LocalReceiptsDialog
         LocalReceiptsDialog(self).exec()
 
+    def _ensure_emergency_workspace(self):
+        if self.emergency_workspace is not None:
+            return
+        self.emergency_workspace = EmergencyWorkspacePage(
+            self.current_user, self.session_id, self
+        )
+        self.admission_page = self.emergency_workspace.queue_page
+        self.full_admission_page = self.emergency_workspace.full_page
+        self.emergency_workspace.billing_requested.connect(
+            self._send_emergency_history_to_billing
+        )
+        self.emergency_workspace.attention_selected.connect(
+            self._use_admission_attention_from_module
+        )
+        self.emergency_workspace.shift_closure_ready.connect(
+            self.process_shift_closure_report
+        )
+        self.emergency_workspace.projection_changed.connect(
+            self._refresh_admission_billing_views
+        )
+        self.emergency_workspace.shift_changed.connect(
+            self._refresh_admission_billing_views
+        )
+        self.theme_toggled.connect(self.emergency_workspace.apply_theme)
+        self.emergency_workspace.apply_theme(self.is_dark_mode)
+        self.main_module_stack.addWidget(self.emergency_workspace)
+
+    def _reset_permission_tabs(self, labels):
+        self.module_tabs.blockSignals(True)
+        while self.module_tabs.count():
+            self.module_tabs.removeTab(0)
+        for label in labels:
+            self.module_tabs.addTab(label)
+
+    def _refresh_permission_modules(self):
+        labels = main_module_labels_for_user(self.current_user)
+        current = tuple(
+            self.module_tabs.tabText(i) for i in range(self.module_tabs.count())
+        )
+        if labels == current:
+            return
+        MainWindow._reset_permission_tabs(self, labels)
+        self.emergency_module_index = (
+            labels.index("Emergencias") if "Emergencias" in labels else None
+        )
+        self.billing_module_index = labels.index("Facturación")
+        self.monthly_lists_module_index = (
+            labels.index("Listados de ARS") if "Listados de ARS" in labels else None
+        )
+        if self.emergency_module_index is not None:
+            self._ensure_emergency_workspace()
+        if (
+            self.monthly_lists_module_index is not None
+            and self.monthly_lists_page is None
+            and not self.offline_login
+        ):
+            self.monthly_lists_page = MonthlyBillingListsPage(self.current_user, self)
+            self.main_module_stack.addWidget(self.monthly_lists_page)
+        self.module_tabs.setCurrentIndex(self.billing_module_index)
+        self.module_tabs.blockSignals(False)
+        self._switch_main_module(self.billing_module_index)
+
     def _switch_main_module(self, index: int):
         switch_started = perf_counter()
         self._last_ui_action = f"cambiar módulo {int(index)}"
@@ -37361,6 +37568,10 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _send_emergency_history_to_billing(self, identity):
+        if isinstance(identity, dict) and identity.get("receipt_id"):
+            if self.open_receipt_in_billing(int(identity["receipt_id"])):
+                self.module_tabs.setCurrentIndex(self.billing_module_index)
+            return
         if not can_access_billing_admission_history(self.current_user):
             QMessageBox.warning(
                 self, "Facturación", "Tu rol no permite esta operación."
@@ -37456,7 +37667,7 @@ class MainWindow(QMainWindow):
 
     def open_users_admin(self):
         self.mark_activity()
-        if not user_can_manage_sessions(self.current_user):
+        if not (user_can_manage_sessions(self.current_user) or user_has_permission(self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS)):
             FloatingToast("No tienes permisos para esta sección", self, is_error=True).show()
             return
         UsersAdminDialog(self.current_user, self).exec()
@@ -37499,6 +37710,14 @@ class MainWindow(QMainWindow):
     @Slot(object, float)
     def _on_session_health_completed(self, result, elapsed_ms: float):
         data = dict(result or {})
+        if data.get("permission_context") is not None and data.get("alive"):
+            self.current_user.update(data["permission_context"])
+            device_id, _device_name = _local_device_identity()
+            _OFFLINE_AUTH_CACHE.refresh_permissions(
+                self.current_user["username"], device_id, self.current_user
+            )
+            self._refresh_permission_modules()
+            self._apply_billing_field_policy()
         self._operational_context = dict(data.get("operational_context") or {})
         update_medication_markup_cache(
             data.get("medication_markup_percent", DEFAULT_MEDICATION_MARKUP_PERCENT),

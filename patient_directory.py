@@ -458,10 +458,21 @@ class CentralPatientDirectoryRepository:
             self._insert_event(con, _mapping(updated), "PATIENT_UPDATED", audit=audit)
             result = self._payload(_mapping(updated))
             if propagate_recent:
-                from admission_demographics import correct_recent_attentions
+                from admission_demographics import correct_recent_attentions, changed_demographic_patch
 
                 result["corrected_attentions"] = correct_recent_attentions(
-                    con, result, edited_at=_mapping(updated).get("updated_at") or _timestamp()
+                    con,
+                    changed_demographic_patch(result, field_names, changed_fields),
+                    edited_at=_mapping(updated).get("updated_at") or _timestamp(),
+                )
+                from admission_receipt_sync import synchronize_patient_receipts
+
+                result["linked_receipts"] = synchronize_patient_receipts(
+                    con,
+                    result,
+                    changed_fields,
+                    actor_user,
+                    _mapping(updated).get("updated_at"),
                 )
         return result
 

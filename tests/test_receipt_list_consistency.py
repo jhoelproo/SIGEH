@@ -131,19 +131,22 @@ def test_missing_receipt_is_rejected_before_mutation():
         ({"document_type": "PASAPORTE"}, "Selecciona"),
         ({"document_number": ""}, "Escribe el NSS"),
         ({"document_number": "x" * 25}, "24 caracteres"),
-        ({"authorization": ""}, "Escribe el número"),
-        ({"authorization": "x" * 41}, "40 caracteres"),
+        ({"authorization": ""}, "únicamente dígitos"),
+        ({"authorization": "1" * 41}, "máximo 40"),
     ],
 )
 def test_invalid_list_corrections_do_not_connect(monkeypatch, values, message):
     connect = Mock()
     monkeypatch.setattr(app, "db_connect", connect)
+    monkeypatch.setattr(
+        app, "get_user", lambda _username: {"username": "admin", "role": app.ROLE_ADMIN}
+    )
     arguments = dict(
         document_type="NSS",
         document_number="1234",
         authorization="1234",
         specialty="",
-        user={"role": app.ROLE_ADMIN},
+        user={"username": "admin", "role": app.ROLE_ADMIN},
     )
     with pytest.raises(ValueError, match=message):
         app.update_monthly_batch_receipt_export_data(1, 2, **{**arguments, **values})

@@ -1142,7 +1142,7 @@ class _HybridAdmissionRuntime:
             )
         if self.patient_directory is None:
             raise RuntimeError("El directorio de pacientes no está disponible.")
-        return self.patient_directory.update_patient(
+        updated = self.patient_directory.update_patient(
             global_patient_id,
             changes,
             expected_revision=expected_revision,
@@ -1150,6 +1150,15 @@ class _HybridAdmissionRuntime:
             actor_role=str(self.current_user.get("role") or ""),
             propagate_recent=True,
         )
+        self.last_patient_edit_receipts = list(updated.get("linked_receipts") or [])
+        signal = getattr(
+            getattr(getattr(self, "host", None), "event_bus", None),
+            "attention_updated",
+            None,
+        )
+        if signal is not None:
+            signal.emit({"global_patient_id": global_patient_id})
+        return updated
 
     def require_write(self, *, primary_only: bool = False):
         attachment = self.attachment
@@ -3830,6 +3839,19 @@ class _HybridDatabaseProxy:
         )
         object.__setattr__(self, "_last_transition_result", transition)
         return transition
+
+    def recibos_ultima_edicion_paciente(self):
+        return list(getattr(self._runtime, "last_patient_edit_receipts", ()))
+
+    def abrir_recibo_ultima_edicion_paciente(self):
+        from admission_receipt_dialog import choose_linked_receipt
+
+        return choose_linked_receipt(
+            getattr(self._runtime, "last_patient_edit_receipts", ()),
+            lambda identity: self._runtime.host.event_bus.billing_requested.emit(
+                {"receipt_id": identity}
+            ),
+        )
 
     def __getattr__(self, name: str):
         if name == "search_patient_directory":

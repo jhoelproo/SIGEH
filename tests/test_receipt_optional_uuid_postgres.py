@@ -93,12 +93,6 @@ def test_bypass_valid_authorization_without_admission_is_null(receipts):
             app.AUTH_REVIEW_NOT_APPLICABLE,
             "AUTHORIZATION_MISSING",
         ),
-        (
-            "ABC123",
-            app.DOCUMENT_READY,
-            app.AUTH_REVIEW_PENDING,
-            "INVALID_AUTHORIZATION_FORMAT",
-        ),
         ("1", app.DOCUMENT_READY, app.AUTH_REVIEW_PENDING, "AUTHORIZATION_TOO_SHORT"),
     ],
 )
@@ -201,3 +195,10 @@ def test_legacy_and_valid_uuid_persistence_boundary(receipts, monkeypatch, ident
         )
         == receipt_id
     )
+
+
+def test_invalid_new_authorization_is_rejected_without_receipt(receipts):
+    with pytest.raises(ValueError, match="numéricos"):
+        save(authorization_number="ABC123")
+    with app.db_connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM recibos").fetchone()[0] == 0

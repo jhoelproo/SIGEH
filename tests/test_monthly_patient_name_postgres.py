@@ -125,6 +125,9 @@ def test_linked_name_updates_master_attention_receipt_and_events_atomically(
             raise RuntimeError("document unavailable")
 
         monkeypatch.setattr(app, "save_receipt_document_snapshot", unavailable)
+        monkeypatch.setattr(
+            "receipt_documents.save_receipt_document_snapshot", unavailable
+        )
 
     def change():
         if direction == "list":

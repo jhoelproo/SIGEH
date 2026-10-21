@@ -57,6 +57,8 @@ class _FakeConnection:
     def execute(self, query, params=None):
         compact = " ".join(str(query).split())
         self.queries.append((compact, params))
+        if compact.startswith("SELECT * FROM users WHERE username="):
+            return _Cursor(row=ADMIN if params[0] == ADMIN["username"] else None)
         if compact.startswith("SELECT id, numero, estado_facturacion"):
             return _Cursor(row=self.receipt)
         if compact.startswith("SELECT EXISTS("):

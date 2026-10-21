@@ -215,7 +215,7 @@ def test_document_failure_rolls_back_receipt_list_and_audit(
     def fail(*_args, **_kwargs):
         raise RuntimeError("simulated document failure")
 
-    monkeypatch.setattr(app, "save_receipt_document_snapshot", fail)
+    monkeypatch.setattr("receipt_documents.save_receipt_document_snapshot", fail)
     with pytest.raises(RuntimeError):
         quick(identity) if operation == "quick" else correct(pending, identity)
     assert app.get_recibo_data(identity)["numero_autorizacion"] == ""

@@ -14423,9 +14423,19 @@ class App:
             justify="left"
         ).grid(row=row_base + len(filas), column=0, columnspan=4, sticky="w", padx=5, pady=(8, 0))
 
+        receipt_editor = getattr(self.db, "abrir_recibo_ultima_edicion_paciente", None)
+        receipt_reader = getattr(self.db, "recibos_ultima_edicion_paciente", lambda: [])
+        btn_editar_recibo = tb.Button(
+            patient_card,
+            text="Editar recibo",
+            command=receipt_editor,
+            state=tk.DISABLED,
+        )
+        btn_editar_recibo.grid(row=row_base + len(filas) + 1, column=0, columnspan=4, sticky="w", padx=5, pady=6)
         original_identidad = {"valor": "", "paciente_id": None}
 
         def _llenar_formulario_paciente(data, ident):
+            btn_editar_recibo.configure(state=tk.DISABLED)
             original_identidad["valor"] = (
                 f"P:{int(data['paciente_id'])}" if data.get("paciente_id") else ident
             )
@@ -14677,7 +14687,16 @@ class App:
                 )
                 self.set_status("Datos del paciente actualizados", "ok")
                 self._mostrar_notificacion("Datos del paciente actualizados. Ctrl+Z para deshacer.", on_undo=_undo_edit_paciente, autohide_ms=5000)
-                messagebox.showinfo("Guardado", "Datos actualizados correctamente. No se generó una hoja nueva.")
+                linked_receipts = receipt_reader()
+                btn_editar_recibo.configure(
+                    state=tk.NORMAL if linked_receipts else tk.DISABLED
+                )
+                receipt_notice = (
+                    "\nEl paciente ya tiene recibo(s). Usa «Editar recibo» para revisar su ARS."
+                    if linked_receipts
+                    else ""
+                )
+                messagebox.showinfo("Guardado", "Datos actualizados correctamente. No se generó una hoja nueva." + receipt_notice)
             except PermissionError:
                 messagebox.showwarning(
                     "Excel abierto",

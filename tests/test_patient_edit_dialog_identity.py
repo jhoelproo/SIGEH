@@ -31,7 +31,12 @@ def editor_callback(name, **closure):
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
     ast.increment_lineno(callback, line - 1)
-    namespace = dict(vars(v15), **closure)
+    namespace = {
+        **vars(v15),
+        "btn_editar_recibo": Mock(),
+        "receipt_reader": list,
+        **closure,
+    }
     exec(
         compile(ast.Module(body=[callback], type_ignores=[]), v15.__file__, "exec"),
         namespace,

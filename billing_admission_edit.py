@@ -74,6 +74,8 @@ def reconcile_owned_identifiers(snapshot, projection, current_receipt):
     for cached, projected, saved in (
         ("nss_clean", "nss_snapshot", "admission_nss_snapshot"),
         ("cedula_clean", "cedula_snapshot", "admission_cedula_snapshot"),
+        ("name", "patient_name", "nombre"),
+        ("service_date", "service_date", "fecha"),
     ):
         if projected not in projection or saved not in current_receipt:
             continue

@@ -170,7 +170,7 @@ def test_linked_service_date_and_specialty_sync_without_reassigning_shift(
         def reject(*_args, **_kwargs):
             raise RuntimeError("snapshot unavailable")
 
-        monkeypatch.setattr(app, "save_receipt_document_snapshot", reject)
+        monkeypatch.setattr("receipt_documents.save_receipt_document_snapshot", reject)
         with pytest.raises(RuntimeError, match="snapshot unavailable"):
             correct(identity, pending, service_date="2026-09-06", specialty="PEDIATRIA")
     else:

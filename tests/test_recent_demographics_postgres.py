@@ -97,8 +97,10 @@ def demographic_database(server):
                 created_at TIMESTAMPTZ,operational_source_id UUID,turn_id INT,
                 origin_user_id TEXT,origin_username TEXT,created_at_device TIMESTAMPTZ,
                 created_at_effective_utc TIMESTAMPTZ,device_local_sequence BIGINT);
-            CREATE TABLE recibos(id INT PRIMARY KEY,patient_name TEXT);
-            INSERT INTO recibos VALUES(1,'ORIGINAL');
+            CREATE TABLE recibos(id INT PRIMARY KEY,patient_name TEXT,
+                is_deleted INT DEFAULT 0,admission_global_attention_id UUID,
+                admission_atencion_id INT,admission_source_instance_id TEXT);
+            INSERT INTO recibos(id,patient_name) VALUES(1,'ORIGINAL');
         """)
 
     def connect():

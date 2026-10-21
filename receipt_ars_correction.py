@@ -202,3 +202,25 @@ def reprice_cart(form, runtime, effective_price):
             cell.setText(f"${value:,.2f}")
             cell.setData(Qt.ItemDataRole.UserRole, value)
     form.locked_ars = form.current_ars if form.cart_has_ars_items() else None
+
+
+def detach_previous_insurer_batches(connection, receipt_id, ars, actor, stamp):
+    """Keep sent copies immutable; remove wrong-insurer pending memberships."""
+    rows = connection.execute(
+        """UPDATE billing_batch_receipts br SET included=0,last_edited_at=%s,last_edited_by=%s
+           FROM billing_batches b WHERE br.batch_id=b.id AND br.recibo_id=%s AND br.included=1
+             AND b.status IN ('PENDIENTE','BORRADOR') AND b.ars<>%s RETURNING br.batch_id""",
+        (stamp, actor, receipt_id, ars),
+    ).fetchall()
+    for row in rows:
+        connection.execute(
+            """INSERT INTO billing_batch_events(batch_id,recibo_id,event_type,performed_at,performed_by,details)
+               VALUES(%s,%s,'ARS_CORREGIDA',%s,%s,%s)""",
+            (
+                row["batch_id"],
+                receipt_id,
+                stamp,
+                actor,
+                "Recibo corregido a ARS: " + ars,
+            ),
+        )

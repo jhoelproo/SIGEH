@@ -670,3 +670,14 @@ def audit_historical_receipts(connection, sample_limit: int = 20) -> dict[str, A
         "counts": dict(sorted(counts.items())),
         "sample_receipt_ids": samples,
     }
+
+
+def refresh_administrative_snapshot(connection, receipt_id, actor):
+    """Append a fresh document while retaining its original document context."""
+    row = connection.execute(
+        """SELECT snapshot_jsonb FROM recibo_document_versions
+           WHERE recibo_id=%s AND is_current=TRUE""",
+        (int(receipt_id),),
+    ).fetchone()
+    context = dict((row["snapshot_jsonb"] or {}).get("document") or {}) if row else {}
+    return save_receipt_document_snapshot(connection, receipt_id, actor, document_context=context)

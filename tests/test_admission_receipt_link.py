@@ -118,7 +118,7 @@ class AdmissionReceiptLinkTests(unittest.TestCase):
                 "2026-07-17 10:05:00",
                 [],
                 "ASEGURADO",
-                "AUT-1",
+                "000001",
                 self.attention(),
                 "session-test",
             )
