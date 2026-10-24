@@ -37,6 +37,7 @@ from time import perf_counter
 from urllib.parse import urlparse
 
 from database_config import resolve_database_url
+from billing_item_rules import honorarium_policy_snapshot
 from admission_billing_consistency import (
     CURRENT_OPERATIONAL_SHIFT_SQL,
     ars_enabled_sql,
@@ -69,6 +70,8 @@ from display_layout import (
 from app_icons import APP_ICONS
 from app_resources import get_app_logo_path
 from offline_auth import OfflineAuthCache
+from password_secrets import hash_secret, public_user, verify_secret
+from update_controls import UpdateCheckControl
 from sigeh_visual_theme import visual_theme_tokens as shared_visual_theme_tokens
 from self_pay_billing import (
     COVERAGE_LABELS,
@@ -107,7 +110,7 @@ except ImportError:
     pool = None
 
 from PySide6.QtCore import Qt, QSize, QDate, QTimer, QObject, QEvent, Signal, Slot, QThread, QRect, QRectF, QPoint, QPointF, QLocale, QSignalBlocker, QSettings  # type: ignore
-from PySide6.QtGui import QPixmap, QColor, QAction, QCursor, QKeySequence, QShortcut, QPainter, QBrush, QPen, QPolygonF, QTextDocument, QTextCursor, QIcon, QPageLayout, QFontMetrics, QPalette, QFont  # type: ignore
+from PySide6.QtGui import QPixmap, QColor, QAction, QCursor, QKeySequence, QShortcut, QPainter, QBrush, QPen, QPolygonF, QTextDocument, QTextCursor, QIcon, QPageLayout, QPageSize, QFontMetrics, QPalette, QFont  # type: ignore
 from PySide6.QtPdf import QPdfDocument  # type: ignore
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog, QPrintPreviewDialog  # type: ignore
 from PySide6.QtWidgets import (  # type: ignore
@@ -596,6 +599,7 @@ PERMISSION_CHANGE_RECEIPT_ARS = "receipt.change_ars"
 PERMISSION_BYPASS_VERIFICATION = "receipt.bypass_verification"
 PERMISSION_VIEW_UNINSURED = "receipt.bill_uninsured"
 PERMISSION_CONFIRM_UNLINKED = "receipt.confirm_unlinked"
+PERMISSION_BILL_OLDER_ATTENTION = "receipt.bill_older_attention"
 
 
 BATCH_DRAFT = "BORRADOR"
@@ -1964,19 +1968,6 @@ def safe_pdf_text(text):
     if not text: return ""
     return text.encode('latin1', 'ignore').decode('latin1').strip()
 
-def _pbkdf2(text: str, salt: bytes) -> str:
-    raw = hashlib.pbkdf2_hmac("sha256", text.encode("utf-8"), salt, 120_000)
-    return base64.b64encode(raw).decode("ascii")
-
-def hash_secret(text: str):
-    salt = os.urandom(16)
-    return _pbkdf2(text, salt), base64.b64encode(salt).decode("ascii")
-
-def verify_secret(text: str, hashed: str, salt_b64: str) -> bool:
-    salt = base64.b64decode(salt_b64.encode("ascii"))
-    probe = _pbkdf2(text, salt)
-    return hmac.compare_digest(probe, hashed)
-
 def _sanitize_audit_details(details) -> str:
     text = "" if details is None else str(details).strip()
     text = re.sub(r"(?i)postgres(?:ql)?://[^\s]+", "[CONEXIÓN OMITIDA]", text)
@@ -2981,6 +2972,9 @@ def db_init():
 
     with db_connect() as con:
         con.executescript(SCHEMA)
+        from billing_item_rule_store import SCHEMA_SQL as billing_item_rules_schema
+
+        con.executescript(billing_item_rules_schema)
         from receipt_command_sync import RECEIPT_SYNC_SCHEMA
         con.executescript(RECEIPT_SYNC_SCHEMA)
         from monthly_receipt_fields import ensure_receipt_insurance_schema
@@ -3525,8 +3519,8 @@ def db_init():
         cur = con.execute("SELECT COUNT(*) AS c FROM users WHERE role=%s", (ROLE_ADMIN,))
         has_admin = int(cur.fetchone()["c"]) > 0
         if not has_admin:
-            pwd_hash, pwd_salt = hash_secret("admin123")
-            ans_hash, ans_salt = hash_secret("admin")
+            pwd_hash, pwd_salt = hash_secret("admin123", compatible=True)
+            ans_hash, ans_salt = hash_secret("admin", compatible=True)
             con.execute(
                 """
                 INSERT INTO users(
@@ -3540,7 +3534,13 @@ def db_init():
 
 
 _BOOTSTRAP_REQUIRED_SCHEMA = {
-    "receipt_self_pay": {"receipt_id", "coverage", "payment_status", "exemption_reason", "paid_at"},
+    "receipt_self_pay": {
+        "receipt_id",
+        "coverage",
+        "payment_status",
+        "exemption_reason",
+        "paid_at",
+    },
     "billing_shift_closures": {"classification_version"},
     "billing_closure_dispatch_policy": {"singleton", "enabled_at"},
     "billing_reporting_policy": {"singleton", "baseline_at", "enabled_at"},
@@ -3566,9 +3566,22 @@ _BOOTSTRAP_REQUIRED_SCHEMA = {
         "admission_global_attention_id",
     },
     "ars": {
-        "id", "nombre", "is_active", "suppress_honorarium_prompt",
+        "id",
+        "nombre",
+        "is_active",
+        "suppress_honorarium_prompt",
         "honorarium_prompt_enabled",
-        "honorarium_prompt_updated_at", "honorarium_prompt_updated_by",
+        "honorarium_prompt_updated_at",
+        "honorarium_prompt_updated_by",
+        "honorarium_specialties",
+    },
+    "universal_items": {"id", "categoria", "nombre", "materials_configured"},
+    "medication_material_links": {
+        "medication_id",
+        "material_id",
+        "units",
+        "updated_at",
+        "updated_by",
     },
     "active_sessions": {"session_id", "username", "is_active"},
     "admission_operational_sessions": {
@@ -3893,8 +3906,8 @@ def create_user(full_name: str, username: str, password: str, question: str, ans
     answer = (answer or "").strip()
     if not full_name or not username or not password or not question or not answer: raise ValueError("Todos los campos son obligatorios.")
     if len(password) < 4: raise ValueError("La contraseña debe tener al menos 4 caracteres.")
-    pwd_hash, pwd_salt = hash_secret(password)
-    ans_hash, ans_salt = hash_secret(answer.casefold())
+    pwd_hash, pwd_salt = hash_secret(password, compatible=True)
+    ans_hash, ans_salt = hash_secret(answer.casefold(), compatible=True)
     with db_connect() as con:
         con.execute("""INSERT INTO users(full_name, username, role, password_hash, password_salt, security_question, security_answer_hash, security_answer_salt, is_active, created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (full_name, username, role, pwd_hash, pwd_salt, question, ans_hash, ans_salt, 1, now_str()))
 
@@ -3906,7 +3919,7 @@ def authenticate_user(username: str, password: str):
         if int(row["is_active"]) != 1: return None
         if not verify_secret(password or "", row["password_hash"], row["password_salt"]): return None
         con.execute("UPDATE users SET last_login=%s WHERE id=%s", (now_str(), row["id"]))
-        return dict(row)
+        return public_user(row)
 
 
 def verify_user_credentials(username: str, password: str):
@@ -3924,7 +3937,7 @@ def verify_user_credentials(username: str, password: str):
         row["password_salt"],
     ):
         return None
-    return dict(row)
+    return public_user(row)
 
 def get_user(username: str):
     with db_connect() as con:
@@ -4431,6 +4444,7 @@ def check_session_health(username: str, session_id: str) -> dict:
                                'ars_id',id,
                                'ars_name',nombre,
                                'suppress_honorarium_prompt',suppress_honorarium_prompt,
+                               'honorarium_specialties',COALESCE(to_jsonb(ars)->'honorarium_specialties','{}'::jsonb),
                                'updated_at',COALESCE(
                                    honorarium_prompt_updated_at,TO_TIMESTAMP(0)
                                )
@@ -4571,7 +4585,7 @@ def get_active_sessions_for_user(username: str) -> list[dict]:
         ]
 
 def admin_reset_password(username: str, new_password: str):
-    pwd_hash, pwd_salt = hash_secret(new_password)
+    pwd_hash, pwd_salt = hash_secret(new_password, compatible=True)
     with db_connect() as con: con.execute("UPDATE users SET password_hash=%s, password_salt=%s WHERE username=%s", (pwd_hash, pwd_salt, username))
 
 def reset_password_by_security(username: str, answer: str, new_password: str) -> bool:
@@ -4580,7 +4594,7 @@ def reset_password_by_security(username: str, answer: str, new_password: str) ->
         row = cur.fetchone()
         if not row: return False
         if not verify_secret((answer or "").strip().casefold(), row["security_answer_hash"], row["security_answer_salt"]): return False
-        pwd_hash, pwd_salt = hash_secret(new_password)
+        pwd_hash, pwd_salt = hash_secret(new_password, compatible=True)
         con.execute("UPDATE users SET password_hash=%s, password_salt=%s WHERE username=%s", (pwd_hash, pwd_salt, username))
         return True
 
@@ -4642,6 +4656,7 @@ class HonorariumPromptSettingsCache:
                 "ars_id": ars_id,
                 "ars_name": name,
                 "suppress_honorarium_prompt": suppressed,
+                "honorarium_specialties": honorarium_policy_snapshot(row),
             }
             if ars_id:
                 by_id[ars_id] = value
@@ -4665,6 +4680,13 @@ class HonorariumPromptSettingsCache:
     def suppressed(self, *, ars_id=0, ars_name="") -> bool:
         return bool(self.value(ars_id=ars_id, ars_name=ars_name))
 
+    def specialty_policy(self, *, ars_id=0, ars_name=""):
+        with self._lock:
+            row = self._by_id.get(int(ars_id or 0)) or self._by_name.get(
+                remove_accents(str(ars_name or ""))
+            )
+            return honorarium_policy_snapshot(row) if row is not None else None
+
     def rows(self) -> list[dict]:
         with self._lock:
             return [dict(row) for row in self._by_id.values()]
@@ -4673,14 +4695,158 @@ class HonorariumPromptSettingsCache:
 HONORARIUM_PROMPT_SETTINGS = HonorariumPromptSettingsCache()
 
 
+def receipt_honorarium_allowed(context):
+    from billing_item_rules import honorarium_allowed
+
+    coverage = getattr(context, "coverage_combo", None)
+    if coverage is not None and coverage_code(coverage.currentText()) != "ASEGURADO":
+        return True
+    policy = HONORARIUM_PROMPT_SETTINGS.specialty_policy(
+        ars_id=getattr(context, "_current_ars_id", 0),
+        ars_name=getattr(context, "current_ars", ""),
+    )
+    if policy is None:
+        policy = getattr(context, "_current_honorarium_specialties", {})
+    attention = dict(getattr(context, "current_admission_attention", None) or {})
+    specialty = (
+        attention.get("specialty")
+        or attention.get("specialty_snapshot")
+        or attention.get("especialidad")
+        or getattr(context, "_editing_specialty_snapshot", "")
+    )
+    try:
+        return honorarium_allowed(policy, specialty)
+    except ValueError:
+        return False
+
+
+def _audit_billing_item_rule(con, user, action, entity_type, identity, details):
+    _insert_action_history(
+        con,
+        user["username"],
+        action,
+        json.dumps(details, ensure_ascii=False, sort_keys=True),
+        module="Facturación",
+        entity_type=entity_type,
+        entity_id=str(identity),
+        role=user.get("role", ""),
+    )
+
+
+def load_billing_material_rules():
+    from billing_item_rule_store import load_material_rules
+
+    with db_connect() as con:
+        return load_material_rules(con)
+
+
+def refresh_billing_material_catalog():
+    from billing_item_rule_store import load_material_rules
+
+    with db_connect() as con:
+        data = load_material_rules(con)
+        rows = con.execute(
+            "SELECT categoria,nombre,precio FROM universal_items WHERE is_active=1 ORDER BY categoria,nombre"
+        ).fetchall()
+    data["universal"] = {
+        category: {
+            row["nombre"]: float(row["precio"])
+            for row in rows
+            if row["categoria"] == category
+        }
+        for category in UNIVERSAL_CATEGORIES
+    }
+    return data
+
+
+def load_medication_material_editor(medication_id):
+    from billing_item_rule_store import load_material_editor
+
+    with db_connect() as con:
+        return load_material_editor(con, medication_id)
+
+
+def save_medication_material_links(medication_id, quantities, current_user):
+    from billing_item_rule_store import load_material_editor, save_material_links
+
+    with db_connect() as con:
+        save_material_links(
+            con,
+            medication_id,
+            quantities,
+            current_user,
+            allowed=user_is_admin,
+            audit=_audit_billing_item_rule,
+        )
+        return load_material_editor(con, medication_id)
+
+
+def _specialty_honorarium_catalog(context):
+    if not receipt_honorarium_allowed(context):
+        return {}
+    return dict((getattr(context, "ars_cache", {}) or {}).get("Honorarios") or {})
+
+
+def _save_specialty_changes(con, changes, user):
+    if changes is None:
+        return
+    from billing_item_rule_store import save_honorarium_policies
+
+    save_honorarium_policies(
+        con, changes, user, allowed=user_is_admin, audit=_audit_billing_item_rule
+    )
+
+
+def _specialty_checkboxes(table, index, policy, flags):
+    from billing_specialties import SPECIALTIES
+    from billing_item_rules import honorarium_allowed
+
+    for column, specialty in enumerate(SPECIALTIES, 2):
+        checkbox = QTableWidgetItem()
+        checkbox.setFlags(flags)
+        checkbox.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        checkbox.setCheckState(
+            Qt.CheckState.Checked
+            if honorarium_allowed(policy, specialty)
+            else Qt.CheckState.Unchecked
+        )
+        table.setItem(index, column, checkbox)
+
+
+def _adjust_linked_material_quantity(context, row, quantity):
+    controller = getattr(context, "material_cart", None)
+    if controller is None:
+        return row, quantity
+    name_item = context.cart_table.item(row, 1)
+    quantity = controller.quantity_changed(row, quantity)
+    return context.cart_table.row(name_item), quantity
+
+
+def _material_cart_action(context, method, *args):
+    controller = getattr(context, "material_cart", None)
+    if controller is not None:
+        getattr(controller, method)(*args)
+
+
+def _defer_material_query_close(context, event):
+    worker = getattr(context, "_material_rules_worker", None)
+    if worker is None or not worker.isRunning():
+        return False
+    worker.finished.connect(context.close, Qt.ConnectionType.SingleShotConnection)
+    event.ignore()
+    return True
+
+
+def _closing_user_data(context):
+    return context.current_user if isinstance(context.current_user, dict) else {}
+
+
 def should_show_honorarium_prompt(ars_id, receipt_context) -> bool:
     """Resolve the prompt entirely from the loaded receipt/catalog caches."""
     ars_name = str(getattr(receipt_context, "current_ars", "") or "").strip()
     if not ars_name:
         return False
-    honorariums = dict(
-        (getattr(receipt_context, "ars_cache", {}) or {}).get("Honorarios") or {}
-    )
+    honorariums = _specialty_honorarium_catalog(receipt_context)
     if not honorariums:
         return False
     if receipt_context.cart_has_category("Honorarios"):
@@ -4708,6 +4874,7 @@ def load_ars_honorarium_prompt_settings() -> list[dict]:
         rows = con.execute(
             """SELECT id AS ars_id,nombre AS ars_name,
                       suppress_honorarium_prompt,
+                      COALESCE(to_jsonb(ars)->'honorarium_specialties','{}'::jsonb) AS honorarium_specialties,
                       COALESCE(honorarium_prompt_updated_at,TO_TIMESTAMP(0)) AS updated_at
                  FROM ars
                 WHERE is_active=1
@@ -4718,7 +4885,7 @@ def load_ars_honorarium_prompt_settings() -> list[dict]:
     return result
 
 
-def save_ars_honorarium_prompt_settings(changes: dict, current_user: dict) -> list[dict]:
+def save_ars_honorarium_prompt_settings(changes: dict, current_user: dict, *, specialty_changes=None) -> list[dict]:
     if not user_is_admin(current_user):
         raise PermissionError(
             "Solo el Administrador puede modificar las excepciones de Honorarios por ARS."
@@ -4726,6 +4893,7 @@ def save_ars_honorarium_prompt_settings(changes: dict, current_user: dict) -> li
     normalized = {int(key): bool(value) for key, value in dict(changes or {}).items()}
     username = str(current_user.get("username") or "Sistema")
     with db_connect() as con:
+        _save_specialty_changes(con, specialty_changes, current_user)
         rows = con.execute(
             """SELECT id,nombre,suppress_honorarium_prompt
                  FROM ars
@@ -4774,6 +4942,7 @@ def save_ars_honorarium_prompt_settings(changes: dict, current_user: dict) -> li
         refreshed = con.execute(
             """SELECT id AS ars_id,nombre AS ars_name,
                       suppress_honorarium_prompt,
+                      COALESCE(to_jsonb(ars)->'honorarium_specialties','{}'::jsonb) AS honorarium_specialties,
                       COALESCE(honorarium_prompt_updated_at,TO_TIMESTAMP(0)) AS updated_at
                  FROM ars WHERE is_active=1 ORDER BY nombre"""
         ).fetchall()
@@ -4859,7 +5028,7 @@ def delete_universal(categoria: str, nombre: str):
 def load_universal_catalog_admin_data() -> dict:
     with db_connect() as con:
         items = con.execute(
-            """SELECT categoria,nombre,precio,is_active
+            """SELECT categoria,nombre,precio,is_active,id
                FROM universal_items
                WHERE categoria IN ('Medicamentos','Materiales')
                ORDER BY categoria,nombre"""
@@ -4983,6 +5152,7 @@ def load_ars_runtime_data(ars_name: str) -> dict:
         rows = con.execute(
             """SELECT a.id AS ars_id,a.sala_emergencia,a.consulta_price,
                       a.suppress_honorarium_prompt,
+                      COALESCE(to_jsonb(a)->'honorarium_specialties','{}'::jsonb) AS honorarium_specialties,
                       ai.categoria,ai.nombre AS item_name,ai.precio AS item_price
                FROM ars a
                LEFT JOIN ars_items ai ON ai.ars_id=a.id AND ai.is_active=1
@@ -5009,6 +5179,7 @@ def load_ars_runtime_data(ars_name: str) -> dict:
         "suppress_honorarium_prompt": bool(
             first.get("suppress_honorarium_prompt")
         ),
+        "honorarium_specialties": honorarium_policy_snapshot(first),
         "catalogs": categories,
         "loaded_at": time.time(),
     }
@@ -6122,7 +6293,7 @@ class BillingAdmissionQueryService:
             raise PermissionError(
                 "Tu rol no puede consultar el Historial de Admisión para Facturación."
             )
-        full_history = _is_privileged_billing_role(user)
+        full_history = can_bill_older_attention(user)
         shift = self.current_shift()
         turn_filter = str(turn_filter or "TODOS").strip().upper()
         if turn_filter not in {"ACTUAL", "HEREDADO", "TODOS"}:
@@ -6296,7 +6467,7 @@ class BillingAdmissionQueryService:
                 (
                     str(shift["source_instance_id"]),
                     int(shift["turn_id"]),
-                    bool(full_history),
+                    bool(_is_privileged_billing_role(user)),
                     turn_filter, bool(full_history),
                     turn_filter, turn_filter, turn_filter,
                     str(date_from or ""), str(date_from or ""),
@@ -7659,14 +7830,15 @@ class ARSHonorariumSettingsDialog(QDialog):
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(12)
 
-        title = QLabel("AVISO DE HONORARIOS POR ARS")
+        title = QLabel("HONORARIOS POR ARS Y ESPECIALIDAD")
         title.setObjectName("ModernTitle")
         layout.addWidget(title)
         explanation = QLabel(
-            "Por defecto el sistema mostrará el recordatorio en todas las ARS "
-            "que tengan Honorarios disponibles. "
+            "Marque las especialidades en las que la ARS permite cobrar honorarios. "
+            "Si una especialidad no está marcada, tampoco se podrán añadir manualmente. "
+            "«No mostrar aviso» solo controla el recordatorio. "
             + (
-                "Seleccione únicamente las ARS en las que NO desea mostrar este aviso."
+                "Los cambios se aplican a cobros nuevos; conservan los recibos históricos."
                 if self.can_edit
                 else "Solo el Administrador puede modificarla."
             )
@@ -7680,12 +7852,16 @@ class ARSHonorariumSettingsDialog(QDialog):
         self.filter_edit.textChanged.connect(self._apply_filter)
         layout.addWidget(self.filter_edit)
 
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(("ARS", "No mostrar aviso"))
+        from billing_specialties import SPECIALTIES
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(("ARS", "No mostrar aviso", *SPECIALTIES))
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeToContents
         )
+        for column in range(2, 5):
+            self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -7695,11 +7871,11 @@ class ARSHonorariumSettingsDialog(QDialog):
         self.status_label.setObjectName("ModernSubtitle")
         layout.addWidget(self.status_label)
         actions = QHBoxLayout()
-        self.clear_button = QPushButton("Seleccionar ninguna")
+        self.clear_button = QPushButton("Permitir en todas")
         self.restore_button = QPushButton("Restaurar comportamiento predeterminado")
         self.clear_button.setVisible(self.can_edit)
         self.restore_button.setVisible(self.can_edit)
-        self.clear_button.clicked.connect(self._clear_suppressions)
+        self.clear_button.clicked.connect(self._enable_specialties)
         self.restore_button.clicked.connect(self._clear_suppressions)
         set_button_role(self.clear_button, "neutral")
         set_button_role(self.restore_button, "neutral")
@@ -7772,6 +7948,7 @@ class ARSHonorariumSettingsDialog(QDialog):
             )
             self.table.setItem(index, 0, name_item)
             self.table.setItem(index, 1, prompt_item)
+            _specialty_checkboxes(self.table, index, honorarium_policy_snapshot(row), prompt_item.flags())
         self.status_label.setText(
             "Configuración global sincronizada."
             if self.can_edit
@@ -7792,19 +7969,31 @@ class ARSHonorariumSettingsDialog(QDialog):
     def _clear_suppressions(self):
         for row in range(self.table.rowCount()):
             self.table.item(row, 1).setCheckState(Qt.Unchecked)
+        self._enable_specialties()
         self.status_label.setText(
             "Predeterminado preparado: todas las ARS con Honorarios mostrarán aviso."
         )
 
+    def _enable_specialties(self):
+        for row in range(self.table.rowCount()):
+            for column in range(2, 5):
+                self.table.item(row, column).setCheckState(Qt.Checked)
+
     def _save(self):
+        from billing_specialties import SPECIALTIES
         changes = {}
+        specialty_changes = {}
         for row in range(self.table.rowCount()):
             ars_id = int(self.table.item(row, 0).data(Qt.UserRole) or 0)
             changes[ars_id] = self.table.item(row, 1).checkState() == Qt.Checked
+            specialty_changes[ars_id] = {
+                specialty: self.table.item(row, column).checkState() == Qt.Checked
+                for column, specialty in enumerate(SPECIALTIES, 2)
+            }
         self.status_label.setText("Guardando configuración central...")
         self._run(
             lambda: save_ars_honorarium_prompt_settings(
-                changes, self.current_user
+                changes, self.current_user, specialty_changes=specialty_changes
             ),
             self._saved,
         )
@@ -11198,6 +11387,7 @@ def save_receipt_with_items(
     }
     actor_user = get_user(str(username or "")) or {"username": str(username or ""), "role": ""}
     _require_receipt_editor(actor_user, recibo_id)
+    is_backdated = max(int(is_backdated), validate_receipt_date_for_user(fecha, actor_user))
     if self_pay and normalize_role(actor_user.get("role")) not in ROLE_PERMISSIONS:
         raise PermissionError("El usuario no está autorizado para registrar cobros.")
     if bypass_data and not admission_attention:
@@ -11293,6 +11483,9 @@ def save_receipt_with_items(
             confirmed = lock_receipt_request(con, local_request_id, local_request_hash, str(username))
             if confirmed is not None:
                 return confirmed[0]
+        from billing_item_rule_store import validate_honorarium_charge
+
+        validate_honorarium_charge(con, ars, admission_values[13], item_rows, recibo_id)
         from receipt_patient_correction import (
             correct_linked_name,
             correct_edited_receipt_metadata,
@@ -14871,6 +15064,7 @@ class ComparisonPdfDialog(QDialog):
 
     def _printer(self):
         printer = QPrinter(QPrinter.HighResolution)
+        printer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
         printer.setPageOrientation(QPageLayout.Landscape)
         return printer
 
@@ -15199,6 +15393,7 @@ def _admission_scope_decision(
     *,
     same_source: bool,
     within_two_days: bool,
+    allow_older: bool,
 ) -> tuple[bool, str]:
     if scope in {"CURRENT", "INHERITED"}:
         return True, f"{scope}_PENDING_ALLOWED"
@@ -15206,7 +15401,7 @@ def _admission_scope_decision(
         return False, "HISTORICAL_SOURCE_DENIED"
     if role not in BILLING_HISTORY_ROLES:
         return False, "HISTORICAL_ROLE_DENIED"
-    if role in UNLIMITED_HISTORY_BILLING_ROLES or within_two_days:
+    if allow_older or within_two_days:
         return True, "HISTORICAL_PENDING_ALLOWED"
     return False, "HISTORICAL_TIME_DENIED"
 
@@ -15249,6 +15444,7 @@ def evaluate_admission_billing_access(
         role,
         same_source=same_source,
         within_two_days=bool(data.get("within_history_billing_window")),
+        allow_older=can_bill_older_attention(current_user),
     )
     result = {
         "turn_scope": scope,
@@ -15270,6 +15466,25 @@ def can_confirm_unlinked_receipt(user: dict) -> bool:
 
 def can_view_uninsured_patients(user: dict) -> bool:
     return user_has_permission(user, PERMISSION_VIEW_UNINSURED)
+
+
+def can_bill_older_attention(user: dict | None) -> bool:
+    return user_has_permission(user or {}, PERMISSION_BILL_OLDER_ATTENTION)
+
+
+def validate_receipt_date_for_user(service_date, user, *, today=None):
+    from billing_date_policy import validate_receipt_date
+
+    return validate_receipt_date(
+        service_date, allow_older=can_bill_older_attention(user),
+        today=today if today is not None else datetime.now().date(),
+    )
+
+
+def validate_receipt_job_date(job):
+    if not job.get("reopen_local_request"):
+        validate_receipt_date_for_user(job["date_str"], job["current_user"])
+
 
 def user_can_manage_sessions(user: dict) -> bool:
     return is_administrator(user)
@@ -15317,6 +15532,7 @@ for _role in (ROLE_ADMIN, ROLE_AUDIT):
             PERMISSION_BYPASS_VERIFICATION,
             PERMISSION_VIEW_UNINSURED,
             PERMISSION_CONFIRM_UNLINKED,
+            PERMISSION_BILL_OLDER_ATTENTION,
         )
     )
 ROLE_PERMISSIONS[ROLE_ADMIN].update(
@@ -15339,6 +15555,7 @@ PERMISSION_LABELS = {
     PERMISSION_BYPASS_VERIFICATION: "Omitir verificación de atención",
     PERMISSION_VIEW_UNINSURED: "Facturar pacientes sin seguro",
     PERMISSION_CONFIRM_UNLINKED: "Confirmar recibos sin vínculo",
+    PERMISSION_BILL_OLDER_ATTENTION: "Facturar atenciones de más de 48 horas",
 }
 
 
@@ -17630,6 +17847,7 @@ class PDFDatabaseWorker(threading.Thread):
         local_request_id = ""
         local_request_hash = ""
         try:
+            validate_receipt_job_date(job)
             local_request_id, local_request_hash, handled = self._prepare_local_job(job)
             if handled:
                 return
@@ -18392,6 +18610,7 @@ def imprimir_factura_desde_html(html: str, parent=None, is_preview: bool = False
         return browser
     
     printer = QPrinter()
+    printer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
     printer.setOutputFormat(QPrinter.PdfFormat)
     
     if parent:
@@ -19489,10 +19708,10 @@ class LoginAuthenticationWorker(QThread):
                         cat: get_universal(cat) for cat in UNIVERSAL_CATEGORIES
                     },
                     "preferences": get_user_preferences(user["username"]),
-                    "catalog_favorites": list_user_catalog_favorites(
-                        user["username"]
-                    ),
+                    "catalog_favorites": list_user_catalog_favorites(user["username"]),
                     "local_admission_ready": local_admission_ready,
+                    "material_rules": load_billing_material_rules(),
+                    "honorarium_settings": load_ars_honorarium_prompt_settings(),
                 }
             )
             self.completed.emit(
@@ -20065,6 +20284,11 @@ class UniversalCatalogAdminDialog(QDialog):
             button.clicked.connect(callback)
             actions.addWidget(button)
             self.action_buttons.append(button)
+        if category == "Medicamentos":
+            self.material_links_button = QPushButton("Materiales vinculados")
+            self.material_links_button.clicked.connect(self._edit_material_links)
+            actions.addWidget(self.material_links_button)
+            self.action_buttons.append(self.material_links_button)
         actions.addStretch(1)
         page_layout.addLayout(actions)
         search.textChanged.connect(lambda text, t=table: filter_table_widget(t, text))
@@ -20080,6 +20304,7 @@ class UniversalCatalogAdminDialog(QDialog):
             return None
         return {
             "name": table.item(row, 0).text(),
+            "id": table.item(row, 0).data(Qt.ItemDataRole.UserRole),
             "price": float(table.item(row, 1).data(Qt.UserRole) or 0.0),
             "active": table.item(row, table.columnCount() - 1).text() == "Activo",
         }
@@ -20145,11 +20370,18 @@ class UniversalCatalogAdminDialog(QDialog):
                      "Activo" if int(item.get("is_active") or 0) else "Inactivo"]
                 )
                 for column, value in enumerate(values):
-                    cell = QTableWidgetItem(str(value))
-                    if column == 1:
-                        cell.setData(Qt.UserRole, base)
+                    cell = self._catalog_cell(value, column, item, base)
                     table.setItem(row, column, cell)
         self._update_markup_example()
+
+    @staticmethod
+    def _catalog_cell(value, column, item, base):
+        cell = QTableWidgetItem(str(value))
+        if column == 0:
+            cell.setData(Qt.ItemDataRole.UserRole, item.get("id"))
+        if column == 1:
+            cell.setData(Qt.ItemDataRole.UserRole, base)
+        return cell
 
     def _update_markup_example(self, *_args):
         percent = float(self.markup_spin.value())
@@ -20174,6 +20406,25 @@ class UniversalCatalogAdminDialog(QDialog):
         )
         if ok:
             self._mutate("UPSERT", category, "", name.strip(), price)
+
+    def _edit_material_links(self):
+        selected = self._selected("Medicamentos")
+        if not selected:
+            return
+        from medication_material_dialog import MedicationMaterialDialog
+
+        dialog = MedicationMaterialDialog(
+            selected["id"],
+            load=load_medication_material_editor,
+            save=lambda identity, quantities: save_medication_material_links(
+                identity, quantities, self.current_user
+            ),
+            worker_factory=HonorariumSettingsWorker,
+            parent=self,
+        )
+        dialog.exec()
+        if dialog.saved:
+            self.catalog_changed = True
 
     def _edit_item(self, category: str):
         selected = self._selected(category)
@@ -21297,6 +21548,7 @@ class UsersAdminDialog(QDialog):
         header.setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         
         # ---> ACTIVAR MENÚ CONTEXTUAL (CLIC DERECHO) <---
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -21309,13 +21561,6 @@ class UsersAdminDialog(QDialog):
         self.btn_add = QPushButton("Crear usuario")
         self.btn_toggle = QPushButton("Activar / Desactivar")
         self.btn_role = QPushButton("Cambiar rol")
-        self.btn_permissions = QPushButton("Permisos individuales")
-        set_button_role(self.btn_permissions, "info")
-        self.btn_permissions.clicked.connect(self.edit_permissions)
-        self.btn_permissions.setEnabled(
-            user_has_permission(self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS)
-        )
-        row.addWidget(self.btn_permissions)
         self.btn_reset = QPushButton("Restablecer contraseña")
         self.btn_remote_logout = QPushButton("Cerrar sesión remota")
         row.addWidget(self.btn_refresh); row.addWidget(self.btn_add); row.addWidget(self.btn_toggle); row.addWidget(self.btn_role); row.addWidget(self.btn_reset); row.addWidget(self.btn_remote_logout); row.addStretch(1)
@@ -21375,6 +21620,15 @@ class UsersAdminDialog(QDialog):
                 self.table.setItem(r, c, item)
 
     def edit_permissions(self):
+        if not user_has_permission(
+            self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS
+        ):
+            FloatingToast(
+                "No tienes permiso para administrar permisos individuales",
+                self,
+                is_error=True,
+            ).show()
+            return
         username = self._selected_username()
         if not username:
             return
@@ -21394,7 +21648,6 @@ class UsersAdminDialog(QDialog):
         )
         if dialog.exec() == QDialog.Accepted:
             self.current_user.update(get_user(self.current_user["username"]) or {})
-            self.btn_permissions.setEnabled(user_has_permission(self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS))
 
     def _selected_username(self):
         row = self.table.currentRow()
@@ -21481,9 +21734,17 @@ class UsersAdminDialog(QDialog):
     def show_context_menu(self, pos):
         row = self.table.rowAt(pos.y())
         if row < 0: return
+        self.table.setCurrentCell(row, 0)
         self.table.selectRow(row)
         
         menu = QMenu(self)
+
+        if user_has_permission(
+            self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS
+        ):
+            permissions_action = menu.addAction("Permisos individuales")
+            permissions_action.triggered.connect(self.edit_permissions)
+            menu.addSeparator()
         
         if user_is_admin(self.current_user):
             a_toggle = QAction("🔄 Activar / Desactivar", self)
@@ -31933,7 +32194,7 @@ class AdmissionHistoryDialog(QDialog):
             )
         super().__init__(parent)
         self.current_user = requested_user
-        self._full_history = _is_privileged_billing_role(self.current_user)
+        self._full_history = can_bill_older_attention(self.current_user)
         self._page_size = 50
         self._cursor = None
         self._has_more = True
@@ -31959,9 +32220,9 @@ class AdmissionHistoryDialog(QDialog):
         subtitle = QLabel(
             "Consulta progresiva de atenciones y su vínculo documental. "
             + (
-                "Tu rol puede consultar el historial completo."
+                "Tus permisos permiten consultar el historial completo."
                 if self._full_history
-                else "Tu rol puede enviar emergencias de los últimos 2 días."
+                else "Tus permisos permiten enviar emergencias de los últimos 2 días."
             )
         )
         subtitle.setWordWrap(True)
@@ -32006,16 +32267,15 @@ class AdmissionHistoryDialog(QDialog):
         self.status_combo.addItem("Todos los estados", "TODOS")
         for value in BILLING_STATUSES:
             self.status_combo.addItem(billing_status_label(value), value)
-        self.coverage_combo = QComboBox()
-        if self._full_history:
+        allow_uninsured = can_view_uninsured_patients(self.current_user)
+        self.coverage_combo = QComboBox(filters_card)
+        if allow_uninsured:
             self.coverage_combo.addItem("Todos", "TODOS")
             self.coverage_combo.addItem("Asegurados", "ASEGURADOS")
             self.coverage_combo.addItem("Sin seguro", "SIN_SEGURO")
         else:
             self.coverage_combo.addItem("Asegurados", "ASEGURADOS")
-        self.coverage_combo.setVisible(
-            can_view_uninsured_patients(self.current_user)
-        )
+        self.coverage_combo.setVisible(allow_uninsured)
         self.search_button = QPushButton("Buscar")
         self.clear_button = QPushButton("Limpiar")
         set_button_role(self.search_button, "info")
@@ -32033,7 +32293,7 @@ class AdmissionHistoryDialog(QDialog):
         filters.addWidget(self.sheet_combo, 1, 4)
         filters.addWidget(self.receipt_combo, 1, 5)
         filters.addWidget(self.status_combo, 1, 6)
-        if self.coverage_combo.isVisible():
+        if allow_uninsured:
             filters.addWidget(QLabel("Cobertura:"), 2, 0)
             filters.addWidget(self.coverage_combo, 2, 1)
         filters.addWidget(self.search_button, 2, 5)
@@ -33496,6 +33756,8 @@ class MainWindow(QMainWindow):
         self._honorarium_prompted_ars = set()
         self._current_ars_id = 0
         self._current_honorarium_prompt_suppressed = False
+        self._current_honorarium_specialties: dict = {}
+        self._editing_specialty_snapshot = ""
         self.mascarilla_prompt_done = False
         self.session_started_at = now_str()
         self.session_id = str(session_id or make_session_id())
@@ -33545,6 +33807,7 @@ class MainWindow(QMainWindow):
         if application is not None:
             application.setStyleSheet(get_stylesheet(self.is_dark_mode))
         self._build_ui()
+        self._initialize_material_rules(startup_data)
         self._setup_hotkeys()
         self._build_timers()
         app = QApplication.instance()
@@ -33690,6 +33953,8 @@ class MainWindow(QMainWindow):
         self.btn_preferences.setToolTip("Preferencias")
         self.btn_preferences.clicked.connect(self.open_preferences_dialog)
         top_right_h.addWidget(self.btn_preferences)
+        self.update_control = UpdateCheckControl(self)
+        top_right_h.addWidget(self.update_control.button)
         self.btn_advanced = None
         if user_can_manage_sessions(self.current_user) or user_has_permission(self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS):
             self.btn_advanced = QToolButton()
@@ -35301,6 +35566,7 @@ class MainWindow(QMainWindow):
         if printer_info.isNull():
             raise RuntimeError("No hay una impresora predeterminada disponible.")
         printer = QPrinter(printer_info, QPrinter.HighResolution)
+        printer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
         printer.setCopyCount(1)
         printer.setPageOrientation(QPageLayout.Landscape)
         document = QPdfDocument(self)
@@ -35422,12 +35688,19 @@ class MainWindow(QMainWindow):
                     button.setIconSize(QSize(max(12, arrow_width - 12), max(12, arrow_height - 5)))
 
     def _install_cart_quantity_editor(self, row: int, quantity: int):
+        from billing_item_rules import MAX_MATERIAL_QUANTITY, MAX_MEDICATION_QUANTITY
+
+        category_item = self.cart_table.item(row, 0)
+        material = category_item is not None and category_item.text().endswith(
+            "Materiales"
+        )
+        maximum = MAX_MATERIAL_QUANTITY if material else MAX_MEDICATION_QUANTITY
         item = self.cart_table.item(row, 2)
         if item is None:
             item = QTableWidgetItem()
             item.setTextAlignment(Qt.AlignCenter)
             self.cart_table.setItem(row, 2, item)
-        quantity = max(1, min(300, int(quantity or 1)))
+        quantity = max(1, min(maximum, int(quantity or 1)))
         item.setText(str(quantity))
         holder = QWidget(self.cart_table)
         holder.setObjectName("CartQuantityHolder")
@@ -35440,7 +35713,9 @@ class MainWindow(QMainWindow):
         holder_layout.addStretch(1)
         editor = QSpinBox(holder)
         editor.setObjectName("CartQuantitySpin")
-        editor.setRange(1, 300)
+        editor.setRange(1, maximum)
+        if material:
+            editor_width = max(editor_width, editor.fontMetrics().horizontalAdvance(str(MAX_MATERIAL_QUANTITY)) + 10)
         editor.setSingleStep(1)
         editor.setButtonSymbols(QAbstractSpinBox.NoButtons)
         editor.setAlignment(Qt.AlignCenter)
@@ -35532,6 +35807,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         quantity = max(1, int(quantity))
+        row, quantity = _adjust_linked_material_quantity(self, row, quantity)
         qty_item = self.cart_table.item(row, 2)
         if qty_item is not None:
             qty_item.setText(str(quantity))
@@ -35627,12 +35903,19 @@ class MainWindow(QMainWindow):
             self._remove_cart_row(row)
 
     def insert_or_increment_cart_item(self, category: str, name: str, price: float, qty: int = 1) -> str:
+        if category == "Honorarios" and not receipt_honorarium_allowed(self):
+            FloatingToast(
+                "Esta ARS no cobra honorarios para esta especialidad.",
+                self,
+                is_error=True,
+            ).show()
+            return "blocked"
         qty = int(qty or 1)
         price = float(price or 0.0)
 
         # Buscar si el item ya existe en el carrito
         for r in range(self.cart_table.rowCount()):
-            if self.cart_table.item(r, 1).text() == name:
+            if self.cart_table.item(r, 1).text() == name and self.cart_table.item(r, 0).text().endswith(category):
                 # Sumar cantidad al item existente
                 existing_qty = self._cart_quantity_value(r)
                 new_qty = existing_qty + qty
@@ -36148,6 +36431,7 @@ class MainWindow(QMainWindow):
         self.current_ars = str(ars_name or "").strip()
         self._current_ars_id = 0
         self._current_honorarium_prompt_suppressed = False
+        self._current_honorarium_specialties = {}
         if not self.current_ars:
             self.sala_spin.setValue(0.0)
             for category in ARS_CATEGORIES:
@@ -36202,6 +36486,7 @@ class MainWindow(QMainWindow):
         self._current_honorarium_prompt_suppressed = bool(
             data.get("suppress_honorarium_prompt")
         )
+        self._current_honorarium_specialties = honorarium_policy_snapshot(data)
         catalogs = dict(data.get("catalogs") or {})
         for category in ARS_CATEGORIES:
             self.ars_cache[category] = dict(catalogs.get(category) or {})
@@ -36290,6 +36575,7 @@ class MainWindow(QMainWindow):
         if dialog.catalog_changed:
             self.universal = dialog.active_catalogs()
             self.refresh_picker()
+            self._request_material_rules()
 
     def save_sala(self):
         self.mark_activity()
@@ -36566,10 +36852,24 @@ class MainWindow(QMainWindow):
             FloatingToast("Seleccione un ítem", self, is_error=True).show()
             return
 
+        MainWindow._add_catalog_selection(self, category, item)
+
+    def _add_catalog_selection(self, category, item):
         name, price = item.data(Qt.UserRole)
         qty = int(self.qty.value())
 
-        self.insert_or_increment_cart_item(category, name, price, qty)
+        configured_materials = False
+        if category == "Medicamentos":
+            try:
+                configured_materials = self.material_cart.prepare_add(name, qty)
+            except ValueError as error:
+                FloatingToast(str(error), self, is_error=True).show()
+                return
+
+        if self.insert_or_increment_cart_item(category, name, price, qty) == "blocked":
+            return
+        if configured_materials:
+            self.material_cart.finish_add(name)
 
         self.update_totals()
         self.search.clear()
@@ -36578,10 +36878,12 @@ class MainWindow(QMainWindow):
 
         FloatingToast("✅ Añadido al recibo", self).show()
 
-        self.maybe_auto_add_guantes(category)
-        self.maybe_auto_add_bajante_cateter(name)
+        if not configured_materials:
+            self.maybe_auto_add_guantes(category)
+            self.maybe_auto_add_bajante_cateter(name)
         self.maybe_prompt_honorario(category)
-        self.maybe_prompt_mascarilla(category, name)
+        if not configured_materials:
+            self.maybe_prompt_mascarilla(category, name)
 
     def show_cart_context_menu(self, pos):
         row = self.cart_table.rowAt(pos.y())
@@ -36624,6 +36926,9 @@ class MainWindow(QMainWindow):
     def _remove_cart_row(self, row):
         self.mark_activity()
         if 0 <= row < self.cart_table.rowCount():
+            name_item = self.cart_table.item(row, 1)
+            _material_cart_action(self, "removing", row)
+            row = self.cart_table.row(name_item)
             self.cart_table.removeRow(row)
             self.update_totals()
             if self.cart_table.rowCount() > 0:
@@ -36666,6 +36971,8 @@ class MainWindow(QMainWindow):
 
     def reset_all(self, *, preserve_claim=None):
         self.receipt_identity_nss = ""
+        self._editing_specialty_snapshot = ""
+        _material_cart_action(self, "reset")
         self._pending_ars_correction = None
         schedule_replaced_admission_claim_release(
             self.current_admission_attention,
@@ -36864,6 +37171,7 @@ class MainWindow(QMainWindow):
         self.btn_generate.setText("GUARDAR CAMBIOS DEL RECIBO (F5)")
 
         self.receipt_identity_nss = str(data.get("admission_nss_snapshot") or "")
+        self._editing_specialty_snapshot = data.get("specialty_snapshot")
         self.name_edit.setText(data["nombre"])
         self.dx_edit.setText(data["dx"])
         self.authorization_edit.setText(data.get("numero_autorizacion") or "")
@@ -37033,20 +37341,11 @@ class MainWindow(QMainWindow):
         date_str = self.date_edit.date().toString("yyyy-MM-dd")
         dx_raw = self.dx_edit.text().strip()
 
-        today = QDate.currentDate()
-        selected_date = self.date_edit.date()
-        days_past = selected_date.daysTo(today)
-
-        if days_past < 0:
-            FloatingToast("❌ No puedes crear recibos con fechas futuras", self, is_error=True).show()
+        try:
+            is_backdated = validate_receipt_date_for_user(date_str, self.current_user)
+        except (ValueError, PermissionError) as exc:
+            FloatingToast(str(exc), self, is_error=True).show()
             return
-
-        is_backdated = 0
-        if days_past > 2:
-            is_backdated = 1
-            if self.current_user.get('role') not in (ROLE_ADMIN, ROLE_AUDIT):
-                FloatingToast("❌ Fechas mayores a 48h requieren rol Administrador o Facturador de Auditoría", self, is_error=True).show()
-                return
 
         grouped_dict = {cat: [] for cat in ALL_CATEGORIES}
         for r in range(self.cart_table.rowCount()):
@@ -37732,6 +38031,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             write_runtime_log(f"LOCAL_PRICING_CACHE_FAILED error_type={type(exc).__name__}")
         HONORARIUM_PROMPT_SETTINGS.update(data.get("honorarium_settings") or [])
+        MainWindow._update_billing_item_rules_cache(self, data)
         write_runtime_log(f"SessionHealth background_ms={elapsed_ms:.1f}")
         if not data.get("alive") and not self._logout_finalizing:
             self._handle_inactive_login_session(
@@ -37746,6 +38046,85 @@ class MainWindow(QMainWindow):
         write_runtime_log(
             f"SessionHealth error={error_type} background_ms={elapsed_ms:.1f}"
         )
+
+    def _update_billing_item_rules_cache(self, data):
+        if not hasattr(self, "material_cart"):
+            return
+        from receipt_continuity import local_receipt_store
+
+        try:
+            local_receipt_store().cache(
+                "honorarium_settings", HONORARIUM_PROMPT_SETTINGS.rows()
+            )
+        except Exception as exc:
+            write_runtime_log(
+                f"LOCAL_HONORARIUM_CACHE_FAILED error_type={type(exc).__name__}"
+            )
+        if (
+            int(data.get("medication_markup_version") or 0)
+            != self._material_rules_version
+        ):
+            self._request_material_rules()
+
+    def _initialize_material_rules(self, startup_data):
+        from billing_material_cart import MedicationMaterialCart
+
+        self.material_cart = MedicationMaterialCart(
+            self, lambda message: FloatingToast(message, self, is_error=True).show()
+        )
+        material_rules = dict(startup_data.get("material_rules") or {})
+        self.material_cart.rules = dict(material_rules.get("links") or {})
+        self._material_rules_version = int(material_rules.get("version") or 0)
+        self._material_rules_worker = None
+        from network_retry import NetworkRetryGate
+
+        self._material_rules_retry = NetworkRetryGate()
+        if "honorarium_settings" in startup_data:
+            HONORARIUM_PROMPT_SETTINGS.update(startup_data["honorarium_settings"])
+
+    def _request_material_rules(self):
+        if (
+            self.offline_login
+            or self._material_rules_worker is not None
+            or not self._material_rules_retry.ready
+        ):
+            return
+        worker = HonorariumSettingsWorker(refresh_billing_material_catalog, self)
+        self._material_rules_worker = worker
+        worker.completed.connect(self._material_rules_loaded)
+        worker.failed.connect(self._material_rules_failed)
+        worker.finished.connect(self._material_rules_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    @Slot(object)
+    def _material_rules_loaded(self, data):
+        self.material_cart.rules = dict(data["links"])
+        self._material_rules_version = int(data["version"])
+        self.universal = dict(data["universal"])
+        self._material_rules_retry.succeeded()
+        self.refresh_picker()
+        from receipt_continuity import local_receipt_store
+
+        try:
+            store = local_receipt_store()
+            store.cache(
+                "material_rules", {"links": data["links"], "version": data["version"]}
+            )
+            store.cache("universal", self.universal)
+        except Exception as exc:
+            write_runtime_log(
+                f"LOCAL_MATERIAL_RULES_CACHE_FAILED error_type={type(exc).__name__}"
+            )
+
+    @Slot(str)
+    def _material_rules_failed(self, message):
+        self._material_rules_retry.failed(RuntimeError(message))
+        write_runtime_log("MATERIAL_RULES_REFRESH_FAILED")
+
+    @Slot()
+    def _material_rules_finished(self):
+        self._material_rules_worker = None
 
     @Slot()
     def _session_health_finished(self):
@@ -37860,6 +38239,7 @@ class MainWindow(QMainWindow):
             "_startup_maintenance_worker",
             "pdf_sync_worker",
             "_session_health_worker",
+            "_material_rules_worker",
         ):
             worker = getattr(self, worker_name, None)
             request_interruption = getattr(worker, "requestInterruption", None)
@@ -38014,17 +38394,14 @@ class MainWindow(QMainWindow):
         
     def closeEvent(self, event):
         current_session_id = getattr(self, "session_id", "")
+        if _defer_material_query_close(self, event):
+            return
         schedule_admission_claim_release(
             self.current_admission_attention, session_id=current_session_id,
         )
-        current_username = (
-            self.current_user.get("username", "")
-            if isinstance(self.current_user, dict) else ""
-        )
-        current_role = (
-            self.current_user.get("role", "")
-            if isinstance(self.current_user, dict) else ""
-        )
+        closing_user = _closing_user_data(self)
+        current_username = closing_user.get("username", "")
+        current_role = closing_user.get("role", "")
         current_device_id, _current_device_name = _local_device_identity()
         if hasattr(self, 'shift_report_timer'):
             self.shift_report_timer.stop()

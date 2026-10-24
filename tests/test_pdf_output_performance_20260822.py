@@ -48,6 +48,7 @@ def _make_app(module, database):
     app._output_lock = threading.Lock()
     app._output_inflight = set()
     app._output_payloads = {}
+    app._embedded_visual_notifier = None
     app.boton_generar_pdf = _Button()
     app.statuses: list[str] = []
     app.set_status = lambda message, _kind: app.statuses.append(message)
@@ -114,7 +115,7 @@ def test_open_and_print_share_the_single_rendered_file(tmp_path: Path, monkeypat
     assert counter["value"] == 1
     assert "open:attention_1.pdf" in events
     assert "print:attention_1.pdf" in events
-    assert events.index("open:attention_1.pdf") < events.index("print:attention_1.pdf") < events.index("excel")
+    assert events.index("print:attention_1.pdf") < events.index("open:attention_1.pdf") < events.index("excel")
     assert events.count("cleanup:attention_1.pdf") == 1
 
 
@@ -130,6 +131,28 @@ def test_pdf_render_failure_preserves_the_saved_attention_and_reports_pdf_error(
     assert database.job["pdf_estado"] == "FALLIDO"
     assert database.job["excel_estado"] == "COMPLETADO"
     assert any("fue guardada" in status for status in app.statuses)
+
+
+def test_viewer_failure_does_not_block_or_repeat_printing(tmp_path: Path, monkeypatch):
+    module = importlib.import_module("ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6")
+    database = _OutputDatabase(print_state="PENDIENTE")
+    app = _make_app(module, database)
+    events = []
+    render, _ = _render_stub(tmp_path, events)
+    monkeypatch.setattr(module, "crear_pdf_temporal", render)
+    monkeypatch.setattr(module, "imprimir_pdf", lambda *_args, **_kwargs: events.append("print") or True)
+    monkeypatch.setattr(module, "programar_limpieza_pdf_temporal", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "reconstruir_excel_turno", lambda *_args: None)
+
+    def failed_viewer(*_args, **_kwargs):
+        assert events.count("print") == 1
+        raise OSError("Viewer unavailable")
+
+    monkeypatch.setattr(module, "abrir_pdf", failed_viewer)
+    app._procesar_salida_atencion(45, "GENERAL", {}, {"id": 1}, abrir_pdf_final=True)
+    assert events.count("print") == 1
+    assert database.job["pdf_estado"] == "COMPLETADO"
+    assert database.job["impresion_estado"] == "ENVIADO_A_IMPRESORA"
 
 
 def test_duplicate_immediate_output_is_suppressed(tmp_path: Path):

@@ -112,20 +112,28 @@ def _require_release_assets(assets: dict[str, dict], names: tuple[str, ...]) -> 
         raise UpdateError("La publicación SIGEH está incompleta: " + ", ".join(missing))
 
 
+def _asset_url(assets: dict, name: str, tag: str) -> str:
+    expected = f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{tag}/{name}"
+    if assets[name].get("browser_download_url") != expected:
+        raise UpdateError("La descarga no pertenece al canal SIGEH autorizado.")
+    return expected
+
+
 def parse_release(data: dict) -> ReleaseInfo:
     version = _stable_release_version(data)
     archive_name, checksum_name, manifest_name = release_asset_names(version)
     html_url = _validated_release_url(data)
     assets = _release_assets(data)
     _require_release_assets(assets, (archive_name, checksum_name, manifest_name))
+    tag = str(data["tag_name"]).strip()
     return ReleaseInfo(
         version=version,
         name=str(data.get("name") or f"SIGEH {version}"),
         notes=str(data.get("body") or "").strip(),
-        archive_url=str(assets[archive_name].get("browser_download_url") or ""),
+        archive_url=_asset_url(assets, archive_name, tag),
         archive_name=archive_name,
-        checksum_url=str(assets[checksum_name].get("browser_download_url") or ""),
-        manifest_url=str(assets[manifest_name].get("browser_download_url") or ""),
+        checksum_url=_asset_url(assets, checksum_name, tag),
+        manifest_url=_asset_url(assets, manifest_name, tag),
         html_url=html_url,
     )
 

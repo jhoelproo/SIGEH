@@ -2,12 +2,25 @@
 
 import pytest
 import psycopg2
+from datetime import date
 
 import CALCULOS_QT as app
 from receipt_documents import load_current_receipt_snapshot
 from self_pay_billing import list_receipts, load_summary, save_payment
 from tests.test_billing_consistency_postgres import server as server
 from tests.test_receipt_optional_uuid_postgres import receipts as receipts, save
+
+
+@pytest.fixture
+def service_day(monkeypatch):
+    validate_date = app.validate_receipt_date_for_user
+    monkeypatch.setattr(
+        app,
+        "validate_receipt_date_for_user",
+        lambda service_date, user: validate_date(
+            service_date, user, today=date(2026, 9, 5)
+        ),
+    )
 
 
 @pytest.fixture
@@ -180,7 +193,7 @@ def test_existing_contributive_flow_remains_unchanged(tariffs):
         assert list_receipts(connection, start="2026-09-05", end="2026-09-05") == []
 
 
-def test_unknown_operator_cannot_save_direct_payment(tariffs, monkeypatch):
+def test_unknown_operator_cannot_save_direct_payment(tariffs, monkeypatch, service_day):
     monkeypatch.setattr(app, "get_user", lambda _: None)
     with pytest.raises(PermissionError, match="no está autorizado"):
         direct_save()
@@ -188,7 +201,9 @@ def test_unknown_operator_cannot_save_direct_payment(tariffs, monkeypatch):
         assert connection.execute("SELECT COUNT(*) FROM recibos").fetchone()[0] == 0
 
 
-def test_auxiliary_can_save_paid_receipt_without_verification(tariffs, monkeypatch):
+def test_auxiliary_can_save_paid_receipt_without_verification(
+    tariffs, monkeypatch, service_day
+):
     monkeypatch.setattr(
         app, "get_user", lambda _: dict(username="uuid_test", role=app.ROLE_AUX)
     )

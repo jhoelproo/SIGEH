@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -13,9 +12,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from user_permissions import overrides_for
+from password_secrets import ITERATIONS, offline_verifier_matches
 
 OFFLINE_LOGIN_VALID_DAYS = 30
-PBKDF2_ITERATIONS = 240_000
+PBKDF2_ITERATIONS = ITERATIONS
 
 
 def _utc_now() -> datetime:
@@ -169,13 +169,14 @@ class OfflineAuthCache:
             valid_until = valid_until.replace(tzinfo=timezone.utc)
         if instant > valid_until:
             return None
-        candidate = _derive(
+        if not offline_verifier_matches(
             password,
-            bytes(row["password_salt"]),
-            int(row["verifier_iterations"]),
-        )
-        if not hmac.compare_digest(candidate, bytes(row["password_verifier"])):
+            row["password_salt"],
+            row["password_verifier"],
+            row["verifier_iterations"],
+        ):
             return None
+        self._upgrade_verifier(row, password)
         return {
             "id": str(row["user_id"]),
             "user_id": str(row["user_id"]),
@@ -187,6 +188,26 @@ class OfflineAuthCache:
             "_offline_login": True,
             "_offline_valid_until": str(row["offline_valid_until"]),
         }
+
+    def _upgrade_verifier(self, row, password):
+        if int(row["verifier_iterations"]) >= PBKDF2_ITERATIONS:
+            return
+        salt = secrets.token_bytes(16)
+        verifier = _derive(password, salt)
+        with sqlite3.connect(self.path) as con:
+            con.execute(
+                """UPDATE offline_auth_cache
+                   SET password_verifier=?,password_salt=?,verifier_iterations=?
+                   WHERE username=? AND device_id=? AND password_verifier=?""",
+                (
+                    verifier,
+                    salt,
+                    PBKDF2_ITERATIONS,
+                    row["username"],
+                    row["device_id"],
+                    row["password_verifier"],
+                ),
+            )
 
     def list_valid_usernames(
         self,

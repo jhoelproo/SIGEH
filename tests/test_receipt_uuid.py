@@ -107,6 +107,7 @@ def test_user_message_never_exposes_sql():
 )
 def test_worker_reports_safe_failure_and_no_success(monkeypatch, error):
     worker = app.PDFDatabaseWorker()
+    monkeypatch.setattr(worker, "_prepare_local_job", lambda _: ("", "", False))
     worker.signals = Mock()
     logs = []
     monkeypatch.setattr(app, "write_runtime_log", logs.append)
@@ -123,7 +124,7 @@ def test_worker_reports_safe_failure_and_no_success(monkeypatch, error):
             "total_general": 100,
             "editing_id": None,
             "editing_num": None,
-            "current_user": {"username": "test"},
+            "current_user": {"username": "test", "role": app.ROLE_ADMIN},
             "is_backdated": False,
             "verification_bypass": {"reason": "Prueba controlada"},
         }

@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QLabel,
+    QLineEdit,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -26,6 +27,10 @@ class UserPermissionsDialog(QDialog):
         layout.addWidget(
             QLabel("Predeterminado usa el rol. Permitir o denegar prevalece sobre él.")
         )
+        self.permission_search = QLineEdit()
+        self.permission_search.setPlaceholderText("Buscar permiso...")
+        self.permission_search.setClearButtonEnabled(True)
+        layout.addWidget(self.permission_search)
         self.table = QTableWidget(len(permissions), 3)
         self.table.setHorizontalHeaderLabels(["Permiso", "Rol", "Excepción individual"])
         for row, (key, caption) in enumerate(permissions.items()):
@@ -55,15 +60,25 @@ class UserPermissionsDialog(QDialog):
         self.table.setColumnWidth(1, 110)
         self.table.setColumnWidth(2, 180)
         layout.addWidget(self.table)
+        self.permission_search.textChanged.connect(self.filter_permissions)
         self.message = QLabel()
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Save).setText("Guardar")
-        buttons.button(QDialogButtonBox.Cancel).setText("Cancelar")
+        save_button = QDialogButtonBox.StandardButton.Save
+        cancel_button = QDialogButtonBox.StandardButton.Cancel
+        buttons = QDialogButtonBox(save_button | cancel_button)
+        buttons.button(save_button).setText("Guardar")
+        buttons.button(cancel_button).setText("Cancelar")
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def filter_permissions(self, text):
+        query = text.strip().casefold()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            caption = item.text().casefold() if item else ""
+            self.table.setRowHidden(row, query not in caption)
 
     def save(self):
         changes = {

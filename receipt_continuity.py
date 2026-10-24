@@ -34,6 +34,8 @@ def remember_startup_catalog(data: dict[str, Any], username: str) -> None:
     store.cache("universal", data.get("universal") or {})
     store.cache("preferences:" + username, data.get("preferences") or {})
     store.cache("favorites:" + username, list(data.get("catalog_favorites") or ()))
+    store.cache("material_rules", data.get("material_rules") or {})
+    store.cache("honorarium_settings", data.get("honorarium_settings") or [])
 
 
 def remember_tariff(name: str, data: dict[str, Any]) -> None:
@@ -53,6 +55,8 @@ def local_catalog_startup(username: str) -> dict[str, Any]:
         "catalog_favorites": store.cached("favorites:" + username, []),
         "local_tariffs": {name: store.cached("tariff:" + name, {}) for name in names},
         "local_medication_markup": store.cached("medication_markup", None),
+        "material_rules": store.cached("material_rules", {}),
+        "honorarium_settings": store.cached("honorarium_settings", []),
     }
 
 

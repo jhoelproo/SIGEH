@@ -42,16 +42,18 @@ def _release(repository=GITHUB_REPOSITORY, version="1.1.2"):
         "prerelease": False,
         "html_url": f"https://github.com/{repository}/releases/tag/v{version}",
         "assets": [
-            {"name": archive, "browser_download_url": f"https://download/{archive}"},
-            {"name": checksum, "browser_download_url": f"https://download/{checksum}"},
-            {"name": manifest, "browser_download_url": f"https://download/{manifest}"},
+            {
+                "name": name,
+                "browser_download_url": f"https://github.com/{repository}/releases/download/v{version}/{name}",
+            }
+            for name in (archive, checksum, manifest)
         ],
     }
 
 
 def test_product_and_channel_are_sigeh_only():
     assert PRODUCT_ID == "SIGEH"
-    assert APP_VERSION == "1.2.13"
+    assert APP_VERSION == "1.2.14"
     assert LATEST_RELEASE_API.endswith(f"/{GITHUB_REPOSITORY}/releases/latest")
     assert "Hospital-Contreras-Facturacion1" not in LATEST_RELEASE_API
 
@@ -67,7 +69,7 @@ def test_release_parser_accepts_complete_sigeh_release():
     assert release.version == "1.1.2"
     assert release.archive_name == "SIGEH-1.1.2-windows-x64.zip"
     assert not is_newer(release.version, APP_VERSION)
-    assert is_newer("1.2.14", APP_VERSION)
+    assert is_newer("1.2.15", APP_VERSION)
     assert is_newer(APP_VERSION, "1.1.2")
     assert not is_newer(APP_VERSION, APP_VERSION)
 

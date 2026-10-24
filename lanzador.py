@@ -13,6 +13,11 @@ _EARLY_ARGS = list(sys.argv[1:])
 if __name__ == "__main__" and _EARLY_ARGS == ["--self-test-fast-launch"]:
     raise SystemExit(0)
 if __name__ == "__main__" and _EARLY_ARGS == ["--self-test"]:
+    from pathlib import Path
+    from updater import restore_legacy_update_state
+
+    if getattr(sys, "frozen", False):
+        restore_legacy_update_state(Path(sys.executable).parent)
     raise SystemExit(_fast_launch_main_before_gui_imports())
 
 import json
@@ -537,15 +542,13 @@ class LauncherDialog(QDialog):
             if not payload_dir:
                 raise IOError("El ZIP no contiene una distribución SIGEH onedir válida.")
 
-            installed_updater = os.path.join(current_dir, UPDATER_NAME)
-            if not os.path.isfile(installed_updater):
-                raise FileNotFoundError(f"No se encontro {UPDATER_NAME}.")
+            payload_updater = os.path.join(payload_dir, UPDATER_NAME)
             updater_temp_dir = os.path.join(
                 tempfile.gettempdir(), "SIGEH-Updater", str(uuid.uuid4())
             )
             os.makedirs(updater_temp_dir, exist_ok=True)
             temporary_updater = os.path.join(updater_temp_dir, UPDATER_NAME)
-            shutil.copy2(installed_updater, temporary_updater)
+            shutil.copy2(payload_updater, temporary_updater)
 
             manifest_path = os.path.join(update_root, "update_manifest.json")
             with open(manifest_path, "w", encoding="utf-8") as manifest_file:

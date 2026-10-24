@@ -109,7 +109,7 @@ def test_patient_edit_receipt_route_preserves_existing_receipt_id(opened):
     assert form.module_tabs.setCurrentIndex.call_count == int(opened)
 
 
-def test_user_manager_permission_button_saves_explicit_deny(monkeypatch):
+def test_user_manager_permission_action_saves_explicit_deny(monkeypatch):
     user = {
         "id": 1,
         "username": "SYNTHETIC",
@@ -147,13 +147,13 @@ def test_user_manager_permission_button_saves_explicit_deny(monkeypatch):
                     modal.reject()
 
         QTimer.singleShot(0, operate)
-        manager.btn_permissions.click()
+        manager.edit_permissions()
         assert not errors
         saved.assert_called_once_with(
             "SYNTHETIC", {app.PERMISSION_EDIT_PENDING: False}, user, expected={}
         )
         QTimer.singleShot(0, lambda: QApplication.activeModalWidget().reject())
-        manager.btn_permissions.click()
+        manager.edit_permissions()
         assert saved.call_count == 1
     finally:
         manager.close()

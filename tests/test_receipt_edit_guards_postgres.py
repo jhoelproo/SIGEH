@@ -99,7 +99,13 @@ def test_non_admin_room_price_is_enforced_during_save(inherited, monkeypatch, ro
             VALUES('FUTURO',460,1,TRUE) ON CONFLICT(nombre) DO UPDATE
             SET sala_emergencia=460,is_active=1,billing_enabled=TRUE""")
     monkeypatch.setattr(
-        app, "get_user", lambda username: {"username": username, "role": role}
+        app,
+        "get_user",
+        lambda username: {
+            "username": username,
+            "role": role,
+            "permission_overrides": {app.PERMISSION_BILL_OLDER_ATTENTION: True},
+        },
     )
     with pytest.raises(PermissionError, match="ADMIN"):
         linked_save(inherited, sala=461, total=561)
@@ -123,7 +129,13 @@ def test_admission_date_cannot_be_overridden_in_billing(inherited):
 def test_auxiliary_cannot_edit_unverified_header(receipts, monkeypatch):
     receipt_id = save()
     monkeypatch.setattr(
-        app, "get_user", lambda username: {"username": username, "role": app.ROLE_AUX}
+        app,
+        "get_user",
+        lambda username: {
+            "username": username,
+            "role": app.ROLE_AUX,
+            "permission_overrides": {app.PERMISSION_BILL_OLDER_ATTENTION: True},
+        },
     )
     with pytest.raises(PermissionError, match="validar"):
         save(recibo_id=receipt_id, verification_bypass=None, dx="CAMBIADO")

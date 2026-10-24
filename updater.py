@@ -19,9 +19,10 @@ from sigeh_product import PRODUCT_ID
 WAIT_SECONDS = 60
 HEALTH_RESULT_WAIT_SECONDS = 15.0
 HEALTH_RESULT_POLL_SECONDS = 0.05
+LEGACY_ROLLBACK_MAX_AGE_SECONDS = 600
 PRESERVE_NAMES = ("recibos", "reportes", "respaldos")
 PRESERVE_FILES = ("lanzador_log.txt", "pdf_performance.log")
-PRESERVE_RELATIVE_DIRECTORIES = (Path("_internal") / "data",)
+PRESERVE_RELATIVE_DIRECTORIES = (Path("_internal") / "data", Path("data"))
 PRESERVE_RELATIVE_FILES = (
     Path(".env"),
     Path("_internal") / ".env",
@@ -29,6 +30,20 @@ PRESERVE_RELATIVE_FILES = (
     Path("database_url.bundle"),
     Path("_internal") / "database_url.protected",
     Path("_internal") / "database_url.bundle",
+    *(
+        Path(folder) / filename
+        for folder in (".", "_internal")
+        for filename in (
+            "settings.json",
+            "app_settings.json",
+            "turnos_config.json",
+            "security.json",
+            "ars_catalogo.json",
+            "logo.jpg",
+        )
+    ),
+    Path("assets") / "logo.jpg",
+    Path("_internal") / "assets" / "logo.jpg",
 )
 UPDATE_PRESERVE_PATHS = (
     *(Path(name) for name in PRESERVE_NAMES),
@@ -48,16 +63,13 @@ def _sha256_file(path: Path) -> str:
 
 def snapshot_preserved_local_state(install_dir: Path) -> dict[str, str]:
     """Fingerprint operational data that an update must preserve byte for byte."""
-    data_dir = Path(install_dir) / "_internal" / "data"
-    if not data_dir.is_dir():
-        return {}
-    candidates = {path for path in data_dir.iterdir() if path.is_file()}
-    database_suffixes = (".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm")
-    candidates.update(
-        path
-        for path in data_dir.rglob("*")
-        if path.is_file() and path.name.lower().endswith(database_suffixes)
-    )
+    candidates = set()
+    for relative in UPDATE_PRESERVE_PATHS:
+        path = Path(install_dir) / relative
+        if path.is_file():
+            candidates.add(path)
+        elif path.is_dir():
+            candidates.update(child for child in path.rglob("*") if child.is_file())
     return {
         path.relative_to(install_dir).as_posix(): _sha256_file(path)
         for path in sorted(candidates)
@@ -75,6 +87,51 @@ def verify_preserved_local_state(expected: dict[str, str], install_dir: Path) ->
             "La actualización no conservó exactamente el estado local; se restaurará "
             "la instalación anterior."
         )
+
+
+def _recent_rollback(candidate: Path, prefix: str, now: float) -> bool:
+    try:
+        age = now - int(candidate.name.removeprefix(prefix))
+    except ValueError:
+        return False
+    if candidate.resolve() != candidate:
+        return False
+    complete = all(
+        (candidate / name).is_file()
+        for name in ("SIGEH.exe", "CALCULOS_QT.exe", "SIGEH_Updater.exe")
+    )
+    if complete and not 0 <= age <= LEGACY_ROLLBACK_MAX_AGE_SECONDS:
+        raise RuntimeError(
+            "Respaldo fuera del intervalo seguro; se cancela la actualización."
+        )
+    return complete
+
+
+def restore_legacy_update_state(install_dir: Path, *, now: float | None = None) -> int:
+    """Recover extended settings while the previous updater retains its rollback.
+
+    Called only by the launcher's installation health check. Failure propagates
+    so the previous updater restores its complete original installation.
+    """
+    install_dir = install_dir.resolve()
+    prefix = f".{install_dir.name}-rollback-"
+    timestamp = time.time() if now is None else now
+    candidates = [
+        path
+        for path in install_dir.parent.glob(prefix + "*")
+        if _recent_rollback(path, prefix, timestamp)
+    ]
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "Recuperación de configuración ambigua; se cancela la actualización."
+        )
+    if not candidates:
+        return 0
+    original = candidates[0]
+    expected = snapshot_preserved_local_state(original)
+    merge_preserved(original, install_dir)
+    verify_preserved_local_state(expected, install_dir)
+    return len(expected)
 
 
 def write_log(log_path: Path, message: str) -> None:
@@ -125,7 +182,7 @@ def merge_preserved(backup_dir: Path, install_dir: Path) -> None:
     for relative in PRESERVE_RELATIVE_FILES:
         source = backup_dir / relative
         target = install_dir / relative
-        if source.is_file() and not target.exists():
+        if source.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
 
