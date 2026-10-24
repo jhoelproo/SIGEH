@@ -162,7 +162,6 @@ def fit_billing_design(window):
     window.tabs.setElideMode(Qt.ElideRight)
     window.header_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
     window.header_subtitle.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-    window.catalog_workspace.sort.setMaximumWidth(140 if compact else 190)
     window.cart_table.parentWidget().setMinimumWidth(0)
     small = window.width() < 1450
     window.catalog_panel.setMinimumWidth(360 if small else 350)

@@ -3516,6 +3516,9 @@ def db_init():
         _apply_sent_batch_reports_migration(con)
 
     with db_connect() as con:
+        from diagnosis_recommendation_schema import SCHEMA_SQL as recommendation_schema
+
+        con.executescript(recommendation_schema)
         cur = con.execute("SELECT COUNT(*) AS c FROM users WHERE role=%s", (ROLE_ADMIN,))
         has_admin = int(cur.fetchone()["c"]) > 0
         if not has_admin:
@@ -3714,6 +3717,14 @@ def _read_database_schema_state(con) -> tuple[bool, bool, list[str]]:
     return bool(marker), compatible, missing
 
 
+def _complete_database_schema_preparation(status):
+    from diagnosis_recommendation_schema import ensure_schema
+
+    with db_connect() as con:
+        ensure_schema(con)
+    return status
+
+
 def prepare_database_schema() -> str:
     """Skip historical DDL on compatible clients; migrate once under a global lock."""
     with db_connect() as con:
@@ -3721,7 +3732,7 @@ def prepare_database_schema() -> str:
     with db_connect() as con:
         marker_present, compatible, _missing = _read_database_schema_state(con)
     if marker_present and compatible:
-        return "ALREADY_COMPATIBLE"
+        return _complete_database_schema_preparation("ALREADY_COMPATIBLE")
 
     database_url = validate_database_url(DB_URL)
     lock_connection = psycopg2.connect(
@@ -3761,7 +3772,7 @@ def prepare_database_schema() -> str:
                            VALUES(%s,%s) ON CONFLICT(migration_id) DO NOTHING""",
                         (BOOTSTRAP_SCHEMA_MIGRATION_ID, BOOTSTRAP_APP_VERSION),
                     )
-            return "ALREADY_COMPATIBLE"
+            return _complete_database_schema_preparation("ALREADY_COMPATIBLE")
 
         write_main_app_log(
             "DATABASE_MIGRATION_REQUIRED",
@@ -3833,7 +3844,7 @@ def prepare_database_schema() -> str:
                    applied_at=NOW(),app_version=EXCLUDED.app_version""",
                 (BOOTSTRAP_SCHEMA_MIGRATION_ID, BOOTSTRAP_APP_VERSION),
             )
-        return "MIGRATED"
+        return _complete_database_schema_preparation("MIGRATED")
     finally:
         try:
             lock_cursor.execute(
@@ -19002,8 +19013,68 @@ def safe_generate_pending_reports(username: str):
         print(f"Error generando reporte pendiente: {e}")
     return generated, errors
 
+def _word_catalog_texts(doc):
+    texts = [paragraph.text for paragraph in doc.paragraphs]
+    texts.extend(
+        cell.text for table in doc.tables for row in table.rows for cell in row.cells
+    )
+    return texts
+
+
+def _word_catalog_target(path: str, preferred_category: str) -> str:
+    if Document is None:
+        raise RuntimeError("Falta dependencia python-docx")
+    doc = Document(path)
+    categories = UNIVERSAL_CATEGORIES + ARS_CATEGORIES
+    for text in _word_catalog_texts(doc):
+        heading = remove_accents(text).strip().casefold().rstrip(":")
+        heading = re.sub(
+            r"^(?:precios?|listado|lista|catalogo)\s+(?:de\s+)?", "", heading
+        )
+        for category in categories:
+            if heading == remove_accents(category).casefold():
+                return "universal" if category in UNIVERSAL_CATEGORIES else "ars"
+    return "universal" if preferred_category in UNIVERSAL_CATEGORIES else "ars"
+
+
+def import_word_catalog(path: str, preferred_category: str, ars_name: str):
+    target = _word_catalog_target(path, preferred_category)
+    if target == "universal":
+        return target, import_word_to_universal_catalog(path)
+    if not ars_name:
+        raise ValueError(
+            "Selecciona una ARS para importar los servicios del documento."
+        )
+    return target, import_word_to_ars_catalog(path, ars_name)
+
+
+def word_catalog_import_message(target: str, summary: dict, ars_name: str) -> str:
+    if target == "universal":
+        return (
+            f"Medicamentos — Actualizados: {summary['Medicamentos']['updated']} | Nuevos: {summary['Medicamentos']['inserted']}\n"
+            f"Materiales — Actualizados: {summary['Materiales']['updated']} | Nuevos: {summary['Materiales']['inserted']}\n\n"
+            f"Regla aplicada: Medicamentos guardados a precio base y mostrados con "
+            f"+{get_medication_markup_percent():.2f}% en Facturación."
+        )
+    rows = [f"ARS: {ars_name}\n"]
+    rows.extend(
+        f"{category} — Actualizados: {summary[category]['updated']} | Nuevos: {summary[category]['inserted']}"
+        for category in ARS_CATEGORIES
+    )
+    return "\n".join(rows)
+
+
+def _require_word_catalog_items(parsed, message: str):
+    if not any(parsed.values()):
+        raise ValueError(message)
+
+
 def import_word_to_universal_catalog(path: str):
     parsed = parse_word_for_universal_categories(path)
+    _require_word_catalog_items(
+        parsed,
+        "No se encontraron medicamentos o materiales con precios válidos en el archivo Word.",
+    )
     summary = {cat: {"updated": 0, "inserted": 0} for cat in UNIVERSAL_CATEGORIES}
     existing_maps = {cat: {} for cat in UNIVERSAL_CATEGORIES}
     for cat in UNIVERSAL_CATEGORIES:
@@ -19036,9 +19107,12 @@ def import_word_to_ars_catalog(path: str, ars_name: str):
     if not ars_name: raise ValueError("Debes seleccionar una ARS.")
     ars_name = require_medication_ars(ars_name)
     parsed = parse_word_for_ars_categories(path)
+    _require_word_catalog_items(
+        parsed,
+        "No se detectaron encabezados válidos de servicios ARS en el archivo Word.",
+    )
     summary = {cat: {"updated": 0, "inserted": 0} for cat in ARS_CATEGORIES}
     existing_maps = {cat: {name.strip().casefold(): name for name in get_ars_items(cat, ars_name).keys()} for cat in ARS_CATEGORIES}
-    total_loaded = 0
     _ensure_ars(ars_name)
     with db_connect() as con:
         for cat in ARS_CATEGORIES:
@@ -19057,8 +19131,6 @@ def import_word_to_ars_catalog(path: str, ars_name: str):
                 else:
                     summary[cat]["inserted"] += 1
                     existing_maps[cat][key] = display_name
-                total_loaded += 1
-    if total_loaded == 0: raise ValueError("No se detectaron encabezados válidos en el archivo Word.")
     return summary
 
 def parse_word_for_universal_categories(path: str):
@@ -21487,21 +21559,23 @@ class ARSManagerDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(self, "Seleccionar archivo Word", "", "Word (*.docx)")
         if not path: return
         try:
-            summary = import_word_to_ars_catalog(path, ars_name)
+            target, summary = import_word_catalog(path, "Laboratorios", ars_name)
+            is_universal = target == "universal"
+            if is_universal:
+                self.universal_catalog_changed = True
             log_action(
-                self.current_user['username'], "Importar Word ARS",
+                self.current_user["username"],
+                "Importar Word Universal" if is_universal else "Importar Word ARS",
                 f"ARS: {ars_name} | Archivo: {os.path.basename(path)}",
-                module="Gestión ARS", entity_type="importación_ars",
-                entity_id=os.path.basename(path), ars_name=ars_name,
+                module="Gestión ARS",
+                entity_type="catálogo_universal" if is_universal else "importación_ars",
+                entity_id=os.path.basename(path),
+                ars_name="CATÁLOGO UNIVERSAL" if is_universal else ars_name,
             )
             ARS_RUNTIME_CACHE.invalidate(ars_name)
             QMessageBox.information(
                 self, "Importación completada",
-                (f"ARS: {ars_name}\n\n"
-                 f"Laboratorios — Actualizados: {summary['Laboratorios']['updated']} | Nuevos: {summary['Laboratorios']['inserted']}\n"
-                 f"Imágenes     — Actualizados: {summary['Imágenes']['updated']} | Nuevos: {summary['Imágenes']['inserted']}\n"
-                 f"Procedimientos — Actualizados: {summary['Procedimientos']['updated']} | Nuevos: {summary['Procedimientos']['inserted']}\n"
-                 f"Honorarios     — Actualizados: {summary['Honorarios']['updated']} | Nuevos: {summary['Honorarios']['inserted']}")
+                word_catalog_import_message(target, summary, ars_name),
             )
         except Exception as e:
             QMessageBox.critical(self, "Importar Word", f"Error al procesar el archivo:\n{e}")
@@ -33808,6 +33882,9 @@ class MainWindow(QMainWindow):
             application.setStyleSheet(get_stylesheet(self.is_dark_mode))
         self._build_ui()
         self._initialize_material_rules(startup_data)
+        from diagnosis_recommendation_ui import RecommendationController
+
+        self.recommendation_controller = RecommendationController(self, sys.modules[__name__])
         self._setup_hotkeys()
         self._build_timers()
         app = QApplication.instance()
@@ -33847,6 +33924,9 @@ class MainWindow(QMainWindow):
         if self._deferred_services_started:
             return
         self._deferred_services_started = True
+        controller = getattr(self, "recommendation_controller", None)
+        if controller is not None:
+            controller.start()
         if self.offline_login:
             self._start_pdf_services()
             return
@@ -33995,6 +34075,9 @@ class MainWindow(QMainWindow):
             honorarium_settings_action.triggered.connect(
                 self.open_ars_honorarium_settings
             )
+            from diagnosis_recommendation_ui import install_recommendation_action
+
+            install_recommendation_action(advanced_menu,self,sys.modules[__name__])
             self.btn_advanced.setMenu(advanced_menu)
             self.btn_advanced.setToolTip("Administración y auditoría del sistema")
             self.btn_advanced.setProperty("preserveOriginalIcons", True)
@@ -34371,10 +34454,12 @@ class MainWindow(QMainWindow):
         btn_qty_down.setFixedSize(30, 30)
         btn_qty_down.clicked.connect(lambda: self.qty.setValue(max(1, self.qty.value() - 1)))
 
+        self.qty.setFixedHeight(btn_qty_up.height())
         qty_container = QWidget()
         qty_lay = QHBoxLayout(qty_container)
         qty_lay.setContentsMargins(0, 0, 0, 0)
         qty_lay.setSpacing(2)
+        qty_lay.addWidget(QLabel("Cant:"))
         qty_lay.addWidget(self.qty)
         qty_lay.addWidget(btn_qty_up)
         qty_lay.addWidget(btn_qty_down)
@@ -34382,7 +34467,6 @@ class MainWindow(QMainWindow):
         self.btn_add = QPushButton("➡️ Añadir al Recibo (Enter)")
         self.btn_add.setAutoDefault(False)
         self.btn_add.setDefault(False)
-        qty_row.addWidget(QLabel("Cant:"))
         qty_row.addWidget(qty_container)
         qty_row.addStretch(1)
         qty_row.addWidget(self.btn_add)
@@ -36337,6 +36421,9 @@ class MainWindow(QMainWindow):
             FloatingToast(f"Ya existe '{name}' en {new_category}", self, is_error=True).show()
 
     def refresh_picker(self):
+        controller = getattr(self, "recommendation_controller", None)
+        if controller is not None:
+            controller.prepare_labels()
         term = (self.search.text() or "").strip()
         self._fill_list(self.source_lists["Medicamentos"], self.universal["Medicamentos"], term)
         self._fill_list(self.source_lists["Materiales"], self.universal["Materiales"], term)
@@ -36555,6 +36642,8 @@ class MainWindow(QMainWindow):
         self._last_ui_action = "abrir Gestión ARS"
         dialog = ARSManagerDialog(self.current_user, self)
         dialog.exec()
+        if getattr(dialog, "universal_catalog_changed", False):
+            self.universal = {category: get_universal(category) for category in UNIVERSAL_CATEGORIES}
         ARS_RUNTIME_CACHE.invalidate()
         names = list(dialog._ars_names or [])
         self.ars_combo.clear(); self.ars_combo.addItems(names)
@@ -37339,9 +37428,11 @@ class MainWindow(QMainWindow):
             return
         self._last_generate_time = now
         date_str = self.date_edit.date().toString("yyyy-MM-dd")
-        dx_raw = self.dx_edit.text().strip()
-
         try:
+            from diagnosis_recommendation_ui import normalize_receipt_diagnosis
+
+            normalize_receipt_diagnosis(self)
+            dx_raw = self.dx_edit.text().strip()
             is_backdated = validate_receipt_date_for_user(date_str, self.current_user)
         except (ValueError, PermissionError) as exc:
             FloatingToast(str(exc), self, is_error=True).show()
@@ -37548,8 +37639,8 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Seleccionar archivo Word", "", "Word (*.docx)")
         if not path: return
         try:
-            if current_cat in UNIVERSAL_CATEGORIES:
-                summary = import_word_to_universal_catalog(path)
+            target, summary = import_word_catalog(path, current_cat, self.current_ars)
+            if target == "universal":
                 self.universal["Medicamentos"] = get_universal("Medicamentos")
                 self.universal["Materiales"] = get_universal("Materiales")
                 log_action(
@@ -37558,18 +37649,7 @@ class MainWindow(QMainWindow):
                     module="Facturación", entity_type="catálogo_universal",
                     entity_id=os.path.basename(path), ars_name="CATÁLOGO UNIVERSAL",
                 )
-                QMessageBox.information(
-                    self, "Importación completada",
-                    (f"Medicamentos — Actualizados: {summary['Medicamentos']['updated']} | Nuevos: {summary['Medicamentos']['inserted']}\n"
-                     f"Materiales   — Actualizados: {summary['Materiales']['updated']} | Nuevos: {summary['Materiales']['inserted']}\n\n"
-                     f"Regla aplicada: Medicamentos guardados a precio base y mostrados con "
-                     f"+{get_medication_markup_percent():.2f}% en Facturación.")
-                )
             else:
-                if not self.current_ars:
-                    FloatingToast("Selecciona una ARS primero", self, is_error=True).show()
-                    return
-                summary = import_word_to_ars_catalog(path, self.current_ars)
                 for cat in ARS_CATEGORIES:
                     self.ars_cache[cat] = get_ars_items(cat, self.current_ars)
                 log_action(
@@ -37578,14 +37658,11 @@ class MainWindow(QMainWindow):
                     module="Gestión ARS", entity_type="importación_ars",
                     entity_id=os.path.basename(path), ars_name=self.current_ars,
                 )
-                QMessageBox.information(
-                    self, "Importación completada",
-                    (f"ARS: {self.current_ars}\n\n"
-                     f"Laboratorios — Actualizados: {summary['Laboratorios']['updated']} | Nuevos: {summary['Laboratorios']['inserted']}\n"
-                     f"Imágenes     — Actualizados: {summary['Imágenes']['updated']} | Nuevos: {summary['Imágenes']['inserted']}\n"
-                     f"Procedimientos — Actualizados: {summary['Procedimientos']['updated']} | Nuevos: {summary['Procedimientos']['inserted']}\n"
-                     f"Honorarios     — Actualizados: {summary['Honorarios']['updated']} | Nuevos: {summary['Honorarios']['inserted']}")
-                )
+            QMessageBox.information(
+                self,
+                "Importación completada",
+                word_catalog_import_message(target, summary, self.current_ars),
+            )
             self.refresh_picker()
             self.search_and_maybe_switch_tab()
         except Exception as e:
@@ -38196,6 +38273,9 @@ class MainWindow(QMainWindow):
             )
 
     def _stop_secondary_workers(self):
+        from diagnosis_recommendation_ui import stop_recommendations
+
+        stop_recommendations(self)
         monthly_page = getattr(self, "monthly_lists_page", None)
         for worker in list(getattr(monthly_page, "_monthly_workers", set()) or set()):
             try:
@@ -38240,6 +38320,7 @@ class MainWindow(QMainWindow):
             "pdf_sync_worker",
             "_session_health_worker",
             "_material_rules_worker",
+            "_recommendation_worker",
         ):
             worker = getattr(self, worker_name, None)
             request_interruption = getattr(worker, "requestInterruption", None)
@@ -38396,6 +38477,9 @@ class MainWindow(QMainWindow):
         current_session_id = getattr(self, "session_id", "")
         if _defer_material_query_close(self, event):
             return
+        from diagnosis_recommendation_ui import stop_recommendations
+
+        stop_recommendations(self)
         schedule_admission_claim_release(
             self.current_admission_attention, session_id=current_session_id,
         )

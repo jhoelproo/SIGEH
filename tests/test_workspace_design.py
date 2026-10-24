@@ -49,6 +49,16 @@ def qt():
     return QApplication.instance() or QApplication([])
 
 
+def catalog_quantity(parent):
+    controls = QWidget(parent)
+    layout = QHBoxLayout(controls)
+    layout.addWidget(QLabel("Cant:"))
+    quantity = app.QSpinBox()
+    quantity.setRange(1, 300)
+    layout.addWidget(quantity)
+    return quantity
+
+
 @pytest.fixture
 def catalog(qt):
     surface = QWidget()
@@ -64,6 +74,7 @@ def catalog(qt):
         layout.addWidget(widget)
     owner = SimpleNamespace(
         catalog_layout=layout,
+        qty=catalog_quantity(surface),
         tabs=tabs,
         source_lists=lists,
         get_current_category=lambda: list(lists)[tabs.currentIndex()],
@@ -103,22 +114,22 @@ def test_catalog_paging_first_last_empty_and_keyboard_selection(catalog):
 
 
 @pytest.mark.parametrize(
-    "order,expected", [(1, "Medicamento 28"), (2, "Medicamento 00")]
+    "index,expected,price", [(1, "Medicamento 00", 100), (29, "Medicamento 28", 72)]
 )
-def test_catalog_price_sort_and_row_add_preserve_category_price(
-    catalog, order, expected
+def test_catalog_alphabetical_order_and_row_add_preserve_category_price(
+    catalog, index, expected, price
 ):
-    catalog.sort.setCurrentIndex(order)
+    catalog.show_page(index // catalog.page_size)
     widget = catalog.current_list()
-    assert widget.item(1).data(Qt.UserRole)[0] == expected
-    item = widget.item(1)
+    assert widget.item(index).data(Qt.UserRole)[0] == expected
+    item = widget.item(index)
     row = widget.itemWidget(item)
     row.findChild(QPushButton).click()
     catalog.window.add_selected_item.assert_called_once_with(
         category_override="Medicamentos"
     )
     assert widget.currentItem() is item
-    assert item.data(Qt.UserRole)[1] == (72 if order == 1 else 100)
+    assert item.data(Qt.UserRole)[1] == price
 
 
 def test_catalog_favorite_button_emits_existing_persistence_signal(catalog):
@@ -507,6 +518,7 @@ def billing(qt):
         QPushButton(),
     )
     window.btn_add = QPushButton()
+    window.qty = catalog_quantity(window.catalog_panel)
     install_billing_design(window, app)
     yield window
     window.close()
@@ -536,7 +548,7 @@ def test_billing_compact_and_wide_geometry_keep_actions_available(billing):
     fit_billing_design(billing)
     assert billing.patient_scroll.minimumWidth() == 240
     assert billing.bottom_layout.indexOf(billing.btn_generate) >= 0
-    assert billing.catalog_workspace.sort.maximumWidth() == 140
+    assert billing.catalog_workspace.quantity is billing.qty.parentWidget()
     assert (
         billing.cart_table.horizontalHeader().sectionResizeMode(1)
         == app.QHeaderView.Interactive
@@ -544,6 +556,6 @@ def test_billing_compact_and_wide_geometry_keep_actions_available(billing):
     assert billing.lbl_total.minimumHeight() == 54
     billing.resize(1680, 950)
     fit_billing_design(billing)
-    assert billing.catalog_workspace.sort.maximumWidth() == 190
+    assert not hasattr(billing.catalog_workspace, "sort")
     assert billing.lbl_total.minimumHeight() == 78
     assert billing.tabs.usesScrollButtons()

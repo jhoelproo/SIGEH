@@ -61,6 +61,9 @@ ARS_HONORARIUM_MIGRATION = (
 PRIMARY_LEASE_MIGRATION = (
     ROOT / "migrations" / "20260820_admission_primary_lease_generation.sql"
 )
+DIAGNOSIS_RECOMMENDATIONS_MIGRATION = (
+    ROOT / "migrations" / "20261024170830_diagnosis_recommendations.sql"
+)
 
 
 def collect_embedded_tcl_tk_data():
@@ -140,6 +143,7 @@ REQUIRED_FILES = [
     BILLING_BYPASS_REVIEW_MIGRATION,
     ARS_HONORARIUM_MIGRATION,
     PRIMARY_LEASE_MIGRATION,
+    DIAGNOSIS_RECOMMENDATIONS_MIGRATION,
     SUMATRA_PDF,
     ASSETS / "logo.jpg",
     ASSETS / "favicon.ico",
@@ -282,6 +286,7 @@ main_datas = [
     (str(BILLING_BYPASS_REVIEW_MIGRATION), "migrations"),
     (str(ARS_HONORARIUM_MIGRATION), "migrations"),
     (str(PRIMARY_LEASE_MIGRATION), "migrations"),
+    (str(DIAGNOSIS_RECOMMENDATIONS_MIGRATION), "migrations"),
     (str(ADMISSION_CORE), "admission_source/emergency_core"),
     (str(ADMISSION_SOURCE / "facturacion_tabs.py"), "admission_source"),
     # V15 busca SumatraPDF directamente en sys._MEIPASS. En onedir este

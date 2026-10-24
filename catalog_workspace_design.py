@@ -14,7 +14,10 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QStyledItemDelegate,
     QFrame,
+    QVBoxLayout,
 )
+
+RECOMMENDATION_ROLE = int(Qt.ItemDataRole.UserRole) + 1267
 
 
 class IntegratedCatalogDelegate(QStyledItemDelegate):
@@ -49,6 +52,7 @@ class CatalogRow(QWidget):
         self.item = item
         self.compact = None
         self.controls = ()
+        self.recommended = False
         self.setObjectName("DesignCatalogRow")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.grid = QGridLayout(self)
@@ -75,7 +79,9 @@ class CatalogRow(QWidget):
         for column, control in enumerate((price, star, add), 1):
             self.grid.addWidget(control, 1 if compact else 0, column)
         self.grid.setColumnStretch(0, 1)
-        height = 64 if compact else 44
+        height = (
+            (80 if compact else 64) if self.recommended else (64 if compact else 44)
+        )
         self.setMinimumHeight(height)
         self.item.setSizeHint(QSize(0, height))
 
@@ -86,7 +92,6 @@ class CatalogWorkspace:
         self.backend = backend
         self.page = 0
         self.page_size = 13
-        self.order = "name"
         for widget in window.source_lists.values():
             widget.setItemDelegate(IntegratedCatalogDelegate(widget))
             widget.setSpacing(0)
@@ -97,13 +102,10 @@ class CatalogWorkspace:
             widget.itemSelectionChanged.connect(
                 lambda widget=widget: self.mark_selection(widget)
             )
-        self.sort = QComboBox()
-        self.sort.addItem("Nombre · A a Z", "name")
-        self.sort.addItem("Precio · Menor primero", "price")
-        self.sort.addItem("Precio · Mayor primero", "price_desc")
-        self.sort.setMinimumWidth(0)
-        window.catalog_layout.itemAt(0).layout().addWidget(self.sort)
-        self.sort.currentIndexChanged.connect(self.order_changed)
+        self.quantity = window.qty.parentWidget()
+        self.quantity.setObjectName("CatalogQuantityControls")
+        self.quantity.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        window.catalog_layout.itemAt(0).layout().addWidget(self.quantity)
         self.header = self.column_headings()
         window.catalog_layout.insertWidget(1, self.header)
         self.footer = QHBoxLayout()
@@ -157,22 +159,19 @@ class CatalogWorkspace:
                 row.style().polish(row)
                 row.update()
 
-    def order_changed(self):
-        self.order = self.sort.currentData()
-        for widget in self.window.source_lists.values():
-            self.reorder(widget)
-        self.show_page(0)
-
     def reorder(self, widget):
         items = [widget.takeItem(0) for _ in range(widget.count())]
         favorites = self.backend.CATALOG_FAVORITE_ROLE
 
         def key(item):
-            name, price = item.data(Qt.UserRole)
-            value = name.casefold() if self.order == "name" else float(price)
-            if self.order == "price_desc":
-                value = -value
-            return not bool(item.data(favorites)), value, name.casefold()
+            name, _price = item.data(Qt.UserRole)
+            suggestion = item.data(RECOMMENDATION_ROLE) or {}
+            return (
+                not bool(suggestion),
+                suggestion.get("rank", 0),
+                not bool(item.data(favorites)),
+                name.casefold(),
+            )
 
         for item in sorted(items, key=key):
             widget.addItem(item)
@@ -185,6 +184,12 @@ class CatalogWorkspace:
         self.show_page(self.page + offset)
 
     def filled(self, widget):
+        labels = getattr(self.window, "recommendation_labels", {})
+        for index in range(widget.count()):
+            item = widget.item(index)
+            name, _price = item.data(Qt.UserRole)
+            category = item.data(self.backend.CATALOG_CATEGORY_ROLE)
+            item.setData(RECOMMENDATION_ROLE, labels.get((category, name)))
         self.reorder(widget)
         if widget is self.current_list():
             self.show_page(0)
@@ -224,6 +229,9 @@ class CatalogWorkspace:
         label = CatalogNameLabel(name)
         label.setObjectName("CatalogItemName")
         label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        suggestion = item.data(RECOMMENDATION_ROLE)
+        if suggestion:
+            label = self.recommended_label(row, label, suggestion)
         price_label = QLabel(f"RD$ {float(price):,.2f}")
         price_label.setObjectName("CatalogPrice")
         price_label.setToolTip(price_label.text())
@@ -248,6 +256,32 @@ class CatalogWorkspace:
         add.clicked.connect(lambda: self.add(widget, item))
         row.set_controls(label, price_label, star, add)
         return row
+
+    @staticmethod
+    def recommended_label(row, name_label, suggestion):
+        row.recommended = True
+        row.setProperty("recommendation", True)
+        row.setStyleSheet(
+            "QWidget#DesignCatalogRow { border-left: 5px solid #b768ff; "
+            "background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #48246b,stop:1 #17243c); "
+            "border-radius: 5px; }"
+        )
+        column = QWidget()
+        column.setMinimumWidth(0)
+        layout = QVBoxLayout(column)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+        badge = QLabel("Recomendado por el sistema")
+        badge.setStyleSheet(
+            "color:#e6c6ff;font-size:9px;font-weight:700;background:transparent;"
+        )
+        diagnosis = CatalogNameLabel("Para: " + "; ".join(suggestion["diagnoses"]))
+        diagnosis.setStyleSheet("color:#d6c4ed;font-size:10px;background:transparent;")
+        name_label.setStyleSheet("color:#ffffff;background:transparent;")
+        layout.addWidget(badge)
+        layout.addWidget(name_label)
+        layout.addWidget(diagnosis)
+        return column
 
     def add(self, widget, item):
         widget.setCurrentItem(item)

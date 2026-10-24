@@ -53,7 +53,7 @@ def _release(repository=GITHUB_REPOSITORY, version="1.1.2"):
 
 def test_product_and_channel_are_sigeh_only():
     assert PRODUCT_ID == "SIGEH"
-    assert APP_VERSION == "1.2.14"
+    assert APP_VERSION == "1.3.0"
     assert LATEST_RELEASE_API.endswith(f"/{GITHUB_REPOSITORY}/releases/latest")
     assert "Hospital-Contreras-Facturacion1" not in LATEST_RELEASE_API
 
@@ -69,7 +69,7 @@ def test_release_parser_accepts_complete_sigeh_release():
     assert release.version == "1.1.2"
     assert release.archive_name == "SIGEH-1.1.2-windows-x64.zip"
     assert not is_newer(release.version, APP_VERSION)
-    assert is_newer("1.2.15", APP_VERSION)
+    assert is_newer("1.3.1", APP_VERSION)
     assert is_newer(APP_VERSION, "1.1.2")
     assert not is_newer(APP_VERSION, APP_VERSION)
 

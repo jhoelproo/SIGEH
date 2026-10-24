@@ -1,0 +1,372 @@
+"""Local diagnosis associations from saved receipts, with explicit ambiguity."""
+
+from difflib import SequenceMatcher
+import re
+import unicodedata
+
+CATEGORIES = ("Medicamentos", "Laboratorios", "Imágenes")
+SPECIALTIES = ("EMERGENCIOLOGÍA", "PEDIATRÍA", "GINECOLOGÍA")
+DEFAULT_SETTINGS = {
+    "min_receipts": 10,
+    "frequency_percent": 60,
+    "invoiced_weight": 2,
+    "pending_weight": 1,
+    "lab_limit": 3,
+    "image_limit": 2,
+}
+SETTING_LIMITS = {
+    "min_receipts": (1, 1000),
+    "frequency_percent": (1, 100),
+    "invoiced_weight": (1, 10),
+    "pending_weight": (1, 10),
+    "lab_limit": (1, 20),
+    "image_limit": (1, 20),
+}
+MAX_DIAGNOSES = 2
+MIN_FUZZY_LENGTH = 5
+MIN_FUZZY_SCORE = 0.90
+FUZZY_MARGIN = 0.06
+
+
+def text_key(value):
+    plain = unicodedata.normalize("NFKD", str(value or ""))
+    plain = "".join(char for char in plain if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]+", " ", plain.casefold()).strip()
+
+
+def specialty_key(value):
+    key = text_key(value)
+    aliases = {
+        "": SPECIALTIES[0],
+        "general": SPECIALTIES[0],
+        "medicina general": SPECIALTIES[0],
+    }
+    aliases.update({text_key(name): name for name in SPECIALTIES})
+    return aliases.get(key, "")
+
+
+def group_key(diagnosis, specialty):
+    return f"{text_key(diagnosis)}::{specialty_key(specialty)}"
+
+
+def _bounded_integer(value, minimum, maximum):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("La configuración requiere números enteros.")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"El valor debe estar entre {minimum} y {maximum}.")
+    return value
+
+
+def _diagnosis_definition(row):
+    name = str(row.get("name") or "").strip().upper()
+    if not text_key(name) or len(name) > 180:
+        raise ValueError("El diagnóstico debe tener entre 1 y 180 caracteres.")
+    aliases = sorted(
+        {str(item).strip().upper() for item in row.get("aliases", []) if text_key(item)}
+    )
+    if len(aliases) > 100 or any(len(item) > 180 for item in aliases):
+        raise ValueError("Hay demasiadas equivalencias o son demasiado largas.")
+    return {"name": name, "aliases": aliases}
+
+
+def normalize_config(value):
+    settings = _normalized_settings(value.get("settings") or {})
+    diagnoses = [_diagnosis_definition(row) for row in value.get("diagnoses", [])]
+    if len({text_key(row["name"]) for row in diagnoses}) != len(diagnoses):
+        raise ValueError("Hay diagnósticos duplicados.")
+    result = {"settings": settings, "diagnoses": diagnoses, "rules": []}
+    catalog = DiagnosisCatalog(result)
+    result["rules"] = [_normalized_rule(row, catalog) for row in value.get("rules", [])]
+    identities = [
+        (row["diagnosis"], row["specialty"], row["category"], text_key(row["item"]))
+        for row in result["rules"]
+    ]
+    if len(set(identities)) != len(identities):
+        raise ValueError("Hay asociaciones duplicadas o contradictorias.")
+    return result
+
+
+def _normalized_settings(value):
+    settings = {**DEFAULT_SETTINGS, **dict(value)}
+    if set(settings) != set(DEFAULT_SETTINGS):
+        raise ValueError("Hay parámetros de recomendaciones desconocidos.")
+    for name, limits in SETTING_LIMITS.items():
+        settings[name] = _bounded_integer(settings[name], *limits)
+    if settings["invoiced_weight"] <= settings["pending_weight"]:
+        raise ValueError("El peso de facturados debe ser mayor que el de pendientes.")
+    return settings
+
+
+def _normalized_rule(row, catalog):
+    diagnosis = text_key(catalog.normalize(str(row.get("diagnosis") or "")))
+    specialty = specialty_key(row.get("specialty"))
+    category = str(row.get("category") or "")
+    mode = str(row.get("mode") or "")
+    item = str(row.get("item") or "").strip()
+    _validate_rule_context(catalog, diagnosis, specialty, category, mode)
+    if not text_key(item) or len(item) > 500:
+        raise ValueError("Selecciona un ítem del catálogo.")
+    return {
+        "diagnosis": diagnosis,
+        "specialty": specialty,
+        "category": category,
+        "item": item,
+        "mode": mode,
+        "priority": _bounded_integer(row.get("priority", 1), 0, 9999),
+    }
+
+
+def _validate_rule_context(catalog, diagnosis, specialty, category, mode):
+    if diagnosis not in catalog.names or not specialty:
+        raise ValueError("Selecciona un diagnóstico y especialidad válidos.")
+    if category not in CATEGORIES or mode not in {"pin", "block"}:
+        raise ValueError("La categoría o acción de la asociación no es válida.")
+
+
+class DiagnosisCatalog:
+    def __init__(self, config, learned_names=()):
+        self.names = {
+            text_key(name): str(name).strip().upper()
+            for name in learned_names
+            if text_key(name)
+        }
+        self.aliases = {}
+        self.canonical_keys = {
+            text_key(row["name"]) for row in config.get("diagnoses", [])
+        }
+        for row in config.get("diagnoses", []):
+            name = str(row["name"])
+            self.names[text_key(name)] = name
+            for alias in [name, *row.get("aliases", [])]:
+                self.aliases.setdefault(text_key(alias), set()).add(name)
+
+    def choices(self, value):
+        key = text_key(value)
+        if key in self.canonical_keys:
+            return [self.names[key]]
+        exact = self.aliases.get(key)
+        if exact:
+            return sorted(exact)
+        if key in self.names:
+            return [self.names[key]]
+        return self._fuzzy_choices(key)
+
+    def _fuzzy_choices(self, key):
+        if len(key) < MIN_FUZZY_LENGTH:
+            return []
+        scores = sorted(
+            (
+                (SequenceMatcher(None, key, candidate).ratio(), name)
+                for candidate, name in self.names.items()
+            ),
+            reverse=True,
+        )
+        if not scores or scores[0][0] < MIN_FUZZY_SCORE:
+            return []
+        best = scores[0][0]
+        return sorted({name for score, name in scores if best - score < FUZZY_MARGIN})
+
+    def split(self, value):
+        text = str(value or "").strip()
+        pieces = [
+            part.strip()
+            for part in re.split(r";|\n|\s*//\s*|\s*\|\s*|\s+/\s+", text)
+            if part.strip()
+        ]
+        if len(pieces) == 1:
+            pieces = self._split_known_conjunction(text)
+        return pieces
+
+    def _split_known_conjunction(self, text):
+        parts = re.split(r"\s+(?:y|Y)\s+|\s+\+\s+", text)
+        if len(parts) < 2 or self.choices(text):
+            return [text]
+        return parts if all(self.choices(part) for part in parts) else [text]
+
+    def normalize(self, value, *, allow_fuzzy=True):
+        result = []
+        for part in self.split(value):
+            exact = text_key(part) in self.names or text_key(part) in self.aliases
+            choices = self.choices(part) if allow_fuzzy or exact else []
+            if len(choices) > 1:
+                raise ValueError(
+                    f"Selecciona el diagnóstico correspondiente a «{part}»."
+                )
+            result.append(choices[0] if choices else part.strip().upper())
+        return "; ".join(result)
+
+    def first_two(self, value, *, allow_fuzzy=True):
+        return list(
+            dict.fromkeys(
+                text_key(part)
+                for part in self.split(self.normalize(value, allow_fuzzy=allow_fuzzy))
+            )
+        )[:MAX_DIAGNOSES]
+
+
+def model_catalog(model):
+    names = [row.get("diagnosis", "") for row in model.get("groups", {}).values()]
+    return DiagnosisCatalog(model.get("config", {}), names)
+
+
+def _rules_for(config, diagnosis, specialty, category):
+    return [
+        row
+        for row in config.get("rules", [])
+        if (row["diagnosis"], row["specialty"], row["category"])
+        == (diagnosis, specialty, category)
+    ]
+
+
+def _eligible_learned(group, category, settings):
+    total = int(group.get("receipts", 0))
+    if total < settings["min_receipts"]:
+        return []
+    return [
+        row
+        for row in group.get("items", [])
+        if row["category"] == category
+        and row["uses"] * 100 >= total * settings["frequency_percent"]
+    ]
+
+
+def _pinned_rules(rules):
+    return sorted(
+        (row for row in rules if row["mode"] == "pin"),
+        key=lambda row: (row["priority"], row["item"]),
+    )
+
+
+def _ranked_group(model, diagnosis, specialty, category):
+    config = model.get("config", {})
+    settings = {**DEFAULT_SETTINGS, **config.get("settings", {})}
+    rules = _rules_for(config, diagnosis, specialty, category)
+    blocked = {text_key(row["item"]) for row in rules if row["mode"] == "block"}
+    pins = _pinned_rules(rules)
+    group = model.get("groups", {}).get(group_key(diagnosis, specialty), {})
+    learned = _eligible_learned(group, category, settings)
+    learned.sort(
+        key=lambda row: (
+            -row["invoiced"] * settings["invoiced_weight"]
+            - row["pending"] * settings["pending_weight"],
+            -row["uses"],
+            row["item"],
+        )
+    )
+    values = [(row["item"], "manual") for row in pins] + [
+        (row["item"], "learned") for row in learned
+    ]
+    return list(
+        dict.fromkeys(
+            (item, origin) for item, origin in values if text_key(item) not in blocked
+        )
+    )
+
+
+def _category_limit(category, settings):
+    return {
+        "Medicamentos": MAX_DIAGNOSES,
+        "Laboratorios": settings["lab_limit"],
+        "Imágenes": settings["image_limit"],
+    }[category]
+
+
+def recommendations(model, diagnoses, specialty, catalogs):
+    result = {category: [] for category in CATEGORIES}
+    specialty = specialty_key(specialty)
+    catalog = model_catalog(model)
+    keys = catalog.first_two(diagnoses, allow_fuzzy=False)
+    settings = {**DEFAULT_SETTINGS, **model.get("config", {}).get("settings", {})}
+    for category in CATEGORIES:
+        available = {text_key(item): item for item in catalogs.get(category, {})}
+        result[category] = _recommend_category(
+            model, keys, specialty, category, available, catalog
+        )
+        result[category] = result[category][: _category_limit(category, settings)]
+    return result
+
+
+def _recommend_category(model, keys, specialty, category, available, catalog):
+    result = {}
+    for diagnosis in keys:
+        added = 0
+        for item, origin in _ranked_group(model, diagnosis, specialty, category):
+            name = available.get(text_key(item))
+            if name is None:
+                continue
+            label = catalog.names.get(diagnosis, diagnosis.upper())
+            row = result.setdefault(
+                name, {"item": name, "diagnoses": [], "origin": origin}
+            )
+            if origin == "manual":
+                row["origin"] = "manual"
+            if label not in row["diagnoses"]:
+                row["diagnoses"].append(label)
+            added += 1
+            if category == "Medicamentos" and added == 1:
+                break
+    return sorted(result.values(), key=lambda row: row["origin"] != "manual")
+
+
+def build_evidence(model, diagnoses, specialty, items):
+    rows = []
+    specialty = specialty_key(specialty)
+    for diagnosis in diagnoses[:MAX_DIAGNOSES]:
+        for category in CATEGORIES:
+            names = list(dict.fromkeys(items.get(category, [])))
+            confirmed = _confirmed_items(
+                model, diagnosis, specialty, category, names, len(diagnoses)
+            )
+            rows.extend(
+                {
+                    "diagnosis": diagnosis,
+                    "specialty": specialty,
+                    "category": category,
+                    "item": name,
+                    "confirmed": name in confirmed,
+                }
+                for name in names
+            )
+    return rows
+
+
+def _confirmed_items(model, diagnosis, specialty, category, names, diagnosis_count):
+    rules = _rules_for(model.get("config", {}), diagnosis, specialty, category)
+    allowed = _allowed_items(rules, names)
+    known = {
+        text_key(item)
+        for item, _origin in _ranked_group(model, diagnosis, specialty, category)
+    }
+    matched = [name for name in allowed if text_key(name) in known]
+    if category == "Medicamentos":
+        principal = _manual_principal(rules, allowed)
+        if principal:
+            return [principal]
+        return _principal_medication(allowed, matched, diagnosis_count, len(names))
+    return allowed if diagnosis_count == 1 else matched
+
+
+def _allowed_items(rules, names):
+    blocked = {text_key(row["item"]) for row in rules if row["mode"] == "block"}
+    return [name for name in names if text_key(name) not in blocked]
+
+
+def _manual_principal(rules, allowed):
+    pins = _pinned_rules(rules)
+    return next(
+        (
+            name
+            for rule in pins
+            for name in allowed
+            if text_key(name) == text_key(rule["item"])
+        ),
+        None,
+    )
+
+
+def _principal_medication(allowed, matched, diagnosis_count, original_count):
+    if len(matched) == 1:
+        return matched
+    if diagnosis_count == 1 and original_count == 1 and len(allowed) == 1:
+        return allowed
+    return []
