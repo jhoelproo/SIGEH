@@ -88,7 +88,7 @@ Cuatro pasadas: funcionalidad **PASS**; regresión **PASS**; clean code **PASS**
 
 ## PUBLICACIÓN
 
-Paquete y base preparados. La publicación y el canal remoto se verifican después de subir el release; este documento no afirma todavía su publicación.
+Publicación estable verificada: https://github.com/jhoelproo/SIGEH/releases/tag/v1.2.14. Cuatro assets remotos con tamaños y SHA-256 coincidentes; canal latest, manifiesto/checksum y salto desde 1.2.13 comprobados. Commit fuente: `c2e979a930ebe52dfc9d6577a257118299a8b081`.
 
 ## PROBLEMAS PENDIENTES
 
