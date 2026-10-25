@@ -110,7 +110,7 @@ Un intento inicial sin la ruta explícita de navegadores falló al localizar Chr
 ## PROBLEMAS PENDIENTES
 
 - La ortografía no incluida en el vocabulario o equivalencias puede requerir confirmación del facturador o configuración administrativa. No se infiere automáticamente un subtipo clínico diferente.
-- Publicación de estos cambios y comprobación en estaciones físicas: pendientes de la entrega productiva. La publicación 1.3.0 existente no se reemplazó durante esta tarea.
+- La entrega local fue seguida por la publicación estable 1.3.1; ver `RELEASE_1.3.1_QA.md`. La comprobación en estaciones físicas queda pendiente. La versión 1.3.0 conserva sus artefactos originales.
 
 ## EVIDENCIA
 
