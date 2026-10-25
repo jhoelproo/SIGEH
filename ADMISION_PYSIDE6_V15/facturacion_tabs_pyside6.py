@@ -1610,6 +1610,15 @@ class TurnoNoVigenteError(RuntimeError):
     pass
 
 
+def _output_error_assignment(columns, completed_column):
+    other_errors = " OR ".join(
+        f"{column} IN ('FALLIDO','DESCONOCIDO')"
+        for column in columns
+        if column != completed_column
+    )
+    return f"ultimo_error=CASE WHEN {other_errors} THEN ultimo_error ELSE NULL END"
+
+
 class DatabaseManager:
     SCHEMA_VERSION = LATEST_SCHEMA_VERSION
     _BOOTSTRAP_READY_PATHS = set()
@@ -2731,7 +2740,16 @@ class DatabaseManager:
         if not columna:
             raise ValueError(f"Etapa de salida desconocida: {etapa}")
         estado = str(estado or "").upper()
-        if estado not in {"PENDIENTE", "PROCESANDO", "COMPLETADO", "FALLIDO", "ENVIADO", "ENVIADO_A_IMPRESORA", "DESCONOCIDO", "NO_APLICA"}:
+        if estado not in {
+            "PENDIENTE",
+            "PROCESANDO",
+            "COMPLETADO",
+            "FALLIDO",
+            "ENVIADO",
+            "ENVIADO_A_IMPRESORA",
+            "DESCONOCIDO",
+            "NO_APLICA",
+        }:
             raise ValueError(f"Estado de salida desconocido: {estado}")
         assignments = [f"{columna}=?", "updated_at=datetime('now','localtime')"]
         params = [estado]
@@ -2739,7 +2757,7 @@ class DatabaseManager:
             assignments.append("ultimo_error=?")
             params.append(str(error)[:2000])
         elif estado in {"COMPLETADO", "ENVIADO", "ENVIADO_A_IMPRESORA", "NO_APLICA"}:
-            assignments.append("ultimo_error=NULL")
+            assignments.append(_output_error_assignment(columnas.values(), columna))
         if pdf_path is not None:
             assignments.append("pdf_path=?")
             params.append(str(pdf_path))
@@ -5011,42 +5029,96 @@ def escribir_log_impresion(mensaje):
     except Exception:
         pass
 
-def _imprimir_pdf_sumatra(ruta_abs, copias):
+def _resolve_sumatra_pdf():
     global SUMATRA_PATH_CACHE
     if not SUMATRA_PATH_CACHE or not os.path.isfile(SUMATRA_PATH_CACHE):
-        exe_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BASE_DIR
-        directories = (exe_dir, getattr(sys, "_MEIPASS", exe_dir), BASE_DIR, PROJECT_ROOT)
-        SUMATRA_PATH_CACHE = next((
-            os.path.join(directory, name)
-            for directory in directories
-            for name in ("SumatraPDF.exe", "SumatraPDF-3.6.1-64.exe", "SumatraPDF.exe.exe")
-            if os.path.isfile(os.path.join(directory, name))
-        ), None)
+        exe_dir = (
+            os.path.dirname(sys.executable)
+            if getattr(sys, "frozen", False)
+            else BASE_DIR
+        )
+        directories = (
+            exe_dir,
+            getattr(sys, "_MEIPASS", exe_dir),
+            BASE_DIR,
+            PROJECT_ROOT,
+        )
+        SUMATRA_PATH_CACHE = next(
+            (
+                os.path.join(directory, name)
+                for directory in directories
+                for name in (
+                    "SumatraPDF.exe",
+                    "SumatraPDF-3.6.1-64.exe",
+                    "SumatraPDF.exe.exe",
+                )
+                if os.path.isfile(os.path.join(directory, name))
+            ),
+            None,
+        )
     if not SUMATRA_PATH_CACHE:
-        raise RuntimeError("No se encontró el motor de impresión de respaldo.")
+        from pdf_printing import ExternalPrintingUnavailable
+
+        raise ExternalPrintingUnavailable(
+            "No se encontró el motor de impresión SumatraPDF."
+        )
+    return SUMATRA_PATH_CACHE
+
+
+def _imprimir_pdf_sumatra(ruta_abs, copias, duplex=None):
+    engine = _resolve_sumatra_pdf()
+    settings = ["paper=letter", "fit"]
+    if duplex is not None:
+        settings.append("duplexlong" if duplex else "simplex")
+    settings.append(f"{copias}x")
     # One job contains every copy and explicitly overrides the driver's A4 default.
-    result = subprocess.run(
-        [SUMATRA_PATH_CACHE, "-print-to-default", "-print-settings",
-         f"paper=letter,fit,{copias}x", "-silent", ruta_abs],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=30,
-        check=False,
+    escribir_log_impresion(
+        f"PDF_PRINT_START backend=SUMATRA paper=LETTER duplex={duplex} copies={copias}"
     )
+    try:
+        result = subprocess.run(
+            [
+                engine,
+                "-print-to-default",
+                "-print-settings",
+                ",".join(settings),
+                "-silent",
+                ruta_abs,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "El envío excedió el tiempo de espera. Revise la cola antes de reintentar."
+        ) from exc
     if result.returncode != 0:
-        raise RuntimeError("El motor de respaldo rechazó la impresión.")
+        raise RuntimeError(
+            f"SumatraPDF rechazó la impresión (código {result.returncode}). Revise la cola de Windows."
+        )
 
 
-def _imprimir_pdf_posix(ruta_abs, copias, sistema):
+def _imprimir_pdf_posix(ruta_abs, copias, sistema, duplex=None):
     command = (
         ["lp", "-n", str(copias), "-o", "media=Letter", ruta_abs]
         if sistema == "Darwin"
         else ["lpr", f"-#{copias}", "-o", "media=Letter", ruta_abs]
     )
+    if duplex is not None:
+        command[-1:-1] = [
+            "-o",
+            "sides=two-sided-long-edge" if duplex else "sides=one-sided",
+        ]
     if subprocess.run(command, check=False, timeout=30).returncode:
         raise RuntimeError("El sistema rechazó el envío a la impresora.")
 
 
-def imprimir_pdf(ruta_pdf, copias=1, mostrar_error=False):
+def imprimir_pdf(
+    ruta_pdf, copias=1, mostrar_error=False, duplex=None, propagar_error=False
+):
     started = _time.perf_counter()
     try:
         if not ruta_pdf or not os.path.isfile(ruta_pdf):
@@ -5055,14 +5127,9 @@ def imprimir_pdf(ruta_pdf, copias=1, mostrar_error=False):
         copias = max(1, int(copias or 1))
         sis = platform.system()
         if sis == "Windows":
-            from pdf_printing import NativePrintingUnavailable, print_pdf_native
-            try:
-                print_pdf_native(ruta_abs, copies=copias, log=escribir_log_impresion)
-            except NativePrintingUnavailable:
-                escribir_log_impresion("PDF_PRINT_FALLBACK reason=NATIVE_UNAVAILABLE paper=LETTER")
-                _imprimir_pdf_sumatra(ruta_abs, copias)
+            _imprimir_pdf_sumatra(ruta_abs, copias, duplex=duplex)
         elif sis in ("Darwin", "Linux"):
-            _imprimir_pdf_posix(ruta_abs, copias, sis)
+            _imprimir_pdf_posix(ruta_abs, copias, sis, duplex=duplex)
         else:
             raise RuntimeError("Este sistema no dispone de impresión compatible.")
         escribir_log_impresion(
@@ -5071,8 +5138,10 @@ def imprimir_pdf(ruta_pdf, copias=1, mostrar_error=False):
         return True
     except Exception as exc:
         escribir_log_impresion(
-            f"PDF_PRINT_FAILED exception_type={type(exc).__name__} elapsed_ms={(_time.perf_counter() - started) * 1000:.1f}"
+            f"PDF_PRINT_FAILED exception_type={type(exc).__name__} detail={str(exc)!r} elapsed_ms={(_time.perf_counter() - started) * 1000:.1f}"
         )
+        if propagar_error:
+            raise
         if mostrar_error:
             messagebox.showwarning(
                 "Impresión",
@@ -5080,6 +5149,7 @@ def imprimir_pdf(ruta_pdf, copias=1, mostrar_error=False):
                 "predeterminada y su cola de impresión. El detalle quedó en el registro de impresión.",
             )
         return False
+
 
 def resumen_excel_actual_simple(turno_cfg=None):
     resumen = {
@@ -12260,6 +12330,8 @@ class App:
                     1,
                     int(self.app_settings.get("print_copies_hoja", 1) or 1),
                 ),
+                duplex=True,
+                propagar_error=True,
             ):
                 raise RuntimeError("No fue posible enviar la hoja a la impresora.")
             self._actualizar_trabajo_salida_seguro(
@@ -13614,12 +13686,18 @@ class App:
         finally:
             programar_limpieza_pdf_temporal(ruta_temporal)
 
-    def _imprimir_hoja_temporal_atencion(self, atencion_id, copias=1, mostrar_error=False):
-        ruta_temporal = self._crear_hoja_temporal_atencion(atencion_id, mostrar_error=mostrar_error)
+    def _imprimir_hoja_temporal_atencion(
+        self, atencion_id, copias=1, mostrar_error=False
+    ):
+        ruta_temporal = self._crear_hoja_temporal_atencion(
+            atencion_id, mostrar_error=mostrar_error
+        )
         if not ruta_temporal:
             return False
         try:
-            return imprimir_pdf(ruta_temporal, copias=copias, mostrar_error=mostrar_error)
+            return imprimir_pdf(
+                ruta_temporal, copias=copias, mostrar_error=mostrar_error, duplex=True
+            )
         finally:
             programar_limpieza_pdf_temporal(ruta_temporal, espera_segundos=90)
 

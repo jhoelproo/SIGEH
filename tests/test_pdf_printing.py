@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 
 import pdf_printing as printing
 from admission_pdf_layout import fit_admission_pages_to_letter
+from tests.pdf_print_device import PdfPrintDevice
 
 
 @pytest.fixture(scope="module")
@@ -180,9 +181,7 @@ def test_real_qt_print_keeps_letter_and_landscape_without_a_dialog(
     qt, source_pdf, tmp_path
 ):
     target = tmp_path / "printed.pdf"
-    printer = QPrinter()
-    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-    printer.setOutputFileName(str(target))
+    printer = PdfPrintDevice(target)
     logs = []
     printing.print_pdf_native(str(source_pdf), printer=printer, log=logs.append)
     pages = PdfReader(target).pages
@@ -209,9 +208,7 @@ def test_printer_resolution_failure_is_logged_and_not_swallowed(
 
 def test_real_qt_print_is_supported_inside_output_worker(qt, source_pdf, tmp_path):
     def worker():
-        printer = QPrinter()
-        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-        printer.setOutputFileName(str(tmp_path / "worker.pdf"))
+        printer = PdfPrintDevice(tmp_path / "worker.pdf")
         printing.print_pdf_native(str(source_pdf), printer=printer, copies=2)
 
     with ThreadPoolExecutor(max_workers=1) as pool:

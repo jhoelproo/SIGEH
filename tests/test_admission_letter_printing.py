@@ -1,7 +1,6 @@
 """Letter paper and immediate print dispatch, using synthetic patients only."""
 
 import importlib
-from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -66,50 +65,48 @@ def test_gynaecology_is_readable_by_native_engine(tmp_path, monkeypatch):
     assert application is not None
 
 
-def test_windows_dispatch_uses_in_process_printing(tmp_path, monkeypatch):
+def test_windows_dispatch_uses_existing_engine_before_native_qt(tmp_path, monkeypatch):
     module = importlib.import_module("ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6")
     source = tmp_path / "synthetic.pdf"
     source.write_bytes(b"%PDF-test")
     native = Mock()
+    external = Mock()
     monkeypatch.setattr(module.platform, "system", lambda: "Windows")
     monkeypatch.setattr(printing, "print_pdf_native", native)
+    monkeypatch.setattr(module, "_imprimir_pdf_sumatra", external)
     popen = Mock(side_effect=AssertionError("External process must not be started"))
     monkeypatch.setattr(module.subprocess, "Popen", popen)
     assert module.imprimir_pdf(str(source), copias=2)
-    native.assert_called_once()
-    assert Path(native.call_args.args[0]) == source
-    assert native.call_args.kwargs["copies"] == 2
+    native.assert_not_called()
+    external.assert_called_once_with(str(source), 2, duplex=None)
     popen.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "failure", [RuntimeError("driver failure"), ValueError("invalid PDF")]
 )
-def test_native_failure_does_not_print_again_through_sumatra(
+def test_external_failure_never_starts_another_print_backend(
     tmp_path, monkeypatch, failure
 ):
     module = importlib.import_module("ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6")
     source = tmp_path / "synthetic.pdf"
     source.touch()
     monkeypatch.setattr(module.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(printing, "print_pdf_native", Mock(side_effect=failure))
-    fallback = Mock()
-    monkeypatch.setattr(module, "_imprimir_pdf_sumatra", fallback)
+    native = Mock()
+    monkeypatch.setattr(printing, "print_pdf_native", native)
+    external = Mock(side_effect=failure)
+    monkeypatch.setattr(module, "_imprimir_pdf_sumatra", external)
     assert not module.imprimir_pdf(str(source))
-    fallback.assert_not_called()
+    external.assert_called_once()
+    native.assert_not_called()
 
 
-def test_fallback_has_one_letter_job_for_all_copies(tmp_path, monkeypatch):
+def test_external_engine_has_one_letter_job_for_all_copies(tmp_path, monkeypatch):
     module = importlib.import_module("ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6")
     source, executable = tmp_path / "synthetic.pdf", tmp_path / "SumatraPDF.exe"
     source.touch()
     executable.touch()
     monkeypatch.setattr(module.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(
-        printing,
-        "print_pdf_native",
-        Mock(side_effect=printing.NativePrintingUnavailable()),
-    )
     monkeypatch.setattr(module, "SUMATRA_PATH_CACHE", str(executable))
     run = Mock(return_value=Mock(returncode=0))
     monkeypatch.setattr(module.subprocess, "run", run)
@@ -144,12 +141,12 @@ def test_fallback_resolves_bundled_engine_and_checks_exit(tmp_path, monkeypatch,
         assert module.SUMATRA_PATH_CACHE == str(tmp_path / "SumatraPDF.exe")
 
 
-def test_missing_fallback_engine_is_not_success(tmp_path, monkeypatch):
+def test_missing_external_engine_is_reported_before_any_job(tmp_path, monkeypatch):
     module = importlib.import_module("ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6")
     monkeypatch.setattr(module, "SUMATRA_PATH_CACHE", None)
     monkeypatch.setattr(module, "BASE_DIR", str(tmp_path))
     monkeypatch.setattr(module, "PROJECT_ROOT", str(tmp_path))
-    with pytest.raises(RuntimeError, match="respaldo"):
+    with pytest.raises(printing.ExternalPrintingUnavailable, match="SumatraPDF"):
         module._imprimir_pdf_sumatra("synthetic.pdf", 1)
 
 

@@ -194,7 +194,11 @@ class LegacyAdmissionBackend:
     def print_document(self, path: str, copies: int = 1):
         return bool(
             self._require_module_function("imprimir_pdf")(
-                str(path), copias=max(1, int(copies)), mostrar_error=False
+                str(path),
+                copias=max(1, int(copies)),
+                mostrar_error=False,
+                duplex=True,
+                propagar_error=True,
             )
         )
 

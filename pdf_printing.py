@@ -20,6 +20,10 @@ class NativePrintingUnavailable(RuntimeError):
     """No Qt application is running; no print job has been started."""
 
 
+class ExternalPrintingUnavailable(RuntimeError):
+    """The external engine is absent; no print job has been started."""
+
+
 def fit_page_rect(width: float, height: float, area: QRectF) -> QRectF:
     if min(width, height, area.width(), area.height()) <= 0:
         raise ValueError("La página o el área de impresión no tiene un tamaño válido.")
@@ -31,15 +35,19 @@ def fit_page_rect(width: float, height: float, area: QRectF) -> QRectF:
 
 
 def configure_letter_page(printer: QPrinter, page_size) -> None:
-    orientation = (
-        QPageLayout.Orientation.Landscape
-        if page_size.width() > page_size.height()
-        else QPageLayout.Orientation.Portrait
-    )
+    orientation = page_orientation(page_size)
     if not printer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter)):
         raise RuntimeError("La impresora no aceptó papel Carta.")
     if not printer.setPageOrientation(orientation):
         raise RuntimeError("La impresora no aceptó la orientación de la hoja.")
+
+
+def page_orientation(page_size):
+    return (
+        QPageLayout.Orientation.Landscape
+        if page_size.width() > page_size.height()
+        else QPageLayout.Orientation.Portrait
+    )
 
 
 def default_printer() -> QPrinter:
@@ -97,16 +105,39 @@ def paint_document(document: QPdfDocument, printer: QPrinter, copies: int) -> No
 
 
 def _paint_pages(document, printer, painter, first, passes: int) -> None:
+    orientation = page_orientation(document.pagePointSize(0))
     for copy in range(passes):
+        _separate_duplex_copy(document, printer, copy)
         for index in range(document.pageCount()):
             if copy or index:
-                configure_letter_page(printer, document.pagePointSize(index))
-                if not printer.newPage():
-                    raise RuntimeError("La impresora rechazó una página de la hoja.")
+                orientation = _advance_page(
+                    printer, document.pagePointSize(index), orientation
+                )
             target, image = (
                 first if index == 0 else render_print_page(document, index, printer)
             )
             painter.drawImage(target, image)
+
+
+def _advance_page(printer, size, previous_orientation):
+    orientation = page_orientation(size)
+    if orientation != previous_orientation and not printer.setPageOrientation(
+        orientation
+    ):
+        raise RuntimeError("La impresora no aceptó la orientación de la hoja.")
+    if not printer.newPage():
+        raise RuntimeError("La impresora rechazó una página de la hoja.")
+    return orientation
+
+
+def _separate_duplex_copy(document, printer, copy):
+    duplex = printer.duplex() in (
+        QPrinter.DuplexMode.DuplexAuto,
+        QPrinter.DuplexMode.DuplexLongSide,
+        QPrinter.DuplexMode.DuplexShortSide,
+    )
+    if copy and document.pageCount() % 2 and duplex and not printer.newPage():
+        raise RuntimeError("La impresora no aceptó separar las copias a doble cara.")
 
 
 def print_pdf_native(
@@ -115,6 +146,7 @@ def print_pdf_native(
     copies: int = 1,
     printer: QPrinter | None = None,
     log: Callable[[str], None] | None = None,
+    duplex: bool | None = None,
 ) -> None:
     if QGuiApplication.instance() is None:
         raise NativePrintingUnavailable(
@@ -136,6 +168,12 @@ def print_pdf_native(
         printer.setResolution(PRINT_DPI)
         printer.setFullPage(False)
         printer.setDocName("SIGEH")
+        if duplex is not None:
+            printer.setDuplex(
+                QPrinter.DuplexMode.DuplexLongSide
+                if duplex
+                else QPrinter.DuplexMode.DuplexNone
+            )
         stage = "SPOOL"
         paint_document(document, printer, copies)
         stage = "SUBMITTED"
