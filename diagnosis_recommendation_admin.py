@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -75,6 +76,15 @@ class RecommendationAdminDialog(QDialog):
         self.status = QLabel("Cargando configuración compartida…")
         self.status.setWordWrap(True)
         self.root.addWidget(self.status)
+        search_bar = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Buscar diagnóstico, equivalencia o ítem…")
+        self.search.setAccessibleName("Buscar en recomendaciones por diagnóstico")
+        self.search.setClearButtonEnabled(True)
+        self.search_results = QLabel()
+        search_bar.addWidget(self.search, 1)
+        search_bar.addWidget(self.search_results)
+        self.root.addLayout(search_bar)
         self.tabs = QTabWidget()
         self.root.addWidget(self.tabs, 1)
         self.diagnoses = self._table(
@@ -102,6 +112,8 @@ class RecommendationAdminDialog(QDialog):
         self._editable_tab(self.rules, "Asociaciones", self.add_rule)
         self._pending_tab()
         self._settings_tab()
+        self.search.textChanged.connect(self._apply_search)
+        self.tabs.currentChanged.connect(self._apply_search)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.save_button = buttons.button(QDialogButtonBox.Save)
         self.save_button.setText("Guardar configuración")
@@ -129,7 +141,55 @@ class RecommendationAdminDialog(QDialog):
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         table.horizontalHeader().setStretchLastSection(True)
+        table.itemChanged.connect(self._apply_search)
+        table.model().rowsRemoved.connect(self._apply_search)
         return table
+
+    @staticmethod
+    def _search_cell(table, row, column):
+        widget = table.cellWidget(row, column)
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        if isinstance(widget, QSpinBox):
+            return str(widget.value())
+        item = table.item(row, column)
+        return item.text() if item is not None else ""
+
+    def _filter_table(self, table, terms):
+        shown = 0
+        for row in range(table.rowCount()):
+            text = text_key(
+                " ".join(
+                    self._search_cell(table, row, column)
+                    for column in range(table.columnCount())
+                )
+            )
+            matches = all(term in text for term in terms)
+            table.setRowHidden(row, not matches)
+            shown += matches
+        return shown
+
+    def _apply_search(self, *_args):
+        if not hasattr(self, "pending"):
+            return
+        terms = text_key(self.search.text()).split()
+        tables = (self.diagnoses, self.rules, self.pending)
+        counts = [self._filter_table(table, terms) for table in tables]
+        current = self.tabs.currentIndex()
+        searching_table = current in range(len(tables))
+        self.search.setEnabled(searching_table)
+        self.search_results.setVisible(searching_table)
+        if searching_table:
+            self.search_results.setText(
+                f"{counts[current]} de {tables[current].rowCount()}"
+            )
+
+    def _reveal_added_row(self, table, row):
+        self.search.clear()
+        table.setCurrentCell(row, 0)
+        table.scrollToItem(table.item(row, 0))
+        table.setFocus()
+        table.editItem(table.item(row, 0))
 
     def _editable_tab(self, table, label, add):
         page = QWidget()
@@ -188,7 +248,12 @@ class RecommendationAdminDialog(QDialog):
     @staticmethod
     def remove_rows(table):
         for row in sorted(
-            {index.row() for index in table.selectedIndexes()}, reverse=True
+            {
+                index.row()
+                for index in table.selectedIndexes()
+                if not table.isRowHidden(index.row())
+            },
+            reverse=True,
         ):
             table.removeRow(row)
 
@@ -197,6 +262,8 @@ class RecommendationAdminDialog(QDialog):
         self.diagnoses.insertRow(row)
         self.diagnoses.setItem(row, 0, QTableWidgetItem(name))
         self.diagnoses.setItem(row, 1, QTableWidgetItem("; ".join(aliases)))
+        if not name:
+            self._reveal_added_row(self.diagnoses, row)
 
     def _diagnosis_names(self):
         return [
@@ -244,6 +311,19 @@ class RecommendationAdminDialog(QDialog):
             for column in range(self.rules.columnCount())
         )
         self.rules.setRowHeight(row, height + 8)
+        for column in range(self.rules.columnCount()):
+            field = self.rules.cellWidget(row, column)
+            signal = (
+                field.valueChanged
+                if isinstance(field, QSpinBox)
+                else field.currentTextChanged
+            )
+            signal.connect(self._apply_search)
+        self._apply_search()
+        if not value:
+            self.search.clear()
+            self.rules.setCurrentCell(row, 0)
+            self.rules.cellWidget(row, 0).setFocus()
 
     def _item_options(self, widget, category, selected=""):
         widget.clear()
@@ -253,7 +333,13 @@ class RecommendationAdminDialog(QDialog):
         widget.setCurrentText(selected)
 
     def review_pending(self, mode):
-        for row in sorted({index.row() for index in self.pending.selectedIndexes()}):
+        for row in sorted(
+            {
+                index.row()
+                for index in self.pending.selectedIndexes()
+                if not self.pending.isRowHidden(index.row())
+            }
+        ):
             values = [self.pending.item(row, column).text() for column in range(4)]
             self.add_rule(
                 dict(
@@ -330,15 +416,18 @@ class RecommendationAdminDialog(QDialog):
 
     def _loaded(self, data):
         self.items = data["items"]
-        self.model = data
-        config = data["config"]
+        config = {
+            **normalize_config(data["config"], preserve_conflicts=True),
+            "version": data["config"]["version"],
+        }
+        self.model = {**data, "config": config}
         self.version = config["version"]
         self.diagnoses.setRowCount(0)
         self.rules.setRowCount(0)
         definitions = {text_key(row["name"]): row for row in config["diagnoses"]}
         catalog = DiagnosisCatalog(config)
         for group in data["groups"].values():
-            name = group["diagnosis"]
+            name = catalog.learning_label(group["diagnosis"])
             if text_key(name) in catalog.aliases:
                 continue
             definitions.setdefault(text_key(name), {"name": name, "aliases": []})
@@ -349,9 +438,33 @@ class RecommendationAdminDialog(QDialog):
         for name, value in config["settings"].items():
             self.settings[name].setValue(value)
         self._fill_pending()
+        self._apply_search()
         self.status.setText(
             f"Configuración compartida v{self.version}. Solo el administrador puede modificarla."
         )
+        self._show_configuration_warning(config)
+
+    def _show_configuration_warning(self, config):
+        try:
+            normalize_config(config)
+        except ValueError as error:
+            conflicts = self._has_conflicting_rules(config["rules"])
+            label = (
+                "Asociaciones en conflicto" if conflicts else "Diagnósticos por revisar"
+            )
+            self.search.clear()
+            self.tabs.setCurrentIndex(1 if conflicts else 0)
+            self.status.setText(
+                f"Configuración compartida v{self.version}. {label}: {error}"
+            )
+
+    @staticmethod
+    def _has_conflicting_rules(rules):
+        identities = [
+            (row["diagnosis"], row["specialty"], row["category"], text_key(row["item"]))
+            for row in rules
+        ]
+        return len(identities) != len(set(identities))
 
     def _fill_pending(self):
         self.pending.setRowCount(0)
@@ -359,27 +472,32 @@ class RecommendationAdminDialog(QDialog):
             (row["diagnosis"], row["specialty"], row["category"], text_key(row["item"]))
             for row in self.model["config"]["rules"]
         }
+        listed = set()
+        catalog = DiagnosisCatalog(self.model["config"])
         for group in self.model["groups"].values():
+            diagnosis = catalog.learning_label(group["diagnosis"])
             for item in group["items"]:
                 identity = (
-                    text_key(group["diagnosis"]),
+                    text_key(diagnosis),
                     group["specialty"],
                     item["category"],
                     text_key(item["item"]),
                 )
-                if not item["candidates"] or identity in reviewed:
+                if not item["candidates"] or identity in reviewed or identity in listed:
                     continue
+                listed.add(identity)
                 row = self.pending.rowCount()
                 self.pending.insertRow(row)
                 for column, value in enumerate(
                     (
-                        group["diagnosis"],
+                        diagnosis,
                         group["specialty"],
                         item["category"],
                         item["item"],
                     )
                 ):
                     self.pending.setItem(row, column, QTableWidgetItem(value))
+        self._apply_search()
 
     def save(self):
         if self.worker is not None:

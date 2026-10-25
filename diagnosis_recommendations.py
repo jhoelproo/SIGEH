@@ -4,6 +4,8 @@ from difflib import SequenceMatcher
 import re
 import unicodedata
 
+from diagnosis_text import BUILTIN_DIAGNOSES, canonical_diagnosis, learning_diagnosis
+
 CATEGORIES = ("Medicamentos", "Laboratorios", "Imágenes")
 SPECIALTIES = ("EMERGENCIOLOGÍA", "PEDIATRÍA", "GINECOLOGÍA")
 DEFAULT_SETTINGS = {
@@ -57,33 +59,73 @@ def _bounded_integer(value, minimum, maximum):
     return value
 
 
-def _diagnosis_definition(row):
-    name = str(row.get("name") or "").strip().upper()
+def _diagnosis_definition(row, preserve_conflicts):
+    name = learning_diagnosis(row.get("name"))
     if not text_key(name) or len(name) > 180:
         raise ValueError("El diagnóstico debe tener entre 1 y 180 caracteres.")
     aliases = sorted(
-        {str(item).strip().upper() for item in row.get("aliases", []) if text_key(item)}
+        {canonical_diagnosis(item) for item in row.get("aliases", []) if text_key(item)}
     )
-    if len(aliases) > 100 or any(len(item) > 180 for item in aliases):
+    if (len(aliases) > 100 and not preserve_conflicts) or any(
+        len(item) > 180 for item in aliases
+    ):
         raise ValueError("Hay demasiadas equivalencias o son demasiado largas.")
     return {"name": name, "aliases": aliases}
 
 
-def normalize_config(value):
+def normalize_config(value, *, preserve_conflicts=False):
     settings = _normalized_settings(value.get("settings") or {})
-    diagnoses = [_diagnosis_definition(row) for row in value.get("diagnoses", [])]
-    if len({text_key(row["name"]) for row in diagnoses}) != len(diagnoses):
-        raise ValueError("Hay diagnósticos duplicados.")
+    diagnoses = _merged_diagnoses(value.get("diagnoses", []), preserve_conflicts)
     result = {"settings": settings, "diagnoses": diagnoses, "rules": []}
     catalog = DiagnosisCatalog(result)
-    result["rules"] = [_normalized_rule(row, catalog) for row in value.get("rules", [])]
-    identities = [
-        (row["diagnosis"], row["specialty"], row["category"], text_key(row["item"]))
-        for row in result["rules"]
-    ]
-    if len(set(identities)) != len(identities):
-        raise ValueError("Hay asociaciones duplicadas o contradictorias.")
+    result["rules"] = _merged_rules(value.get("rules", []), catalog, preserve_conflicts)
     return result
+
+
+def _merged_diagnoses(rows, preserve_conflicts):
+    merged, originals = {}, set()
+    for row in rows:
+        original = str(row.get("name") or "").strip().upper()
+        if original in originals and not preserve_conflicts:
+            raise ValueError("Hay diagnósticos duplicados.")
+        originals.add(original)
+        value = _diagnosis_definition(row, preserve_conflicts)
+        key = text_key(value["name"])
+        target = merged.setdefault(key, {"name": value["name"], "aliases": []})
+        aliases = set(target["aliases"]) | set(value["aliases"])
+        target["aliases"] = sorted(alias for alias in aliases if text_key(alias) != key)
+        if len(target["aliases"]) > 100 and not preserve_conflicts:
+            raise ValueError("Hay demasiadas equivalencias o son demasiado largas.")
+    return list(merged.values())
+
+
+def _merged_rules(rows, catalog, preserve_conflicts):
+    merged, sources = {}, {}
+    for row in rows:
+        value = _normalized_rule(row, catalog)
+        identity = tuple(
+            value[field] for field in ("diagnosis", "specialty", "category")
+        )
+        identity += (text_key(value["item"]),)
+        if preserve_conflicts:
+            identity += (value["mode"],)
+        source = str(row.get("diagnosis") or "").strip().upper()
+        if identity in merged:
+            _merge_equivalent_rule(
+                merged[identity],
+                value,
+                source in sources[identity] and not preserve_conflicts,
+            )
+            sources[identity].add(source)
+        else:
+            merged[identity], sources[identity] = value, {source}
+    return list(merged.values())
+
+
+def _merge_equivalent_rule(previous, value, repeated_source):
+    if repeated_source or previous["mode"] != value["mode"]:
+        raise ValueError("Hay asociaciones duplicadas o contradictorias.")
+    previous["priority"] = min(previous["priority"], value["priority"])
 
 
 def _normalized_settings(value):
@@ -98,7 +140,9 @@ def _normalized_settings(value):
 
 
 def _normalized_rule(row, catalog):
-    diagnosis = text_key(catalog.normalize(str(row.get("diagnosis") or "")))
+    diagnosis = text_key(
+        learning_diagnosis(catalog.normalize(str(row.get("diagnosis") or "")))
+    )
     specialty = specialty_key(row.get("specialty"))
     category = str(row.get("category") or "")
     mode = str(row.get("mode") or "")
@@ -125,23 +169,41 @@ def _validate_rule_context(catalog, diagnosis, specialty, category, mode):
 
 class DiagnosisCatalog:
     def __init__(self, config, learned_names=()):
+        self.trusted_labels = tuple(
+            canonical_diagnosis(row["name"]) for row in config.get("diagnoses", [])
+        )
         self.names = {
-            text_key(name): str(name).strip().upper()
-            for name in learned_names
-            if text_key(name)
+            text_key(name): name
+            for source in (*BUILTIN_DIAGNOSES, *learned_names)
+            if text_key(name := self.learning_label(source))
         }
         self.aliases = {}
         self.canonical_keys = {
-            text_key(row["name"]) for row in config.get("diagnoses", [])
+            text_key(self.learning_label(row["name"]))
+            for row in config.get("diagnoses", [])
         }
         for row in config.get("diagnoses", []):
-            name = str(row["name"])
+            name = self.learning_label(row["name"])
             self.names[text_key(name)] = name
             for alias in [name, *row.get("aliases", [])]:
-                self.aliases.setdefault(text_key(alias), set()).add(name)
+                self.aliases.setdefault(
+                    text_key(self._canonical_label(alias)), set()
+                ).add(name)
+
+    def _canonical_label(self, value):
+        return canonical_diagnosis(value)
+
+    def learning_label(self, value):
+        """Correct trusted spelling for stored evidence without guessing a subtype."""
+        return learning_diagnosis(
+            canonical_diagnosis(value, trusted_labels=self.trusted_labels)
+        )
 
     def choices(self, value):
-        key = text_key(value)
+        canonical = self._canonical_label(value)
+        key = text_key(canonical)
+        if learning_diagnosis(canonical) != canonical:
+            return [canonical]
         if key in self.canonical_keys:
             return [self.names[key]]
         exact = self.aliases.get(key)
@@ -150,6 +212,22 @@ class DiagnosisCatalog:
         if key in self.names:
             return [self.names[key]]
         return self._fuzzy_choices(key)
+
+    def suggestions(self, value, limit=12):
+        if limit <= 0:
+            return []
+        key = text_key(self._canonical_label(value))
+        if not key:
+            return []
+        matches = {name for candidate, name in self.names.items() if key in candidate}
+        for alias, names in self.aliases.items():
+            if key in alias:
+                matches.update(names)
+        if not matches:
+            matches = self._fuzzy_choices(key)
+        return sorted(
+            set(matches), key=lambda name: (not text_key(name).startswith(key), name)
+        )[:limit]
 
     def _fuzzy_choices(self, key):
         if len(key) < MIN_FUZZY_LENGTH:
@@ -167,7 +245,12 @@ class DiagnosisCatalog:
         return sorted({name for score, name in scores if best - score < FUZZY_MARGIN})
 
     def split(self, value):
-        text = str(value or "").strip()
+        text = re.sub(
+            r"\b(?:DE\s+)?O\s*[/\.]\s*I\.?(?=\s*(?:[.;,]|$))",
+            "DE ORIGEN A INVESTIGAR",
+            str(value or "").strip(),
+            flags=re.IGNORECASE,
+        )
         pieces = [
             part.strip()
             for part in re.split(r";|\n|\s*//\s*|\s*\|\s*|\s+/\s+", text)
@@ -186,19 +269,22 @@ class DiagnosisCatalog:
     def normalize(self, value, *, allow_fuzzy=True):
         result = []
         for part in self.split(value):
-            exact = text_key(part) in self.names or text_key(part) in self.aliases
+            canonical = self._canonical_label(part)
+            exact = (
+                text_key(canonical) in self.names or text_key(canonical) in self.aliases
+            )
             choices = self.choices(part) if allow_fuzzy or exact else []
             if len(choices) > 1:
                 raise ValueError(
                     f"Selecciona el diagnóstico correspondiente a «{part}»."
                 )
-            result.append(choices[0] if choices else part.strip().upper())
+            result.append(choices[0] if choices else canonical)
         return "; ".join(result)
 
     def first_two(self, value, *, allow_fuzzy=True):
         return list(
             dict.fromkeys(
-                text_key(part)
+                text_key(learning_diagnosis(part))
                 for part in self.split(self.normalize(value, allow_fuzzy=allow_fuzzy))
             )
         )[:MAX_DIAGNOSES]

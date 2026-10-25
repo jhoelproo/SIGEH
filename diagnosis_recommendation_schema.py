@@ -10,6 +10,8 @@ SELECT to_regclass('sigeh_recommendations.settings') IS NOT NULL
  AND to_regclass('sigeh_recommendations.changes') IS NOT NULL
  AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('sigeh_recommendations.settings')
             AND attname='generation' AND NOT attisdropped)
+ AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('sigeh_recommendations.observations')
+            AND attname='normalization_version' AND NOT attisdropped)
  AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('public.recibos')
             AND tgname='recommendation_receipt_change')
  AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('public.recibo_items')
@@ -51,6 +53,9 @@ CREATE TABLE IF NOT EXISTS sigeh_recommendations.observations(
  receipt_id BIGINT PRIMARY KEY,diagnoses JSONB NOT NULL,
  specialty TEXT NOT NULL,status TEXT NOT NULL
 );
+ALTER TABLE sigeh_recommendations.observations ADD COLUMN IF NOT EXISTS normalization_version INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS recommendation_normalization_idx
+ ON sigeh_recommendations.observations(normalization_version,receipt_id);
 CREATE INDEX IF NOT EXISTS recommendation_diagnoses_idx
  ON sigeh_recommendations.observations USING GIN(diagnoses);
 CREATE INDEX IF NOT EXISTS recommendation_specialty_idx

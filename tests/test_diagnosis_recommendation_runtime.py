@@ -302,7 +302,7 @@ def test_save_guard_honors_cancellation_and_legacy_window():
 
 
 @pytest.mark.parametrize(
-    "selected,expected", [("ALFA", "ALFA"), ("Conservar texto ingresado", "X")]
+    "selected,expected", [("ALFA", "ALFA."), ("Conservar texto ingresado", "X.")]
 )
 def test_ambiguous_diagnosis_can_be_selected_or_preserved(
     runtime, monkeypatch, selected, expected
@@ -320,7 +320,9 @@ def test_ambiguous_diagnosis_can_be_selected_or_preserved(
     window.dx_edit.setText("X")
     assert controller.normalize_before_save() and window.dx_edit.text() == expected
     window.dx_edit.setText("DESCONOCIDO")
-    assert controller.normalize_before_save() and window.dx_edit.text() == "DESCONOCIDO"
+    assert (
+        controller.normalize_before_save() and window.dx_edit.text() == "DESCONOCIDO."
+    )
 
 
 @pytest.mark.parametrize("result", [QDialog.Accepted, QDialog.Rejected])

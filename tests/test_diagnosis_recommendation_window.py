@@ -99,7 +99,7 @@ def test_normalization_is_applied_before_generation_not_add(main_window):
     prepare_window(window)
     assert window.dx_edit.text() == "DA; DB"
     assert window.recommendation_controller.normalize_before_save()
-    assert window.dx_edit.text() == "DIAGNÓSTICO ALFA; DIAGNÓSTICO BETA"
+    assert window.dx_edit.text() == "DIAGNÓSTICO ALFA; DIAGNÓSTICO BETA."
 
 
 def test_doubtful_diagnosis_requires_selection_and_cancel_keeps_text(

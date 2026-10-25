@@ -1,11 +1,27 @@
 """Nonblocking recommendation refresh and receipt diagnosis normalization."""
 
 from contextlib import contextmanager
+import re
 import sqlite3
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QDialog, QInputDialog, QMessageBox
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QStringListModel,
+    QThread,
+    QTimer,
+    Qt,
+    Signal,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCompleter,
+    QDialog,
+    QInputDialog,
+    QMessageBox,
+)
 
+from diagnosis_text import canonical_diagnosis, receipt_diagnosis
 from diagnosis_recommendations import model_catalog, recommendations, text_key
 from diagnosis_recommendation_store import (
     apply_changes,
@@ -20,6 +36,140 @@ CACHE_KEY = "diagnosis_recommendations"
 SYNC_INTERVAL_MS = 60_000
 BATCH_INTERVAL_MS = 2_000
 _RUNNING_TASKS: set["RecommendationTask"] = set()
+DIAGNOSIS_SEPARATOR = re.compile(r";|\n|\s*//\s*|\s*\|\s*|\s+/\s+")
+MIN_COMPLETION_LENGTH = 2
+
+
+def _diagnosis_separators(text):
+    for match in DIAGNOSIS_SEPARATOR.finditer(text):
+        is_origin_abbreviation = (
+            match.group().strip() == "/"
+            and re.search(r"\bO\s*$", text[: match.start()], re.IGNORECASE)
+            and re.match(r"\s*I\b", text[match.end() :], re.IGNORECASE)
+        )
+        if not is_origin_abbreviation:
+            yield match
+
+
+def active_diagnosis_segment(text, cursor):
+    """Locate the current diagnosis without treating the slash in O/I as a separator."""
+    cursor = max(0, min(cursor, len(text)))
+    start, end = 0, len(text)
+    for match in _diagnosis_separators(text):
+        if match.end() <= cursor:
+            start = match.end()
+        elif match.start() < cursor:
+            return cursor, cursor, ""
+        else:
+            end = match.start()
+            break
+    segment = text[start:end]
+    start += len(segment) - len(segment.lstrip())
+    end -= len(segment) - len(segment.rstrip())
+    end = max(start, end)
+    return start, end, text[start : max(start, cursor)].strip()
+
+
+def replace_active_diagnosis(text, cursor, diagnosis):
+    start, end, _prefix = active_diagnosis_segment(text, cursor)
+    replacement = canonical_diagnosis(diagnosis)
+    return text[:start] + replacement + text[end:], start + len(replacement)
+
+
+class DiagnosisCompletion(QObject):
+    """Offer local diagnosis choices while leaving text editing in the line edit."""
+
+    def __init__(self, field, catalog_provider, parent=None):
+        super().__init__(parent)
+        self.field, self.catalog_provider = field, catalog_provider
+        self.closed = False
+        self.applying = False
+        self.model = QStringListModel(self)
+        self.completer = QCompleter(self.model, self)
+        self.completer.setWidget(field)
+        self.completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
+        self.completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.completer.setMaxVisibleItems(12)
+        self.completer.activated[str].connect(self.select)
+        field.textEdited.connect(self.update)
+        field.cursorPositionChanged.connect(self.cursor_moved)
+        field.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if (
+            not self.closed
+            and watched is self.field
+            and event.type() == QEvent.KeyPress
+            and self.completer.popup().isVisible()
+        ):
+            return self._popup_key(event.key())
+        return False
+
+    def _popup_key(self, key):
+        popup = self.completer.popup()
+        if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab):
+            selected = popup.currentIndex()
+            if selected.isValid():
+                self.select(selected.data())
+            return selected.isValid()
+        if key == Qt.Key_Escape:
+            popup.hide()
+            return True
+        if key in (Qt.Key_Up, Qt.Key_Down):
+            self._move_selection(-1 if key == Qt.Key_Up else 1)
+            return True
+        return False
+
+    def _move_selection(self, delta):
+        popup = self.completer.popup()
+        model = self.completer.completionModel()
+        row = max(0, min(popup.currentIndex().row() + delta, model.rowCount() - 1))
+        popup.setCurrentIndex(model.index(row, 0))
+
+    def update(self, _text=None):
+        if self.closed or self.applying or not self.field.hasFocus():
+            return
+        _start, _end, prefix = active_diagnosis_segment(
+            self.field.text(), self.field.cursorPosition()
+        )
+        values = (
+            self.catalog_provider().suggestions(prefix)
+            if len(text_key(prefix)) >= MIN_COMPLETION_LENGTH
+            else []
+        )
+        self.model.setStringList(values)
+        if not values:
+            self.completer.popup().hide()
+            return
+        self.completer.setCompletionPrefix(prefix)
+        self.completer.popup().setMinimumWidth(max(self.field.width(), 360))
+        self.completer.complete()
+        self.completer.popup().setCurrentIndex(
+            self.completer.completionModel().index(0, 0)
+        )
+
+    def cursor_moved(self, _previous, _current):
+        if self.completer.popup().isVisible():
+            self.update()
+
+    def select(self, diagnosis):
+        if self.closed:
+            return
+        text, cursor = replace_active_diagnosis(
+            self.field.text(), self.field.cursorPosition(), diagnosis
+        )
+        self.applying = True
+        try:
+            self.field.setText(text)
+            self.field.setCursorPosition(cursor)
+            self.completer.popup().hide()
+            self.field.setFocus()
+        finally:
+            self.applying = False
+
+    def stop(self):
+        self.closed = True
+        self.completer.popup().hide()
 
 
 class RecommendationTask(QThread):
@@ -140,7 +290,10 @@ class RecommendationController(QObject):
         self.debounce.timeout.connect(self.refresh)
         window.dx_edit.textChanged.connect(lambda: self.debounce.start())
         window.dx_edit.setToolTip(
-            "Separa diagnósticos con «;» o « / ». Las recomendaciones utilizan los dos primeros diagnósticos distintos."
+            "Escribe para seleccionar un diagnóstico. Separa diagnósticos con «;» o « / ». Las recomendaciones utilizan los dos primeros diagnósticos distintos."
+        )
+        self.completion = DiagnosisCompletion(
+            window.dx_edit, lambda: model_catalog(self.model), self
         )
         window.recommendation_labels = {}
         self.prepare_labels()
@@ -153,6 +306,7 @@ class RecommendationController(QObject):
         self.closed = True
         self.timer.stop()
         self.debounce.stop()
+        self.completion.stop()
         if self.worker is not None:
             self.worker.cancel()
             self.worker.setParent(None)
@@ -241,6 +395,8 @@ class RecommendationController(QObject):
     def refresh(self):
         if self.closed:
             return
+        if self.completion.completer.popup().isVisible():
+            self.completion.update()
         previous = self.window.recommendation_labels
         self.prepare_labels()
         if previous != self.window.recommendation_labels:
@@ -254,14 +410,19 @@ class RecommendationController(QObject):
             if value is None:
                 return False
             values.append(value)
-        self.window.dx_edit.setText("; ".join(values))
+        self.window.dx_edit.setText(receipt_diagnosis("; ".join(values)))
         return True
 
     def choose_diagnosis(self, catalog, part):
+        part = canonical_diagnosis(part)
         choices = catalog.choices(part)
         if not choices:
             return part.strip().upper()
-        exact = text_key(part) in catalog.names or text_key(part) in catalog.aliases
+        exact = (
+            text_key(part) in catalog.names
+            or text_key(part) in catalog.aliases
+            or choices == [part]
+        )
         if len(choices) == 1 and exact:
             return choices[0]
         value, accepted = QInputDialog.getItem(

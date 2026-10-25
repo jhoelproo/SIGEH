@@ -2,6 +2,7 @@
 
 import json
 
+from diagnosis_text import NORMALIZATION_VERSION
 from diagnosis_recommendations import (
     CATEGORIES,
     SPECIALTIES,
@@ -36,7 +37,10 @@ def load_config(con):
     row = con.execute(
         "SELECT config,version FROM sigeh_recommendations.settings WHERE singleton"
     ).fetchone()
-    return {**normalize_config(dict(row["config"])), "version": int(row["version"])}
+    return {
+        **normalize_config(dict(row["config"]), preserve_conflicts=True),
+        "version": int(row["version"]),
+    }
 
 
 def _publish(con, rows):
@@ -87,7 +91,7 @@ def save_config(con, value, actor, expected_version, *, audit):
     version = expected_version + 1
     con.execute(
         "UPDATE sigeh_recommendations.settings SET config=%s::jsonb,version=%s WHERE singleton",
-        (_json(value), version),
+        (_json({**value, "normalization_version": NORMALIZATION_VERSION}), version),
     )
     _publish(con, [{"change_key": "config", "payload": {**value, "version": version}}])
     con.execute(
@@ -157,7 +161,9 @@ def _receipt_items(items):
 
 def _diagnosis_labels(catalog, normalized):
     unique = {
-        text_key(part): part for part in catalog.split(normalized) if text_key(part)
+        text_key(label): label
+        for part in catalog.split(normalized)
+        if text_key(label := catalog.learning_label(part))
     }
     return dict(list(unique.items())[:MAX_DIAGNOSES])
 
@@ -196,10 +202,10 @@ def _replace_observations(con, identities, observations, evidence):
     if not observations:
         return
     con.execute(
-        """INSERT INTO sigeh_recommendations.observations(receipt_id,diagnoses,specialty,status)
-           SELECT receipt_id,diagnoses,specialty,status FROM jsonb_to_recordset(%s::jsonb)
+        """INSERT INTO sigeh_recommendations.observations(receipt_id,diagnoses,specialty,status,normalization_version)
+           SELECT receipt_id,diagnoses,specialty,status,%s FROM jsonb_to_recordset(%s::jsonb)
            AS r(receipt_id BIGINT,diagnoses JSONB,specialty TEXT,status TEXT)""",
-        (_json(observations),),
+        (NORMALIZATION_VERSION, _json(observations)),
     )
     con.execute(
         """INSERT INTO sigeh_recommendations.evidence(receipt_id,diagnosis,specialty,category,item,confirmed)
@@ -282,7 +288,37 @@ def _check_interrupted(interrupted):
         raise InterruptedError("Procesamiento de recomendaciones cancelado.")
 
 
+def _prepare_normalization(con):
+    ready = con.execute(
+        "SELECT COALESCE((config->>'normalization_version')::integer,0)>=%s "
+        "FROM sigeh_recommendations.settings WHERE singleton",
+        (NORMALIZATION_VERSION,),
+    ).fetchone()
+    if ready[0]:
+        return False
+    row = con.execute(
+        "SELECT config,version FROM sigeh_recommendations.settings WHERE singleton"
+    ).fetchone()
+    raw = dict(row["config"])
+    value = normalize_config(raw, preserve_conflicts=True)
+    definitions_changed = any(
+        raw.get(field, []) != value[field] for field in ("diagnoses", "rules")
+    )
+    version = int(row["version"]) + int(definitions_changed)
+    con.execute(
+        "UPDATE sigeh_recommendations.settings SET config=%s::jsonb,version=%s WHERE singleton",
+        (_json({**value, "normalization_version": NORMALIZATION_VERSION}), version),
+    )
+    _publish(con, [{"change_key": "config", "payload": {**value, "version": version}}])
+    con.execute(
+        "INSERT INTO sigeh_recommendations.jobs(receipt_id) SELECT id FROM recibos "
+        "ON CONFLICT(receipt_id) DO UPDATE SET touched_at=NOW()"
+    )
+    return True
+
+
 def _process_jobs(con, interrupted):
+    _queue_outdated_observations(con)
     rows = con.execute(
         "SELECT receipt_id FROM sigeh_recommendations.jobs ORDER BY touched_at DESC,receipt_id DESC LIMIT %s FOR UPDATE SKIP LOCKED",
         (BATCH_SIZE,),
@@ -320,6 +356,16 @@ def _process_jobs(con, interrupted):
     return True
 
 
+def _queue_outdated_observations(con):
+    con.execute(
+        """INSERT INTO sigeh_recommendations.jobs(receipt_id)
+           SELECT receipt_id FROM sigeh_recommendations.observations
+           WHERE normalization_version<%s ORDER BY normalization_version,receipt_id LIMIT %s
+           ON CONFLICT(receipt_id) DO NOTHING""",
+        (NORMALIZATION_VERSION, BATCH_SIZE),
+    )
+
+
 def synchronize(con, cursor=0, *, generation=None, interrupted=lambda: False):
     con.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
     con.execute("SET LOCAL statement_timeout='5s'")
@@ -339,6 +385,8 @@ def synchronize(con, cursor=0, *, generation=None, interrupted=lambda: False):
         "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0))", (LOCK_KEY,)
     ).fetchone()[0]
     _check_interrupted(interrupted)
+    if acquired:
+        _prepare_normalization(con)
     processed = _process_jobs(con, interrupted) if acquired else False
     _check_interrupted(interrupted)
     rows = con.execute(
@@ -391,7 +439,7 @@ def restore_model(value):
         raise ValueError("La configuración local de recomendaciones no es válida.")
     try:
         normalized = {
-            **normalize_config(config),
+            **normalize_config(config, preserve_conflicts=True),
             "version": _nonnegative(config.get("version", 0)),
         }
     except (AttributeError, TypeError, KeyError) as exc:
