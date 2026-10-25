@@ -137,7 +137,8 @@ class DiagnosisCompletion(QObject):
             if len(text_key(prefix)) >= MIN_COMPLETION_LENGTH
             else []
         )
-        self.model.setStringList(values)
+        if values != self.model.stringList():
+            self.model.setStringList(values)
         if not values:
             self.completer.popup().hide()
             return
@@ -292,11 +293,20 @@ class RecommendationController(QObject):
         window.dx_edit.setToolTip(
             "Escribe para seleccionar un diagnóstico. Separa diagnósticos con «;» o « / ». Las recomendaciones utilizan los dos primeros diagnósticos distintos."
         )
-        self.completion = DiagnosisCompletion(
-            window.dx_edit, lambda: model_catalog(self.model), self
-        )
+        self.completion = DiagnosisCompletion(window.dx_edit, self.catalog, self)
         window.recommendation_labels = {}
         self.prepare_labels()
+
+    def catalog(self):
+        signature = (
+            id(self.model),
+            id(self.model.get("config")),
+            id(self.model.get("groups")),
+        )
+        if signature != getattr(self, "_catalog_signature", None):
+            self._catalog = model_catalog(self.model)
+            self._catalog_signature = signature
+        return self._catalog
 
     def start(self):
         self.timer.start()
@@ -322,15 +332,17 @@ class RecommendationController(QObject):
             return
         cursor = self.model.get("cursor", 0)
         generation = self.model.get("generation", "")
+        snapshot = self.model
 
         def fetch():
             with recommendation_connection(self.backend) as con:
-                return synchronize(
+                data = synchronize(
                     con,
                     cursor,
                     generation=generation,
                     interrupted=QThread.currentThread().isInterruptionRequested,
                 )
+            return self.prepare_response(snapshot, data)
 
         self.worker = RecommendationTask(fetch, self)
         self.worker.completed.connect(self.loaded)
@@ -340,6 +352,31 @@ class RecommendationController(QObject):
         self.window._recommendation_worker = self.worker
         self.worker.start()
 
+    def prepare_response(self, snapshot, data):
+        if self.closed or QThread.currentThread().isInterruptionRequested():
+            return data
+        if not data["changes"] and not data.get("reset"):
+            return data
+        model = restore_model(apply_response(snapshot, data))
+        catalog = model_catalog(model)
+        if self.closed or QThread.currentThread().isInterruptionRequested():
+            return data
+        error = self.persist_model(model)
+        return {
+            **data,
+            "prepared_model": model,
+            "prepared_catalog": catalog,
+            "cache_error": error,
+        }
+
+    @staticmethod
+    def persist_model(model):
+        try:
+            local_receipt_store().cache(CACHE_KEY, model)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            return f"RECOMMENDATION_CACHE_WRITE_FAILED {type(exc).__name__}"
+        return ""
+
     def loaded(self, data):
         if self.closed:
             return
@@ -348,17 +385,27 @@ class RecommendationController(QObject):
             self.retry.succeeded()
             return
         try:
-            self.model = restore_model(apply_response(self.model, data))
+            self.model = data.get("prepared_model") or restore_model(
+                apply_response(self.model, data)
+            )
         except (ValueError, TypeError) as exc:
             self.failed(exc)
             return
         self.retry.succeeded()
-        try:
-            local_receipt_store().cache(CACHE_KEY, self.model)
-        except (OSError, ValueError, sqlite3.Error) as exc:
-            self.backend.write_runtime_log(
-                f"RECOMMENDATION_CACHE_WRITE_FAILED {type(exc).__name__}"
+        if "prepared_catalog" in data:
+            self._catalog = data["prepared_catalog"]
+            self._catalog_signature = (
+                id(self.model),
+                id(self.model.get("config")),
+                id(self.model.get("groups")),
             )
+        error = (
+            data.get("cache_error", "")
+            if "prepared_model" in data
+            else self.persist_model(self.model)
+        )
+        if error:
+            self.backend.write_runtime_log(error)
         self.refresh()
 
     def failed(self, error):
@@ -383,6 +430,7 @@ class RecommendationController(QObject):
                 self.window.dx_edit.text(),
                 current_specialty(self.window),
                 catalogs,
+                catalog=self.catalog(),
             )
         except ValueError:
             values = {}
@@ -403,7 +451,7 @@ class RecommendationController(QObject):
             self.window.refresh_picker()
 
     def normalize_before_save(self):
-        catalog = model_catalog(self.model)
+        catalog = self.catalog()
         values = []
         for part in catalog.split(self.window.dx_edit.text()):
             value = self.choose_diagnosis(catalog, part)

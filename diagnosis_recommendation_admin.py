@@ -1,5 +1,11 @@
 """Administrator-only diagnoses, aliases, priority, blocks and ambiguous pairs."""
 
+from collections import deque
+from contextlib import contextmanager
+from time import perf_counter
+
+from PySide6.QtCore import QSignalBlocker, QStringListModel, QTimer
+
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -39,12 +45,90 @@ SETTING_LABELS = {
     "lab_limit": "Laboratorios visibles",
     "image_limit": "Imágenes visibles",
 }
+POPULATION_BATCH_SIZE = 25
+POPULATION_BUDGET_SECONDS = 0.008
 
 
-def combo(values, selected="", editable=False):
+def pending_rows(model, catalog):
+    reviewed = {
+        (row["diagnosis"], row["specialty"], row["category"], text_key(row["item"]))
+        for row in model["config"]["rules"]
+    }
+    listed, result = set(), []
+    for group in model["groups"].values():
+        diagnosis = catalog.learning_label(group["diagnosis"])
+        for item in group["items"]:
+            if not item["candidates"]:
+                continue
+            identity = (
+                text_key(diagnosis),
+                group["specialty"],
+                item["category"],
+                text_key(item["item"]),
+            )
+            if identity not in reviewed and identity not in listed:
+                listed.add(identity)
+                result.append(
+                    (diagnosis, group["specialty"], item["category"], item["item"])
+                )
+    return result
+
+
+def prepare_admin_data(data):
+    config = {
+        **normalize_config(data["config"], preserve_conflicts=True),
+        "version": data["config"]["version"],
+    }
+    model = {"config": config, "groups": data["groups"], "items": data["items"]}
+    definitions = {text_key(row["name"]): row for row in config["diagnoses"]}
+    catalog = DiagnosisCatalog(config)
+    for source in dict.fromkeys(
+        group["diagnosis"] for group in data["groups"].values()
+    ):
+        name = catalog.learning_label(source)
+        if text_key(name) not in catalog.aliases:
+            definitions.setdefault(text_key(name), {"name": name, "aliases": []})
+    return {
+        **model,
+        "definitions": sorted(definitions.values(), key=lambda row: row["name"]),
+        "pending_rows": pending_rows(model, catalog),
+        "configuration_error": configuration_error(config),
+    }
+
+
+def configuration_error(config):
+    try:
+        normalize_config(config)
+    except ValueError as error:
+        return str(error)
+    return ""
+
+
+@contextmanager
+def table_batch(tables):
+    blockers = [QSignalBlocker(table) for table in tables]
+    enabled = [table.updatesEnabled() for table in tables]
+    for table in tables:
+        table.setUpdatesEnabled(False)
+    try:
+        yield
+    finally:
+        for table, previous in zip(tables, enabled):
+            table.setUpdatesEnabled(previous)
+        for blocker in blockers:
+            blocker.unblock()
+
+
+def combo(values, selected="", editable=False, model=None):
     widget = QComboBox()
     widget.setEditable(editable)
-    widget.addItems(list(values))
+    widget.setInsertPolicy(QComboBox.NoInsert)
+    widget.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+    widget.setMinimumContentsLength(12)
+    if model is None:
+        widget.addItems(list(values))
+    else:
+        widget.setModel(model)
     widget.setCurrentText(str(selected))
     widget.setToolTip(widget.currentText())
     widget.currentTextChanged.connect(widget.setToolTip)
@@ -63,6 +147,15 @@ class RecommendationAdminDialog(QDialog):
         self.version = 0
         self.worker = None
         self.saved = False
+        self._operation = None
+        self._populating = False
+        self._closing = False
+        self._population = deque()
+        self._search_cache = {}
+        self._item_models = {}
+        self.population_timer = QTimer(self)
+        self.population_timer.setInterval(0)
+        self.population_timer.timeout.connect(self._populate_next)
         self.setWindowTitle("Recomendaciones por diagnóstico")
         screen = parent.screen() if parent is not None else self.screen()
         available = screen.availableGeometry()
@@ -141,9 +234,13 @@ class RecommendationAdminDialog(QDialog):
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         table.horizontalHeader().setStretchLastSection(True)
-        table.itemChanged.connect(self._apply_search)
-        table.model().rowsRemoved.connect(self._apply_search)
+        table.itemChanged.connect(lambda *_args: self._invalidate_search(table))
+        table.model().rowsRemoved.connect(lambda *_args: self._invalidate_search(table))
         return table
+
+    def _invalidate_search(self, table):
+        self._search_cache.pop(table, None)
+        self._apply_search()
 
     @staticmethod
     def _search_cell(table, row, column):
@@ -156,21 +253,26 @@ class RecommendationAdminDialog(QDialog):
         return item.text() if item is not None else ""
 
     def _filter_table(self, table, terms):
-        shown = 0
-        for row in range(table.rowCount()):
-            text = text_key(
-                " ".join(
-                    self._search_cell(table, row, column)
-                    for column in range(table.columnCount())
+        if table not in self._search_cache:
+            self._search_cache[table] = [
+                text_key(
+                    " ".join(
+                        self._search_cell(table, row, column)
+                        for column in range(table.columnCount())
+                    )
                 )
-            )
+                for row in range(table.rowCount())
+            ]
+        shown = 0
+        for row, text in enumerate(self._search_cache[table]):
             matches = all(term in text for term in terms)
-            table.setRowHidden(row, not matches)
+            if table.isRowHidden(row) == matches:
+                table.setRowHidden(row, not matches)
             shown += matches
         return shown
 
     def _apply_search(self, *_args):
-        if not hasattr(self, "pending"):
+        if self._populating or self._closing or not hasattr(self, "pending"):
             return
         terms = text_key(self.search.text()).split()
         tables = (self.diagnoses, self.rules, self.pending)
@@ -276,16 +378,7 @@ class RecommendationAdminDialog(QDialog):
         value = value or {}
         row = self.rules.rowCount()
         self.rules.insertRow(row)
-        names = self._diagnosis_names()
-        diagnosis = next(
-            (
-                name
-                for name in names
-                if text_key(name) == text_key(value.get("diagnosis"))
-            ),
-            value.get("diagnosis", ""),
-        )
-        self.rules.setCellWidget(row, 0, combo(names, diagnosis, True))
+        self.rules.setCellWidget(row, 0, self._diagnosis_selector(value))
         self.rules.setCellWidget(
             row, 1, combo(SPECIALTIES, value.get("specialty", SPECIALTIES[0]))
         )
@@ -297,6 +390,27 @@ class RecommendationAdminDialog(QDialog):
             lambda selected, item=item: self._item_options(item, selected)
         )
         self._item_options(item, category.currentText(), value.get("item", ""))
+        self._rule_controls(row, value)
+        if not value:
+            self.search.clear()
+            self.rules.setCurrentCell(row, 0)
+            self.rules.cellWidget(row, 0).setFocus()
+
+    def _diagnosis_selector(self, value):
+        names = self._bulk_names if self._populating else self._diagnosis_names()
+        labels = (
+            self._bulk_name_keys
+            if self._populating
+            else {text_key(name): name for name in names}
+        )
+        diagnosis = labels.get(
+            text_key(value.get("diagnosis")), value.get("diagnosis", "")
+        )
+        return combo(
+            names, diagnosis, True, self._bulk_names_model if self._populating else None
+        )
+
+    def _rule_controls(self, row, value):
         mode = combo(
             ["Recomendar", "Bloquear"],
             "Bloquear" if value.get("mode") == "block" else "Recomendar",
@@ -318,18 +432,16 @@ class RecommendationAdminDialog(QDialog):
                 if isinstance(field, QSpinBox)
                 else field.currentTextChanged
             )
-            signal.connect(self._apply_search)
-        self._apply_search()
-        if not value:
-            self.search.clear()
-            self.rules.setCurrentCell(row, 0)
-            self.rules.cellWidget(row, 0).setFocus()
+            signal.connect(lambda *_args: self._invalidate_search(self.rules))
+        self._invalidate_search(self.rules)
 
     def _item_options(self, widget, category, selected=""):
-        widget.clear()
-        widget.addItems(
-            [row["nombre"] for row in self.items if row["categoria"] == category]
-        )
+        if category not in self._item_models:
+            self._item_models[category] = QStringListModel(
+                [row["nombre"] for row in self.items if row["categoria"] == category],
+                self,
+            )
+        widget.setModel(self._item_models[category])
         widget.setCurrentText(selected)
 
     def review_pending(self, mode):
@@ -393,8 +505,9 @@ class RecommendationAdminDialog(QDialog):
         self.worker.start()
 
     def reload(self):
-        if self.worker is not None:
+        if self.worker is not None or self._populating:
             return
+        self._operation = "load"
         self.status.setText("Cargando configuración compartida…")
 
         def fetch():
@@ -404,50 +517,88 @@ class RecommendationAdminDialog(QDialog):
                 rows = con.execute(
                     "SELECT change_key,payload FROM sigeh_recommendations.changes WHERE change_key LIKE 'group:%%' AND payload IS NOT NULL"
                 ).fetchall()
-                return {
+                data = {
                     "config": config,
                     "items": items,
                     "groups": {
                         row["change_key"][6:]: dict(row["payload"]) for row in rows
                     },
                 }
+            return prepare_admin_data(data)
 
         self._task(fetch, self._loaded)
 
     def _loaded(self, data):
+        if self._closing:
+            return
+        data = data if "definitions" in data else prepare_admin_data(data)
         self.items = data["items"]
-        config = {
-            **normalize_config(data["config"], preserve_conflicts=True),
-            "version": data["config"]["version"],
-        }
-        self.model = {**data, "config": config}
-        self.version = config["version"]
-        self.diagnoses.setRowCount(0)
-        self.rules.setRowCount(0)
-        definitions = {text_key(row["name"]): row for row in config["diagnoses"]}
-        catalog = DiagnosisCatalog(config)
-        for group in data["groups"].values():
-            name = catalog.learning_label(group["diagnosis"])
-            if text_key(name) in catalog.aliases:
-                continue
-            definitions.setdefault(text_key(name), {"name": name, "aliases": []})
-        for value in sorted(definitions.values(), key=lambda row: row["name"]):
-            self.add_diagnosis(value["name"], value["aliases"])
-        for value in config["rules"]:
-            self.add_rule(value)
-        for name, value in config["settings"].items():
+        self.model = {key: data[key] for key in ("config", "groups", "items")}
+        self.version = data["config"]["version"]
+        self._configuration_error = data["configuration_error"]
+        self._populating = True
+        self._set_busy(True)
+        self._reset_population(data)
+        self._population_total = len(self._population)
+        for name, value in data["config"]["settings"].items():
             self.settings[name].setValue(value)
-        self._fill_pending()
+        self._populate_next()
+
+    def _reset_population(self, data):
+        with table_batch((self.diagnoses, self.rules, self.pending)):
+            for table in (self.diagnoses, self.rules, self.pending):
+                table.setRowCount(0)
+        self._search_cache.clear()
+        for model in self._item_models.values():
+            model.deleteLater()
+        self._item_models.clear()
+        self._bulk_names = [value["name"] for value in data["definitions"]]
+        self._bulk_name_keys = {text_key(name): name for name in self._bulk_names}
+        if hasattr(self, "_bulk_names_model"):
+            self._bulk_names_model.deleteLater()
+        self._bulk_names_model = QStringListModel(self._bulk_names, self)
+        self._population = deque(
+            [
+                (self.add_diagnosis, (value["name"], value["aliases"]))
+                for value in data["definitions"]
+            ]
+            + [(self.add_rule, (value,)) for value in data["config"]["rules"]]
+            + [(self._append_pending_row, (value,)) for value in data["pending_rows"]]
+        )
+
+    def _populate_next(self):
+        if self._closing:
+            return
+        started = perf_counter()
+        with table_batch((self.diagnoses, self.rules, self.pending)):
+            for _ in range(min(POPULATION_BATCH_SIZE, len(self._population))):
+                callback, args = self._population.popleft()
+                callback(*args)
+                if perf_counter() - started >= POPULATION_BUDGET_SECONDS:
+                    break
+        if self._population:
+            self.status.setText(
+                f"Cargando configuración: {self._population_total - len(self._population)} de {self._population_total} filas…"
+            )
+            self.population_timer.start()
+            return
+        self.population_timer.stop()
+        self._populating = False
+        self._search_cache.clear()
         self._apply_search()
         self.status.setText(
             f"Configuración compartida v{self.version}. Solo el administrador puede modificarla."
         )
-        self._show_configuration_warning(config)
+        self._show_configuration_warning(
+            self.model["config"], self._configuration_error
+        )
+        if self.worker is None:
+            self._operation = None
+            self._set_busy(False)
 
-    def _show_configuration_warning(self, config):
-        try:
-            normalize_config(config)
-        except ValueError as error:
+    def _show_configuration_warning(self, config, error=None):
+        error = configuration_error(config) if error is None else error
+        if error:
             conflicts = self._has_conflicting_rules(config["rules"])
             label = (
                 "Asociaciones en conflicto" if conflicts else "Diagnósticos por revisar"
@@ -467,40 +618,23 @@ class RecommendationAdminDialog(QDialog):
         return len(identities) != len(set(identities))
 
     def _fill_pending(self):
-        self.pending.setRowCount(0)
-        reviewed = {
-            (row["diagnosis"], row["specialty"], row["category"], text_key(row["item"]))
-            for row in self.model["config"]["rules"]
-        }
-        listed = set()
-        catalog = DiagnosisCatalog(self.model["config"])
-        for group in self.model["groups"].values():
-            diagnosis = catalog.learning_label(group["diagnosis"])
-            for item in group["items"]:
-                identity = (
-                    text_key(diagnosis),
-                    group["specialty"],
-                    item["category"],
-                    text_key(item["item"]),
-                )
-                if not item["candidates"] or identity in reviewed or identity in listed:
-                    continue
-                listed.add(identity)
-                row = self.pending.rowCount()
-                self.pending.insertRow(row)
-                for column, value in enumerate(
-                    (
-                        diagnosis,
-                        group["specialty"],
-                        item["category"],
-                        item["item"],
-                    )
-                ):
-                    self.pending.setItem(row, column, QTableWidgetItem(value))
+        with table_batch((self.pending,)):
+            self.pending.setRowCount(0)
+            for values in pending_rows(
+                self.model, DiagnosisCatalog(self.model["config"])
+            ):
+                self._append_pending_row(values)
+        self._search_cache.pop(self.pending, None)
         self._apply_search()
 
+    def _append_pending_row(self, values):
+        row = self.pending.rowCount()
+        self.pending.insertRow(row)
+        for column, value in enumerate(values):
+            self.pending.setItem(row, column, QTableWidgetItem(value))
+
     def save(self):
-        if self.worker is not None:
+        if self.worker is not None or self._populating:
             return
         try:
             value = self.configuration()
@@ -508,6 +642,7 @@ class RecommendationAdminDialog(QDialog):
             self._failed(exc)
             return
         self.status.setText("Guardando configuración compartida…")
+        self._operation = "save"
 
         def persist():
             with recommendation_connection(self.backend) as con:
@@ -526,6 +661,8 @@ class RecommendationAdminDialog(QDialog):
         self.saved = True
 
     def _failed(self, error):
+        if self._closing:
+            return
         self.status.setText(
             "No se guardaron cambios. Revisa el mensaje o actualiza la configuración."
         )
@@ -533,13 +670,39 @@ class RecommendationAdminDialog(QDialog):
 
     def _finished(self):
         self.worker = None
-        self.tabs.setEnabled(True)
-        self.save_button.setEnabled(True)
-        self.reload_button.setEnabled(True)
+        if self._closing:
+            return
+        if not self._populating:
+            self._operation = None
+            self._set_busy(False)
         if self.saved:
             self.accept()
 
+    def _set_busy(self, busy):
+        self.tabs.setEnabled(not busy)
+        self.save_button.setEnabled(not busy)
+        self.reload_button.setEnabled(not busy)
+
+    def _cancel_loading(self):
+        if self._operation != "load" and not self._populating:
+            return False
+        self._closing = True
+        self.population_timer.stop()
+        self._population.clear()
+        self._populating = False
+        if self.worker is not None:
+            worker, self.worker = self.worker, None
+            worker.requestInterruption()
+            worker.setParent(None)
+            worker.completed.disconnect(self._loaded)
+            worker.failed.disconnect(self._failed)
+            worker.finished.disconnect(self._finished)
+        return True
+
     def closeEvent(self, event):
+        if self._cancel_loading():
+            super().closeEvent(event)
+            return
         if self.worker is not None:
             self.status.setText("Espera a que termine la operación antes de cerrar.")
             event.ignore()
@@ -547,10 +710,13 @@ class RecommendationAdminDialog(QDialog):
         super().closeEvent(event)
 
     def reject(self):
-        if self.worker is None:
+        if self._cancel_loading() or self.worker is None:
             super().reject()
 
     def shutdown_for_logout(self):
+        if self._cancel_loading():
+            self.close()
+            return
         if self.worker is not None:
             self.worker.cancel()
             if not self.worker.wait(5000):

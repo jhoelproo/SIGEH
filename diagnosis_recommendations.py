@@ -1,6 +1,7 @@
 """Local diagnosis associations from saved receipts, with explicit ambiguity."""
 
 from difflib import SequenceMatcher
+from functools import lru_cache
 import re
 import unicodedata
 
@@ -167,6 +168,36 @@ def _validate_rule_context(catalog, diagnosis, specialty, category, mode):
         raise ValueError("La categoría o acción de la asociación no es válida.")
 
 
+def _one_edit_apart(left, right):
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(first != second for first, second in zip(left, right)) == 1
+    shorter, longer = sorted((left, right), key=len)
+    return any(
+        shorter == longer[:index] + longer[index + 1 :] for index in range(len(longer))
+    )
+
+
+@lru_cache(maxsize=4096)
+def _complete_suggestion(name):
+    if name in BUILTIN_DIAGNOSES:
+        return True
+    if re.search(r"[/;|+?]|\b(?:VS|PB)\b|\bORIGEN INVESTIGAR\b", name):
+        return False
+    final = name.split()[-1]
+    if len(final) == 1 and not re.search(
+        r"\b(?:TIPO|GRADO|HEPATITIS)\s+[A-EIVX]$", name
+    ):
+        return False
+    if final in {"DE", "DEL", "CON", "SIN", "TIPO", "POR"}:
+        return False
+    key = text_key(name)
+    return not any(
+        _one_edit_apart(key, text_key(candidate)) for candidate in BUILTIN_DIAGNOSES
+    )
+
+
 class DiagnosisCatalog:
     def __init__(self, config, learned_names=()):
         self.trusted_labels = tuple(
@@ -189,6 +220,22 @@ class DiagnosisCatalog:
                 self.aliases.setdefault(
                     text_key(self._canonical_label(alias)), set()
                 ).add(name)
+        self._prepare_suggestions()
+
+    def _prepare_suggestions(self):
+        self.suggestion_names = {
+            key: name
+            for key, name in self.names.items()
+            if (key in self.canonical_keys or name in BUILTIN_DIAGNOSES)
+            and _complete_suggestion(name)
+        }
+        self._suggestion_entries = tuple(self.suggestion_names.items()) + tuple(
+            (alias, name)
+            for alias, names in self.aliases.items()
+            for name in names
+            if text_key(name) in self.suggestion_names
+        )
+        self._suggestion_cache = {}
 
     def _canonical_label(self, value):
         return canonical_diagnosis(value)
@@ -219,15 +266,24 @@ class DiagnosisCatalog:
         key = text_key(self._canonical_label(value))
         if not key:
             return []
-        matches = {name for candidate, name in self.names.items() if key in candidate}
-        for alias, names in self.aliases.items():
-            if key in alias:
-                matches.update(names)
+        if key not in self._suggestion_cache:
+            if len(self._suggestion_cache) >= 128:
+                self._suggestion_cache.clear()
+            self._suggestion_cache[key] = self._suggestion_matches(key)
+        return list(self._suggestion_cache[key][:limit])
+
+    def _suggestion_matches(self, key):
+        matches = {
+            name for candidate, name in self._suggestion_entries if key in candidate
+        }
         if not matches:
             matches = self._fuzzy_choices(key)
-        return sorted(
-            set(matches), key=lambda name: (not text_key(name).startswith(key), name)
-        )[:limit]
+        return tuple(
+            sorted(
+                set(matches),
+                key=lambda name: (not text_key(name).startswith(key), name),
+            )
+        )
 
     def _fuzzy_choices(self, key):
         if len(key) < MIN_FUZZY_LENGTH:
@@ -235,7 +291,7 @@ class DiagnosisCatalog:
         scores = sorted(
             (
                 (SequenceMatcher(None, key, candidate).ratio(), name)
-                for candidate, name in self.names.items()
+                for candidate, name in self.suggestion_names.items()
             ),
             reverse=True,
         )
@@ -357,10 +413,10 @@ def _category_limit(category, settings):
     }[category]
 
 
-def recommendations(model, diagnoses, specialty, catalogs):
+def recommendations(model, diagnoses, specialty, catalogs, *, catalog=None):
     result = {category: [] for category in CATEGORIES}
     specialty = specialty_key(specialty)
-    catalog = model_catalog(model)
+    catalog = catalog if catalog is not None else model_catalog(model)
     keys = catalog.first_two(diagnoses, allow_fuzzy=False)
     settings = {**DEFAULT_SETTINGS, **model.get("config", {}).get("settings", {})}
     for category in CATEGORIES:

@@ -176,6 +176,80 @@ def test_real_background_task_updates_cursor_and_finishes_without_gui_io(
     assert fetch.call_args.kwargs["generation"] == "qa-generation"
 
 
+def test_model_validation_indexing_and_cache_write_run_in_the_background(
+    runtime, monkeypatch
+):
+    from PySide6.QtCore import QThread
+
+    controller, memory, backend, _window = runtime
+    backend.db_pool = object()
+    operations = []
+
+    @contextmanager
+    def connect():
+        yield Mock()
+
+    backend.db_connect = connect
+    original_restore, original_catalog = ui.restore_model, ui.model_catalog
+
+    def checked_restore(value):
+        operations.append(
+            ("restore", QThread.currentThread() == QApplication.instance().thread())
+        )
+        return original_restore(value)
+
+    def checked_catalog(value):
+        operations.append(
+            ("catalog", QThread.currentThread() == QApplication.instance().thread())
+        )
+        return original_catalog(value)
+
+    def checked_cache(_key, _value):
+        operations.append(
+            ("cache", QThread.currentThread() == QApplication.instance().thread())
+        )
+
+    monkeypatch.setattr(ui, "restore_model", checked_restore)
+    monkeypatch.setattr(ui, "model_catalog", checked_catalog)
+    memory.cache.side_effect = checked_cache
+    monkeypatch.setattr(
+        ui,
+        "synchronize",
+        lambda *_args, **_kwargs: {
+            "changes": [
+                {"change_key": "config", "revision": 2, "payload": snapshot()["config"]}
+            ],
+            "more": False,
+        },
+    )
+    controller.request_sync()
+    wait_task(controller.worker)
+    assert controller.model["cursor"] == 2
+    assert {name for name, _on_gui in operations} == {"restore", "catalog", "cache"}
+    assert not any(on_gui for _name, on_gui in operations)
+
+
+def test_closing_during_model_preparation_does_not_write_a_late_cache(
+    runtime, monkeypatch
+):
+    controller, memory, _backend, _window = runtime
+    restore = ui.restore_model
+
+    def close_after_restore(value):
+        controller.closed = True
+        return restore(value)
+
+    monkeypatch.setattr(ui, "restore_model", close_after_restore)
+    data = {
+        "changes": [
+            {"change_key": "config", "revision": 2, "payload": snapshot()["config"]}
+        ],
+        "more": False,
+    }
+    assert controller.prepare_response(controller.model, data) is data
+    memory.cache.assert_not_called()
+
+
 def test_background_failure_and_cancellation_signal_outcomes():
     def broken():
         raise RuntimeError("Synthetic failure")
