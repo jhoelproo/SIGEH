@@ -64,6 +64,11 @@ El primer comando recompila las fuentes sobre el grafo de dependencias verificad
 | Revisión de seguridad | PASS |
 | Cuatro pasadas finales: función, regresión, código y QA | PASS |
 
+## PUBLICACIÓN
+PASS. [Versión estable 1.3.4](https://github.com/jhoelproo/SIGEH/releases/tag/v1.3.4). Los cuatro activos del servidor coinciden en digest y tamaño con los locales; los tres metadatos descargados coinciden byte a byte. El cliente real de actualización obtiene 1.3.4 y el SHA256 esperado. Tag fuente: `aefccf6cc94eebbffbe994c1e9120de819fafcc1`.
+
+Evidencia: `output/release-134-draft-verification.json`, `output/release-134-publication-verification.json`.
+
 ## PROBLEMAS PENDIENTES
 La impresión física en la Canon de la reparación 1.3.3 sigue **NO VERIFICADA** en este equipo, que solo dispone de impresoras virtuales. No se enviaron trabajos a impresoras. La propagación se probó entre dos clientes locales; confirmar la operación en los equipos del hospital después de actualizar. Las mediciones de tema corresponden al equipo de QA.
 
