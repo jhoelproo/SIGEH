@@ -1,6 +1,6 @@
 # QA de SIGEH 1.3.5
 
-Fecha: 2026-10-27. Alcance: actualizaciones incrementales, descargas reanudables y progreso. Compilación local; GitHub continúa en 1.3.4.
+Fecha: 2026-10-27. Alcance: actualizaciones incrementales, descargas reanudables y progreso. Publicada como estable a las 22:41:42 UTC en [GitHub](https://github.com/jhoelproo/SIGEH/releases/tag/v1.3.5), desde el commit `7e739594f81d808e66ccc6987461a175b82802ca`.
 
 ## IMPLEMENTACIÓN
 
@@ -80,6 +80,10 @@ La compilación usa el grafo de dependencias verificado de la distribución ante
 
 Evidencia del paquete final: `output/download-package-validation.json` y `.log`. Resumen con hashes y tamaños: `RELEASE_1.3.5_EVIDENCE.json`.
 
+Publicación: PASS. Los cinco assets remotos coinciden en tamaño y SHA-256 informado por GitHub con los paquetes locales; los tres archivos de metadatos se descargaron y compararon byte por byte. El tag remoto resuelve al commit validado. `get_latest_release()` y `resolve_release_payload()` reconocen 1.3.5 y su checksum tanto en el cliente actual como en el código compilado de 1.3.4. El cliente anterior selecciona el paquete completo. Evidencia: `output/release-135-draft-verification.json` y `output/release-135-publication-verification.json`, incorporada también al resumen versionado. No se repitió la suite de 516 pruebas porque el código y los binarios no cambiaron durante la publicación.
+
+Reanudación en el CDN público: PASS. Ambos ZIP respondieron HTTP 206 a `Range: bytes=0-4095`, con el tamaño total correcto y cabecera ZIP válida. Solo se leyeron 4.096 bytes de cada paquete; no se volvió a descargar íntegramente el paquete remoto. La integridad remota completa se comprobó mediante los hashes reportados por GitHub y la comparación de metadatos descrita arriba.
+
 ## QUALITY GATES
 
 | Gate | Estado |
@@ -96,14 +100,13 @@ Evidencia del paquete final: `output/download-package-validation.json` y `.log`.
 | QA final del actualizador | PASS |
 | Cambios de esquema o pruebas contra producción | N/A: no se modificó persistencia de negocio |
 | Impresora física Canon | N/A: controlador y binario de impresión intactos; no se ensayó físicamente |
-| Descarga del nuevo paquete desde GitHub/CDN | N/A para entrega local: no está publicado; descarga remota NO VERIFICADA, protocolo probado por HTTP local |
+| Publicación, integridad remota y compatibilidad del canal | PASS: cinco assets, metadatos descargados y comprobación mediante ambos clientes |
 
 ## PROBLEMAS PENDIENTES
 
-- Publicación de 1.3.5 y validación posterior del canal remoto. La autorización de este trabajo fue implementar la mejora; no se cambió el release estable.
 - Instalar una vez el cliente nuevo mediante el paquete completo en equipos con 1.3.4 o anteriores. El porcentaje ahorrado corresponde al paquete construido; depende de los archivos que cambien en cada versión y no garantiza velocidad del proveedor/CDN.
 - Investigar el fallo intermitente preexistente de concurrencia de recomendaciones descrito arriba.
 
-La aprobación corresponde a la entrega local del actualizador. La publicación y su verificación remota permanecen pendientes.
+La aprobación incluye el actualizador y la publicación verificada. La incidencia intermitente fuera del alcance y la necesidad de instalar una vez el cliente nuevo se mantienen documentadas.
 
 **ESTADO FINAL: APROBADO PARA ENTREGA**

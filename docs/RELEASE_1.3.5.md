@@ -12,7 +12,7 @@ Actualizador con descargas reanudables y paquetes incrementales opcionales.
 
 La versión 1.3.4 y anteriores no reconocen incrementales ni conservan descargas interrumpidas. Deben recibir una vez el paquete completo que incorpora este cliente. A partir de 1.3.5, las siguientes publicaciones pueden usar incrementales. Se mantiene siempre el ZIP completo para instalaciones nuevas, saltos de versión y recuperación.
 
-El incremental de ensayo 1.3.4 → 1.3.5 permite validar la reconstrucción y la compatibilidad del instalador anterior. No puede seleccionarlo automáticamente el cliente antiguo. No se ha publicado esta versión en GitHub.
+El incremental de ensayo 1.3.4 → 1.3.5 permite validar la reconstrucción y la compatibilidad del instalador anterior. No puede seleccionarlo automáticamente el cliente antiguo. La versión se publicó como estable en [GitHub](https://github.com/jhoelproo/SIGEH/releases/tag/v1.3.5) el 27 de octubre de 2026; se verificó la detección y el checksum con ambos clientes.
 
 ## Empaquetado de siguientes versiones
 

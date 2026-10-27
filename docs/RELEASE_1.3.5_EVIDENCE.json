@@ -1,9 +1,8 @@
 {
   "version": "1.3.5",
   "date": "2026-10-27",
-  "scope": "local update client and packaging",
-  "published": false,
-  "production_release_unchanged": "1.3.4",
+  "scope": "production update client and GitHub release",
+  "published": true,
   "status": "PASS",
   "tests": {
     "related": {
@@ -381,6 +380,71 @@
     "download-coverage.json": "28a913639355ece8ebfba0b65054383a4989758e60a6009f75bdad163e5ccf0d",
     "download-quality-quality.json": "c3f370f6887464a9418a3867f25d74e0a7f5e12d82b441ad6039dd2d48130d28",
     "download-package-validation.json": "6ae7409238c6cf04c28a7210fbd32e0058416291e5caefb9383a0728d2681c27",
-    "download-ui-qa.json": "edf432c1516c0f31205d9c5c7127e44fff3b34e381abfb5e74e9cbf48f680d79"
+    "download-ui-qa.json": "edf432c1516c0f31205d9c5c7127e44fff3b34e381abfb5e74e9cbf48f680d79",
+    "release-135-draft-verification.json": "312833f27c7af13ac306d517a6d09ec231d6dce42d7e7af0cf5374629b48990a",
+    "release-135-publication-verification.json": "706458ad7fa01bf8d4d5980b31ac54a832a7974d755dda5097a29c7c9dddc1c0"
+  },
+  "production_release": "1.3.5",
+  "source_commit": "7e739594f81d808e66ccc6987461a175b82802ca",
+  "publication": {
+    "status": "PASS",
+    "version": "1.3.5",
+    "url": "https://github.com/jhoelproo/SIGEH/releases/tag/v1.3.5",
+    "release_id": 426061840,
+    "published_at": "2026-10-27T22:41:42Z",
+    "draft": false,
+    "prerelease": false,
+    "latest": true,
+    "sha256": "11e0424a88af20cfb91be0b4df174ad9c692eef2461e8a3f8ad3b995c157f2b2",
+    "current_client_verified": true,
+    "compiled_v134_client_verified": true,
+    "older_client_uses_full_package": true,
+    "assets": [
+      {
+        "asset": "SIGEH-1.3.5-files-manifest.json",
+        "size": 378305,
+        "sha256": "3f546f7fb1b10004287c64b6333a487c75ed33917a0aa6b30aacc18373699d21",
+        "server_digest_matches": true
+      },
+      {
+        "asset": "SIGEH-1.3.5-from-1.3.4-delta.zip",
+        "size": 29811993,
+        "sha256": "b7df6ce05d956d520f259fd7910bba6e606a47668a603994c45739ddedb44422",
+        "server_digest_matches": true
+      },
+      {
+        "asset": "SIGEH-1.3.5-manifest.json",
+        "size": 1022,
+        "sha256": "8a240d684b3f54c112c5dd066d3c192b577aa009b5e19fc6d76da6ac263ee1b1",
+        "server_digest_matches": true
+      },
+      {
+        "asset": "SIGEH-1.3.5-windows-x64.zip",
+        "size": 310288096,
+        "sha256": "11e0424a88af20cfb91be0b4df174ad9c692eef2461e8a3f8ad3b995c157f2b2",
+        "server_digest_matches": true
+      },
+      {
+        "asset": "SIGEH-1.3.5-windows-x64.zip.sha256",
+        "size": 95,
+        "sha256": "a7df554d01660012400646f93a6981d68750ab09856248cc0cbf038dc79f6511",
+        "server_digest_matches": true
+      }
+    ],
+    "source_commit": "7e739594f81d808e66ccc6987461a175b82802ca",
+    "public_range_checks": [
+      {
+        "asset": "SIGEH-1.3.5-from-1.3.4-delta.zip",
+        "status": 206,
+        "content_range": "bytes 0-4095/29811993",
+        "bytes_read": 4096
+      },
+      {
+        "asset": "SIGEH-1.3.5-windows-x64.zip",
+        "status": 206,
+        "content_range": "bytes 0-4095/310288096",
+        "bytes_read": 4096
+      }
+    ]
   }
 }
