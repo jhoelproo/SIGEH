@@ -29,12 +29,22 @@ class ReleaseInfo:
     checksum_url: str
     manifest_url: str
     html_url: str
+    optional_assets: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class DeltaInfo:
+    from_version: str
+    url: str
+    sha256: str
+    size: int
 
 
 @dataclass(frozen=True)
 class VerifiedReleasePayload:
     release: ReleaseInfo
     sha256: str
+    delta: DeltaInfo | None = None
 
 
 def version_tuple(value: str) -> tuple[int, int, int]:
@@ -135,6 +145,11 @@ def parse_release(data: dict) -> ReleaseInfo:
         checksum_url=_asset_url(assets, checksum_name, tag),
         manifest_url=_asset_url(assets, manifest_name, tag),
         html_url=html_url,
+        optional_assets=tuple(
+            (name, str(item.get("browser_download_url", "")))
+            for name, item in assets.items()
+            if name.endswith("-delta.zip")
+        ),
     )
 
 
@@ -190,14 +205,42 @@ def _validate_manifest(manifest: dict, release: ReleaseInfo) -> str:
 def resolve_release_payload(
     release: ReleaseInfo, *, timeout: int = 20
 ) -> VerifiedReleasePayload:
-    manifest_checksum = _validate_manifest(_load_manifest(release, timeout), release)
+    manifest = _load_manifest(release, timeout)
+    manifest_checksum = _validate_manifest(manifest, release)
     checksum_text = _request_bytes(release.checksum_url, timeout=timeout).decode(
         "ascii"
     )
     checksum = parse_checksum(checksum_text, release.archive_name)
     if checksum != manifest_checksum:
         raise UpdateError("Manifest y checksum SIGEH no coinciden.")
-    return VerifiedReleasePayload(release=release, sha256=checksum)
+    return VerifiedReleasePayload(
+        release=release, sha256=checksum, delta=_select_delta(manifest, release)
+    )
+
+
+def _select_delta(manifest: dict, release: ReleaseInfo) -> DeltaInfo | None:
+    deltas = manifest.get("deltas", [])
+    if not isinstance(deltas, list):
+        return None
+    name = f"SIGEH-{release.version}-from-{APP_VERSION}-delta.zip"
+    expected_url = release.archive_url.rsplit("/", 1)[0] + "/" + name
+    if dict(release.optional_assets).get(name) != expected_url:
+        return None
+    for row in deltas:
+        if not isinstance(row, dict) or row.get("from_version") != APP_VERSION:
+            continue
+        checksum = str(row.get("sha256", ""))
+        if row.get("asset") == name and _valid_delta_metadata(row, checksum):
+            return DeltaInfo(APP_VERSION, expected_url, checksum, row["size"])
+    return None
+
+
+def _valid_delta_metadata(row: dict, checksum: str) -> bool:
+    return (
+        re.fullmatch(r"[a-f0-9]{64}", checksum) is not None
+        and type(row.get("size")) is int
+        and row["size"] > 0
+    )
 
 
 def sha256_file(path: str | Path) -> str:

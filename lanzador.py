@@ -22,17 +22,16 @@ if __name__ == "__main__" and _EARLY_ARGS == ["--self-test"]:
 
 import json
 import time
-import hashlib
 import shutil
 import subprocess
 import tempfile
 import uuid
-import zipfile
-import requests
 from pathlib import Path
 from sigeh_product import APP_VERSION, PRODUCT_ID
 from sigeh_visual_theme import visual_theme_tokens
 from sigeh_update import get_latest_release, is_newer, resolve_release_payload
+from update_preparation import format_progress, prepare_update
+from update_payload import extract_distribution
 from PySide6.QtCore import Qt, QThread, Signal, QSettings
 from PySide6.QtWidgets import QApplication, QDialog, QVBoxLayout, QLabel, QProgressBar, QMessageBox
 
@@ -308,6 +307,7 @@ class UpdateChecker(QThread):
             local_version = get_local_version()
             if is_newer(release.version, local_version):
                 payload = resolve_release_payload(release)
+                self.payload = payload
                 self.update_found.emit(
                     release.version, release.archive_url, payload.sha256
                 )
@@ -324,57 +324,41 @@ class DownloadWorker(QThread):
     finished_download = Signal(str)
     progress_update = Signal(int, int)
     error_download = Signal(str)
+    status_update = Signal(str)
 
-    def __init__(self, url, expected_sha256="", version="pending"):
+    def __init__(self, url, expected_sha256="", version="pending", delta=None):
         super().__init__()
         self.url = url
         self.expected_sha256 = expected_sha256
         self.version = str(version or "pending")
+        self.delta = delta
+        self._last_progress_at = 0.0
+
+    def report_progress(self, downloaded, total):
+        now = time.monotonic()
+        if now - self._last_progress_at >= 0.1 or downloaded == total:
+            self._last_progress_at = now
+            self.progress_update.emit(downloaded, total)
 
     def run(self):
-        new_zip_path = ""
         try:
-            response = requests.get(self.url, stream=True, timeout=60)
-            response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
-
-            local_root = Path(
-                os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
-            ) / PRODUCT_ID / "updates" / "staging" / self.version
-            local_root.mkdir(parents=True, exist_ok=True)
-            update_dir = tempfile.mkdtemp(prefix="download-", dir=str(local_root))
-            new_zip_path = os.path.join(update_dir, "SIGEH-update.zip")
-
-            downloaded_size = 0
-            digest = hashlib.sha256()
-            with open(new_zip_path, "wb") as f:
-                for chunk in response.iter_content(32768):
-                    if chunk:
-                        f.write(chunk)
-                        digest.update(chunk)
-                        downloaded_size += len(chunk)
-                        self.progress_update.emit(downloaded_size, total_size)
-
-            if total_size > 0 and downloaded_size != total_size:
-                raise IOError(
-                    f"Descarga incompleta: {downloaded_size} de {total_size} bytes."
-                )
-
-            with open(new_zip_path, "rb") as executable_file:
-                if executable_file.read(4) != b"PK\x03\x04":
-                    raise IOError("El archivo descargado no es un ejecutable válido de Windows.")
-
-            if self.expected_sha256 and digest.hexdigest().lower() != self.expected_sha256:
-                raise IOError("La firma SHA-256 del paquete no coincide.")
-            if not zipfile.is_zipfile(new_zip_path):
-                raise IOError("El archivo descargado no es un ZIP valido.")
-            self.finished_download.emit(new_zip_path)
+            local_root = (
+                Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+                / PRODUCT_ID
+                / "updates"
+            )
+            payload = prepare_update(
+                self.url,
+                self.expected_sha256,
+                local_root,
+                Path(get_real_dir()),
+                self.version,
+                delta=self.delta,
+                progress=self.report_progress,
+                status=self.status_update.emit,
+            )
+            self.finished_download.emit(str(payload))
         except Exception as e:
-            if new_zip_path and os.path.exists(new_zip_path):
-                try:
-                    shutil.rmtree(os.path.dirname(new_zip_path), ignore_errors=True)
-                except Exception:
-                    pass
             self.error_download.emit(str(e))
             self.finished_download.emit("")
 
@@ -395,7 +379,7 @@ class LauncherDialog(QDialog):
             f"QLabel{{color:{tokens['text_primary']};background:transparent;border:none;}}"
             f"QProgressBar{{background:{tokens['input_bg']};color:{tokens['text_primary']};"
             f"border:1px solid {tokens['border']};border-radius:4px;text-align:center;font-weight:bold;}}"
-            f"QProgressBar::chunk{{background:{tokens['success']};border-radius:4px;}}"
+            f"QProgressBar::chunk{{background:{tokens['success'] if self._is_dark else tokens['success_bg']};border-radius:4px;}}"
             f"QMessageBox{{background:{tokens['window_bg']};color:{tokens['text_primary']};}}"
             f"QMessageBox QLabel{{color:{tokens['text_primary']};}}"
             f"QMessageBox QPushButton{{background:{tokens['button_primary_bg']};"
@@ -442,8 +426,13 @@ class LauncherDialog(QDialog):
         self.lbl_status.setText(f"Descargando actualización {version}...")
         self.progress.show()
 
-        self.downloader = DownloadWorker(url, expected_sha256, version)
+        payload = getattr(self.checker, "payload", None)
+        self.downloader = DownloadWorker(
+            url, expected_sha256, version, delta=getattr(payload, "delta", None)
+        )
+        self._download_sample = None
         self.downloader.progress_update.connect(self.update_progress)
+        self.downloader.status_update.connect(self.lbl_status.setText)
         self.downloader.finished_download.connect(self.apply_update)
         self.downloader.error_download.connect(self.handle_download_error)
         self.downloader.start()
@@ -455,15 +444,18 @@ class LauncherDialog(QDialog):
         QApplication.processEvents()
 
     def update_progress(self, downloaded, total):
+        now = time.monotonic()
+        sample = getattr(self, "_download_sample", None)
+        if sample is None or downloaded < sample[1] or total != sample[2]:
+            sample = (now, downloaded, total)
+            self._download_sample = sample
+        text = format_progress(downloaded, total, now - sample[0], downloaded - sample[1])
         if total > 0:
-            self.progress.setMaximum(total)
-            self.progress.setValue(downloaded)
-            mb_down = downloaded / (1024 * 1024)
-            mb_total = total / (1024 * 1024)
-            self.progress.setFormat(f"{mb_down:.1f} MB / {mb_total:.1f} MB")
+            self.progress.setMaximum(1000)
+            self.progress.setValue(min(1000, downloaded * 1000 // total))
         else:
             self.progress.setMaximum(0)
-            self.progress.setFormat(f"{(downloaded / (1024 * 1024)):.1f} MB")
+        self.progress.setFormat(text)
 
     def _apply_legacy_update(self, new_exe_path):
         if not new_exe_path or not os.path.exists(new_exe_path):
@@ -519,67 +511,65 @@ class LauncherDialog(QDialog):
         extract_dir = os.path.join(update_root, "extraido")
 
         try:
-            with zipfile.ZipFile(new_zip_path) as archive:
-                extract_abs = os.path.abspath(extract_dir)
-                for member in archive.infolist():
-                    target = os.path.abspath(os.path.join(extract_abs, member.filename))
-                    if os.path.commonpath([extract_abs, target]) != extract_abs:
-                        raise IOError("El ZIP contiene una ruta no permitida.")
-                archive.extractall(extract_abs)
+            if os.path.isdir(new_zip_path):
+                payload_dir = new_zip_path
+            else:
+                payload_dir = self._extract_legacy_archive(new_zip_path, extract_dir)
 
-            candidates = [os.path.join(extract_dir, "SIGEH"), extract_dir]
-            payload_dir = next(
-                (
-                    path
-                    for path in candidates
-                    if os.path.isfile(os.path.join(path, MAIN_APP_NAME))
-                    and os.path.isfile(os.path.join(path, LAUNCHER_NAME))
-                    and os.path.isfile(os.path.join(path, UPDATER_NAME))
-                    and os.path.isdir(os.path.join(path, "_internal"))
-                ),
-                "",
-            )
-            if not payload_dir:
-                raise IOError("El ZIP no contiene una distribución SIGEH onedir válida.")
-
-            payload_updater = os.path.join(payload_dir, UPDATER_NAME)
-            updater_temp_dir = os.path.join(
-                tempfile.gettempdir(), "SIGEH-Updater", str(uuid.uuid4())
-            )
-            os.makedirs(updater_temp_dir, exist_ok=True)
-            temporary_updater = os.path.join(updater_temp_dir, UPDATER_NAME)
-            shutil.copy2(payload_updater, temporary_updater)
-
-            manifest_path = os.path.join(update_root, "update_manifest.json")
-            with open(manifest_path, "w", encoding="utf-8") as manifest_file:
-                json.dump(
-                    {
-                        "install_dir": current_dir,
-                        "payload_dir": os.path.abspath(payload_dir),
-                        "version": self.new_version_string,
-                        "product": PRODUCT_ID,
-                    },
-                    manifest_file,
-                )
-
-            creationflags = 0
-            if sys.platform.startswith("win"):
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-            subprocess.Popen(
-                [temporary_updater, "--manifest", manifest_path, "--wait-pid", str(os.getpid())],
-                cwd=updater_temp_dir,
-                close_fds=True,
-                creationflags=creationflags,
-            )
-            write_launcher_log(f"Actualizacion {self.new_version_string} entregada al instalador externo.")
-            self.lbl_status.setText("Cerrando para completar la actualizacion...")
-            QApplication.processEvents()
-            QApplication.instance().quit()
+            self._handoff_payload(payload_dir, current_dir, update_root)
         except Exception as exc:
             write_launcher_log(f"No se pudo preparar la actualizacion onedir: {exc}")
             self.lbl_status.setText("No se pudo instalar. Iniciando version local...")
             QApplication.processEvents()
             self.launch_main_app()
+
+    def _extract_legacy_archive(self, new_zip_path, extract_dir):
+        return str(extract_distribution(Path(new_zip_path), Path(extract_dir)))
+
+    def _handoff_payload(self, payload_dir, current_dir, update_root):
+        payload_updater = os.path.join(payload_dir, UPDATER_NAME)
+        updater_temp_dir = os.path.join(
+            tempfile.gettempdir(), "SIGEH-Updater", str(uuid.uuid4())
+        )
+        os.makedirs(updater_temp_dir, exist_ok=True)
+        temporary_updater = os.path.join(updater_temp_dir, UPDATER_NAME)
+        shutil.copy2(payload_updater, temporary_updater)
+
+        manifest_path = os.path.join(update_root, "update_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(
+                {
+                    "install_dir": current_dir,
+                    "payload_dir": os.path.abspath(payload_dir),
+                    "version": self.new_version_string,
+                    "product": PRODUCT_ID,
+                },
+                manifest_file,
+            )
+
+        creationflags = 0
+        if sys.platform.startswith("win"):
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            )
+        subprocess.Popen(
+            [
+                temporary_updater,
+                "--manifest",
+                manifest_path,
+                "--wait-pid",
+                str(os.getpid()),
+            ],
+            cwd=updater_temp_dir,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+        write_launcher_log(
+            f"Actualizacion {self.new_version_string} entregada al instalador externo."
+        )
+        self.lbl_status.setText("Cerrando para completar la actualizacion...")
+        QApplication.processEvents()
+        QApplication.instance().quit()
 
     def launch_main_app(self):
         result = launch_main_app_immediately()

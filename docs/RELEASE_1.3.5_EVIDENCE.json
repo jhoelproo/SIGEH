@@ -1,0 +1,386 @@
+{
+  "version": "1.3.5",
+  "date": "2026-10-27",
+  "scope": "local update client and packaging",
+  "published": false,
+  "production_release_unchanged": "1.3.4",
+  "status": "PASS",
+  "tests": {
+    "related": {
+      "tests": 211,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 211
+    },
+    "regression_final": {
+      "tests": 305,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 305
+    },
+    "total_passed": 516,
+    "regression_initial": {
+      "tests": 305,
+      "failures": 1,
+      "errors": 0,
+      "skipped": 0,
+      "passed": 304
+    }
+  },
+  "legacy_race": {
+    "observed": true,
+    "source_and_test_identical_to_v134": true,
+    "final_full_rerun_passed": true,
+    "fixed_in_this_change": false
+  },
+  "coverage": {
+    "lines": 501,
+    "covered_lines": 501,
+    "branches": 148,
+    "covered_branches": 146,
+    "line_percent": 100.0,
+    "branch_percent": 98.64864864864865
+  },
+  "coverage_by_file": {
+    "lanzador.py": {
+      "lines": 115,
+      "covered_lines": 115,
+      "line_percent": 100.0,
+      "branches": 14,
+      "covered_branches": 13,
+      "branch_percent": 92.85714285714286,
+      "missing_lines": [],
+      "missing_branches": [
+        [
+          551,
+          555
+        ]
+      ]
+    },
+    "release_delta.py": {
+      "lines": 44,
+      "covered_lines": 44,
+      "line_percent": 100.0,
+      "branches": 12,
+      "covered_branches": 12,
+      "branch_percent": 100.0,
+      "missing_lines": [],
+      "missing_branches": []
+    },
+    "release_packaging.py": {
+      "lines": 76,
+      "covered_lines": 76,
+      "line_percent": 100.0,
+      "branches": 20,
+      "covered_branches": 20,
+      "branch_percent": 100.0,
+      "missing_lines": [],
+      "missing_branches": []
+    },
+    "sigeh_update.py": {
+      "lines": 33,
+      "covered_lines": 33,
+      "line_percent": 100.0,
+      "branches": 12,
+      "covered_branches": 12,
+      "branch_percent": 100.0,
+      "missing_lines": [],
+      "missing_branches": []
+    },
+    "update_download.py": {
+      "lines": 70,
+      "covered_lines": 70,
+      "line_percent": 100.0,
+      "branches": 28,
+      "covered_branches": 28,
+      "branch_percent": 100.0,
+      "missing_lines": [],
+      "missing_branches": []
+    },
+    "update_payload.py": {
+      "lines": 122,
+      "covered_lines": 122,
+      "line_percent": 100.0,
+      "branches": 50,
+      "covered_branches": 49,
+      "branch_percent": 98.0,
+      "missing_lines": [],
+      "missing_branches": [
+        [
+          67,
+          69
+        ]
+      ]
+    },
+    "update_preparation.py": {
+      "lines": 41,
+      "covered_lines": 41,
+      "line_percent": 100.0,
+      "branches": 12,
+      "covered_branches": 12,
+      "branch_percent": 100.0,
+      "missing_lines": [],
+      "missing_branches": []
+    }
+  },
+  "quality": {
+    "new_lint": {
+      "lanzador.py": [],
+      "sigeh_update.py": [],
+      "release_packaging.py": []
+    },
+    "new_types": {
+      "lanzador.py": [],
+      "sigeh_update.py": [],
+      "release_packaging.py": []
+    },
+    "new_security": {
+      "lanzador.py": [],
+      "sigeh_update.py": [],
+      "release_packaging.py": []
+    },
+    "complexity": {
+      "lanzador.py": {
+        "UpdateChecker.run": {
+          "before": 3,
+          "after": 3
+        },
+        "DownloadWorker.__init__": {
+          "before": 2,
+          "after": 2
+        },
+        "DownloadWorker.report_progress": {
+          "before": null,
+          "after": 3
+        },
+        "DownloadWorker.run": {
+          "before": 14,
+          "after": 3
+        },
+        "LauncherDialog.__init__": {
+          "before": 1,
+          "after": 2
+        },
+        "LauncherDialog.start_download": {
+          "before": 1,
+          "after": 1
+        },
+        "LauncherDialog.update_progress": {
+          "before": 2,
+          "after": 5
+        },
+        "LauncherDialog.apply_update": {
+          "before": 13,
+          "after": 5
+        },
+        "LauncherDialog._extract_legacy_archive": {
+          "before": null,
+          "after": 1
+        },
+        "LauncherDialog._handoff_payload": {
+          "before": null,
+          "after": 2
+        }
+      },
+      "sigeh_update.py": {
+        "parse_release": {
+          "before": 3,
+          "after": 5
+        },
+        "resolve_release_payload": {
+          "before": 2,
+          "after": 2
+        },
+        "_select_delta": {
+          "before": null,
+          "after": 8
+        },
+        "_valid_delta_metadata": {
+          "before": null,
+          "after": 3
+        }
+      },
+      "release_packaging.py": {
+        "_zip_file_manifest": {
+          "before": 4,
+          "after": 1
+        },
+        "_deployment_bundle": {
+          "before": null,
+          "after": 8
+        },
+        "_write_archive": {
+          "before": null,
+          "after": 4
+        },
+        "_optional_delta": {
+          "before": null,
+          "after": 2
+        },
+        "prepare_release": {
+          "before": 15,
+          "after": 9
+        },
+        "main": {
+          "before": 2,
+          "after": 2
+        }
+      }
+    },
+    "formatter": {
+      "lanzador.py": 0,
+      "sigeh_update.py": 0,
+      "release_packaging.py": 0
+    },
+    "fresh_lint_exit": 0,
+    "fresh_format_exit": 0,
+    "fresh_types_exit": 0,
+    "fresh_security": [],
+    "fresh_complexity": {
+      "update_download.py": {
+        "_response_size": 7,
+        "_transfer": 8,
+        "_cached_archive": 5,
+        "download_archive": 9
+      },
+      "update_payload.py": {
+        "distribution_path": 10,
+        "archive_entries": 7,
+        "validate_distribution": 4,
+        "_payload_workspace": 3,
+        "extract_distribution": 2,
+        "read_delta_manifest": 5,
+        "manifest_files": 7,
+        "_valid_file_metadata": 4,
+        "_copy_local_file": 4,
+        "_materialize_files": 6,
+        "assemble_delta": 1
+      },
+      "update_preparation.py": {
+        "_download_delta": 4,
+        "prepare_update": 4,
+        "format_progress": 4
+      },
+      "release_delta.py": {
+        "archive_version": 2,
+        "archive_file_index": 3,
+        "_ships_preserved_default": 3,
+        "create_delta": 6
+      }
+    },
+    "new_duplicate_blocks": [],
+    "complexity_gate": true,
+    "gate": true
+  },
+  "package": {
+    "status": "PASS",
+    "version": "1.3.5",
+    "full_sha256": "11e0424a88af20cfb91be0b4df174ad9c692eef2461e8a3f8ad3b995c157f2b2",
+    "delta_sha256": "b7df6ce05d956d520f259fd7910bba6e606a47668a603994c45739ddedb44422",
+    "full_bytes": 310288096,
+    "delta_bytes": 29811993,
+    "target_files_verified": 1823,
+    "smokes": [
+      {
+        "binary": "SIGEH.exe",
+        "command": "--self-test",
+        "exit_code": 0
+      },
+      {
+        "binary": "SIGEH_Updater.exe",
+        "command": "--help",
+        "exit_code": 0
+      },
+      {
+        "binary": "CALCULOS_QT.exe",
+        "command": "--check-v15-package",
+        "exit_code": 0
+      },
+      {
+        "binary": "CALCULOS_QT.exe",
+        "command": "--self-test-pdf",
+        "exit_code": 0
+      },
+      {
+        "binary": "CALCULOS_QT.exe",
+        "command": "--self-test-report-viewer",
+        "exit_code": 0
+      },
+      {
+        "binary": "CALCULOS_QT.exe",
+        "command": "--self-test-reports",
+        "exit_code": 0
+      }
+    ],
+    "download_reduction_percent": 90.39215703589221,
+    "compiled_sources": {
+      "launcher:lanzador": true,
+      "updater:updater": true,
+      "main:CALCULOS_QT": true,
+      "launcher:sigeh_update": true,
+      "launcher:sigeh_product": true,
+      "launcher:update_download": true,
+      "launcher:update_payload": true,
+      "launcher:update_preparation": true,
+      "main:sigeh_product": true,
+      "main:sigeh_update": true,
+      "main:pdf_printing": true,
+      "main:recommendation_config_events": true
+    },
+    "reconstructed_files_verified": 1823,
+    "installation": {
+      "from": "1.3.4",
+      "to": "1.3.5",
+      "preserved_files": 8,
+      "sqlite_databases": 2,
+      "rows_per_database": 2,
+      "real_frozen_health_check": true,
+      "restart_intercepted": true
+    }
+  },
+  "ui": {
+    "status": "PASS",
+    "checks": [
+      {
+        "theme": "light",
+        "image": "output/download-ui-light.png",
+        "progress": "10.0 MB / 28.4 MB · 1024 KB/s · 0:18 restantes",
+        "text_fits": true,
+        "progress_maximum": 1000,
+        "download_thread": "mocked, no network"
+      },
+      {
+        "theme": "dark",
+        "image": "output/download-ui-dark.png",
+        "progress": "10.0 MB / 28.4 MB · 1024 KB/s · 0:18 restantes",
+        "text_fits": true,
+        "progress_maximum": 1000,
+        "download_thread": "mocked, no network"
+      }
+    ]
+  },
+  "source_sha256": {
+    "update_download.py": "4592248cbf4fc7194d51c5e7bca80fe367fb7e19762e82f718cbea8d36457292",
+    "update_payload.py": "028e447ffbc11a42f04dc4e980c3489d829719151b0e8481677993fdcc922886",
+    "update_preparation.py": "f8a352cc1e6616ec9f04d8fd4a01ed9f30449b703073d3f1ba6740073d70b24f",
+    "release_delta.py": "cd1d7d103c55cafc87c9198adf777ac7076ab48658d95bf64ee941d3c93efa1a",
+    "lanzador.py": "16d5bef5fc852916c9560a26d58bf17c3ed8385d910df838eb1ba33e3e12012d",
+    "sigeh_update.py": "aef8b27a015a13aba376cd76a1abb00876ebb0d61299c1989aea6cb0f5189b74",
+    "release_packaging.py": "583c22f6ecc13d06974cc47d3df28ffa7775ae3fc6c9221f3f9547f7edabbabd",
+    "build_app.spec": "fe34f65a0a1847baa1bf5900b7d6a73d8fa9791e76a56456d3562f86ea4e4188",
+    "sigeh_product.py": "b060341b4724a879b3cbf1e9934ab5ae2f11f7d14b77556c28d81befaf1ea269",
+    "version_config.json": "e753e3c618cfa0ef8459b5222d596743482aa10cbee0b60bbdd516acd5e1aaf8"
+  },
+  "artifact_sha256": {
+    "download-verified-tests.xml": "35f55f930588d4f517586d0f48f26aed9b7508a988b7546baeb3de2a61fc9f65",
+    "download-regression-tests.xml": "5c8e389dd7c2bf9a008cbc3e5263d3e1ab1e9f1f8ba9878075daae9661724106",
+    "download-regression-initial.xml": "7e307df17a5d576318fa15cec457ff81c127b4ec6d75c1cdf11d3331356e4b42",
+    "download-coverage-summary.json": "447f58eef1a44c37381682a635eae888c8c4a5f9403f1a362d912f2de7964807",
+    "download-coverage.json": "28a913639355ece8ebfba0b65054383a4989758e60a6009f75bdad163e5ccf0d",
+    "download-quality-quality.json": "c3f370f6887464a9418a3867f25d74e0a7f5e12d82b441ad6039dd2d48130d28",
+    "download-package-validation.json": "6ae7409238c6cf04c28a7210fbd32e0058416291e5caefb9383a0728d2681c27",
+    "download-ui-qa.json": "edf432c1516c0f31205d9c5c7127e44fff3b34e381abfb5e74e9cbf48f680d79"
+  }
+}

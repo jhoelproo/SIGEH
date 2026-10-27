@@ -12,6 +12,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from database_config import read_bundled_database_url
 from sigeh_product import APP_VERSION, PRODUCT_ID
+from release_delta import archive_file_index, archive_version, create_delta
 
 REQUIRED_DIST_ENTRIES = (
     Path("SIGEH.exe"),
@@ -122,23 +123,47 @@ def _validate_internal_bundle(path: Path) -> Path:
 
 
 def _zip_file_manifest(archive_path: Path) -> list[dict[str, object]]:
-    files: list[dict[str, object]] = []
     with ZipFile(archive_path) as archive:
-        for info in sorted(archive.infolist(), key=lambda item: item.filename):
-            if info.is_dir():
-                continue
-            digest = hashlib.sha256()
-            with archive.open(info) as stream:
-                while chunk := stream.read(1024 * 1024):
-                    digest.update(chunk)
-            files.append(
-                {
-                    "relative_path": info.filename,
-                    "size": info.file_size,
-                    "sha256": digest.hexdigest(),
-                }
-            )
-    return files
+        return archive_file_index(archive)
+
+
+def _deployment_bundle(internal_deployment, backend_bundle, base_archive):
+    if backend_bundle is not None and not internal_deployment:
+        raise ValueError(
+            "backend_bundle requiere internal_deployment; nunca se agrega al ZIP público."
+        )
+    if internal_deployment and backend_bundle is None:
+        raise ValueError("internal_deployment requiere backend_bundle explícito.")
+    if internal_deployment and base_archive is not None:
+        raise ValueError(
+            "Los incrementales requieren un paquete público sin credenciales."
+        )
+    return (
+        _validate_internal_bundle(backend_bundle)
+        if backend_bundle is not None
+        else None
+    )
+
+
+def _write_archive(archive_path: Path, dist_dir: Path, bundle: Path | None) -> None:
+    with ZipFile(
+        archive_path, "w", compression=ZIP_DEFLATED, compresslevel=6
+    ) as archive:
+        for path in sorted(dist_dir.rglob("*")):
+            if path.is_file():
+                archive.write(path, Path("SIGEH") / path.relative_to(dist_dir))
+        if bundle is not None:
+            archive.write(bundle, Path("SIGEH") / "_internal" / "database_url.bundle")
+
+
+def _optional_delta(archive_path, base_archive, output_dir, version):
+    if base_archive is None:
+        return None
+    with ZipFile(base_archive) as base:
+        base_version = archive_version(base)
+    path = output_dir / f"SIGEH-{version}-from-{base_version}-delta.zip"
+    metadata = create_delta(archive_path, base_archive, path)
+    return path, metadata
 
 
 def prepare_release(
@@ -149,20 +174,13 @@ def prepare_release(
     version: str = APP_VERSION,
     internal_deployment: bool = False,
     backend_bundle: Path | None = None,
+    base_archive: Path | None = None,
 ) -> dict:
     dist_dir = Path(dist_dir).resolve()
     updater_exe = Path(updater_exe).resolve()
     output_dir = Path(output_dir).resolve()
-    if backend_bundle is not None and not internal_deployment:
-        raise ValueError(
-            "backend_bundle requiere internal_deployment; nunca se agrega al ZIP público."
-        )
-    if internal_deployment and backend_bundle is None:
-        raise ValueError("internal_deployment requiere backend_bundle explícito.")
-    validated_bundle = (
-        _validate_internal_bundle(backend_bundle)
-        if backend_bundle is not None
-        else None
+    validated_bundle = _deployment_bundle(
+        internal_deployment, backend_bundle, base_archive
     )
     if not updater_exe.is_file():
         raise FileNotFoundError(f"No existe updater ONEFILE: {updater_exe}")
@@ -174,17 +192,7 @@ def prepare_release(
     channel_suffix = "-internal" if internal_deployment else ""
     asset_name = f"SIGEH-{version}{channel_suffix}-windows-x64.zip"
     archive_path = output_dir / asset_name
-    with ZipFile(
-        archive_path, "w", compression=ZIP_DEFLATED, compresslevel=6
-    ) as archive:
-        for path in sorted(dist_dir.rglob("*")):
-            if path.is_file():
-                archive.write(path, Path("SIGEH") / path.relative_to(dist_dir))
-        if validated_bundle is not None:
-            archive.write(
-                validated_bundle,
-                Path("SIGEH") / "_internal" / "database_url.bundle",
-            )
+    _write_archive(archive_path, dist_dir, validated_bundle)
     checksum = sha256_file(archive_path)
     checksum_path = output_dir / f"{asset_name}.sha256"
     checksum_path.write_text(f"{checksum} *{asset_name}\n", encoding="ascii")
@@ -217,6 +225,9 @@ def prepare_release(
         ),
         "components": components,
     }
+    delta = _optional_delta(archive_path, base_archive, output_dir, version)
+    if delta is not None:
+        manifest["deltas"] = [delta[1]]
     manifest_path = output_dir / f"SIGEH-{version}{channel_suffix}-manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -236,13 +247,16 @@ def prepare_release(
     file_manifest_path.write_text(
         json.dumps(file_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    return {
+    result = {
         "archive": archive_path,
         "checksum": checksum_path,
         "manifest": manifest_path,
         "file_manifest": file_manifest_path,
         "sha256": checksum,
     }
+    if delta is not None:
+        result["delta"] = delta[0]
+    return result
 
 
 def main() -> int:
@@ -253,6 +267,7 @@ def main() -> int:
     parser.add_argument("--version", default=APP_VERSION)
     parser.add_argument("--internal-deployment", action="store_true")
     parser.add_argument("--backend-bundle", type=Path)
+    parser.add_argument("--base-archive", type=Path)
     args = parser.parse_args()
     result = prepare_release(
         args.dist,
@@ -261,6 +276,7 @@ def main() -> int:
         version=args.version,
         internal_deployment=args.internal_deployment,
         backend_bundle=args.backend_bundle,
+        base_archive=args.base_archive,
     )
     print(json.dumps({key: str(value) for key, value in result.items()}, indent=2))
     return 0

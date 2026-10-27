@@ -184,6 +184,10 @@ def test_launcher_uses_new_verified_payload_updater(tmp_path, monkeypatch):
     owner = SimpleNamespace(
         lbl_status=Mock(), new_version_string="9.0.0", launch_main_app=Mock()
     )
+    from types import MethodType
+
+    for name in ("_extract_legacy_archive", "_handoff_payload"):
+        setattr(owner, name, MethodType(getattr(lanzador.LauncherDialog, name), owner))
     monkeypatch.setattr(qt, "quit", Mock())
     from pathlib import Path
 
