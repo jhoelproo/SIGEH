@@ -17,6 +17,7 @@ import re
 import sys
 import uuid
 import weakref
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -1123,20 +1124,60 @@ class _WidgetMixin:
 
 
 class Style:
+    _batch_depth = 0
+    _pending_styles: set[str] = set()
+
     def __init__(self, *args, **kwargs):
         _ensure_app()
 
+    @classmethod
+    @contextmanager
+    def batch(cls):
+        cls._batch_depth += 1
+        try:
+            yield
+        finally:
+            cls._batch_depth -= 1
+            if not cls._batch_depth:
+                pending, cls._pending_styles = cls._pending_styles, set()
+                cls._refresh(pending)
+
     def configure(self, style_name, **kwargs):
-        _STYLE_REGISTRY.setdefault(str(style_name), {}).update(kwargs)
+        registry = _STYLE_REGISTRY.setdefault(str(style_name), {})
+        if kwargs and all(registry.get(key) == value for key, value in kwargs.items()):
+            return
+        registry.update(kwargs)
+        if self._batch_depth:
+            self._pending_styles.add(str(style_name))
+        else:
+            self._refresh({str(style_name)})
+
+    @staticmethod
+    def _matches(widget, styles):
+        return (
+            getattr(widget, "_style_name", "") in styles
+            or f"{getattr(widget, '_bootstyle', '')}.TButton" in styles
+            or isinstance(widget, Treeview)
+            and bool(
+                styles
+                & {
+                    "Treeview",
+                    "Modern.Treeview",
+                    "Treeview.Heading",
+                    "Modern.Treeview.Heading",
+                }
+            )
+            or isinstance(widget, Notebook)
+            and any(name.startswith("TNotebook") for name in styles)
+        )
+
+    @classmethod
+    def _refresh(cls, styles):
+        if not styles:
+            return
         for w in list(_STYLE_WIDGETS):
             try:
-                if getattr(w, "_style_name", "") == style_name or (
-                    getattr(w, "_bootstyle", "") and f"{getattr(w, '_bootstyle')}.TButton" == style_name
-                ):
-                    w._apply_compat_style()
-                elif isinstance(w, Treeview) and style_name in ("Treeview", "Modern.Treeview", "Treeview.Heading", "Modern.Treeview.Heading"):
-                    w._apply_compat_style()
-                elif isinstance(w, Notebook) and str(style_name).startswith("TNotebook"):
+                if cls._matches(w, styles):
                     w._apply_compat_style()
             except Exception:
                 pass

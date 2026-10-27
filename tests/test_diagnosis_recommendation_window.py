@@ -166,13 +166,15 @@ def test_admin_reviews_ambiguous_pair_without_receipt_identifiers(admin_dialog):
             "items": [{"category": "Laboratorios", "item": "LAB QA", "candidates": 2}],
         }
     }
-    dialog.items.append({"categoria": "Laboratorios", "nombre": "LAB QA"})
+    dialog.items.append({"ars_id": 1, "categoria": "Laboratorios", "nombre": "LAB QA"})
+    dialog.ars_selector.addItem("ARS QA", 1)
+    dialog.ars_selector.setCurrentIndex(dialog.ars_selector.findData(1))
     dialog._fill_pending()
     dialog.pending.selectRow(0)
     before = dialog.rules.rowCount()
     dialog.review_pending("pin")
     assert dialog.rules.rowCount() == before + 1
-    assert dialog.configuration()["rules"][-1]["item"] == "LAB QA"
+    assert dialog.configuration()["ars_rules"][-1]["item"] == "LAB QA"
 
 
 def test_admin_window_uses_application_theme_and_has_readable_columns(

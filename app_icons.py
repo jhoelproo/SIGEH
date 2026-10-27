@@ -6,6 +6,7 @@ import re
 import math
 import unicodedata
 import weakref
+from contextlib import contextmanager
 
 from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
@@ -32,6 +33,18 @@ class AppIcons(QObject):
     OBJECT_KEYS = {
         "SidebarNewItemButton": "add",
     }
+    _icon_cache: dict[tuple, QIcon] = {}
+    _refresh_depth = 0
+
+    @contextmanager
+    def batch_refresh(self, root):
+        self._refresh_depth += 1
+        try:
+            yield
+        finally:
+            self._refresh_depth -= 1
+            if not self._refresh_depth:
+                self.decorate_tree(root)
 
     # Longest/specific phrases are intentionally evaluated first.
     TEXT_KEYS = (
@@ -294,10 +307,16 @@ class AppIcons(QObject):
         )
         if not hover_color.isValid():
             hover_color = base_color
+        identity = (key, base_color.rgba(), hover_color.rgba(), size)
+        if identity in cls._icon_cache:
+            return QIcon(cls._icon_cache[identity])
         icon = QIcon()
         icon.addPixmap(cls._paint(key, base_color, size), QIcon.Normal, QIcon.Off)
         icon.addPixmap(cls._paint(key, hover_color, size), QIcon.Active, QIcon.Off)
         icon.addPixmap(cls._paint(key, QColor("#8A98A8"), size), QIcon.Disabled, QIcon.Off)
+        if len(cls._icon_cache) >= 256:
+            cls._icon_cache.clear()
+        cls._icon_cache[identity] = icon
         return icon
 
     def decorate_button(self, button) -> str:
@@ -311,9 +330,13 @@ class AppIcons(QObject):
         cleaned = _clean_button_text(button.text())
         if cleaned != button.text():
             button.setText(cleaned)
-        button.setIcon(self.icon(key, button))
-        button.setIconSize(QSize(18, 18))
-        button.setProperty("semanticIcon", key)
+        icon = self.icon(key, button)
+        if button.icon().cacheKey() != icon.cacheKey():
+            button.setIcon(icon)
+        if button.iconSize() != QSize(18, 18):
+            button.setIconSize(QSize(18, 18))
+        if button.property("semanticIcon") != key:
+            button.setProperty("semanticIcon", key)
         return key
 
     @staticmethod
@@ -378,8 +401,15 @@ class AppIcons(QObject):
         return False
 
     def eventFilter(self, watched, event):
-        if isinstance(watched, (QPushButton, QToolButton)) and self._in_scope(watched):
-            if event.type() in (QEvent.Polish, QEvent.Show, QEvent.PaletteChange, QEvent.StyleChange):
+        if self._refresh_depth:
+            return False
+        if event.type() in (
+            QEvent.Polish,
+            QEvent.Show,
+            QEvent.PaletteChange,
+            QEvent.StyleChange,
+        ):
+            if isinstance(watched, (QPushButton, QToolButton)) and self._in_scope(watched):
                 self.decorate_button(watched)
         return False
 

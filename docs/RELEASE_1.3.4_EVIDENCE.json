@@ -1,0 +1,108 @@
+{
+  "version": "1.3.4",
+  "date": "2026-10-27",
+  "test_runs": [
+    {
+      "report": "oct27-verified-tests.xml",
+      "tests": 638,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "report": "oct27-regression-tests.xml",
+      "tests": 194,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  ],
+  "passed": 832,
+  "failed": 0,
+  "skipped": 0,
+  "coverage_scope": "new and modified semantic statements",
+  "coverage": {
+    "lines_covered": 337,
+    "lines_total": 338,
+    "line_percent": 99.7,
+    "branches_covered": 107,
+    "branches_total": 108,
+    "branch_percent": 99.07
+  },
+  "quality_gate": true,
+  "new_lint_errors": 0,
+  "new_type_errors": 0,
+  "new_security_findings": 0,
+  "new_duplicate_blocks": 0,
+  "maximum_new_function_complexity": 10,
+  "package_sha256": "45a18c3075203db1877f67804fbd5e8d128f3b57752777881428b8af532bbc52",
+  "files_verified": 1823,
+  "compiled_modules_verified": 20,
+  "smoke_checks": [
+    {
+      "binary": "SIGEH.exe",
+      "test": "--self-test",
+      "exit_code": 0
+    },
+    {
+      "binary": "SIGEH_Updater.exe",
+      "test": "--help",
+      "exit_code": 0
+    },
+    {
+      "binary": "CALCULOS_QT.exe",
+      "test": "--check-v15-package",
+      "exit_code": 0
+    },
+    {
+      "binary": "CALCULOS_QT.exe",
+      "test": "--self-test-pdf",
+      "exit_code": 0
+    },
+    {
+      "binary": "CALCULOS_QT.exe",
+      "test": "--self-test-report-viewer",
+      "exit_code": 0
+    },
+    {
+      "binary": "CALCULOS_QT.exe",
+      "test": "--self-test-reports",
+      "exit_code": 0
+    }
+  ],
+  "update": {
+    "from": "1.3.3",
+    "to": "1.3.4",
+    "preserved_files": 8,
+    "all_hashes_unchanged": true,
+    "real_packaged_health_check": true,
+    "restart": "callback captured; no actual login or production connection"
+  },
+  "visual_qa": {
+    "status": "PASS",
+    "captures": [
+      "output/oct27-diagnosis-popup-light.png",
+      "output/oct27-diagnosis-popup-dark.png",
+      "output/oct27-ars-recommendations.png"
+    ],
+    "transitions_seconds": [
+      1.874448399998073,
+      1.9390472000013688
+    ]
+  },
+  "source_hashes": {
+    "CALCULOS_QT.py": "4954bfa55f010cd6b0d0d1b174038486f7609d79c9c02d459b61fc20f815e314",
+    "ADMISION_PYSIDE6_V15/qt_compat.py": "5ec61e0505f778aa957e8b692131d8e481d4ba45783c9c7098e852bd010218aa",
+    "ADMISION_PYSIDE6_V15/facturacion_tabs_pyside6.py": "c43f5baa7d376bf435b3e6b90b25c3941a881d660bae6b71f8d6e6de6ca454c0",
+    "app_icons.py": "5c70870999eefa1a452df3d22222c1ac947c4974097c4fa2e1d0a4792341703d",
+    "sigeh_visual_theme.py": "d68d865228526d01126350342564cf3d1d432f1693952cb126f4a13085bba1d6",
+    "diagnosis_recommendation_admin.py": "3e66b8ceedafbbe3c94e547b0754f7b96a2b0cb3d785a77178e8fa091d057014",
+    "diagnosis_recommendation_schema.py": "8036dfb5ec63f6b29a3ba20acdd6bca125be129598d578502bfb2bf653e6fe16",
+    "diagnosis_recommendation_store.py": "21155d8fe2edbc24463eb4bcefaf4de83e8b63684a56556bc37870d9fdf26f1a",
+    "diagnosis_recommendation_ui.py": "8e1ada298ff81bd26e6f5224c99a75424ebe6ea358fc93691956ea5583c4fc89",
+    "diagnosis_recommendations.py": "186f8599ca811029b96a38567680563dc4085a2a70d34bfcc2db7e1232b74eb6",
+    "user_permissions.py": "8e9027eeae024ed9e1f9c6bd4d037ba79075ad42a6a29bdf118643e51e1cabe6",
+    "local_receipts.py": "aa4d5ea65908d9f8381de295e2e243c81ec02f27a26fa5671cbe488f9b021efd",
+    "recommendation_config_events.py": "3e05553151cb843419b6be10c83b922b238ae72fa5db91977bb44bbea90d5700"
+  }
+}

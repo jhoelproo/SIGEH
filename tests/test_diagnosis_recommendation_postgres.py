@@ -28,6 +28,7 @@ def learning(receipts):
         con.execute(
             "UPDATE sigeh_recommendations.settings SET config='{}'::jsonb,version=0"
         )
+        con.execute("UPDATE sigeh_recommendations.config_extensions SET config='{}'::jsonb")
     return ADMIN
 
 

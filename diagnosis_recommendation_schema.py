@@ -8,6 +8,9 @@ SELECT to_regclass('sigeh_recommendations.settings') IS NOT NULL
  AND to_regclass('sigeh_recommendations.observations') IS NOT NULL
  AND to_regclass('sigeh_recommendations.evidence') IS NOT NULL
  AND to_regclass('sigeh_recommendations.changes') IS NOT NULL
+ AND to_regclass('sigeh_recommendations.config_extensions') IS NOT NULL
+ AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sigeh_recommendations.settings')
+            AND tgname='recommendation_config_changed')
  AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('sigeh_recommendations.settings')
             AND attname='generation' AND NOT attisdropped)
  AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('sigeh_recommendations.observations')
@@ -47,6 +50,12 @@ CREATE TABLE IF NOT EXISTS sigeh_recommendations.settings(
 CREATE TABLE IF NOT EXISTS sigeh_recommendations.jobs(
  receipt_id BIGINT PRIMARY KEY,touched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS sigeh_recommendations.config_extensions(
+ singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK(singleton),
+ config JSONB NOT NULL DEFAULT '{}'::jsonb CHECK(jsonb_typeof(config)='object')
+);
+ALTER TABLE sigeh_recommendations.config_extensions ENABLE ROW LEVEL SECURITY;
+INSERT INTO sigeh_recommendations.config_extensions(singleton) VALUES(TRUE) ON CONFLICT DO NOTHING;
 ALTER TABLE sigeh_recommendations.settings ADD COLUMN IF NOT EXISTS generation UUID NOT NULL DEFAULT gen_random_uuid();
 CREATE INDEX IF NOT EXISTS recommendation_jobs_recent_idx ON sigeh_recommendations.jobs(touched_at DESC,receipt_id DESC);
 CREATE TABLE IF NOT EXISTS sigeh_recommendations.observations(
@@ -97,7 +106,19 @@ BEGIN
  RETURN NULL;
 END; $$;
 REVOKE ALL ON FUNCTION sigeh_recommendations.enqueue_receipt() FROM PUBLIC;
+CREATE OR REPLACE FUNCTION sigeh_recommendations.notify_config_change()
+ RETURNS TRIGGER LANGUAGE plpgsql SECURITY INVOKER AS $$
+BEGIN
+ PERFORM pg_notify('sigeh_recommendation_config',NEW.version::text);
+ RETURN NULL;
+END; $$;
+REVOKE ALL ON FUNCTION sigeh_recommendations.notify_config_change() FROM PUBLIC;
 DO $$ BEGIN
+ IF NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='sigeh_recommendations.settings'::regclass AND tgname='recommendation_config_changed') THEN
+  CREATE TRIGGER recommendation_config_changed AFTER UPDATE OF version ON sigeh_recommendations.settings
+  FOR EACH ROW WHEN(OLD.version IS DISTINCT FROM NEW.version)
+  EXECUTE FUNCTION sigeh_recommendations.notify_config_change();
+ END IF;
  IF NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='recibos'::regclass AND tgname='recommendation_receipt_change') THEN
   CREATE TRIGGER recommendation_receipt_change
   AFTER INSERT OR DELETE OR UPDATE OF dx,specialty_snapshot,estado_facturacion,is_deleted ON recibos

@@ -4,7 +4,7 @@ from collections import deque
 from contextlib import contextmanager
 from time import perf_counter
 
-from PySide6.QtCore import QSignalBlocker, QStringListModel, QTimer
+from PySide6.QtCore import QSignalBlocker, QStringListModel, QTimer, Qt
 
 from PySide6.QtWidgets import (
     QComboBox,
@@ -57,6 +57,8 @@ def pending_rows(model, catalog):
     listed, result = set(), []
     for group in model["groups"].values():
         diagnosis = catalog.learning_label(group["diagnosis"])
+        if text_key(diagnosis) in catalog.excluded:
+            continue
         for item in group["items"]:
             if not item["candidates"]:
                 continue
@@ -80,16 +82,24 @@ def prepare_admin_data(data):
         "version": data["config"]["version"],
     }
     model = {"config": config, "groups": data["groups"], "items": data["items"]}
-    definitions = {text_key(row["name"]): row for row in config["diagnoses"]}
     catalog = DiagnosisCatalog(config)
+    definitions = {
+        text_key(row["name"]): row
+        for row in config["diagnoses"]
+        if text_key(row["name"]) not in catalog.excluded
+    }
     for source in dict.fromkeys(
         group["diagnosis"] for group in data["groups"].values()
     ):
         name = catalog.learning_label(source)
-        if text_key(name) not in catalog.aliases:
+        if (
+            text_key(name) not in catalog.aliases
+            and text_key(name) not in catalog.excluded
+        ):
             definitions.setdefault(text_key(name), {"name": name, "aliases": []})
     return {
         **model,
+        "insurers": data.get("insurers", []),
         "definitions": sorted(definitions.values(), key=lambda row: row["name"]),
         "pending_rows": pending_rows(model, catalog),
         "configuration_error": configuration_error(config),
@@ -203,6 +213,14 @@ class RecommendationAdminDialog(QDialog):
         self.pending.setEditTriggers(QTableWidget.NoEditTriggers)
         self._editable_tab(self.diagnoses, "Diagnósticos", self.add_diagnosis)
         self._editable_tab(self.rules, "Asociaciones", self.add_rule)
+        self.ars_selector = QComboBox()
+        self.ars_selector.setAccessibleName("Catálogo ARS de las asociaciones")
+        self.ars_selector.addItem("Compartido / asociaciones anteriores", 0)
+        self.ars_selector.currentIndexChanged.connect(self._apply_search)
+        scope = QHBoxLayout()
+        scope.addWidget(QLabel("Catálogo ARS:"))
+        scope.addWidget(self.ars_selector, 1)
+        self.tabs.widget(1).layout().insertLayout(0, scope)
         self._pending_tab()
         self._settings_tab()
         self.search.textChanged.connect(self._apply_search)
@@ -266,10 +284,17 @@ class RecommendationAdminDialog(QDialog):
         shown = 0
         for row, text in enumerate(self._search_cache[table]):
             matches = all(term in text for term in terms)
+            matches = matches and self._matches_ars_scope(table, row)
             if table.isRowHidden(row) == matches:
                 table.setRowHidden(row, not matches)
             shown += matches
         return shown
+
+    def _matches_ars_scope(self, table, row):
+        if table is not self.rules or not hasattr(self, "ars_selector"):
+            return True
+        ars_id = int(table.cellWidget(row, 0).property("arsId") or 0)
+        return ars_id == int(self.ars_selector.currentData() or 0)
 
     def _apply_search(self, *_args):
         if self._populating or self._closing or not hasattr(self, "pending"):
@@ -363,6 +388,7 @@ class RecommendationAdminDialog(QDialog):
         row = self.diagnoses.rowCount()
         self.diagnoses.insertRow(row)
         self.diagnoses.setItem(row, 0, QTableWidgetItem(name))
+        self.diagnoses.item(row, 0).setData(Qt.UserRole, name)
         self.diagnoses.setItem(row, 1, QTableWidgetItem("; ".join(aliases)))
         if not name:
             self._reveal_added_row(self.diagnoses, row)
@@ -376,9 +402,11 @@ class RecommendationAdminDialog(QDialog):
 
     def add_rule(self, value=None):
         value = value or {}
+        ars_id = int(value.get("ars_id", self.ars_selector.currentData()) or 0)
         row = self.rules.rowCount()
         self.rules.insertRow(row)
         self.rules.setCellWidget(row, 0, self._diagnosis_selector(value))
+        self.rules.cellWidget(row, 0).setProperty("arsId", ars_id)
         self.rules.setCellWidget(
             row, 1, combo(SPECIALTIES, value.get("specialty", SPECIALTIES[0]))
         )
@@ -387,9 +415,13 @@ class RecommendationAdminDialog(QDialog):
         item = combo([], editable=True)
         self.rules.setCellWidget(row, 3, item)
         category.currentTextChanged.connect(
-            lambda selected, item=item: self._item_options(item, selected)
+            lambda selected, item=item, ars_id=ars_id: self._item_options(
+                item, selected, ars_id=ars_id
+            )
         )
-        self._item_options(item, category.currentText(), value.get("item", ""))
+        self._item_options(
+            item, category.currentText(), value.get("item", ""), ars_id=ars_id
+        )
         self._rule_controls(row, value)
         if not value:
             self.search.clear()
@@ -435,13 +467,21 @@ class RecommendationAdminDialog(QDialog):
             signal.connect(lambda *_args: self._invalidate_search(self.rules))
         self._invalidate_search(self.rules)
 
-    def _item_options(self, widget, category, selected=""):
-        if category not in self._item_models:
-            self._item_models[category] = QStringListModel(
-                [row["nombre"] for row in self.items if row["categoria"] == category],
+    def _item_options(self, widget, category, selected="", *, ars_id=0):
+        identity = (category, 0 if category == "Medicamentos" else ars_id)
+        if identity not in self._item_models:
+            self._item_models[identity] = QStringListModel(
+                sorted(
+                    {
+                        row["nombre"]
+                        for row in self.items
+                        if row["categoria"] == category
+                        and int(row.get("ars_id") or 0) == identity[1]
+                    }
+                ),
                 self,
             )
-        widget.setModel(self._item_models[category])
+        widget.setModel(self._item_models[identity])
         widget.setCurrentText(selected)
 
     def review_pending(self, mode):
@@ -458,31 +498,68 @@ class RecommendationAdminDialog(QDialog):
                     zip(("diagnosis", "specialty", "category", "item"), values),
                     mode=mode,
                     priority=1,
+                    ars_id=int(self.ars_selector.currentData() or 0),
                 )
             )
         self.tabs.setCurrentIndex(1)
 
     def configuration(self):
         diagnoses = [
-            {
-                "name": self.diagnoses.item(row, 0).text(),
-                "aliases": self.diagnoses.item(row, 1).text().split(";"),
-            }
-            for row in range(self.diagnoses.rowCount())
+            self._diagnosis_value(row) for row in range(self.diagnoses.rowCount())
         ]
-        rules = [self._rule_value(row) for row in range(self.rules.rowCount())]
+        excluded = self._removed_diagnoses(diagnoses)
+        rules = self._retained_rules(diagnoses, excluded)
+        shared, scoped = [], []
+        for row in rules:
+            ars_id = row.pop("ars_id")
+            if ars_id:
+                scoped.append({**row, "ars_id": ars_id})
+            else:
+                shared.append(row)
         return normalize_config(
             {
                 "diagnoses": diagnoses,
-                "rules": rules,
+                "excluded_diagnoses": excluded,
+                "rules": shared,
+                "ars_rules": scoped,
                 "settings": {
                     name: field.value() for name, field in self.settings.items()
                 },
             }
         )
 
+    def _removed_diagnoses(self, diagnoses):
+        names = {text_key(row["name"]) for row in diagnoses}
+        excluded = {
+            text_key(name): name
+            for name in self.model.get("config", {}).get("excluded_diagnoses", [])
+        }
+        excluded.update(
+            {
+                key: name
+                for key, name in self._original_diagnoses.items()
+                if key not in names
+            }
+        )
+        return [name for key, name in excluded.items() if key not in names]
+
+    def _retained_rules(self, diagnoses, excluded):
+        rules = [self._rule_value(row) for row in range(self.rules.rowCount())]
+        aliases = {text_key(alias) for row in diagnoses for alias in row["aliases"]}
+        removed = {text_key(name) for name in excluded} - aliases
+        return [row for row in rules if text_key(row["diagnosis"]) not in removed]
+
+    def _diagnosis_value(self, row):
+        item = self.diagnoses.item(row, 0)
+        aliases = self.diagnoses.item(row, 1).text().split(";")
+        original = item.data(Qt.UserRole)
+        if original and text_key(original) != text_key(item.text()):
+            aliases.append(original)
+        return {"name": item.text(), "aliases": aliases}
+
     def _rule_value(self, row):
         return {
+            "ars_id": int(self.rules.cellWidget(row, 0).property("arsId") or 0),
             "diagnosis": self.rules.cellWidget(row, 0).currentText(),
             "specialty": self.rules.cellWidget(row, 1).currentText(),
             "category": self.rules.cellWidget(row, 2).currentText(),
@@ -520,6 +597,12 @@ class RecommendationAdminDialog(QDialog):
                 data = {
                     "config": config,
                     "items": items,
+                    "insurers": [
+                        dict(row)
+                        for row in con.execute(
+                            "SELECT id,nombre FROM ars ORDER BY nombre"
+                        ).fetchall()
+                    ],
                     "groups": {
                         row["change_key"][6:]: dict(row["payload"]) for row in rows
                     },
@@ -533,6 +616,18 @@ class RecommendationAdminDialog(QDialog):
             return
         data = data if "definitions" in data else prepare_admin_data(data)
         self.items = data["items"]
+        self._original_diagnoses = {
+            text_key(row["name"]): row["name"] for row in data["definitions"]
+        }
+        selected_ars = self.ars_selector.currentData()
+        with QSignalBlocker(self.ars_selector):
+            self.ars_selector.clear()
+            self.ars_selector.addItem("Compartido / asociaciones anteriores", 0)
+            for row in data.get("insurers", []):
+                self.ars_selector.addItem(row["nombre"], row["id"])
+            self.ars_selector.setCurrentIndex(
+                max(0, self.ars_selector.findData(selected_ars))
+            )
         self.model = {key: data[key] for key in ("config", "groups", "items")}
         self.version = data["config"]["version"]
         self._configuration_error = data["configuration_error"]
@@ -562,7 +657,13 @@ class RecommendationAdminDialog(QDialog):
                 (self.add_diagnosis, (value["name"], value["aliases"]))
                 for value in data["definitions"]
             ]
-            + [(self.add_rule, (value,)) for value in data["config"]["rules"]]
+            + [
+                (self.add_rule, (value,))
+                for value in [
+                    *data["config"]["rules"],
+                    *data["config"].get("ars_rules", []),
+                ]
+            ]
             + [(self._append_pending_row, (value,)) for value in data["pending_rows"]]
         )
 

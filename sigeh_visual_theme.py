@@ -3,6 +3,35 @@
 from __future__ import annotations
 
 
+def apply_diagnosis_popup_theme(view, is_dark):
+    from PySide6.QtGui import QColor, QPalette
+
+    tokens = visual_theme_tokens(bool(is_dark))
+    palette = view.palette()
+    for role, key in (
+        (QPalette.Base, "popup_bg"),
+        (QPalette.Window, "popup_bg"),
+        (QPalette.Text, "text_primary"),
+        (QPalette.WindowText, "text_primary"),
+        (QPalette.Highlight, "selection_bg"),
+        (QPalette.HighlightedText, "selection_text"),
+    ):
+        palette.setColor(role, QColor(tokens[key]))
+    view.setPalette(palette)
+    view.viewport().setPalette(palette)
+    view.viewport().setAutoFillBackground(True)
+    view.setStyleSheet(
+        f"QAbstractItemView {{background:{tokens['popup_bg']};"
+        f"color:{tokens['text_primary']};border:1px solid {tokens['border']};"
+        f"selection-background-color:{tokens['selection_bg']};"
+        f"selection-color:{tokens['selection_text']};outline:0;}}"
+        "QAbstractItemView::item {min-height:28px;padding:4px 8px;}"
+    )
+    view.viewport().setStyleSheet(
+        f"background:{tokens['popup_bg']};color:{tokens['text_primary']};"
+    )
+
+
 def visual_theme_tokens(is_dark=False):
     """Return the semantic visual contract shared by Billing and Admisión.
 

@@ -43,8 +43,15 @@ def receipt_command(job: dict[str, Any]) -> tuple[str, str]:
     payload = {field: job.get(field) for field in JOB_FIELDS}
     from authorization_validation import numeric_authorization
 
-    payload["authorization_number"] = numeric_authorization(payload["authorization_number"])
+    payload["authorization_number"] = numeric_authorization(
+        payload["authorization_number"]
+    )
     user = dict(job.get("current_user") or {})
+    from user_permissions import require_preliminary_authorization
+
+    require_preliminary_authorization(
+        user, payload["authorization_number"], payload["coverage"]
+    )
     payload["current_user"] = {field: user.get(field, "") for field in USER_FIELDS}
     _require_actor_and_patient(payload, user)
     date.fromisoformat(str(payload["date_str"]))

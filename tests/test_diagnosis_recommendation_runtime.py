@@ -89,6 +89,37 @@ def test_offline_restart_retains_suggestions_without_network(runtime):
     assert memory.value["cursor"] == 1
 
 
+def test_configuration_events_start_after_reconnect_and_stop_with_window(
+    runtime, monkeypatch
+):
+    controller, _memory, backend, _window = runtime
+    import recommendation_config_events
+
+    factory = Mock()
+    monkeypatch.setattr(
+        recommendation_config_events, "RecommendationConfigEvents", factory
+    )
+    backend.db_pool = object()
+    controller.start_config_events()
+    factory.assert_not_called()
+    backend.DB_URL = "host=localhost user=synthetic"
+    controller.start_config_events()
+    controller.start_config_events()
+    factory.assert_called_once_with(backend.DB_URL, controller)
+    factory.return_value.start.assert_called_once()
+    factory.return_value.changed.connect.assert_called_once_with(
+        controller.configuration_changed
+    )
+    refresh = Mock()
+    monkeypatch.setattr(controller, "request_sync", refresh)
+    controller.configuration_changed()
+    refresh.assert_called_once()
+    controller.stop()
+    controller.configuration_changed()
+    refresh.assert_called_once()
+    factory.return_value.stop.assert_called_once()
+
+
 def test_new_revision_is_persisted_but_empty_poll_does_not_repaint(runtime):
     controller, memory, _backend, window = runtime
     blocked = snapshot()["config"]

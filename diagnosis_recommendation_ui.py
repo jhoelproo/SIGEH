@@ -31,6 +31,7 @@ from diagnosis_recommendation_store import (
 )
 from network_retry import NetworkRetryGate
 from receipt_continuity import local_receipt_store
+from sigeh_visual_theme import apply_diagnosis_popup_theme
 
 CACHE_KEY = "diagnosis_recommendations"
 SYNC_INTERVAL_MS = 60_000
@@ -294,8 +295,15 @@ class RecommendationController(QObject):
             "Escribe para seleccionar un diagnóstico. Separa diagnósticos con «;» o « / ». Las recomendaciones utilizan los dos primeros diagnósticos distintos."
         )
         self.completion = DiagnosisCompletion(window.dx_edit, self.catalog, self)
+        self.apply_theme(bool(getattr(window, "is_dark_mode", False)))
+        theme_signal = getattr(window, "theme_toggled", None)
+        if theme_signal is not None:
+            theme_signal.connect(self.apply_theme)
         window.recommendation_labels = {}
         self.prepare_labels()
+
+    def apply_theme(self, is_dark):
+        apply_diagnosis_popup_theme(self.completion.completer.popup(), is_dark)
 
     def catalog(self):
         signature = (
@@ -310,6 +318,28 @@ class RecommendationController(QObject):
 
     def start(self):
         self.timer.start()
+        self.start_config_events()
+        self.request_sync()
+
+    def start_config_events(self):
+        if (
+            getattr(self, "config_events", None) is not None
+            or getattr(self.backend, "db_pool", None) is None
+        ):
+            return
+        dsn = getattr(self.backend, "DB_URL", "")
+        if not dsn:
+            return
+        from recommendation_config_events import RecommendationConfigEvents
+
+        self.config_events = RecommendationConfigEvents(dsn, self)
+        self.config_events.changed.connect(self.configuration_changed)
+        self.config_events.start()
+
+    def configuration_changed(self):
+        if self.closed:
+            return
+        self.retry.succeeded()
         self.request_sync()
 
     def stop(self):
@@ -317,6 +347,11 @@ class RecommendationController(QObject):
         self.timer.stop()
         self.debounce.stop()
         self.completion.stop()
+        events = getattr(self, "config_events", None)
+        if events is not None:
+            events.stop()
+            events.setParent(None)
+            events.finished.connect(events.deleteLater)
         if self.worker is not None:
             self.worker.cancel()
             self.worker.setParent(None)
@@ -330,6 +365,7 @@ class RecommendationController(QObject):
             return
         if getattr(self.backend, "db_pool", None) is None:
             return
+        self.start_config_events()
         cursor = self.model.get("cursor", 0)
         generation = self.model.get("generation", "")
         snapshot = self.model
@@ -431,6 +467,17 @@ class RecommendationController(QObject):
                 current_specialty(self.window),
                 catalogs,
                 catalog=self.catalog(),
+                ars_id=int(
+                    (
+                        self.backend.ARS_RUNTIME_CACHE.get(
+                            getattr(self.window, "current_ars", "")
+                        )
+                        or {}
+                    ).get("ars_id")
+                    or 0
+                )
+                if hasattr(self.backend, "ARS_RUNTIME_CACHE")
+                else 0,
             )
         except ValueError:
             values = {}

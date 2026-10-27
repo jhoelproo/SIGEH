@@ -2,6 +2,26 @@
 
 import json
 
+SAVE_PRELIMINARY_WITHOUT_AUTHORIZATION = "receipt.save_without_authorization"
+
+
+def require_preliminary_authorization(user, authorization, coverage, *, allowed=None):
+    from self_pay_billing import is_self_pay
+
+    if str(authorization or "").strip() or is_self_pay(coverage):
+        return
+    if allowed is None:
+        allowed = effective_permission(
+            user,
+            SAVE_PRELIMINARY_WITHOUT_AUTHORIZATION,
+            {SAVE_PRELIMINARY_WITHOUT_AUTHORIZATION},
+        )
+    if not allowed:
+        raise PermissionError(
+            "No tienes permiso para guardar preliminares sin número de autorización."
+        )
+
+
 SCHEMA_SQL = """ALTER TABLE users ADD COLUMN IF NOT EXISTS
     permission_overrides JSONB NOT NULL DEFAULT '{}'::jsonb"""
 

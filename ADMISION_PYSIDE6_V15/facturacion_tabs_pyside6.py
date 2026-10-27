@@ -8138,7 +8138,8 @@ class App:
         - Al iniciar: root.
         - Al guardar preferencias: usar forzar_todo=True.
         """
-        self._configurar_estilos_desde_preferencias()
+        with qt_compat.Style.batch():
+            self._configurar_estilos_desde_preferencias()
 
         if forzar_todo:
             self._aplicar_preferencias_a_widgets(self.root)

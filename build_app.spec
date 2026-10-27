@@ -334,6 +334,7 @@ main_hidden_imports = sorted(
             "excel_printing",
             "turn_excel_delivery",
             "admission_refresh_coordinator",
+            "recommendation_config_events",
             "patient_directory",
             "patient_seed_tool",
             "admission_database_import",

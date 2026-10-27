@@ -8,6 +8,7 @@ from diagnosis_recommendations import (
     SPECIALTIES,
     MAX_DIAGNOSES,
     build_evidence,
+    config_for_ars,
     group_key,
     model_catalog,
     normalize_config,
@@ -19,6 +20,7 @@ LOCK_KEY = "sigeh-diagnosis-recommendations-v1"
 BATCH_SIZE = 20
 DELTA_LIMIT = 100
 VALID_STATUSES = {"PENDIENTE", "FACTURADO"}
+EXTENSION_FIELDS = ("excluded_diagnoses", "ars_rules")
 
 
 def _json(value):
@@ -37,8 +39,14 @@ def load_config(con):
     row = con.execute(
         "SELECT config,version FROM sigeh_recommendations.settings WHERE singleton"
     ).fetchone()
+    extension = con.execute(
+        "SELECT config FROM sigeh_recommendations.config_extensions WHERE singleton"
+    ).fetchone()
     return {
-        **normalize_config(dict(row["config"]), preserve_conflicts=True),
+        **normalize_config(
+            {**dict(row["config"]), **dict(extension["config"])},
+            preserve_conflicts=True,
+        ),
         "version": int(row["version"]),
     }
 
@@ -65,8 +73,10 @@ def _administrator(con, actor):
     return row
 
 
-def _validate_items(con, rules):
-    requested = {(row["category"], text_key(row["item"])) for row in rules}
+def _validate_items(con, rules, previous=()):
+    requested = {
+        (row["category"], text_key(row["item"])) for row in rules if row not in previous
+    }
     if not requested:
         return
     rows = con.execute(
@@ -81,17 +91,39 @@ def _validate_items(con, rules):
 def save_config(con, value, actor, expected_version, *, audit):
     user = _administrator(con, actor)
     value = normalize_config(value)
-    _validate_items(con, value["rules"])
     con.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (LOCK_KEY,))
     current = load_config(con)
     if current["version"] != expected_version:
         raise ValueError(
             "Otro administrador cambió la configuración. Actualiza antes de guardar."
         )
+    _validate_items(con, value["rules"], current["rules"])
+    extensions = {
+        field: value.get(field, current.get(field, [])) for field in EXTENSION_FIELDS
+    }
+    value = {**value, **extensions}
+    _validate_shared_rules(value["rules"], current["rules"])
+    _validate_scoped_items(con, value["ars_rules"], current.get("ars_rules", []))
+    con.execute(
+        "UPDATE sigeh_recommendations.config_extensions SET config=%s::jsonb WHERE singleton",
+        (_json(extensions),),
+    )
     version = expected_version + 1
     con.execute(
         "UPDATE sigeh_recommendations.settings SET config=%s::jsonb,version=%s WHERE singleton",
-        (_json({**value, "normalization_version": NORMALIZATION_VERSION}), version),
+        (
+            _json(
+                {
+                    **{
+                        key: item
+                        for key, item in value.items()
+                        if key not in EXTENSION_FIELDS
+                    },
+                    "normalization_version": NORMALIZATION_VERSION,
+                }
+            ),
+            version,
+        ),
     )
     _publish(con, [{"change_key": "config", "payload": {**value, "version": version}}])
     con.execute(
@@ -108,22 +140,66 @@ def save_config(con, value, actor, expected_version, *, audit):
     return version
 
 
+def _validate_shared_rules(rules, previous):
+    def identity(row):
+        return tuple(row[key] for key in ("diagnosis", "specialty", "category", "item"))
+
+    existing = {identity(row) for row in previous}
+    if any(
+        row["category"] != "Medicamentos" and identity(row) not in existing
+        for row in rules
+    ):
+        raise ValueError("Selecciona una ARS para asociar laboratorios o imágenes.")
+
+
+def _validate_scoped_items(con, rules, previous=()):
+    rules = [row for row in rules if row not in previous]
+    if not rules:
+        return
+    rows = admin_catalog_rows(con)
+    known = {
+        (int(row["ars_id"]), row["categoria"], text_key(row["nombre"])) for row in rows
+    }
+    active = {
+        int(row[0])
+        for row in con.execute(
+            "SELECT id FROM ars WHERE is_active=1 AND billing_enabled"
+        ).fetchall()
+    }
+    for row in rules:
+        identity = (
+            0 if row["category"] == "Medicamentos" else row["ars_id"],
+            row["category"],
+            text_key(row["item"]),
+        )
+        if row["ars_id"] not in active or identity not in known:
+            raise ValueError(
+                "El ítem no pertenece al catálogo activo de la ARS seleccionada."
+            )
+
+
+def admin_catalog_rows(con):
+    return con.execute(
+        """SELECT 0 AS ars_id,'' AS ars_nombre,categoria,nombre FROM universal_items
+           WHERE categoria='Medicamentos' AND is_active=1
+           UNION SELECT a.id,a.nombre,i.categoria,i.nombre FROM ars_items i JOIN ars a ON a.id=i.ars_id
+           WHERE i.categoria IN ('Laboratorios','Imágenes') AND i.is_active=1 AND a.is_active=1 AND a.billing_enabled
+           ORDER BY ars_id,categoria,nombre"""
+    ).fetchall()
+
+
 def admin_catalog(con, actor):
     _administrator(con, actor)
-    rows = con.execute(
-        """SELECT categoria,nombre FROM universal_items WHERE categoria='Medicamentos' AND is_active=1
-           UNION SELECT categoria,nombre FROM ars_items WHERE categoria IN ('Laboratorios','Imágenes') AND is_active=1
-           ORDER BY categoria,nombre"""
-    ).fetchall()
+    rows = admin_catalog_rows(con)
     return [dict(row) for row in rows]
 
 
 def _receipt_rows(con, identities):
     return con.execute(
-        """SELECT r.id,r.dx,r.specialty_snapshot,r.estado_facturacion,r.is_deleted,
+        """SELECT r.id,r.dx,r.specialty_snapshot,r.estado_facturacion,r.is_deleted,COALESCE(a.id,0) AS ars_id,
                   COALESCE((SELECT jsonb_agg(jsonb_build_object('category',i.categoria,'item',i.nombre))
                     FROM recibo_items i WHERE i.recibo_id=r.id AND i.categoria IN ('Medicamentos','Laboratorios','Imágenes')),'[]'::jsonb) AS items
-           FROM recibos r WHERE r.id=ANY(%s)""",
+           FROM recibos r LEFT JOIN ars a ON a.nombre=r.ars WHERE r.id=ANY(%s)""",
         (identities,),
     ).fetchall()
 
@@ -146,6 +222,7 @@ def _observation(row, catalog):
         "specialty": specialty,
         "status": row["estado_facturacion"],
         "items": items,
+        "ars_id": int(row.get("ars_id") or 0),
     }
     return value
 
@@ -164,6 +241,7 @@ def _diagnosis_labels(catalog, normalized):
         text_key(label): label
         for part in catalog.split(normalized)
         if text_key(label := catalog.learning_label(part))
+        and text_key(label) not in catalog.excluded
     }
     return dict(list(unique.items())[:MAX_DIAGNOSES])
 
@@ -344,7 +422,10 @@ def _process_jobs(con, interrupted):
         {"receipt_id": row["receipt_id"], **item}
         for row in current
         for item in build_evidence(
-            known, list(row["diagnoses"]), row["specialty"], row["items"]
+            {**known, "config": config_for_ars(config, row["ars_id"])},
+            list(row["diagnoses"]),
+            row["specialty"],
+            row["items"],
         )
     ]
     _replace_observations(con, identities, current, evidence)
@@ -394,12 +475,20 @@ def synchronize(con, cursor=0, *, generation=None, interrupted=lambda: False):
         (cursor, DELTA_LIMIT),
     ).fetchall()
     return {
-        "changes": [dict(row) for row in rows],
+        "changes": _authoritative_changes(con, rows),
         "more": processed or len(rows) == DELTA_LIMIT,
         "installed": True,
         "generation": current_generation,
         "reset": reset,
     }
+
+
+def _authoritative_changes(con, rows):
+    changes = [dict(row) for row in rows]
+    for change in changes:
+        if change["change_key"] == "config":
+            change["payload"] = load_config(con)
+    return changes
 
 
 def apply_changes(model, changes):

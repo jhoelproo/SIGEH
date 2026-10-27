@@ -600,6 +600,7 @@ PERMISSION_BYPASS_VERIFICATION = "receipt.bypass_verification"
 PERMISSION_VIEW_UNINSURED = "receipt.bill_uninsured"
 PERMISSION_CONFIRM_UNLINKED = "receipt.confirm_unlinked"
 PERMISSION_BILL_OLDER_ATTENTION = "receipt.bill_older_attention"
+PERMISSION_SAVE_PRELIMINARY_WITHOUT_AUTHORIZATION = "receipt.save_without_authorization"
 
 
 BATCH_DRAFT = "BORRADOR"
@@ -11398,6 +11399,7 @@ def save_receipt_with_items(
     }
     actor_user = get_user(str(username or "")) or {"username": str(username or ""), "role": ""}
     _require_receipt_editor(actor_user, recibo_id)
+    require_preliminary_authorization_for_user(actor_user, authorization_number, coverage)
     is_backdated = max(int(is_backdated), validate_receipt_date_for_user(fecha, actor_user))
     if self_pay and normalize_role(actor_user.get("role")) not in ROLE_PERMISSIONS:
         raise PermissionError("El usuario no está autorizado para registrar cobros.")
@@ -15549,6 +15551,8 @@ for _role in (ROLE_ADMIN, ROLE_AUDIT):
 ROLE_PERMISSIONS[ROLE_ADMIN].update(
     (PERMISSION_MANAGE_USER_PERMISSIONS, PERMISSION_CHANGE_RECEIPT_ARS)
 )
+for _permissions in ROLE_PERMISSIONS.values():
+    _permissions.add(PERMISSION_SAVE_PRELIMINARY_WITHOUT_AUTHORIZATION)
 
 PERMISSION_LABELS = {
     PERMISSION_VALIDATE_RECEIPT: "Validar recibos",
@@ -15567,6 +15571,7 @@ PERMISSION_LABELS = {
     PERMISSION_VIEW_UNINSURED: "Facturar pacientes sin seguro",
     PERMISSION_CONFIRM_UNLINKED: "Confirmar recibos sin vínculo",
     PERMISSION_BILL_OLDER_ATTENTION: "Facturar atenciones de más de 48 horas",
+    PERMISSION_SAVE_PRELIMINARY_WITHOUT_AUTHORIZATION: "Guardar preliminares sin autorización",
 }
 
 
@@ -15592,6 +15597,19 @@ def user_has_permission(user: dict, permission: str) -> bool:
 
     role = normalize_role((user or {}).get("role"))
     return effective_permission(user, permission, ROLE_PERMISSIONS.get(role, set()))
+
+
+def require_preliminary_authorization_for_user(user, authorization, coverage):
+    from user_permissions import require_preliminary_authorization
+
+    require_preliminary_authorization(
+        user,
+        authorization,
+        coverage,
+        allowed=user_has_permission(
+            user, PERMISSION_SAVE_PRELIMINARY_WITHOUT_AUTHORIZATION
+        ),
+    )
 
 
 def main_module_labels_for_user(user: dict) -> tuple[str, ...]:
@@ -17858,6 +17876,7 @@ class PDFDatabaseWorker(threading.Thread):
         local_request_id = ""
         local_request_hash = ""
         try:
+            require_preliminary_authorization_for_user(current_user, authorization, coverage)
             validate_receipt_job_date(job)
             local_request_id, local_request_hash, handled = self._prepare_local_job(job)
             if handled:
@@ -35093,15 +35112,23 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Backspace"), self.cart_table).activated.connect(self.remove_current_cart_selection)
 
     def toggle_theme(self):
-        self.is_dark_mode = not self.is_dark_mode
-        store_boot_theme_preference(self.is_dark_mode)
-        QApplication.instance().setStyleSheet(get_stylesheet(self.is_dark_mode))
-        self.apply_button_colors()
-        self._restore_billing_original_icons()
-        if hasattr(self, "date_edit"):
-            self.date_edit.apply_theme(self.is_dark_mode)
-        self._refresh_cart_action_icons()
-        self.theme_toggled.emit(self.is_dark_mode)
+        with APP_ICONS.batch_refresh(self):
+            self._apply_theme_transition()
+
+    def _apply_theme_transition(self):
+        self.setUpdatesEnabled(False)
+        try:
+            self.is_dark_mode = not self.is_dark_mode
+            store_boot_theme_preference(self.is_dark_mode)
+            self.setStyleSheet(get_stylesheet(self.is_dark_mode))
+            self.apply_button_colors()
+            self._restore_billing_original_icons()
+            if hasattr(self, "date_edit"):
+                self.date_edit.apply_theme(self.is_dark_mode)
+            self._refresh_cart_action_icons()
+            self.theme_toggled.emit(self.is_dark_mode)
+        finally:
+            self.setUpdatesEnabled(True)
 
     def _restore_billing_original_icons(self):
         """Restaura los controles propios de Facturación sin mezclarlos con V15."""
@@ -37431,6 +37458,7 @@ class MainWindow(QMainWindow):
         try:
             from diagnosis_recommendation_ui import normalize_receipt_diagnosis
 
+            require_preliminary_authorization_for_user(self.current_user, self.authorization_edit.text(), form_coverage(self))
             normalize_receipt_diagnosis(self)
             dx_raw = self.dx_edit.text().strip()
             is_backdated = validate_receipt_date_for_user(date_str, self.current_user)
@@ -38964,7 +38992,6 @@ class AppController(QObject):
     def _on_theme_toggled(self, is_dark):
         self._is_dark = bool(is_dark)
         store_boot_theme_preference(self._is_dark)
-        self.app.setStyleSheet(get_stylesheet(is_dark))
 
     def _on_activity(self):
         window = self.main_window

@@ -76,22 +76,26 @@ def server(tmp_path_factory):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.run(
-        [
-            str(binary / "initdb.exe"),
-            "-D",
-            str(root / "data"),
-            "-U",
-            "tester",
-            "-A",
-            "trust",
-            "--encoding=UTF8",
-            "--no-locale",
-        ],
-        check=True,
-        capture_output=True,
-        creationflags=flags,
-    )
+    with (root / "initdb.log").open("wb") as output:
+        subprocess.run(
+            [
+                str(binary / "initdb.exe"),
+                "-D",
+                str(root / "data"),
+                "-U",
+                "tester",
+                "-A",
+                "trust",
+                "--encoding=UTF8",
+                "--no-locale",
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            creationflags=flags,
+        )
     control = [str(binary / "pg_ctl.exe"), "-D", str(root / "data")]
     subprocess.run(
         control

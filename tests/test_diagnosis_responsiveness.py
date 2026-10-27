@@ -265,7 +265,9 @@ def mock_connection(dialog, rows=()):
 
 def test_real_reload_fetches_and_prepares_in_background_once(dialog, monkeypatch):
     group = {"diagnosis": "DIAGNÓSTICO QA", "items": []}
-    mock_connection(dialog, [{"change_key": "group:qa", "payload": group}])
+    connection = mock_connection(dialog, [{"change_key": "group:qa", "payload": group}])
+    result = connection.execute.return_value
+    connection.execute.side_effect = lambda statement, *_: Mock(fetchall=lambda: []) if statement.startswith("SELECT id,nombre FROM ars") else result
     configuration = {**normalize_config({}), "version": 1}
     monkeypatch.setattr(admin, "load_config", lambda _connection: configuration)
     lookup = Mock(return_value=[])

@@ -2,14 +2,18 @@
 
 import pytest
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from psycopg2.pool import ThreadedConnectionPool
 
 import CALCULOS_QT as app
+import transfer_budget
 from tests.test_billing_consistency_postgres import server as server
 
 
 @pytest.fixture
 def receipts(server, tmp_path, monkeypatch):
+    meter = SimpleNamespace(record=lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(transfer_budget, "get_transfer_meter", lambda: meter)
     pool = ThreadedConnectionPool(1, 4, server)
     monkeypatch.setattr(app, "db_pool", pool)
     monkeypatch.setattr(app, "REPORTS_DIR", str(tmp_path / "reports"))

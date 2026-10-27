@@ -80,7 +80,49 @@ def normalize_config(value, *, preserve_conflicts=False):
     result = {"settings": settings, "diagnoses": diagnoses, "rules": []}
     catalog = DiagnosisCatalog(result)
     result["rules"] = _merged_rules(value.get("rules", []), catalog, preserve_conflicts)
+    if "excluded_diagnoses" in value:
+        result["excluded_diagnoses"] = _excluded_diagnoses(value["excluded_diagnoses"])
+    if "ars_rules" in value:
+        result["ars_rules"] = _normalized_ars_rules(
+            value["ars_rules"], catalog, preserve_conflicts
+        )
     return result
+
+
+def _excluded_diagnoses(values):
+    if not isinstance(values, list) or any(
+        not isinstance(name, str) or not text_key(name) or len(name) > 180
+        for name in values
+    ):
+        raise ValueError("La lista de diagnósticos retirados no es válida.")
+    return sorted({canonical_diagnosis(name) for name in values})
+
+
+def _normalized_ars_rules(rows, catalog, preserve_conflicts):
+    scoped = {}
+    for row in rows:
+        ars_id = _bounded_integer(row.get("ars_id"), 1, 2147483647)
+        scoped.setdefault(ars_id, []).append(row)
+    return [
+        {**row, "ars_id": ars_id}
+        for ars_id, values in sorted(scoped.items())
+        for row in _merged_rules(values, catalog, preserve_conflicts)
+    ]
+
+
+def config_for_ars(config, ars_id):
+    scoped = [row for row in config.get("ars_rules", []) if row["ars_id"] == ars_id]
+    identities = {
+        (row["diagnosis"], row["specialty"], row["category"], text_key(row["item"]))
+        for row in scoped
+    }
+    shared = [
+        row
+        for row in config.get("rules", [])
+        if (row["diagnosis"], row["specialty"], row["category"], text_key(row["item"]))
+        not in identities
+    ]
+    return {**config, "rules": [*shared, *scoped]}
 
 
 def _merged_diagnoses(rows, preserve_conflicts):
@@ -200,6 +242,10 @@ def _complete_suggestion(name):
 
 class DiagnosisCatalog:
     def __init__(self, config, learned_names=()):
+        self.excluded = {
+            text_key(canonical_diagnosis(name))
+            for name in config.get("excluded_diagnoses", [])
+        }
         self.trusted_labels = tuple(
             canonical_diagnosis(row["name"]) for row in config.get("diagnoses", [])
         )
@@ -207,6 +253,7 @@ class DiagnosisCatalog:
             text_key(name): name
             for source in (*BUILTIN_DIAGNOSES, *learned_names)
             if text_key(name := self.learning_label(source))
+            and text_key(name) not in self.excluded
         }
         self.aliases = {}
         self.canonical_keys = {
@@ -215,6 +262,8 @@ class DiagnosisCatalog:
         }
         for row in config.get("diagnoses", []):
             name = self.learning_label(row["name"])
+            if text_key(name) in self.excluded:
+                continue
             self.names[text_key(name)] = name
             for alias in [name, *row.get("aliases", [])]:
                 self.aliases.setdefault(
@@ -249,6 +298,8 @@ class DiagnosisCatalog:
     def choices(self, value):
         canonical = self._canonical_label(value)
         key = text_key(canonical)
+        if key in self.excluded and key not in self.aliases:
+            return []
         if learning_diagnosis(canonical) != canonical:
             return [canonical]
         if key in self.canonical_keys:
@@ -342,6 +393,7 @@ class DiagnosisCatalog:
             dict.fromkeys(
                 text_key(learning_diagnosis(part))
                 for part in self.split(self.normalize(value, allow_fuzzy=allow_fuzzy))
+                if text_key(learning_diagnosis(part)) not in self.excluded
             )
         )[:MAX_DIAGNOSES]
 
@@ -413,7 +465,8 @@ def _category_limit(category, settings):
     }[category]
 
 
-def recommendations(model, diagnoses, specialty, catalogs, *, catalog=None):
+def recommendations(model, diagnoses, specialty, catalogs, *, catalog=None, ars_id=0):
+    model = {**model, "config": config_for_ars(model.get("config", {}), ars_id)}
     result = {category: [] for category in CATEGORIES}
     specialty = specialty_key(specialty)
     catalog = catalog if catalog is not None else model_catalog(model)

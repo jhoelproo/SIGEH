@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QTableWidgetItem, QToolButton
 
 from diagnosis_recommendation_admin import RecommendationAdminDialog
 from diagnosis_recommendations import normalize_config
+from tests.qt_population import wait_for_population
 
 
 @pytest.fixture
@@ -58,6 +59,7 @@ def editor(monkeypatch):
             },
         }
     )
+    wait_for_population(dialog)
     dialog.show()
     application.processEvents()
     yield dialog
@@ -154,6 +156,7 @@ def test_search_survives_reload_and_parameters_disable_only_search(editor):
     editor.search.setText("cefalea")
     data = {**editor.model, "config": {**editor.configuration(), "version": 3}}
     editor._loaded(data)
+    wait_for_population(editor)
     assert editor.search.text() == "cefalea"
     assert shown_names(editor.diagnoses) == ["CEFALEA INTENSA"]
     editor.tabs.setCurrentIndex(3)
@@ -177,6 +180,7 @@ def test_learned_typos_punctuation_and_locations_share_one_admin_definition(edit
         )
     }
     editor._loaded(data)
+    wait_for_population(editor)
     assert shown_names(editor.diagnoses).count("ARTRALGIA") == 1
     assert editor.configuration()["diagnoses"][0]["name"] == "ARTRALGIA"
 
@@ -232,6 +236,7 @@ def test_legacy_conflicting_associations_remain_editable_until_explicit_resoluti
             "groups": {},
         }
     )
+    wait_for_population(editor)
     assert editor.diagnoses.rowCount() == 1
     assert editor.rules.rowCount() == 2
     assert editor.search.text() == ""
@@ -275,6 +280,7 @@ def test_custom_typo_groups_use_trusted_label_without_creating_admin_anchor(edit
             },
         }
     )
+    wait_for_population(editor)
     assert shown_names(editor.diagnoses) == ["GASTROENTERITIS"]
     assert shown_names(editor.pending) == ["GASTROENTERITIS"]
     assert editor.configuration()["diagnoses"] == [
@@ -298,6 +304,7 @@ def test_legacy_merged_alias_overflow_loads_without_loss_then_can_be_trimmed(edi
             "groups": {},
         }
     )
+    wait_for_population(editor)
     assert editor.tabs.currentIndex() == 0
     assert editor.diagnoses.rowCount() == 1
     assert "equivalencias" in editor.status.text()
