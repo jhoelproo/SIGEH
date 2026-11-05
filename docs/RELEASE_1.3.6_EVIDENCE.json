@@ -1,0 +1,165 @@
+{
+  "product": "SIGEH",
+  "version": "1.3.6",
+  "published": true,
+  "release_url": "https://github.com/jhoelproo/SIGEH/releases/tag/v1.3.6",
+  "published_at": "2026-11-05T16:33:50Z",
+  "source_commit": "5a12221769e92c7b4be14638d19ea8711cc87ab3",
+  "channel": {
+    "status": "PASS",
+    "client_source": "published 1.3.5 compiled module",
+    "client_version": "1.3.5",
+    "latest_version": "1.3.6",
+    "public_latest_api": "https://api.github.com/repos/jhoelproo/SIGEH/releases/latest",
+    "public_manifest_and_checksum": "PASS",
+    "selected_delta": "https://github.com/jhoelproo/SIGEH/releases/download/v1.3.6/SIGEH-1.3.6-from-1.3.5-delta.zip",
+    "full_sha256": "5a20d18c547248a2559745724e84c3f85924814ee087ab1cb8b7f56251d2461f",
+    "delta_sha256": "051da21feb0a981a54341246278e843b885e6edb82326b8b64f17f5e6149c5e2"
+  },
+  "assets": [
+    {
+      "name": "SIGEH-1.3.6-files-manifest.json",
+      "size": 379137,
+      "sha256": "a0b4314723dd65b1c31f69e15e890c1d534b06fc31796048c2eb5f11803c85e7",
+      "github_digest_match": true
+    },
+    {
+      "name": "SIGEH-1.3.6-from-1.3.5-delta.zip",
+      "size": 36189935,
+      "sha256": "051da21feb0a981a54341246278e843b885e6edb82326b8b64f17f5e6149c5e2",
+      "github_digest_match": true
+    },
+    {
+      "name": "SIGEH-1.3.6-manifest.json",
+      "size": 1022,
+      "sha256": "7c1371a51c7ad515d3f4dee5323633465d1213d0a9770f17efca092c3cd230d6",
+      "github_digest_match": true
+    },
+    {
+      "name": "SIGEH-1.3.6-windows-x64.zip",
+      "size": 310313515,
+      "sha256": "5a20d18c547248a2559745724e84c3f85924814ee087ab1cb8b7f56251d2461f",
+      "github_digest_match": true
+    },
+    {
+      "name": "SIGEH-1.3.6-windows-x64.zip.sha256",
+      "size": 95,
+      "sha256": "b4d6471762e02c91718cf186c21583c565a8d00a128ed3c99f3f586c37a3b80e",
+      "github_digest_match": true
+    }
+  ],
+  "package_validation": {
+    "status": "PASS",
+    "full_sha256": "5a20d18c547248a2559745724e84c3f85924814ee087ab1cb8b7f56251d2461f",
+    "delta_sha256": "051da21feb0a981a54341246278e843b885e6edb82326b8b64f17f5e6149c5e2",
+    "files_verified": 1827,
+    "full_size": 310313515,
+    "delta_size": 36189935,
+    "incremental_reconstruction": "PASS",
+    "actual_update": "PASS",
+    "packaged_health_check": "PASS",
+    "preserved_files_checked": 8,
+    "custom_logo_hospital_hours_users_history": "PASS",
+    "production_access": false
+  },
+  "build_validation": {
+    "status": "PASS",
+    "smokes": [
+      {
+        "binary": "SIGEH.exe",
+        "command": "--self-test",
+        "exit_code": 0
+      },
+      {
+        "binary": "SIGEH_Updater.exe",
+        "command": "--help",
+        "exit_code": 0
+      },
+      {
+        "binary": "CALCULOS_QT.exe",
+        "command": "--check-v15-package",
+        "exit_code": 0
+      },
+      {
+        "binary": "CALCULOS_QT.exe",
+        "command": "--self-test-pdf",
+        "exit_code": 0
+      },
+      {
+        "binary": "CALCULOS_QT.exe",
+        "command": "--self-test-report-viewer",
+        "exit_code": 0
+      },
+      {
+        "binary": "CALCULOS_QT.exe",
+        "command": "--self-test-reports",
+        "exit_code": 0
+      }
+    ],
+    "compiled_sources": {
+      "sigeh_product": true,
+      "ars_management": true,
+      "ars_manager_workspace": true,
+      "catalog_removal": true,
+      "admission_history_layout": true,
+      "admission_contract": true,
+      "admission_v15_adapter": true,
+      "admission_visit_dates": true,
+      "billing_material_cart": true,
+      "medication_material_dialog": true,
+      "ADMISION_PYSIDE6_V15/facturacion_tabs_pyside6.py": true,
+      "ADMISION_PYSIDE6_V15/qt_compat.py": true,
+      "CALCULOS_QT": true
+    },
+    "files": 1827,
+    "sha256": "e19f6c031fec69de4d4139c6d4cf15b5300d547de93ac62452e94ddd0482a4fa",
+    "release_guard": "PASS"
+  },
+  "tests": {
+    "release": {
+      "passed": 133,
+      "failed": 0,
+      "skipped": 0
+    },
+    "functional_regression": {
+      "initial_passed": 678,
+      "initial_subtests_passed": 29,
+      "setup_errors_resolved_by_rerun": 4,
+      "rerun_passed": 4
+    },
+    "final_admission_passed": 136,
+    "final_ui_passed": 17,
+    "final_history_passed": 26
+  },
+  "changed_code_coverage": {
+    "lines_covered": 615,
+    "lines_total": 616,
+    "line_percent": 99.84,
+    "branches_covered": 146,
+    "branches_total": 150,
+    "branch_percent": 97.33
+  },
+  "version_constant_coverage": {
+    "status": "PASS",
+    "scope": "APP_VERSION changed constant",
+    "lines_covered": 1,
+    "lines_total": 1,
+    "line_percent": 100,
+    "branches": "N/A: constant assignment"
+  },
+  "quality": {
+    "functional_gate": true,
+    "release_gate": true,
+    "new_lint_errors": 0,
+    "new_type_errors": 0,
+    "new_security_findings": 0,
+    "maximum_new_function_complexity": 10,
+    "new_duplicate_blocks": 0
+  },
+  "scope": {
+    "main_branch_overwritten": false,
+    "production_data_mutations": false,
+    "physical_multi_station_test": "NO VERIFICADO: independent database connections tested"
+  },
+  "final_status": "APROBADO PARA ENTREGA"
+}

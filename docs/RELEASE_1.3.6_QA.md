@@ -99,4 +99,10 @@ Evidencia: `release-136-build-validation.json`, `release-136-package-validation.
 
 Sin fallos pendientes detectados en el alcance validado. Permanecen avisos heredados de deprecación de PyPDF2/ttkbootstrap. No se afirma una prueba física simultánea en dos estaciones del hospital ni una nueva prueba de impresora, cuya lógica no cambió en esta entrega.
 
-El código de la release se etiqueta desde la rama validada `codex/admission-ars-materials-nov04`; la rama remota `main`, con una línea de desarrollo anterior diferente, se conserva sin sobrescritura. La publicación estable y la detección desde 1.3.5 se verifican después de subir todos los assets.
+El código de la release se etiqueta desde la rama validada `codex/admission-ars-materials-nov04`; la rama remota `main`, con una línea de desarrollo anterior diferente, se conserva sin sobrescritura.
+
+## PUBLICACIÓN VERIFICADA
+
+[SIGEH 1.3.6](https://github.com/jhoelproo/SIGEH/releases/tag/v1.3.6) publicada como estable y última versión. Los cinco assets están completos y sus tamaños y SHA-256 calculados por GitHub coinciden con los locales. El cliente real extraído del paquete publicado 1.3.5 consulta el canal público, detecta 1.3.6, valida manifest/checksum y selecciona el incremental correcto. Commit de código etiquetado: `5a12221769e92c7b4be14638d19ea8711cc87ab3`.
+
+Evidencia persistida: [RELEASE_1.3.6_EVIDENCE.json](RELEASE_1.3.6_EVIDENCE.json). No se reemplazó el paquete después de validarlo.
