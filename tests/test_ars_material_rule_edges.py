@@ -14,7 +14,7 @@ def test_untracked_rows_and_deleted_materials_preserve_manual_choice(cart):
     cart.material_cart.finish_add("ABSENT")
     cart.insert_or_increment_cart_item("Materiales", "GUANTES", 2, 1)
     edit(cart, "GUANTES", 3, "Materiales")
-    assert cart.material_cart.manual_quantities == {}
+    assert cart.material_cart.manual_quantities == {"GUANTES": 3}
     add(cart, "UNCONFIGURED", 1)
     remove(cart, "UNCONFIGURED")
     add(cart, "MED B", 1)
@@ -55,13 +55,13 @@ def selection_context():
     return context, item
 
 
-def test_unconfigured_selection_preserves_legacy_helpers(monkeypatch):
+def test_unconfigured_selection_keeps_only_gloves_automation(monkeypatch):
     monkeypatch.setattr(app, "FloatingToast", Mock())
     context, item = selection_context()
     app.MainWindow._add_catalog_selection(context, "Medicamentos", item)
     context.maybe_auto_add_guantes.assert_called_once_with("Medicamentos")
-    context.maybe_auto_add_bajante_cateter.assert_called_once_with("MED QA")
-    context.maybe_prompt_mascarilla.assert_called_once_with("Medicamentos", "MED QA")
+    context.maybe_auto_add_bajante_cateter.assert_not_called()
+    context.maybe_prompt_mascarilla.assert_not_called()
     context.material_cart.finish_add.assert_not_called()
 
 

@@ -24,6 +24,35 @@ def date_variants(value):
     )
 
 
+def history_date_range(value):
+    values = value if isinstance(value, (list, tuple)) else (value, value)
+    if len(values) != 2:
+        raise ValueError("Indica la fecha inicial y la final.")
+    first, last = (service_date(item) for item in values)
+    if last < first:
+        raise ValueError("La fecha final debe ser igual o posterior a la inicial.")
+    return first.isoformat(), last.isoformat()
+
+
+def history_date_sql(column):
+    if column not in {"fecha", "p.service_date"}:
+        raise ValueError("Columna de fecha no permitida.")
+    return (
+        f"(CASE WHEN SUBSTR({column},5,1)='-' THEN SUBSTR({column},1,10) "
+        f"ELSE SUBSTR({column},7,4)||'-'||SUBSTR({column},4,2)||'-'||SUBSTR({column},1,2) END)"
+    )
+
+
+def history_date_predicate(mode, value, column, placeholder):
+    if placeholder not in {"?", "%s"} or column not in {"fecha", "p.service_date"}:
+        raise ValueError("Filtro de fecha no permitido.")
+    if mode == "Entre fechas":
+        return history_date_sql(
+            column
+        ) + f" BETWEEN {placeholder} AND {placeholder}", history_date_range(value)
+    return column + " IN (" + ",".join([placeholder] * 3) + ")", date_variants(value)
+
+
 def visit_moment(data):
     selected = service_date(
         data.get("Fecha") or data.get("fecha") or data.get("service_date")

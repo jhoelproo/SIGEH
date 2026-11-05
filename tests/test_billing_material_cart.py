@@ -71,18 +71,18 @@ def remove(cart, name, category="Medicamentos"):
     cart.cart_table.removeRow(cart.cart_table.row(item))
 
 
-def test_proportional_add_increment_edit_and_remove(cart):
+def test_single_material_add_increment_edit_and_remove(cart):
     add(cart, "MED A", 3)
-    assert quantity(cart, "Materiales", "GUANTES") == 6
+    assert quantity(cart, "Materiales", "GUANTES") == 1
     add(cart, "MED A", 2)
-    assert quantity(cart, "Materiales", "GUANTES") == 10
+    assert quantity(cart, "Materiales", "GUANTES") == 1
     edit(cart, "MED A", 1)
-    assert quantity(cart, "Materiales", "GUANTES") == 2
+    assert quantity(cart, "Materiales", "GUANTES") == 1
     edit(cart, "MED A", 300)
-    assert quantity(cart, "Materiales", "GUANTES") == 600
-    assert quantity(cart, "Materiales", "JERINGA") == 300
+    assert quantity(cart, "Materiales", "GUANTES") == 1
+    assert quantity(cart, "Materiales", "JERINGA") == 1
     cart.update_totals()
-    assert cart.lbl_total.text() == "Total: RD$ 5,100.00"
+    assert cart.lbl_total.text() == "Total: RD$ 3,005.00"
     remove(cart, "MED A")
     assert cart.cart_table.rowCount() == 0
 
@@ -91,34 +91,33 @@ def test_shared_materials_keep_manual_floor_and_other_medication(cart):
     cart.insert_or_increment_cart_item("Materiales", "GUANTES", 2, 5)
     add(cart, "MED A", 2)
     add(cart, "MED B", 3)
-    assert quantity(cart, "Materiales", "GUANTES") == 18
+    assert quantity(cart, "Materiales", "GUANTES") == 5
     edit(cart, "GUANTES", 20, "Materiales")
     remove(cart, "MED A")
-    assert quantity(cart, "Materiales", "GUANTES") == 16
+    assert quantity(cart, "Materiales", "GUANTES") == 20
     remove(cart, "MED B")
-    assert quantity(cart, "Materiales", "GUANTES") == 7
+    assert quantity(cart, "Materiales", "GUANTES") == 20
 
 
 def test_historical_quantity_is_not_retroactively_charged(cart):
     cart.insert_or_increment_cart_item("Medicamentos", "MED A", 10, 5)
     add(cart, "MED A", 2)
-    assert quantity(cart, "Materiales", "GUANTES") == 4
+    assert quantity(cart, "Materiales", "GUANTES") == 1
     edit(cart, "MED A", 4)
     assert quantity(cart, "Materiales", "GUANTES") == 0
     remove(cart, "MED A")
     assert cart.cart_table.rowCount() == 0
 
 
-def test_limit_rejects_atomic_add_and_reverts_quantity_editor(cart):
+def test_existing_material_at_limit_is_not_incremented_by_medication(cart):
+    cart.insert_or_increment_cart_item("Materiales", "GUANTES", 2, 1000000)
     add(cart, "MED A", 1)
-    cart.insert_or_increment_cart_item("Materiales", "GUANTES", 2, 999998)
+    add(cart, "MED A", 1)
+    edit(cart, "MED A", 300)
+    assert quantity(cart, "Medicamentos", "MED A") == 300
     assert quantity(cart, "Materiales", "GUANTES") == 1000000
-    with pytest.raises(ValueError, match="máximo"):
-        add(cart, "MED A", 1)
-    assert quantity(cart, "Medicamentos", "MED A") == 1
-    edit(cart, "MED A", 2)
-    assert quantity(cart, "Medicamentos", "MED A") == 1
-    assert cart.errors and quantity(cart, "Materiales", "JERINGA") == 1
+    assert quantity(cart, "Materiales", "JERINGA") == 1
+    assert not cart.errors
 
 
 @pytest.mark.parametrize("active,prices", [(False, {"GUANTES": 2}), (True, {})])
@@ -152,7 +151,7 @@ def test_manual_delete_and_material_without_editor_callback(cart):
     add(cart, "MED B", 1)
     remove(cart, "GUANTES", "Materiales")
     edit(cart, "MED B", 2)
-    assert quantity(cart, "Materiales", "GUANTES") == 3
+    assert quantity(cart, "Materiales", "GUANTES") == 1
     remove(cart, "MED B")
     assert cart.cart_table.rowCount() == 0
 
@@ -163,4 +162,4 @@ def test_other_category_does_not_consume_medication_allocation(cart):
     row = cart.material_cart.row("Procedimientos", "MED B")
     cart.material_cart.quantity_changed(row, 2)
     remove(cart, "MED B", "Procedimientos")
-    assert quantity(cart, "Materiales", "GUANTES") == 3
+    assert quantity(cart, "Materiales", "GUANTES") == 1

@@ -8,7 +8,7 @@ las dependencias que ya pertenecen a la aplicación principal.
 from __future__ import annotations
 
 from admission_specialty import with_resolved_specialty
-from admission_visit_dates import current_turn_mode, date_variants
+from admission_visit_dates import current_turn_mode
 from network_retry import NetworkRetryGate
 
 import importlib
@@ -2253,6 +2253,32 @@ class _HybridDatabaseProxy:
         """Snapshot ya adoptado en memoria; nunca consulta red ni SQLite."""
         return dict(self._runtime.state())
 
+    def listar_ars_conteo(self):
+        from ars_management import current_insurer_counts
+
+        if self._runtime.offline:
+            return self._database.listar_ars_conteo()
+        with self._runtime.host.connection_factory() as con:
+            return current_insurer_counts(con)
+
+    def reemplazar_ars_global(self, source, destination):
+        from ars_management import replace_current_insurer
+        from CALCULOS_QT import user_is_admin
+
+        if self._runtime.offline:
+            raise RuntimeError("Conecta la estación antes de cambiar ARS compartidas.")
+        with self._runtime.host.connection_factory() as con:
+            return replace_current_insurer(
+                con,
+                source,
+                destination,
+                self._runtime.current_user,
+                allowed=user_is_admin,
+            )
+
+    def eliminar_ars_global(self, source):
+        return self.reemplazar_ars_global(source, "SIN SEGURO")
+
     def resumen_turno_actual(self) -> dict[str, Any]:
         """Returns the latest snapshot without blocking the Qt event loop."""
         with self._summary_lock:
@@ -2743,9 +2769,14 @@ class _HybridDatabaseProxy:
             where.append("p.coverage_status='UNINSURED_DECLARED'")
         if mode == "Hoy":
             where.append("p.service_date=CURRENT_DATE::TEXT")
-        if mode == "Por fecha":
-            where.append("p.service_date IN (%s,%s,%s)")
-            params.extend(date_variants(values.get("fecha_txt")))
+        if mode in {"Entre fechas", "Por fecha"}:
+            from admission_visit_dates import history_date_predicate
+
+            clause, dates = history_date_predicate(
+                mode, values.get("fecha_txt"), "p.service_date", "%s"
+            )
+            where.append(clause)
+            params.extend(dates)
         specialty = str(values.get("especialidad") or "").strip()
         if mode == "Por especialidad" and specialty and specialty != "(TODAS)":
             where.append("UPPER(COALESCE(p.specialty,''))=UPPER(%s)")

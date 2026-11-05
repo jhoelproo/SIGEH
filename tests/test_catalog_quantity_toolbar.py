@@ -62,9 +62,7 @@ def test_moved_quantity_keeps_arrows_limits_and_direct_editing(main_window):
     assert window.qty.value() == 299
 
 
-def test_row_add_uses_top_quantity_and_preserves_material_scaling(
-    main_window, monkeypatch
-):
+def test_row_add_uses_top_quantity_and_adds_material_once(main_window, monkeypatch):
     window = main_window
     window.universal["Medicamentos"] = {"MED QA": 10}
     window.universal["Materiales"] = {"JERINGA QA": 2}
@@ -78,5 +76,5 @@ def test_row_add_uses_top_quantity_and_preserves_material_scaling(
     listing = window.source_lists["Medicamentos"]
     listing.itemWidget(listing.item(0)).findChild(QPushButton, "DesignAdd").click()
     assert window.material_cart._quantity("Medicamentos", "MED QA") == 3
-    assert window.material_cart._quantity("Materiales", "JERINGA QA") == 6
+    assert window.material_cart._quantity("Materiales", "JERINGA QA") == 1
     assert window.qty.value() == 1

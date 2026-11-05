@@ -29,21 +29,21 @@ def test_explicit_materials_override_legacy_helpers_and_follow_quantity(
         ),
         helpers,
     ):
-        monkeypatch.setattr(window, name, helper)
+        monkeypatch.setattr(window, name, helper, raising=False)
     window.tabs.setCurrentIndex(app.ALL_CATEGORIES.index("Medicamentos"))
     window.refresh_picker()
     window.source_lists["Medicamentos"].setCurrentRow(0)
     window.qty.setValue(3)
     window.add_selected_item()
     assert window.material_cart._quantity("Medicamentos", "MED QA") == 3
-    assert window.material_cart._quantity("Materiales", "JERINGA QA") == 6
-    helpers[0].assert_not_called()
+    assert window.material_cart._quantity("Materiales", "JERINGA QA") == 1
+    helpers[0].assert_called_once()
     helpers[1].assert_not_called()
     helpers[2].assert_called_once()
     helpers[3].assert_not_called()
     row = window.material_cart.row("Medicamentos", "MED QA")
     window._cart_quantity_editor(row).setValue(4)
-    assert window.material_cart._quantity("Materiales", "JERINGA QA") == 8
+    assert window.material_cart._quantity("Materiales", "JERINGA QA") == 1
     for width, height in ((1280, 680), (1920, 1000)):
         window.resize(width, height)
         QTest.qWait(150)

@@ -1,12 +1,44 @@
-"""Track only consumables added by this draft, preserving manual quantities."""
+"""Add configured consumables once, retaining materials chosen by the operator."""
 
-from PySide6.QtCore import QSignalBlocker
+from billing_item_rules import MAX_MEDICATION_QUANTITY
+from monthly_candidate_search import normalized_name
 
-from billing_item_rules import (
-    MAX_MATERIAL_QUANTITY,
-    MAX_MEDICATION_QUANTITY,
-    MaterialAllocation,
-)
+
+def mask_size(name):
+    label = normalized_name(name)
+    if "mascarilla" not in label:
+        return ""
+    if any(token in label for token in ("pediatr", "infantil", "nino")):
+        return "pediatric"
+    return "adult" if "adult" in label else ""
+
+
+def material_matches_specialty(name, specialty):
+    size = mask_size(name)
+    expected = "pediatric" if "pediatr" in normalized_name(specialty) else "adult"
+    return not size or size == expected
+
+
+def specialty_materials(materials, specialty):
+    matching = [
+        item
+        for item in materials
+        if material_matches_specialty(item["name"], specialty)
+    ]
+    masks = [item for item in matching if "mascarilla" in normalized_name(item["name"])]
+    selected = preferred_mask(masks)
+    return [item for item in matching if item not in masks or item is selected]
+
+
+def preferred_mask(masks):
+    return next((item for item in masks if mask_size(item["name"])), None) or next(
+        iter(masks), None
+    )
+
+
+def consumable_family(name):
+    label = normalized_name(name)
+    return next((family for family in ("mascarilla", "guante") if family in label), "")
 
 
 class MedicationMaterialCart:
@@ -16,11 +48,13 @@ class MedicationMaterialCart:
         self.rules = {}
         self.allocations = {}
         self.manual_quantities = {}
+        self._automatic = set()
         self._updating = False
 
     def reset(self):
         self.allocations.clear()
         self.manual_quantities.clear()
+        self._automatic.clear()
 
     def row(self, category, name):
         table = self.window.cart_table
@@ -38,35 +72,49 @@ class MedicationMaterialCart:
         row = self.row(category, name)
         return self.window._cart_quantity_value(row) if row >= 0 else 0
 
+    def _has_material(self, name):
+        if self._quantity("Materiales", name) > 0:
+            return True
+        family = consumable_family(name)
+        table = self.window.cart_table
+        return bool(family) and any(
+            table.item(row, 0).text().endswith("Materiales")
+            and consumable_family(table.item(row, 1).text()) == family
+            and self.window._cart_quantity_value(row) > 0
+            for row in range(table.rowCount())
+        )
+
     def prepare_add(self, name, quantity):
         if name not in self.rules:
             return False
         selected = self._available_materials(name)
         previous = self._quantity("Medicamentos", name)
-        allocation = self.allocations.get(name) or MaterialAllocation(
-            selected, baseline=previous
+        self.allocations.setdefault(
+            name, {"baseline": previous, "quantity": previous, "materials": selected}
         )
-        target = min(MAX_MEDICATION_QUANTITY, previous + quantity)
-        self._validate(allocation.preview(target))
-        self.allocations[name] = allocation
-        for material in allocation.materials:
-            self.manual_quantities.setdefault(
-                material, self._quantity("Materiales", material)
-            )
         return True
 
     def _available_materials(self, medication):
         prices = self.window.universal.get("Materiales", {})
-        available = {}
-        for material in self.rules[medication]:
+        selected = []
+        for material in specialty_materials(self.rules[medication], self._specialty()):
             name = material["name"]
-            if material["active"] and name in prices:
-                available[name] = material["units"]
-            else:
+            if not material["active"] or name not in prices:
                 raise ValueError(
                     f"Material vinculado no disponible: {name}. Revisa el catálogo."
                 )
-        return available
+            selected.append(name)
+        return selected
+
+    def _specialty(self):
+        attention = getattr(self.window, "current_admission_attention", None) or {}
+        return (
+            attention.get("specialty")
+            or attention.get("specialty_snapshot")
+            or attention.get("especialidad")
+            or attention.get("hoja")
+            or getattr(self.window, "_editing_specialty_snapshot", "")
+        )
 
     def finish_add(self, name):
         row = self.row("Medicamentos", name)
@@ -79,80 +127,46 @@ class MedicationMaterialCart:
         table = self.window.cart_table
         name = table.item(row, 1).text()
         if table.item(row, 0).text().endswith("Materiales"):
-            self._manual_quantity_changed(row, name, quantity)
-            return quantity
-        if not table.item(row, 0).text().endswith("Medicamentos"):
-            return quantity
-        allocation = self.allocations.get(name)
-        if allocation is None:
-            return quantity
-        try:
-            self._validate(allocation.preview(quantity))
-        except ValueError as error:
-            self.report_error(str(error))
-            self._set_quantity(row, allocation.quantity)
-            return allocation.quantity
-        self._apply(allocation.change(quantity))
+            self.manual_quantities[name] = quantity
+            self._automatic.discard(name)
+        elif (
+            table.item(row, 0).text().endswith("Medicamentos")
+            and name in self.allocations
+        ):
+            self.allocations[name]["quantity"] = min(MAX_MEDICATION_QUANTITY, quantity)
+            self._reconcile()
         return quantity
-
-    def _manual_quantity_changed(self, row, name, quantity):
-        if name in self.manual_quantities:
-            previous = int(self.window.cart_table.item(row, 2).text())
-            self.manual_quantities[name] = max(
-                0, self.manual_quantities[name] + quantity - previous
-            )
 
     def removing(self, row):
         table = self.window.cart_table
         name = table.item(row, 1).text()
         if table.item(row, 0).text().endswith("Materiales"):
             self.manual_quantities.pop(name, None)
-            return
-        if not table.item(row, 0).text().endswith("Medicamentos"):
-            return
-        allocation = self.allocations.pop(name, None)
-        if allocation is not None:
-            self._apply(allocation.change(0))
+            self._automatic.discard(name)
+        elif table.item(row, 0).text().endswith("Medicamentos"):
+            self.allocations.pop(name, None)
+            self._reconcile()
 
-    def _validate(self, deltas):
-        for material, quantity in deltas.items():
-            if (
-                self._quantity("Materiales", material) + quantity
-                > MAX_MATERIAL_QUANTITY
-            ):
-                raise ValueError(
-                    "La cantidad de materiales supera el máximo del recibo."
-                )
-
-    def _set_quantity(self, row, quantity):
-        editor = self.window._cart_quantity_editor(row)
-        blocker = QSignalBlocker(editor)
-        editor.setValue(quantity)
-        del blocker
-
-    def _apply(self, deltas):
+    def _reconcile(self):
+        required = {
+            name
+            for allocation in self.allocations.values()
+            if allocation["quantity"] > allocation["baseline"]
+            for name in allocation["materials"]
+        }
         self._updating = True
         try:
-            for name, delta in deltas.items():
-                self._apply_material(name, delta)
+            for name in self._automatic - required:
+                row = self.row("Materiales", name)
+                if row >= 0:
+                    self.window.cart_table.removeRow(row)
+            self._automatic.intersection_update(required)
+            for name in sorted(required):
+                if not self._has_material(name):
+                    price = self.window.universal["Materiales"][name]
+                    self.window.insert_or_increment_cart_item(
+                        "Materiales", name, price, 1
+                    )
+                    self._automatic.add(name)
         finally:
             self._updating = False
-
-    def _apply_material(self, name, delta):
-        row = self.row("Materiales", name)
-        if delta > 0:
-            self.manual_quantities.setdefault(name, self._quantity("Materiales", name))
-            price = self.window.universal["Materiales"][name]
-            self.window.insert_or_increment_cart_item("Materiales", name, price, delta)
-        elif row >= 0:
-            quantity = max(
-                self.manual_quantities.get(name, 0),
-                self._quantity("Materiales", name) + delta,
-            )
-            if quantity <= 0:
-                self.window.cart_table.removeRow(row)
-            else:
-                self._set_quantity(row, quantity)
-                self.window._cart_quantity_changed(
-                    self.window._cart_quantity_editor(row), quantity, recalculate=False
-                )

@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from billing_item_rules import MAX_MATERIAL_UNITS
 from monthly_candidate_search import normalized_name
 
 
@@ -34,7 +33,7 @@ class MedicationMaterialDialog(QDialog):
         self.title.setObjectName("ModernTitle")
         layout.addWidget(self.title)
         hint = QLabel(
-            "Selecciona los materiales y las unidades por cada unidad del medicamento. Se añadirán al recibo automáticamente. Sin selección, este medicamento no añadirá materiales."
+            "Selecciona los materiales: se añadirá una unidad por recibo, sin duplicar los que ya estén. Puedes vincular ambas mascarillas: Pediatría usará la pediátrica; las otras especialidades, la de adulto."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -45,7 +44,7 @@ class MedicationMaterialDialog(QDialog):
         self.table = QTableWidget(0, 4)
         self.table.setObjectName("ModernDataTable")
         self.table.setHorizontalHeaderLabels(
-            ("Usar", "Material", "Precio", "Unidades por medicamento")
+            ("Usar", "Material", "Precio", "Una unidad por recibo")
         )
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         for column in (0, 2, 3):
@@ -109,8 +108,8 @@ class MedicationMaterialDialog(QDialog):
         )
         quantity = QSpinBox()
         quantity.setMinimumHeight(36)
-        quantity.setRange(1, MAX_MATERIAL_UNITS)
-        quantity.setValue(max(1, int(material["units"])))
+        quantity.setRange(1, 1)
+        quantity.setValue(1)
         quantity.setEnabled(checkbox.checkState() == Qt.Checked)
         self.table.setCellWidget(row, 3, quantity)
 

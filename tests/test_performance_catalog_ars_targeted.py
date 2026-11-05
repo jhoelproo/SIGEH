@@ -64,7 +64,9 @@ def test_failed_claim_has_bounded_central_diagnosis(monkeypatch):
         },
     )
     assert result is None
-    assert len(connection.calls) == 3  # reservation, diagnostic timeout, diagnostic SELECT
+    assert (
+        len(connection.calls) == 3
+    )  # reservation, diagnostic timeout, diagnostic SELECT
     assert "INSERT INTO admission_billing_claims" in connection.calls[0][0]
     assert "ELIGIBILITY" not in connection.calls[2][0]  # SQL, not a second mutation
     assert connection.calls[2][0].lstrip().startswith("SELECT p.*")
@@ -107,7 +109,9 @@ def test_action_history_has_exact_nine_headers(monkeypatch, qapp):
 
 def test_ars_audit_uses_structured_ars_column(monkeypatch):
     captured = {}
-    monkeypatch.setattr(app, "log_action", lambda *args, **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(
+        app, "log_action", lambda *args, **kwargs: captured.update(kwargs)
+    )
     app.log_ars_item_action(
         {"username": "admin", "role": "administrador"},
         "ITEM_ARS_ACTUALIZADO",
@@ -120,12 +124,10 @@ def test_ars_audit_uses_structured_ars_column(monkeypatch):
 
 def test_catalog_dialog_rejects_non_admin(qapp):
     with pytest.raises(PermissionError):
-        app.UniversalCatalogAdminDialog(
-            {"username": "aux", "role": "auxiliar"}
-        )
+        app.UniversalCatalogAdminDialog({"username": "aux", "role": "auxiliar"})
 
 
-def test_ars_dialog_uses_available_1080p_height(monkeypatch, qapp):
+def test_ars_dialog_uses_compact_tabs_within_available_1080p_height(monkeypatch, qapp):
     from PySide6.QtCore import QRect
     from PySide6.QtWidgets import QWidget
 
@@ -143,9 +145,9 @@ def test_ars_dialog_uses_available_1080p_height(monkeypatch, qapp):
         {"username": "admin", "role": "administrador"}, parent
     )
     try:
-        assert dialog.height() >= 990
-        assert dialog.height() <= 1008
-        assert dialog.width() <= 1888
+        assert dialog.height() == 760
+        assert dialog.width() <= 1180
+        assert dialog.workspace.tabs.count() == 4
     finally:
         dialog.close()
         parent.close()

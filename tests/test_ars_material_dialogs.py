@@ -76,10 +76,10 @@ def test_material_filter_keeps_hidden_selection_and_saves_quantities(material_di
     dialog.search.setText("cateter")
     assert dialog.table.isRowHidden(0)
     assert not dialog.table.isRowHidden(1)
-    assert dialog.quantities() == {1: 2, 2: 3}
+    assert dialog.quantities() == {1: 1, 2: 1}
     dialog.save_button.click()
     settle(dialog)
-    save.assert_called_once_with(10, {1: 2, 2: 3})
+    save.assert_called_once_with(10, {1: 1, 2: 1})
     assert dialog.saved
     assert dialog.save_button.isEnabled()
 

@@ -714,6 +714,7 @@ def batch_status_label(value) -> str:
 
 
 def normalize_monthly_ars_name(value) -> str:
+    value = canonicalize_ars(value) or value
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
 
 
@@ -4621,29 +4622,16 @@ def get_security_question(username: str):
         return row["security_question"] if row else ""
 
 def ars_list():
+    from ars_management import selectable_insurer_names
+
     with db_connect() as con:
-        cur = con.execute(
-            "SELECT nombre FROM ars "
-            "WHERE is_active=1 AND COALESCE(billing_enabled,TRUE)=TRUE "
-            "ORDER BY nombre"
-        )
-        names = {
-            str(r["nombre"] or "").strip()
-            for r in cur.fetchall()
-            if medication_ars_is_selectable(r["nombre"])
-        }
+        rows = con.execute("SELECT nombre,is_active,billing_enabled FROM ars ORDER BY nombre").fetchall()
     try:
-        names.update(
-            name
-            for name in AdmissionReadOnlyRepository().list_canonical_ars()
-            if medication_ars_is_selectable(name)
-        )
+        admission_names = AdmissionReadOnlyRepository().list_canonical_ars()
     except AdmissionBridgeError as exc:
         write_runtime_log(f"Catálogo ARS de Admisión no disponible: {exc}")
-    return sorted(
-        (name for name in names if medication_ars_is_selectable(name)),
-        key=str.casefold,
-    )
+        admission_names = []
+    return selectable_insurer_names(rows, admission_names, medication_ars_is_selectable)
 
 
 class HonorariumPromptSettingsCache:
@@ -4768,6 +4756,7 @@ def refresh_billing_material_catalog():
         }
         for category in UNIVERSAL_CATEGORIES
     }
+    data["ars_names"] = ars_list()
     return data
 
 
@@ -5022,8 +5011,46 @@ def upsert_ars(nombre: str, sala: float = 0.0, consulta: float = 0.0):
             (nombre, float(sala), float(consulta)),
         )
 
-def delete_ars(nombre: str):
-    with db_connect() as con: con.execute("UPDATE ars SET is_active=0 WHERE nombre=%s", (nombre,))
+def delete_ars(nombre: str, current_user):
+    from billing_item_rule_store import _administrator
+
+    with db_connect() as con:
+        user = _administrator(con, current_user, user_is_admin)
+        con.execute("UPDATE ars SET is_active=0 WHERE nombre=%s", (nombre,))
+        con.execute(
+            "UPDATE billing_pricing_settings SET version=version+1,updated_at=NOW() WHERE setting_key='medication_markup_percent'"
+        )
+        _audit_billing_item_rule(
+            con, user, "ARS_DISABLED", "ars", nombre, {"ars": nombre}
+        )
+
+
+def preview_ars_merge(source, destination, current_user):
+    from ars_management import merge_preview
+    from billing_item_rule_store import _administrator
+
+    if not user_is_admin(current_user):
+        raise PermissionError("Solo el administrador puede fusionar ARS.")
+    with db_connect() as con:
+        _administrator(con, current_user, user_is_admin)
+        return merge_preview(con, source, destination)
+
+
+def merge_billing_insurers(source, destination, current_user, token):
+    from ars_management import merge_equivalent_ars
+
+    with db_connect() as con:
+        result = merge_equivalent_ars(
+            con,
+            source,
+            destination,
+            current_user,
+            allowed=user_is_admin,
+            audit=_audit_billing_item_rule,
+            expected_token=token,
+        )
+    ARS_RUNTIME_CACHE.invalidate()
+    return result
 
 def get_universal(categoria: str) -> dict:
     with db_connect() as con:
@@ -5091,7 +5118,13 @@ def mutate_universal_catalog(
                    WHERE categoria=%s AND nombre=%s""",
                 (new_name, float(base_price), category, name),
             )
-        elif action in {"ACTIVATE", "DEACTIVATE", "DELETE"}:
+        elif action == "DELETE":
+            from billing_item_rule_store import _administrator
+            from catalog_removal import delete_catalog_item
+
+            _administrator(con, current_user, user_is_admin)
+            delete_catalog_item(con, category, name)
+        elif action in {"ACTIVATE", "DEACTIVATE"}:
             active = 1 if action == "ACTIVATE" else 0
             con.execute(
                 """UPDATE universal_items SET is_active=%s
@@ -5100,17 +5133,28 @@ def mutate_universal_catalog(
             )
         else:
             raise ValueError("Acción de catálogo inválida.")
-        details = (
-            f"{category}: {name or new_name}"
-            + (f" → {new_name} · precio base RD$ {float(base_price):,.2f}" if action in {"UPSERT", "EDIT"} else "")
-            + f" · Dispositivo {device_name} ({device_id})"
-        )
+        details = _catalog_mutation_details(category, name, new_name, action, base_price, device_id, device_name)
         _insert_action_history(
             con, username, f"CATALOG_{action}", details,
             module="Facturación", entity_type="catálogo_universal",
             entity_id=f"{category}|{new_name or name}",
             role=current_user.get("role", ""), ars_name="CATÁLOGO UNIVERSAL",
         )
+
+
+def _catalog_mutation_details(
+    category, name, new_name, action, base_price, device_id, device_name
+):
+    return (
+        f"{category}: {name or new_name}"
+        + (
+            f" → {new_name} · precio base RD$ {float(base_price):,.2f}"
+            if action in {"UPSERT", "EDIT"}
+            else ""
+        )
+        + f" · Dispositivo {device_name} ({device_id})"
+    )
+
 
 def _ensure_ars(nombre_ars: str):
     nombre_ars = require_medication_ars(nombre_ars)
@@ -9783,10 +9827,11 @@ def list_sent_billing_batches_report(
         params.append(int(month))
     normalized_ars = normalize_monthly_ars_name(ars)
     if normalized_ars:
+        from admission_contract import equivalent_ars_values
         clauses.append(
-            "REGEXP_REPLACE(LOWER(TRIM(sent_ars)), '\\s+', ' ', 'g')=%s"
+            "REGEXP_REPLACE(LOWER(TRIM(sent_ars)), '\\s+', ' ', 'g')=ANY(%s)"
         )
-        params.append(normalized_ars)
+        params.append(equivalent_ars_values(ars))
     if batch_ids is not None:
         ids = sorted({int(value) for value in batch_ids})
         if not ids:
@@ -9952,6 +9997,7 @@ def _query_available_receipts_for_batch(
         return []
     ars_expr = _batch_ars_expression("r")
     normalized_ars = normalize_monthly_ars_name(batch.get("ars"))
+    from admission_contract import equivalent_ars_values
     rows = con.execute(
         f"""SELECT r.id AS recibo_id, r.numero, r.nombre,
                        r.admission_nss_snapshot AS nss_snapshot,
@@ -9986,7 +10032,7 @@ def _query_available_receipts_for_batch(
                    AND COALESCE(r.tipo_cobertura,'ASEGURADO')='ASEGURADO'
                    AND COALESCE(r.receipt_origin,'')<>'SELF_PAY'
                    AND NULLIF(TRIM(COALESCE(r.ars,'')),'') IS NOT NULL
-                   AND REGEXP_REPLACE(LOWER(TRIM({ars_expr})), '\\s+', ' ', 'g')=%s
+                   AND REGEXP_REPLACE(LOWER(TRIM({ars_expr})), '\\s+', ' ', 'g')=ANY(%s)
                    AND (
                        %s IS NULL OR (
                            LEFT(COALESCE(r.fecha,''),10) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
@@ -10018,7 +10064,7 @@ def _query_available_receipts_for_batch(
                     r.id DESC
                 LIMIT %s""",
         (
-            normalized_ars,
+            equivalent_ars_values(batch.get("ars")),
             date_from,
             date_from,
             date_to,
@@ -20309,8 +20355,9 @@ class UniversalCatalogAdminDialog(QDialog):
         self._catalog_data = {"items": [], "markup": DEFAULT_MEDICATION_MARKUP_PERCENT}
         self.catalog_changed = False
         self.setWindowTitle("Catálogo de Medicamentos y Materiales")
-        self.setMinimumSize(920, 620)
-        self.resize(1120, 760)
+        from admission_history_layout import fit_history_dialog
+
+        fit_history_dialog(self)
         layout = QVBoxLayout(self)
         title = QLabel("CATÁLOGO DE MEDICAMENTOS Y MATERIALES")
         title.setObjectName("ModernTitle")
@@ -20363,6 +20410,10 @@ class UniversalCatalogAdminDialog(QDialog):
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda position, c=category: self._show_catalog_menu(c, position)
+        )
         page_layout.addWidget(table, 1)
         actions = QHBoxLayout()
         for text, callback in (
@@ -20386,6 +20437,33 @@ class UniversalCatalogAdminDialog(QDialog):
         self.searches[category] = search
         self.tables[category] = table
         self.tabs.addTab(page, category)
+
+    def _show_catalog_menu(self, category, position):
+        if self._worker is not None:
+            return
+        table = self.tables[category]
+        index = table.indexAt(position)
+        if index.isValid():
+            table.selectRow(index.row())
+        else:
+            table.clearSelection()
+            table.setCurrentCell(-1, -1)
+        menu = QMenu(table)
+        callbacks = (
+            ("Agregar", lambda: self._add_item(category)),
+            ("Editar", lambda: self._edit_item(category)),
+            ("Activar / desactivar", lambda: self._toggle_item(category)),
+            ("Eliminar", lambda: self._delete_item(category)),
+        )
+        for label, callback in callbacks:
+            action = menu.addAction(label, callback)
+            action.setEnabled(label == "Agregar" or index.isValid())
+        if category == "Medicamentos":
+            action = menu.addAction("Materiales vinculados", self._edit_material_links)
+            action.setEnabled(index.isValid())
+        self._catalog_menu = menu
+        menu.aboutToHide.connect(menu.deleteLater)
+        menu.popup(table.viewport().mapToGlobal(position))
 
     def _selected(self, category: str):
         table = self.tables[category]
@@ -20419,12 +20497,12 @@ class UniversalCatalogAdminDialog(QDialog):
         self._worker = worker
         worker.completed.connect(self._worker_completed)
         worker.failed.connect(self._worker_failed)
+        worker.finished.connect(self._catalog_worker_finished)
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
     @Slot(str, object)
     def _worker_completed(self, operation: str, result):
-        self._worker = None
         if operation == "load":
             self._catalog_data = dict(result or {})
             self.markup_spin.setValue(float(self._catalog_data.get("markup") or 0.0))
@@ -20434,13 +20512,22 @@ class UniversalCatalogAdminDialog(QDialog):
         self.catalog_changed = True
         ARS_RUNTIME_CACHE.invalidate()
         self._set_busy(False, "Cambio guardado correctamente.")
-        QTimer.singleShot(0, self.reload_async)
+        self._reload_catalog_after_write = True
 
     @Slot(str, str)
     def _worker_failed(self, operation: str, message: str):
-        self._worker = None
         self._set_busy(False, "No se pudo completar la operación.")
         QMessageBox.warning(self, "Catálogo", message)
+
+    def _catalog_worker_finished(self):
+        self._worker = None
+        if getattr(self, "_reload_catalog_after_write", False):
+            self._reload_catalog_after_write = False
+            self.reload_async()
+
+    def done(self, result):
+        if self._worker is None:
+            super().done(result)
 
     def _populate_tables(self):
         markup = float(self._catalog_data.get("markup") or 0.0)
@@ -20546,7 +20633,7 @@ class UniversalCatalogAdminDialog(QDialog):
         if not selected:
             return
         answer = QMessageBox.question(
-            self, "Eliminar", f"¿Desactivar '{selected['name']}' del catálogo?",
+            self, "Eliminar", f"¿Eliminar definitivamente '{selected['name']}' del catálogo?\nLos conceptos de los recibos guardados se conservan.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer == QMessageBox.Yes:
@@ -21044,6 +21131,7 @@ class ARSManagerDialog(QDialog):
         self.current_user = current_user
         self._report_document_worker = None
         self._manager_load_worker = None
+        self._manager_action_worker = None
         self._pending_manager_ars = ""
         parent_ars_combo = getattr(parent, "ars_combo", None)
         self._ars_names = (
@@ -21117,8 +21205,10 @@ class ARSManagerDialog(QDialog):
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(6)
         self.sala_spin = configure_decimal_spinbox(QDoubleSpinBox()); self.sala_spin.setRange(0, 1_000_000); self.sala_spin.setDecimals(2); self.sala_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        up = QToolButton(); up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp)); up.setIconSize(QSize(14,14))
-        dn = QToolButton(); dn.setIcon(self.style().standardIcon(QStyle.SP_ArrowDown)); dn.setIconSize(QSize(14,14))
+        up = QToolButton()
+        up.setText("▲")
+        up.setAccessibleName("Aumentar sala de emergencia")
+        dn = QToolButton(); dn.setText("▼"); dn.setAccessibleName("Disminuir sala de emergencia")
         hl = QHBoxLayout(); hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(4)
         hl.addWidget(self.sala_spin, 1); hl.addWidget(up); hl.addWidget(dn)
         box = QWidget(); box.setLayout(hl)
@@ -21230,7 +21320,7 @@ class ARSManagerDialog(QDialog):
             content_layout.addWidget(mig)
             self.btn_toggle_migrate.clicked.connect(lambda: mig.setVisible(not mig.isVisible()))
             self.btn_exec_migrate.clicked.connect(self.migrate_ars)
-        content_layout.addStretch(1)
+        self._build_insurer_workspace(content_layout, configuration_box, profile_box, catalogs)
         layout.addWidget(self.ars_scroll, 1)
         self.ars_combo.currentTextChanged.connect(self.on_ars_change)
         self.btn_add.clicked.connect(self.add_ars)
@@ -21271,16 +21361,43 @@ class ARSManagerDialog(QDialog):
         self.apply_ars_theme(bool(getattr(parent, "is_dark_mode", False)))
         self._fit_initial_geometry()
 
+    def _build_insurer_workspace(
+        self, content_layout, configuration_box, profile_box, catalogs
+    ):
+        from ars_manager_workspace import InsurerWorkspace
+
+        groups = [
+            ("Tarifas", [configuration_box]),
+            ("Perfil fiscal", [profile_box]),
+            ("Catálogos", [catalogs]),
+        ]
+        moved = [configuration_box, profile_box, catalogs]
+        if user_is_admin(self.current_user):
+            self.btn_fuse = QPushButton("Fusionar con el nombre principal de Admisión")
+            self.btn_fuse.clicked.connect(self.open_merge_dialog)
+            self.btn_toggle_migrate.setText("Copiar catálogo entre ARS")
+            groups.append(
+                (
+                    "Equivalencias",
+                    [self.btn_fuse, self.btn_toggle_migrate, self.migration_group],
+                )
+            )
+            moved.extend([self.btn_toggle_migrate, self.migration_group])
+        for widget in moved:
+            content_layout.removeWidget(widget)
+        self.workspace = InsurerWorkspace(self, groups, self.ars_scroll_content)
+        content_layout.addWidget(self.workspace, 1)
+
     def _fit_initial_geometry(self):
         available = self._available_geometry
         hint = self.sizeHint()
         target_width = min(
             max(560, available.width() - 32),
-            max(self.minimumWidth(), hint.width(), int(available.width() * 0.90)),
+            max(self.minimumWidth(), min(1180, hint.width()), min(1180, int(available.width() * 0.90))),
         )
         target_height = min(
             max(430, available.height() - 32),
-            max(self.minimumHeight(), hint.height(), int(available.height() * 0.96)),
+            max(self.minimumHeight(), min(760, hint.height()), min(760, int(available.height() * 0.90))),
         )
         self.resize(target_width, target_height)
 
@@ -21297,8 +21414,8 @@ class ARSManagerDialog(QDialog):
             QDialog#ARSManagerDialog {{
                 background: {background}; color: {text};
             }}
-            QDialog#ARSManagerDialog QLabel {{
-                color: {text};
+            QDialog#ARSManagerDialog QLabel, QDialog#ARSManagerDialog QLineEdit, QDialog#ARSManagerDialog QTextEdit {{
+                color: {text}; placeholder-text-color: {muted};
             }}
             QScrollArea#ARSManagerScroll,
             QScrollArea#ARSManagerScroll > QWidget > QWidget,
@@ -21329,11 +21446,11 @@ class ARSManagerDialog(QDialog):
             QPushButton#ARSCategoryCard {{
                 text-align: left; padding: 14px 18px; min-height: 36px;
                 border-radius: 10px; font-size: 11pt; font-weight: 800;
-                background: {tokens['audit_bg']}; color: {title};
+                background: {tokens["audit_bg"]}; color: {title};
                 border: 1px solid {border};
             }}
             QPushButton#ARSCategoryCard:hover {{
-                background: {tokens['sel_bg']}; color: {title};
+                background: {tokens["sel_bg"]}; color: {title};
             }}
             """
         )
@@ -21376,6 +21493,58 @@ class ARSManagerDialog(QDialog):
             self.mig_src.clear(); self.mig_src.addItems(items)
         if hasattr(self, 'mig_dst'):
             self.mig_dst.clear(); self.mig_dst.addItems(items)
+        if hasattr(self, "workspace"):
+            self.workspace.refresh_names(items)
+
+    def _run_manager_action(self, operation):
+        if self._manager_action_worker is not None:
+            return
+
+        def run():
+            operation()
+            return ars_list()
+
+        self._manager_action_worker = HonorariumSettingsWorker(run, self)
+        self._manager_action_worker.completed.connect(self._manager_action_done)
+        self._manager_action_worker.failed.connect(
+            lambda message: QMessageBox.warning(self, "Gestión de ARS", str(message))
+        )
+        self._manager_action_worker.finished.connect(self._manager_action_finished)
+        self._manager_action_worker.finished.connect(
+            self._manager_action_worker.deleteLater
+        )
+        self.workspace.setEnabled(False)
+        self._manager_action_worker.start()
+
+    def _manager_action_done(self, names):
+        self._ars_names = list(names)
+        self.refresh_ars()
+        ARS_RUNTIME_CACHE.invalidate()
+
+    def _manager_action_finished(self):
+        self._manager_action_worker = None
+        self.workspace.setEnabled(True)
+
+    def open_merge_dialog(self):
+        if not user_is_admin(self.current_user):
+            return
+        from ars_manager_workspace import InsurerMergeDialog
+
+        dialog = InsurerMergeDialog(
+            self._ars_names or [],
+            lambda source, target: preview_ars_merge(source, target, self.current_user),
+            lambda source, target, token: merge_billing_insurers(
+                source, target, self.current_user, token
+            ),
+            HonorariumSettingsWorker,
+            self,
+        )
+        if dialog.exec() == QDialog.Accepted:
+            self._run_manager_action(lambda: None)
+
+    def reject(self):
+        if self._manager_action_worker is None and self._manager_load_worker is None:
+            super().reject()
 
     def on_ars_change(self, name):
         if name and not medication_ars_is_selectable(name):
@@ -21393,12 +21562,12 @@ class ARSManagerDialog(QDialog):
         self._manager_load_worker = worker
         worker.completed.connect(self._on_manager_data_loaded)
         worker.failed.connect(self._on_manager_data_failed)
+        worker.finished.connect(self._manager_data_finished)
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
     @Slot(str, object, object, float)
     def _on_manager_data_loaded(self, name, runtime, profile, elapsed_ms):
-        self._manager_load_worker = None
         ARS_RUNTIME_CACHE.put(name, dict(runtime or {}))
         if name == self.ars_combo.currentText().strip():
             self.sala_spin.setValue(float(dict(runtime or {}).get("sala_emergencia") or 0.0))
@@ -21407,22 +21576,20 @@ class ARSManagerDialog(QDialog):
         write_runtime_log(
             f"Gestión ARS carga background_ms={float(elapsed_ms):.1f} ars={name}"
         )
-        pending = self._pending_manager_ars
-        self._pending_manager_ars = ""
-        if pending and pending != name:
-            QTimer.singleShot(0, lambda value=pending: self.on_ars_change(value))
 
     @Slot(str, str, float)
     def _on_manager_data_failed(self, name, error_type, elapsed_ms):
-        self._manager_load_worker = None
         self._clear_profile_fields()
         write_runtime_log(
             f"Gestión ARS error={error_type} background_ms={float(elapsed_ms):.1f} ars={name}"
         )
+
+    def _manager_data_finished(self):
+        self._manager_load_worker = None
         pending = self._pending_manager_ars
         self._pending_manager_ars = ""
-        if pending and pending != name:
-            QTimer.singleShot(0, lambda value=pending: self.on_ars_change(value))
+        if pending:
+            QTimer.singleShot(0, lambda: self.on_ars_change(pending))
 
     def _apply_manager_profile(self, name: str, profile: dict):
         self.profile_display_name.setText(str(profile.get("display_name") or name))
@@ -21537,13 +21704,12 @@ class ARSManagerDialog(QDialog):
         FloatingToast("✅ ARS agregada", self).show()
 
     def delete_ars_clicked(self):
+        if not user_is_admin(self.current_user):
+            return
         name = self.ars_combo.currentText()
         if not name: return
         if QMessageBox.question(self, "Eliminar", f"¿Eliminar '{name}'?") != QMessageBox.Yes: return
-        delete_ars(name)
-        log_action(self.current_user["username"], "Eliminar ARS", name, ars_name=name)
-        self.refresh_ars(force=True)
-        FloatingToast("✅ ARS eliminada", self).show()
+        self._run_manager_action(lambda: delete_ars(name, self.current_user))
 
     def save_price(self):
         if not is_administrator(self.current_user):
@@ -30484,48 +30650,6 @@ class HonorarioSelectorDialog(QDialog):
     def values(self):
         return [self.selected_item] if self.selected_item else []
 
-class MascarillaSelectorDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Seleccionar mascarilla para nebulizar")
-        self.setFixedSize(420, 300)
-        self.selected_name = None
-        root = QVBoxLayout(self)
-        root.setContentsMargins(18, 18, 18, 18)
-        root.setSpacing(10)
-        lbl = QLabel("Se detectó \"nebulizar con\". Selecciona la mascarilla a agregar:")
-        lbl.setWordWrap(True)
-        lbl.setStyleSheet("font-weight: bold; font-size: 11pt;")
-        root.addWidget(lbl)
-        self.list_widget = QListWidget()
-        self.list_widget.setAlternatingRowColors(True)
-        self.list_widget.setStyleSheet("QListWidget::item { padding: 10px; } QListWidget::item:selected { background-color: #1565c0; color: #ffffff; }")
-        root.addWidget(self.list_widget, 1)
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("Agregar")
-        btns.button(QDialogButtonBox.Cancel).setText("Omitir")
-        btns.accepted.connect(self._accept)
-        btns.rejected.connect(self.reject)
-        root.addWidget(btns)
-        for btn in btns.buttons():
-            set_button_role(btn, "success" if btn is btns.button(QDialogButtonBox.Ok) else "neutral")
-        self.list_widget.itemDoubleClicked.connect(self._accept)
-
-    def load_items(self, items: dict):
-        self.list_widget.clear()
-        for n, p in sorted(items.items(), key=lambda x: x[0]):
-            it = QListWidgetItem(f"{n}\n${p:,.2f}")
-            it.setData(Qt.UserRole, n)
-            font = it.font(); font.setPointSize(10); it.setFont(font)
-            self.list_widget.addItem(it)
-        if self.list_widget.count() > 0:
-            self.list_widget.setCurrentRow(0)
-
-    def _accept(self):
-        item = self.list_widget.currentItem()
-        if item:
-            self.selected_name = item.data(Qt.UserRole)
-        self.accept()
 
 class IdleEventFilter(QObject):
     activity = Signal()
@@ -33844,14 +33968,12 @@ class MainWindow(QMainWindow):
         # The application stylesheet and the embedded Admission context must
         # agree before either one creates a visual child.
         self.is_dark_mode = resolve_startup_theme_is_dark(startup_data)
-        self.bajante_added_for_solucion = False
         self._reverting_ars_change = False
         self._honorarium_prompted_ars = set()
         self._current_ars_id = 0
         self._current_honorarium_prompt_suppressed = False
         self._current_honorarium_specialties: dict = {}
         self._editing_specialty_snapshot = ""
-        self.mascarilla_prompt_done = False
         self.session_started_at = now_str()
         self.session_id = str(session_id or make_session_id())
         self._last_generate_time = 0.0
@@ -36115,42 +36237,23 @@ class MainWindow(QMainWindow):
         self.update_totals()
         FloatingToast("✅ Honorario agregado", self).show()
 
-    def maybe_prompt_mascarilla(self, trigger_category: str, trigger_name: str):
-        if trigger_category not in ["Medicamentos", "Materiales", "Laboratorios", "Imágenes", "Procedimientos", "Honorarios"]:
-            return
-        needle = "nebulizar con"
-        if needle not in (trigger_name or "").casefold():
-            return
-        if getattr(self, "mascarilla_prompt_done", False):
-            return
-        self.mascarilla_prompt_done = True
-        items = self.universal.get("Materiales", {})
-        candidates = {n: p for n, p in items.items() if ("mascarilla" in n.casefold() or "nebuliz" in n.casefold()) and "cpap" not in n.casefold()}
-        if not candidates:
-            return
-        dlg = MascarillaSelectorDialog(self)
-        dlg.load_items(candidates)
-        if dlg.exec() != QDialog.Accepted or not dlg.selected_name:
-            self.mascarilla_prompt_done = False
-            return
-        price = candidates[dlg.selected_name]
-        self.insert_or_increment_cart_item("Materiales", dlg.selected_name, price, 1)
-        self.update_totals()
-        FloatingToast("😷 Mascarilla agregada", self).show()
 
     def maybe_auto_add_guantes(self, trigger_category: str):
         if trigger_category != "Medicamentos":
             return
         if not self.preferences.get("auto_add_guantes", True):
             return
-        if getattr(self, "guantes_auto_added", False):
+        if any(
+            self.cart_table.item(row, 0).text().endswith("Materiales")
+            and "GUANTE" in normalize_key(self.cart_table.item(row, 1).text())
+            for row in range(self.cart_table.rowCount())
+        ):
             return
-
         guantes_name = "Guantes"
         materiales = self.universal.get("Materiales", {})
         if guantes_name not in materiales:
             for candidate in materiales:
-                if candidate.strip().casefold() == "guantes":
+                if normalize_key(candidate) == "GUANTES":
                     guantes_name = candidate
                     break
             else:
@@ -36158,55 +36261,10 @@ class MainWindow(QMainWindow):
 
         guantes_price = materiales[guantes_name]
         self.insert_or_increment_cart_item("Materiales", guantes_name, guantes_price, 1)
-        self.guantes_auto_added = True
         self.update_totals()
         FloatingToast("🧤 Guantes agregados automáticamente", self).show()
 
-    def _is_in_cart(self, name: str) -> bool:
-        for r in range(self.cart_table.rowCount()):
-            if self.cart_table.item(r, 1).text() == name:
-                return True
-        return False
 
-    def maybe_auto_add_bajante_cateter(self, trigger_name: str):
-        if not self.preferences.get("auto_add_bajante_cateter", True):
-            return
-        needle = trigger_name or ""
-        needle_clean = needle.replace(" ", "").casefold()
-        is_solucion = "sol." in needle.casefold() or "solucion" in needle.casefold() or "solución" in needle.casefold()
-        is_paracetamol_1gr = "paracetamol" in needle.casefold() and "1gr" in needle_clean
-        
-        if not is_solucion and not is_paracetamol_1gr:
-            return
-
-        materiales = self.universal.get("Materiales", {})
-        bajante_name = next((n for n in materiales if "bajante" in n.casefold() and ("suero" in n.casefold() or "sol." in n.casefold() or "solucion" in n.casefold() or "solución" in n.casefold())), None)
-        cateter_name = next((n for n in materiales if "cateter" in n.casefold() or "catéter" in n.casefold()), None)
-
-        added = 0
-        if is_paracetamol_1gr:
-            # Paracetamol 1gr: SIEMPRE agregar bajante, y catéter (si no está)
-            if bajante_name:
-                self.insert_or_increment_cart_item("Materiales", bajante_name, materiales[bajante_name], 1)
-                added += 1
-            if cateter_name and not self._is_in_cart(cateter_name):
-                self.insert_or_increment_cart_item("Materiales", cateter_name, materiales[cateter_name], 1)
-                added += 1
-        elif is_solucion and not self.bajante_added_for_solucion:
-            # Solución: Agregar bajante Y catéter la primera vez (si no están)
-            if bajante_name and not self._is_in_cart(bajante_name):
-                self.insert_or_increment_cart_item("Materiales", bajante_name, materiales[bajante_name], 1)
-                added += 1
-            if cateter_name and not self._is_in_cart(cateter_name):
-                self.insert_or_increment_cart_item("Materiales", cateter_name, materiales[cateter_name], 1)
-                added += 1
-            if added > 0:
-                self.bajante_added_for_solucion = True
-
-        if added:
-            self.bajante_cateter_auto_added = True
-            self.update_totals()
-            FloatingToast("🩺 Bajante de suero y catéter agregados automáticamente", self).show()
 
     def _fill_list(self, widget: QListWidget, items: dict, term: str) -> int:
         widget.clear()
@@ -36533,9 +36591,6 @@ class MainWindow(QMainWindow):
             return
 
         if proposed_ars != previous_ars:
-            self.mascarilla_prompt_done = False
-            self.bajante_cateter_auto_added = False
-            self.bajante_added_for_solucion = False
             if admin_correction:
                 self._pending_ars_correction = {"previous": previous_ars, "target": proposed_ars}
 
@@ -36673,9 +36728,7 @@ class MainWindow(QMainWindow):
             self.universal = {category: get_universal(category) for category in UNIVERSAL_CATEGORIES}
         ARS_RUNTIME_CACHE.invalidate()
         names = list(dialog._ars_names or [])
-        self.ars_combo.clear(); self.ars_combo.addItems(names)
-        if self.current_ars not in names and names: self.ars_combo.setCurrentIndex(0)
-        self.on_ars_changed(self.ars_combo.currentText())
+        self._apply_shared_ars_names(names)
 
     def open_universal_catalog_admin(self):
         self.mark_activity()
@@ -36994,12 +37047,8 @@ class MainWindow(QMainWindow):
 
         FloatingToast("✅ Añadido al recibo", self).show()
 
-        if not configured_materials:
-            self.maybe_auto_add_guantes(category)
-            self.maybe_auto_add_bajante_cateter(name)
+        self.maybe_auto_add_guantes(category)
         self.maybe_prompt_honorario(category)
-        if not configured_materials:
-            self.maybe_prompt_mascarilla(category, name)
 
     def show_cart_context_menu(self, pos):
         row = self.cart_table.rowAt(pos.y())
@@ -37100,10 +37149,6 @@ class MainWindow(QMainWindow):
         self.qty.setValue(1)
         self.locked_ars = None  # LIBERAR ARS AL LIMPIAR
         self._honorarium_prompted_ars.clear()
-        self.guantes_auto_added = False
-        self.bajante_cateter_auto_added = False
-        self.bajante_added_for_solucion = False
-        self.mascarilla_prompt_done = False
         self.editing_recibo_id = None
         self.editing_recibo_numero = None
         self.current_admission_attention = None
@@ -37137,6 +37182,9 @@ class MainWindow(QMainWindow):
         self._responsive_mode = None
         self._update_responsive_ui()
         self._update_document_flow_ui()
+        pending_ars = getattr(self, "_pending_shared_ars_names", None)
+        if pending_ars is not None:
+            self._apply_shared_ars_names(pending_ars)
 
     def cancel_edit(self):
         self.reset_all()
@@ -38209,6 +38257,8 @@ class MainWindow(QMainWindow):
         self.universal = dict(data["universal"])
         self._material_rules_retry.succeeded()
         self.refresh_picker()
+        if "ars_names" in data:
+            self._apply_shared_ars_names(data["ars_names"])
         from receipt_continuity import local_receipt_store
 
         try:
@@ -38221,6 +38271,23 @@ class MainWindow(QMainWindow):
             write_runtime_log(
                 f"LOCAL_MATERIAL_RULES_CACHE_FAILED error_type={type(exc).__name__}"
             )
+
+    def _apply_shared_ars_names(self, names):
+        names = list(names)
+        self._local_tariff_names = names
+        if self.cart_table.rowCount() or self.editing_recibo_id is not None:
+            self._pending_shared_ars_names = names
+            return
+        current = self.ars_combo.currentText()
+        canonical = canonicalize_ars(current)
+        selected = current if current in names else canonical
+        with QSignalBlocker(self.ars_combo):
+            self.ars_combo.clear()
+            self.ars_combo.addItems(names)
+            if selected in names:
+                self.ars_combo.setCurrentText(selected)
+        self._pending_shared_ars_names = None
+        self.on_ars_changed(self.ars_combo.currentText())
 
     @Slot(str)
     def _material_rules_failed(self, message):
@@ -39107,12 +39174,6 @@ class PreferencesDialog(QDialog):
         note_print.setWordWrap(True)
         note_print.setObjectName("PreferenceNote")
 
-        self.chk_bajante_cateter = QCheckBox("Autoagregar bajante y catéter al agregar soluciones")
-        self.chk_bajante_cateter.setChecked(bool(current_prefs.get("auto_add_bajante_cateter", True)))
-        note_bc = QLabel("Nota: al agregar ítems con 'sol.' o 'solución', se agregan bajante y catéter de Materiales.")
-        note_bc.setWordWrap(True)
-        note_bc.setObjectName("PreferenceNote")
-
         self.chk_theme_dark = QCheckBox("Usar tema oscuro")
         self.chk_theme_dark.setChecked(bool(current_prefs.get("theme") == "oscuro"))
 
@@ -39142,8 +39203,6 @@ class PreferencesDialog(QDialog):
         add_preference_option(self.chk_guantes, note_guantes)
         add_separator()
         add_preference_option(self.chk_auto_print, note_print)
-        add_separator()
-        add_preference_option(self.chk_bajante_cateter, note_bc)
         add_separator()
         add_preference_option(self.chk_theme_dark)
         add_separator()
@@ -39256,7 +39315,7 @@ class PreferencesDialog(QDialog):
         return {
             "auto_add_guantes": self.chk_guantes.isChecked(),
             "auto_print": self.chk_auto_print.isChecked(),
-            "auto_add_bajante_cateter": self.chk_bajante_cateter.isChecked(),
+            "auto_add_bajante_cateter": False,
             "theme": "oscuro" if self.chk_theme_dark.isChecked() else "claro",
             "layout_profile": self.layout_profile_combo.currentData(),
             "layout_density": self.layout_density_combo.currentData(),

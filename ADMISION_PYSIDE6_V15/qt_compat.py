@@ -1474,6 +1474,11 @@ class EmbeddedWindowRoot(QWidget, _WidgetMixin):
 
 
 class Toplevel(QDialog, _WidgetMixin):
+    closing = Signal()
+
+    def destroy(self):
+        _WidgetMixin.destroy(self)
+
     def __init__(self, parent=None, **kwargs):
         _ensure_app()
         qt_parent = parent if isinstance(parent, QMainWindow) else _qt_parent(parent)
@@ -1587,6 +1592,7 @@ class Toplevel(QDialog, _WidgetMixin):
             event.accept()
             self._restore_owner_focus()
             return
+        self.closing.emit()
         if self._close_callback:
             try:
                 self._in_close_callback = True

@@ -3528,8 +3528,8 @@ class DatabaseManager:
             cur = conn.cursor()
             cur.execute(
                 "SELECT ars, nss, COUNT(*) AS cantidad "
-                "FROM atenciones "
-                "WHERE estado='ACTIVA' AND TRIM(IFNULL(ars,'')) <> '' "
+                "FROM pacientes "
+                "WHERE TRIM(IFNULL(ars,'')) <> '' "
                 "GROUP BY ars, nss"
             )
             for r in cur.fetchall():
@@ -3618,7 +3618,7 @@ class DatabaseManager:
         modo = (modo or "Todos").strip()
         ars = (ars or "").strip()
         especialidad = (especialidad or "").strip().upper()
-        from admission_visit_dates import date_variants
+        from admission_visit_dates import history_date_predicate
 
         fecha_obj = fecha_txt if fecha_txt else None
 
@@ -3646,9 +3646,10 @@ class DatabaseManager:
             )
             params.append(fecha_base_operativa_actual().isoformat())
 
-        if modo == "Por fecha":
-            where.append("fecha IN (?,?,?)")
-            params.extend(date_variants(fecha_obj))
+        if modo in {"Entre fechas", "Por fecha"}:
+            clause, dates = history_date_predicate(modo, fecha_obj, "fecha", "?")
+            where.append(clause)
+            params.extend(dates)
 
         if modo == "Por especialidad" and especialidad and especialidad != "(TODAS)":
             where.append("UPPER(IFNULL(hoja,'')) = ?")
@@ -12907,6 +12908,9 @@ class App:
         win = self._crear_toplevel_estable("Historial de Atenciones", "1160x720", "historial_win")
         if win is None:
             return
+        import admission_history_layout as history_layout
+
+        history_layout.fit_history_dialog(win)
         pal = self._paleta_visual_actual()
 
         # FASE 3: Constante para el caché del menú
@@ -12930,14 +12934,23 @@ class App:
         tb.Label(frm_bus, text="Buscar", font=("Arial", 10, "bold"), foreground=pal["text"], background=pal["card"]).pack(side="left", padx=(0, 8))
         self.var_bus = tk.StringVar()
         ent_bus = tb.Entry(frm_bus, textvariable=self.var_bus, width=44)
-        ent_bus.pack(side="left", ipady=4)
-        win.after(80, lambda: (ent_bus.focus_set(), ent_bus.icursor("end")))
+        ent_bus.setMinimumWidth(130)
+        ent_bus.pack(side="left", fill="x", expand=True, ipady=4)
+        win.after(80, lambda: (win.activateWindow(), ent_bus.focus_set(), ent_bus.icursor("end")))
 
         # El historial abre acotado al turno vigente registrado en la base.
         filtro_rapido_var = tk.StringVar(value="Este turno")
         ars_filtro_var = tk.StringVar(value="(Todas)")
         esp_filtro_var = tk.StringVar(value="(Todas)")
-        fecha_filtro = crear_selector_fecha(frm_bus, width=12)
+        fecha_frame = tb.Frame(cont, padding=6, style="Card.TFrame")
+        fecha_frame.pack(fill="x")
+        tb.Label(fecha_frame, text="Desde").pack(side="left", padx=4)
+        fecha_filtro = crear_selector_fecha(fecha_frame, width=12)
+        fecha_filtro.pack(side="left", padx=4)
+        fecha_hasta_label = tb.Label(fecha_frame, text="Hasta")
+        fecha_hasta_label.pack(side="left", padx=4)
+        fecha_hasta = crear_selector_fecha(fecha_frame, width=12)
+        fecha_hasta.pack(side="left", padx=4)
 
         tb.Label(frm_bus, text="Filtro", font=("Arial", 10, "bold"), foreground=pal["text"], background=pal["card"]).pack(side="left", padx=(10, 4))
 
@@ -12947,7 +12960,7 @@ class App:
             textvariable=filtro_label_var,
             relief="solid",
             bd=1,
-            width=24,
+            width=18,
             anchor="w",
             bg=pal["entry"],
             fg=pal["text"],
@@ -13015,11 +13028,6 @@ class App:
         win._admission_theme_refresh = _refresh_history_theme
         _refresh_history_theme()
 
-        try:
-            fecha_filtro.pack_forget()
-        except Exception:
-            pass
-
         turno_info_var = tk.StringVar(value="Turno seleccionado: cargando…")
         resultados_var = tk.StringVar(value="")
         turno_info = tb.Frame(cont, padding=(10, 6), style="Card.TFrame")
@@ -13058,12 +13066,10 @@ class App:
                 filtro_label_var.set(f"{modo}  ▾")
 
         def _actualizar_visibilidad_filtros(*_):
-            try:
-                fecha_filtro.pack_forget()
-            except Exception:
-                pass
-            if filtro_rapido_var.get() == "Por fecha":
-                fecha_filtro.pack(side="left", padx=4)
+            mode = filtro_rapido_var.get()
+            fecha_frame.setVisible(mode in {"Por fecha", "Entre fechas"})
+            fecha_hasta.setVisible(mode == "Entre fechas")
+            fecha_hasta_label.setVisible(mode == "Entre fechas")
             try:
                 _actualizar_texto_boton_filtro()
                 _resolver_turno_historial()
@@ -13161,6 +13167,7 @@ class App:
                 filtro_menu.add_cascade(label="Por especialidad", menu=esp_menu)
 
                 filtro_menu.add_command(label="Por fecha", command=lambda: _seleccionar_filtro_simple("Por fecha"))
+                filtro_menu.add_command(label="Entre fechas", command=lambda: _seleccionar_filtro_simple("Entre fechas"))
                 menu_state["last_build"] = ahora
             finally:
                 menu_state["busy"] = False
@@ -13178,6 +13185,7 @@ class App:
 
         cols = ("id", "fecha", "hora", "nombre", "hoja", "ars", "nss", "cedula", "tipo")
         tree = ttk.Treeview(cont, columns=cols, show="headings", height=10, style="Modern.Treeview")
+        tree.setMinimumHeight(history_layout.HISTORY_TABLE_MIN_HEIGHT)
         tree.pack(fill="both", expand=True, pady=(0, 10))
 
         cols_def = [
@@ -13227,6 +13235,11 @@ class App:
                     deduplicadas.append(fila)
             return deduplicadas
 
+        def continuar_busqueda_pendiente():
+            pending = page_state.pop("pending", None)
+            if pending and win.winfo_exists():
+                win.after(0, lambda: cargar_pagina(reset=True, **pending))
+
         def cargar_pagina(
             reset=False,
             *,
@@ -13239,7 +13252,13 @@ class App:
                     "HISTORY_REFRESH_SKIPPED reason=page_busy source=%s",
                     "cache" if cache_only else "central",
                 )
-                if callable(completion):
+                if reset:
+                    page_state["pending"] = {
+                        "completion": completion,
+                        "cache_only": cache_only,
+                        "show_loading": show_loading,
+                    }
+                elif callable(completion):
                     completion(changed=False)
                 return
             page_state["loading"] = True
@@ -13265,6 +13284,8 @@ class App:
 
             limit = page_state["first_limit"] if reset else page_state["next_limit"]
             fecha_txt = obtener_fecha_selector(fecha_filtro) if filtro_rapido_var.get() == "Por fecha" else None
+            if filtro_rapido_var.get() == "Entre fechas":
+                fecha_txt = (obtener_fecha_selector(fecha_filtro), obtener_fecha_selector(fecha_hasta))
             modo_actual = filtro_rapido_var.get()
             turno_id_seleccionado = _resolver_turno_historial()
 
@@ -13276,7 +13297,7 @@ class App:
                 combined_rows = _deduplicar_filas_historial(combined_rows)
                 new_fingerprint = history_rows_fingerprint(combined_rows)
                 changed = new_fingerprint != page_state["fingerprint"]
-                if reset and changed:
+                if reset and (changed or not filas):
                     billing_rows.clear()
                     for i in tree.get_children():
                         tree.delete(i)
@@ -13304,7 +13325,6 @@ class App:
                         values = tree.item(item, "values")
                         if values and str(values[0] or "") == selected_attention_id:
                             tree.selection_set(item)
-                            tree.focus(item)
                             break
                 if changed:
                     try:
@@ -13316,7 +13336,7 @@ class App:
                 page_state["offset"] = len(combined_rows)
                 if len(filas) < limit:
                     page_state["done"] = True
-                if reset and not filas and changed:
+                if reset and not filas:
                     tree.insert("", "end", values=("", "", "", "No se encontraron registros.", "", "", "", "", ""))
                 cantidad = len(combined_rows)
                 resultados_var.set(
@@ -13331,6 +13351,7 @@ class App:
                 )
                 if callable(completion):
                     completion(changed=changed, rows=cantidad)
+                continuar_busqueda_pendiente()
 
             def _error_carga(err):
                 if current_load != page_state["load_id"]:
@@ -13357,7 +13378,11 @@ class App:
                     self.set_status("Error cargando historial.", "error")
                 if callable(completion):
                     completion(changed=False, error=err)
+                continuar_busqueda_pendiente()
 
+            texto_actual = self.var_bus.get().strip()
+            ars_actual = ars_filtro_var.get()
+            especialidad_actual = esp_filtro_var.get()
             def _hacer_carga():
                 if page_state["done"] and not reset:
                     return []
@@ -13372,10 +13397,10 @@ class App:
                     return []
                 method_name = "listar_atenciones_filtradas"
                 method_values = {
-                    "filtro_texto": self.var_bus.get().strip(),
+                    "filtro_texto": texto_actual,
                     "modo": modo_actual,
-                    "ars": ars_filtro_var.get(),
-                    "especialidad": esp_filtro_var.get(),
+                    "ars": ars_actual,
+                    "especialidad": especialidad_actual,
                     "fecha_txt": fecha_txt,
                     "limite": limit,
                     "offset": page_state["offset"],
@@ -13385,7 +13410,7 @@ class App:
                 if modo_actual == "Sin seguro":
                     method_name = "listar_atenciones_sin_seguro"
                     method_values = {
-                        "filtro_texto": self.var_bus.get().strip(),
+                        "filtro_texto": texto_actual,
                         "limite": limit,
                         "offset": page_state["offset"],
                     }
@@ -13447,6 +13472,8 @@ class App:
         try:
             fecha_filtro.calendarWidget().clicked.connect(lambda _date: buscar())
             fecha_filtro.editingFinished.connect(buscar)
+            fecha_hasta.calendarWidget().clicked.connect(lambda _date: buscar())
+            fecha_hasta.editingFinished.connect(buscar)
         except Exception:
             pass
         tree.bind("<MouseWheel>", _al_mover_scroll)
@@ -14991,6 +15018,7 @@ class App:
                 ent_nueva = tb.Entry(tab_ars, textvariable=ars_nueva_var)
                 ent_nueva.grid(row=3, column=1, sticky="ew", padx=5, pady=(0, 6), ipady=4)
 
+                ars_originales = {}
                 def cargar_ars():
                     for i in tree_ars.get_children():
                         tree_ars.delete(i)
@@ -15007,8 +15035,12 @@ class App:
                             return
                         rows, catalogo = resultado
                         tree_ars.delete(*tree_ars.get_children())
+                        ars_originales.clear()
                         for ars, cantidad in rows:
-                            tree_ars.insert("", "end", values=(seguro_para_mostrar(ars), cantidad))
+                            item = tree_ars.insert(
+                                "", "end", values=(seguro_para_mostrar(ars), cantidad)
+                            )
+                            ars_originales[item] = ars
                         self._ars_catalogo = catalogo
                         self._invalidar_cache_ars()
                         info_ars.set("Seleccione una ARS para corregirla o use las acciones de limpieza.")
@@ -15029,7 +15061,7 @@ class App:
                     if not sel:
                         return
                     vals = tree_ars.item(sel[0], "values")
-                    ars_actual_var.set(vals[0])
+                    ars_actual_var.set(ars_originales.get(sel[0], vals[0]))
 
                 def reemplazar_ars():
                     actual = ars_actual_var.get().strip()
@@ -15086,26 +15118,55 @@ class App:
 
                 menu_ars = tk.Menu(win, tearoff=0)
                 menu_ars.add_command(label="✏ Cargar para reemplazar", command=seleccionar_ars)
+                ars_delete_state = {"busy": False}
                 def eliminar_ars_sel():
+                    if ars_delete_state["busy"]:
+                        return
                     sel = tree_ars.selection()
                     if not sel:
                         messagebox.showwarning("ARS", "Seleccione una ARS para eliminar."); return
-                    actual = tree_ars.item(sel[0], "values")[0]
+                    actual = ars_originales.get(sel[0], tree_ars.item(sel[0], "values")[0])
                     if not messagebox.askyesno(
                         "Eliminar ARS",
                         f"¿Convertir las fichas actuales de '{actual}' a SIN SEGURO?\n\n"
                         "Las atenciones históricas no se modificarán.",
                     ):
                         return
-                    total = self.db.eliminar_ars_global(actual)
-                    self.security.audit(
-                        "ARS_CURRENT_RECORDS_REMOVED",
-                        actor=self._admin_authorized_actor or self._actor_actual(),
-                        success=True,
-                        detail=f"ars={actual}; fichas={total}",
+                    ars_delete_state["busy"] = True
+                    info_ars.set("Eliminando ARS de las fichas actuales…")
+                    actor = self._admin_authorized_actor or self._actor_actual()
+
+                    def operation():
+                        total = self.db.eliminar_ars_global(actual)
+                        self.security.audit(
+                            "ARS_CURRENT_RECORDS_REMOVED",
+                            actor=actor,
+                            success=True,
+                            detail=f"ars={actual}; fichas={total}",
+                        )
+                        return total
+
+                    def completed(total):
+                        ars_delete_state["busy"] = False
+                        if win.winfo_exists():
+                            cargar_ars()
+                            self._actualizar_resumen_turno_panel()
+                            messagebox.showinfo(
+                                "ARS", f"Fichas actuales actualizadas: {total}"
+                            )
+
+                    def failed(error):
+                        ars_delete_state["busy"] = False
+                        if win.winfo_exists():
+                            info_ars.set("No se completó el cambio de ARS.")
+                            messagebox.showerror("ARS", str(error))
+
+                    self._ejecutar_en_segundo_plano(
+                        "Eliminando ARS…",
+                        operation,
+                        al_terminar=completed,
+                        al_error=failed,
                     )
-                    cargar_ars(); self._actualizar_resumen_turno_panel()
-                    messagebox.showinfo("ARS", f"Registros convertidos a SIN SEGURO: {total}")
                 menu_ars.add_command(label="🗑 Eliminar ARS (pasar a SIN SEGURO)", command=eliminar_ars_sel)
                 def mostrar_menu_ars(event):
                     item = tree_ars.identify_row(event.y)
@@ -16847,6 +16908,7 @@ class App:
         except Exception:
             pass
         allowed, _reason_code, _message = self.can_change_admission_turn()
+        App._refresh_turn_change_button(self, allowed)
         try:
             self.change_turn_menu_action.setEnabled(bool(allowed))
         except Exception:
@@ -16873,6 +16935,11 @@ class App:
                 )
         except Exception:
             pass
+
+    def _refresh_turn_change_button(self, allowed):
+        button = getattr(self, "boton_cambiar_turno", None)
+        if button is not None:
+            button.configure(state="normal" if allowed else "disabled")
 
     def can_change_admission_turn(self, *, allow_open_dialog=False):
         if (
@@ -16995,6 +17062,9 @@ class App:
             self._set_turn_change_controls_enabled(True)
 
         win.bind("<Destroy>", release_turn_action, add="+")
+        from admission_history_layout import bind_dialog_close
+
+        bind_dialog_close(win, release_turn_action)
 
         self._bind_esc_cerrar(win)
 

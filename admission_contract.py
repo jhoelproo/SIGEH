@@ -55,11 +55,11 @@ CANONICAL_ARS_ALIASES = {
     ),
     "SENASA CONTRIBUTIVO": (
         "CONT", "CONTR", "CONTRI", "CONTRIB", "CONTRIBUTIVO",
-        "SENASA CONT", "SENASA CONTRIBUTIVO",
+        "SENASA CONT", "SENASA CONTRIBUTIVO", "S.CONTRIBUTIVO",
     ),
     "SENASA PENSIONADOS": (
         "PENS", "PENSIONADO", "PENSIONADOS", "SENASA PENSIONADOS",
-        "SENASA JUBILADOS",
+        "SENASA JUBILADOS", "S.PENSIONADOS",
     ),
     "APS": ("APS",),
     "ASEMAP": ("ASEMAP", "ARS ASEMAP"),
@@ -70,7 +70,7 @@ CANONICAL_ARS_ALIASES = {
     "SEMMA": ("SEMMA",),
     "FUTURO": ("FUTURO", "FUT"),
     "HUMANO": ("HUMANO", "HUM", "HUMANO PRIMARIA"),
-    "PRIMERA": ("PRIMERA", "ARS PRIMERA"),
+    "PRIMERA": ("PRIMERA", "ARS PRIMERA", "HUMANO/PRIMERA", "HUMANO / PRIMERA"),
     "ABEL GONZALEZ/SIMAG": (
         "ABEL", "ARS ABEL", "SIMAG", "ABEL GONZALEZ/SIMAG",
     ),
@@ -135,6 +135,13 @@ class ReadinessAssessment:
 
 def canonicalize_ars(value: Any) -> str:
     return ARS_LOOKUP.get(normalize_key(value), "")
+
+
+def equivalent_ars_values(value: Any) -> list[str]:
+    original = str(value or "").strip()
+    canonical = canonicalize_ars(original)
+    aliases = CANONICAL_ARS_ALIASES.get(canonical, ())
+    return sorted({name.casefold() for name in (original, canonical, *aliases) if name})
 
 
 def normalize_service_type(value: Any) -> str:
