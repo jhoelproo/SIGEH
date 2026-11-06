@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QGroupBox,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -25,6 +27,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from admin_workspace_design import (
+    AdminSplit,
+    RecordInspector,
+    admin_heading,
+    admin_label,
+    admin_styles,
+    admin_table,
+    fit_admin_dialog,
+)
 from diagnosis_recommendations import (
     CATEGORIES,
     DiagnosisCatalog,
@@ -45,6 +56,23 @@ SETTING_LABELS = {
     "lab_limit": "Laboratorios visibles",
     "image_limit": "Imágenes visibles",
 }
+SETTING_SECTIONS = (
+    (
+        "Evidencia mínima",
+        "Define cuándo hay suficientes coincidencias para sugerir un ítem.",
+        ("min_receipts", "frequency_percent"),
+    ),
+    (
+        "Peso de los recibos",
+        "Ajusta la influencia de recibos facturados y pendientes.",
+        ("invoiced_weight", "pending_weight"),
+    ),
+    (
+        "Límites en pantalla",
+        "Define cuántas sugerencias se muestran de cada tipo.",
+        ("lab_limit", "image_limit"),
+    ),
+)
 POPULATION_BATCH_SIZE = 25
 POPULATION_BUDGET_SECONDS = 0.008
 
@@ -163,35 +191,38 @@ class RecommendationAdminDialog(QDialog):
         self._population = deque()
         self._search_cache = {}
         self._item_models = {}
+        self._selection_buttons = {}
         self.population_timer = QTimer(self)
         self.population_timer.setInterval(0)
         self.population_timer.timeout.connect(self._populate_next)
         self.setWindowTitle("Recomendaciones por diagnóstico")
-        screen = parent.screen() if parent is not None else self.screen()
-        available = screen.availableGeometry()
-        self.resize(
-            min(1120, available.width() - 40), min(680, available.height() - 60)
-        )
+        fit_admin_dialog(self, (1240, 760))
         self.root = QVBoxLayout(self)
-        title = QLabel("Recomendaciones por diagnóstico")
-        title.setStyleSheet("font-size:20px;font-weight:700;color:#bd85ff;")
-        self.root.addWidget(title)
-        self.status = QLabel("Cargando configuración compartida…")
-        self.status.setWordWrap(True)
+        self.root.addWidget(
+            admin_heading(
+                "Recomendaciones por diagnóstico",
+                "Edita equivalencias, decide asociaciones y ajusta los criterios de sugerencia.",
+            )
+        )
+        self.status = admin_label("Cargando configuración compartida…", "Status")
         self.root.addWidget(self.status)
         search_bar = QHBoxLayout()
+        self.search_label = QLabel("Buscar en esta sección")
         self.search = QLineEdit()
+        self.search.setObjectName("AdminSearch")
         self.search.setPlaceholderText("Buscar diagnóstico, equivalencia o ítem…")
         self.search.setAccessibleName("Buscar en recomendaciones por diagnóstico")
         self.search.setClearButtonEnabled(True)
-        self.search_results = QLabel()
+        self.search_label.setBuddy(self.search)
+        self.search_results = admin_label(role="Status")
+        search_bar.addWidget(self.search_label)
         search_bar.addWidget(self.search, 1)
         search_bar.addWidget(self.search_results)
         self.root.addLayout(search_bar)
         self.tabs = QTabWidget()
         self.root.addWidget(self.tabs, 1)
         self.diagnoses = self._table(
-            ["Diagnóstico correcto", "Abreviaturas y equivalencias (;)"]
+            ["Diagnóstico correcto", "Abreviaturas y equivalencias"]
         )
         self.rules = self._table(
             ["Diagnóstico", "Especialidad", "Categoría", "Ítem", "Acción", "Prioridad"]
@@ -199,8 +230,10 @@ class RecommendationAdminDialog(QDialog):
         self.pending = self._table(
             ["Diagnóstico", "Especialidad", "Categoría", "Ítem pendiente de asociación"]
         )
-        self.diagnoses.setColumnWidth(0, 280)
+        self.diagnoses.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.rules.horizontalHeader().setStretchLastSection(False)
+        self.rules.verticalHeader().show()
+        self.rules.verticalHeader().setDefaultSectionSize(46)
         for column, width in (
             (0, 190),
             (1, 175),
@@ -211,16 +244,39 @@ class RecommendationAdminDialog(QDialog):
         ):
             self.rules.setColumnWidth(column, width)
         self.pending.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._editable_tab(self.diagnoses, "Diagnósticos", self.add_diagnosis)
-        self._editable_tab(self.rules, "Asociaciones", self.add_rule)
+        self._editable_tab(
+            self.diagnoses,
+            "Diagnósticos",
+            "Equivalencias de diagnóstico",
+            "Edita con doble clic. Separa las equivalencias con punto y coma.",
+            "Añadir diagnóstico",
+            self.add_diagnosis,
+        )
+        self._editable_tab(
+            self.rules,
+            "Asociaciones",
+            "Reglas de recomendación",
+            "Elige diagnóstico, especialidad e ítem. Guarda para aplicar tus cambios.",
+            "Añadir asociación",
+            self.add_rule,
+        )
         self.ars_selector = QComboBox()
         self.ars_selector.setAccessibleName("Catálogo ARS de las asociaciones")
+        self.ars_selector.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.ars_selector.setMinimumContentsLength(18)
         self.ars_selector.addItem("Compartido / asociaciones anteriores", 0)
         self.ars_selector.currentIndexChanged.connect(self._apply_search)
-        scope = QHBoxLayout()
-        scope.addWidget(QLabel("Catálogo ARS:"))
+        self.scope_bar = QWidget()
+        self.scope_bar.setObjectName("AdminToolbar")
+        scope = QHBoxLayout(self.scope_bar)
+        scope_label = QLabel("Catálogo ARS")
+        scope_label.setBuddy(self.ars_selector)
+        scope.addWidget(scope_label)
         scope.addWidget(self.ars_selector, 1)
-        self.tabs.widget(1).layout().insertLayout(0, scope)
+        self.root.insertWidget(self.root.indexOf(self.tabs), self.scope_bar)
+        self.scope_bar.hide()
         self._pending_tab()
         self._settings_tab()
         self.search.textChanged.connect(self._apply_search)
@@ -228,29 +284,39 @@ class RecommendationAdminDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.save_button = buttons.button(QDialogButtonBox.Save)
         self.save_button.setText("Guardar configuración")
+        buttons.button(QDialogButtonBox.Cancel).setText("Cerrar")
         self.save_button.clicked.connect(self.save)
         buttons.rejected.connect(self.reject)
         self.reload_button = QPushButton("Actualizar")
         self.reload_button.clicked.connect(self.reload)
         buttons.addButton(self.reload_button, QDialogButtonBox.ActionRole)
         self.root.addWidget(buttons)
-        self._style_buttons(parent)
+        self._apply_theme(bool(getattr(parent, "is_dark_mode", False)))
+        if parent is not None and hasattr(parent, "theme_toggled"):
+            parent.theme_toggled.connect(self._apply_theme)
+        self.search.setFocus()
         self.reload()
 
-    def _style_buttons(self, parent):
+    def _apply_theme(self, is_dark):
+        base = getattr(self.backend, "get_stylesheet", lambda _dark: "")
+        self.setStyleSheet(base(is_dark) + admin_styles(is_dark))
         style_button = getattr(self.backend, "set_button_role", None)
         if style_button is None:
             return
-        is_dark = bool(getattr(parent, "is_dark_mode", False))
         for button in self.findChildren(QPushButton):
-            role = "primary" if button is self.save_button else "secondary"
+            role = (
+                "primary"
+                if button is self.save_button
+                else button.property("adminRole")
+            )
+            role = role or "secondary"
             style_button(button, role, is_dark=is_dark)
 
     def _table(self, headings):
         table = QTableWidget(0, len(headings))
         table.setHorizontalHeaderLabels(headings)
         table.setSelectionBehavior(QTableWidget.SelectRows)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        admin_table(table, {})
         table.horizontalHeader().setStretchLastSection(True)
         table.itemChanged.connect(lambda *_args: self._invalidate_search(table))
         table.model().rowsRemoved.connect(lambda *_args: self._invalidate_search(table))
@@ -299,17 +365,29 @@ class RecommendationAdminDialog(QDialog):
     def _apply_search(self, *_args):
         if self._populating or self._closing or not hasattr(self, "pending"):
             return
-        terms = text_key(self.search.text()).split()
         tables = (self.diagnoses, self.rules, self.pending)
-        counts = [self._filter_table(table, terms) for table in tables]
         current = self.tabs.currentIndex()
         searching_table = current in range(len(tables))
         self.search.setEnabled(searching_table)
+        self.search_label.setVisible(searching_table)
+        self.search.setVisible(searching_table)
         self.search_results.setVisible(searching_table)
+        self.scope_bar.setVisible(current in (1, 2))
         if searching_table:
-            self.search_results.setText(
-                f"{counts[current]} de {tables[current].rowCount()}"
+            table = tables[current]
+            self.search.setPlaceholderText(
+                (
+                    "Diagnóstico o equivalencia",
+                    "Diagnóstico o ítem",
+                    "Diagnóstico o ítem pendiente",
+                )[current]
             )
+            count = self._filter_table(table, text_key(self.search.text()).split())
+            self._update_selection_buttons(table)
+            self.search_results.setText(
+                f"{count:,} de {table.rowCount():,}" if count else "Sin coincidencias"
+            )
+        self.pending_inspector.refresh()
 
     def _reveal_added_row(self, table, row):
         self.search.clear()
@@ -318,15 +396,18 @@ class RecommendationAdminDialog(QDialog):
         table.setFocus()
         table.editItem(table.item(row, 0))
 
-    def _editable_tab(self, table, label, add):
+    def _editable_tab(self, table, label, heading, hint, action, add):
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.addWidget(admin_label(heading, "Section"))
+        layout.addWidget(admin_label(hint))
         layout.addWidget(table, 1)
         actions = QHBoxLayout()
-        create = QPushButton("Añadir")
+        create = QPushButton(action)
         create.clicked.connect(lambda _checked=False: add())
-        remove = QPushButton("Eliminar selección")
+        remove = QPushButton("Quitar selección")
         remove.clicked.connect(lambda: self.remove_rows(table))
+        self._bind_selection_action(table, remove)
         actions.addWidget(create)
         actions.addWidget(remove)
         actions.addStretch()
@@ -336,52 +417,93 @@ class RecommendationAdminDialog(QDialog):
     def _pending_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        label = QLabel(
-            "Estas asociaciones requieren decisión del administrador. No se asignan automáticamente al facturador."
+        layout.addWidget(admin_label("Asociaciones pendientes", "Section"))
+        layout.addWidget(
+            admin_label(
+                "Selecciona una asociación para recomendarla o bloquearla en el catálogo ARS elegido."
+            )
         )
-        label.setWordWrap(True)
-        layout.addWidget(label)
-        layout.addWidget(self.pending, 1)
+        admin_table(self.pending, {0: 210, 1: 140, 2: 126, 3: 245}, stretch=3)
+        self.pending_inspector = RecordInspector(
+            self.pending,
+            "Asociación seleccionada",
+            "Selecciona una fila para ver el diagnóstico y el ítem completos.",
+        )
+        layout.addWidget(AdminSplit(self.pending, self.pending_inspector), 1)
         actions = QHBoxLayout()
         for label, mode in (
             ("Recomendar selección", "pin"),
             ("Bloquear selección", "block"),
         ):
             button = QPushButton(label)
+            button.setProperty("adminRole", "primary" if mode == "pin" else "warning")
             button.clicked.connect(
                 lambda _checked=False, mode=mode: self.review_pending(mode)
             )
+            self._bind_selection_action(self.pending, button)
             actions.addWidget(button)
         layout.addLayout(actions)
         self.tabs.addTab(page, "Por revisar")
 
     def _settings_tab(self):
-        page = QWidget()
-        form = QFormLayout(page)
-        self.settings = {}
-        for name, value in DEFAULT_SETTINGS.items():
-            field = QSpinBox()
-            field.setRange(*SETTING_LIMITS[name])
-            field.setValue(value)
-            self.settings[name] = field
-            form.addRow(SETTING_LABELS[name], field)
-        note = QLabel(
-            "Se utiliza un medicamento principal por cada uno de los dos primeros diagnósticos. Añadir al carrito o reimprimir no genera aprendizaje."
+        page = QScrollArea()
+        page.setObjectName("AdminScroll")
+        page.setWidgetResizable(True)
+        page.setFrameShape(QScrollArea.NoFrame)
+        content = QWidget()
+        content.setObjectName("AdminScrollContent")
+        layout = QVBoxLayout(content)
+        layout.addWidget(admin_label("Criterios de aprendizaje", "Section"))
+        layout.addWidget(
+            admin_label(
+                "Se aprende al guardar el recibo. Se considera el medicamento principal de cada uno de los dos primeros diagnósticos."
+            )
         )
-        note.setWordWrap(True)
-        form.addRow(note)
+        self.settings = {}
+        for heading, hint, names in SETTING_SECTIONS:
+            layout.addWidget(self._settings_section(heading, hint, names))
+        layout.addStretch(1)
+        page.setWidget(content)
         self.tabs.addTab(page, "Parámetros")
 
+    def _settings_section(self, heading, hint, names):
+        group = QGroupBox(heading)
+        group.setMaximumWidth(670)
+        form = QFormLayout(group)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.addRow(admin_label(hint))
+        for name in names:
+            field = QSpinBox()
+            field.setRange(*SETTING_LIMITS[name])
+            field.setValue(DEFAULT_SETTINGS[name])
+            self.settings[name] = field
+            form.addRow(SETTING_LABELS[name], field)
+        return group
+
     @staticmethod
-    def remove_rows(table):
-        for row in sorted(
+    def _visible_selected_rows(table):
+        return sorted(
             {
                 index.row()
-                for index in table.selectedIndexes()
+                for index in table.selectionModel().selectedRows()
                 if not table.isRowHidden(index.row())
-            },
-            reverse=True,
-        ):
+            }
+        )
+
+    def _bind_selection_action(self, table, button):
+        self._selection_buttons.setdefault(table, []).append(button)
+        table.itemSelectionChanged.connect(
+            lambda: self._update_selection_buttons(table)
+        )
+        self._update_selection_buttons(table)
+
+    def _update_selection_buttons(self, table):
+        enabled = bool(self._visible_selected_rows(table))
+        for button in self._selection_buttons.get(table, ()):
+            button.setEnabled(enabled)
+
+    def remove_rows(self, table):
+        for row in reversed(self._visible_selected_rows(table)):
             table.removeRow(row)
 
     def add_diagnosis(self, name="", aliases=()):
@@ -485,13 +607,10 @@ class RecommendationAdminDialog(QDialog):
         widget.setCurrentText(selected)
 
     def review_pending(self, mode):
-        for row in sorted(
-            {
-                index.row()
-                for index in self.pending.selectedIndexes()
-                if not self.pending.isRowHidden(index.row())
-            }
-        ):
+        rows = self._visible_selected_rows(self.pending)
+        if not rows:
+            return
+        for row in rows:
             values = [self.pending.item(row, column).text() for column in range(4)]
             self.add_rule(
                 dict(

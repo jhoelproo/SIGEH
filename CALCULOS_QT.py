@@ -69,6 +69,16 @@ from display_layout import (
 )
 from app_icons import APP_ICONS
 from app_resources import get_app_logo_path
+from admin_workspace_design import (
+    AdminSplit,
+    RecordInspector,
+    admin_heading,
+    admin_label,
+    admin_styles,
+    admin_table,
+    fit_admin_dialog,
+    selected_table_row,
+)
 from offline_auth import OfflineAuthCache
 from password_secrets import hash_secret, public_user, verify_secret
 from update_controls import UpdateCheckControl
@@ -9999,7 +10009,7 @@ def _query_available_receipts_for_batch(
     normalized_ars = normalize_monthly_ars_name(batch.get("ars"))
     from admission_contract import equivalent_ars_values
     rows = con.execute(
-        f"""SELECT r.id AS recibo_id, r.numero, r.nombre,
+        f"""SELECT r.id AS recibo_id, r.numero, r.nombre, r.estado_facturacion,
                        r.admission_nss_snapshot AS nss_snapshot,
                        r.admission_cedula_snapshot AS cedula_snapshot,
                        CASE
@@ -21792,91 +21802,154 @@ class UsersAdminDialog(QDialog):
         super().__init__(parent)
         self.current_user = current_user
         self.setWindowTitle("Administración de usuarios")
-        self.setMinimumSize(1050, 600)
+        fit_admin_dialog(self, (1210, 690))
+        is_dark = bool(getattr(parent, "is_dark_mode", False))
         lay = QVBoxLayout(self)
-        
+        self.btn_add = QPushButton("Crear usuario")
+        self.btn_add.setEnabled(user_is_admin(self.current_user))
+        self.btn_add.clicked.connect(self.create_user)
+        set_button_role(self.btn_add, "success", is_dark=is_dark)
+        lay.addWidget(
+            admin_heading(
+                "Administración de usuarios",
+                "Consulta cuentas, permisos y sesiones desde el usuario seleccionado.",
+                self.btn_add,
+            )
+        )
+
+        search_bar = QHBoxLayout()
+        search_label = QLabel("Usuario, nombre o rol")
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("🔍 Buscar usuario...")
-        self.search_edit.textChanged.connect(lambda t: filter_table_widget(self.table, t))
-        lay.addWidget(self.search_edit)
+        self.search_edit.setObjectName("AdminSearch")
+        self.search_edit.setPlaceholderText("Buscar una cuenta…")
+        self.search_edit.setClearButtonEnabled(True)
+        search_label.setBuddy(self.search_edit)
+        self.btn_refresh = QPushButton("Actualizar")
+        set_button_role(self.btn_refresh, "secondary", is_dark=is_dark)
+        self.btn_refresh.clicked.connect(self.load_users)
+        search_bar.addWidget(search_label)
+        search_bar.addWidget(self.search_edit, 1)
+        search_bar.addWidget(self.btn_refresh)
+        lay.addLayout(search_bar)
+        self.user_count = admin_label(role="Status")
+        lay.addWidget(self.user_count)
 
         self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(["Usuario", "Nombre", "Rol", "Activo", "Sesión actual", "Creado", "Último login", "Recibos"])
-        self.table.verticalHeader().hide()
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Usuario",
+                "Nombre",
+                "Rol",
+                "Cuenta",
+                "Sesión",
+                "Creado",
+                "Último acceso",
+                "Recibos",
+            ]
+        )
+        admin_table(
+            self.table,
+            {0: 165, 1: 220, 2: 130, 3: 95, 4: 105},
+            stretch=1,
+            hidden=(5, 6, 7),
+        )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        
-        # ---> ACTIVAR MENÚ CONTEXTUAL (CLIC DERECHO) <---
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
-        
-        lay.addWidget(self.table)
-        
+        self.user_inspector = RecordInspector(
+            self.table,
+            "Usuario seleccionado",
+            "Selecciona un usuario para ver su ficha.",
+        )
+        lay.addWidget(AdminSplit(self.table, self.user_inspector), 1)
+
         row = QHBoxLayout()
-        self.btn_refresh = QPushButton("Actualizar")
-        self.btn_add = QPushButton("Crear usuario")
-        self.btn_toggle = QPushButton("Activar / Desactivar")
-        self.btn_role = QPushButton("Cambiar rol")
-        self.btn_reset = QPushButton("Restablecer contraseña")
-        self.btn_remote_logout = QPushButton("Cerrar sesión remota")
-        row.addWidget(self.btn_refresh); row.addWidget(self.btn_add); row.addWidget(self.btn_toggle); row.addWidget(self.btn_role); row.addWidget(self.btn_reset); row.addWidget(self.btn_remote_logout); row.addStretch(1)
+        self.btn_manage = QPushButton("Acciones del usuario")
+        set_button_role(self.btn_manage, "info", is_dark=is_dark)
+        self.btn_manage.clicked.connect(self._open_user_actions)
+        row.addWidget(self.btn_manage)
+        row.addStretch(1)
         self.btn_logout = add_secondary_logout_button(
             row, parent, "Gestión de Usuarios"
         )
+        close_button = QPushButton("Cerrar")
+        set_button_role(close_button, "neutral", is_dark=is_dark)
+        close_button.clicked.connect(self.reject)
+        row.addWidget(close_button)
         lay.addLayout(row)
-        
-        self.btn_refresh.clicked.connect(self.load_users)
-        self.btn_add.clicked.connect(self.create_user)
-        self.btn_toggle.clicked.connect(self.toggle_active)
-        self.btn_role.clicked.connect(self.change_role)
-        self.btn_reset.clicked.connect(self.reset_password)
-        self.btn_remote_logout.clicked.connect(self.close_remote_session)
-        close_btn = QDialogButtonBox(QDialogButtonBox.Close)
-        close_btn.rejected.connect(self.reject)
-        lay.addWidget(close_btn)
+        self.search_edit.textChanged.connect(self._filter_users)
+        self.table.itemSelectionChanged.connect(self._update_user_actions)
+        self._update_user_actions()
+        self.setStyleSheet(get_stylesheet(is_dark) + admin_styles(is_dark))
         self.load_users()
-        set_button_role(self.btn_refresh, 'info')
-        set_button_role(self.btn_add, 'success')
-        set_button_role(self.btn_toggle, 'warning')
-        set_button_role(self.btn_role, 'info')
-        set_button_role(self.btn_reset, 'danger')
-        set_button_role(self.btn_remote_logout, 'warning')
-        if not user_is_admin(self.current_user):
-            self.btn_add.setEnabled(False)
-            self.btn_toggle.setEnabled(False)
-            self.btn_role.setEnabled(False)
-            self.btn_reset.setEnabled(False)
-        for btn in close_btn.buttons(): set_button_role(btn, 'neutral')
+        self.search_edit.setFocus()
 
     def load_users(self):
-        counts = get_user_receipt_counts()
-        active_sessions = get_active_sessions_map()
+        row = selected_table_row(self.table)
+        current = self.table.item(row, 0).text() if row is not None else None
+        try:
+            counts = get_user_receipt_counts()
+            active_sessions = get_active_sessions_map()
+            users = list_users()
+        except Exception as exc:
+            self.user_count.setText(
+                "No se pudieron cargar los usuarios. Pulsa Actualizar."
+            )
+            write_runtime_log(f"Administración de usuarios error={type(exc).__name__}")
+            return
         self.table.setRowCount(0)
-        for user in list_users():
-            r = self.table.rowCount(); self.table.insertRow(r)
+        for user in users:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
             username = user["username"]
             session_status = "Activa" if username in active_sessions else "No activa"
             values = [
                 username,
                 user["full_name"],
                 user["role"],
-                "Sí" if int(user["is_active"]) else "No",
+                "Activa" if int(user["is_active"]) else "Inactiva",
                 session_status,
                 user["created_at"] or "",
                 user.get("last_login") or "",
                 counts.get(username, 0)
             ]
             for c, val in enumerate(values):
-                item = QTableWidgetItem(str(val))
-                if c == 4 and session_status == "Activa":
-                    item.setForeground(QColor("#2e7d32"))
-                    font = item.font()
-                    font.setBold(True)
-                    item.setFont(font)
-                self.table.setItem(r, c, item)
+                self.table.setItem(r, c, QTableWidgetItem(str(val)))
+            if username == current:
+                self.table.selectRow(r)
+        self._filter_users(self.search_edit.text())
+
+    def _filter_users(self, text):
+        filter_table_widget(self.table, text)
+        visible = sum(
+            not self.table.isRowHidden(row) for row in range(self.table.rowCount())
+        )
+        self.user_count.setText(
+            f"{visible} de {self.table.rowCount()} usuarios"
+            if visible
+            else "No hay usuarios que coincidan con la búsqueda."
+        )
+        self.user_inspector.refresh()
+        self._update_user_actions()
+
+    def _update_user_actions(self):
+        allowed = (
+            user_is_admin(self.current_user)
+            or user_can_manage_sessions(self.current_user)
+            or user_has_permission(
+                self.current_user, PERMISSION_MANAGE_USER_PERMISSIONS
+            )
+        )
+        self.btn_manage.setEnabled(
+            allowed and selected_table_row(self.table) is not None
+        )
+
+    def _open_user_actions(self):
+        if selected_table_row(self.table) is not None:
+            menu = self._user_action_menu()
+            menu.exec(self.btn_manage.mapToGlobal(self.btn_manage.rect().bottomLeft()))
 
     def edit_permissions(self):
         if not user_has_permission(
@@ -21909,8 +21982,8 @@ class UsersAdminDialog(QDialog):
             self.current_user.update(get_user(self.current_user["username"]) or {})
 
     def _selected_username(self):
-        row = self.table.currentRow()
-        if row < 0:
+        row = selected_table_row(self.table)
+        if row is None:
             FloatingToast("Selecciona un usuario", self, is_error=True).show()
             return None
         return self.table.item(row, 0).text().strip()
@@ -21995,7 +22068,11 @@ class UsersAdminDialog(QDialog):
         if row < 0: return
         self.table.setCurrentCell(row, 0)
         self.table.selectRow(row)
-        
+        menu = self._user_action_menu()
+        if menu.actions():
+            menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _user_action_menu(self):
         menu = QMenu(self)
 
         if user_has_permission(
@@ -22006,9 +22083,9 @@ class UsersAdminDialog(QDialog):
             menu.addSeparator()
         
         if user_is_admin(self.current_user):
-            a_toggle = QAction("🔄 Activar / Desactivar", self)
-            a_role = QAction("🏷️ Cambiar rol", self)
-            a_reset = QAction("🔑 Restablecer contraseña", self)
+            a_toggle = QAction("Activar o desactivar cuenta", self)
+            a_role = QAction("Cambiar rol", self)
+            a_reset = QAction("Restablecer contraseña", self)
             
             a_toggle.triggered.connect(self.toggle_active)
             a_role.triggered.connect(self.change_role)
@@ -22019,13 +22096,13 @@ class UsersAdminDialog(QDialog):
             menu.addAction(a_reset)
             menu.addSeparator()
 
-        a_remote = QAction("🚪 Cerrar sesión remota", self)
-        a_remote.triggered.connect(self.close_remote_session)
-        menu.addAction(a_remote)
+        if user_can_manage_sessions(self.current_user):
+            a_remote = menu.addAction("Cerrar sesión remota")
+            a_remote.triggered.connect(self.close_remote_session)
         
         if user_is_admin(self.current_user):
             menu.addSeparator()
-            a_delete = QAction("❌ Eliminar usuario", self)
+            a_delete = QAction("Eliminar usuario", self)
             a_delete.triggered.connect(self.delete_user)
             
             font = a_delete.font()
@@ -22034,7 +22111,7 @@ class UsersAdminDialog(QDialog):
             
             menu.addAction(a_delete)
             
-        menu.exec(self.table.viewport().mapToGlobal(pos))
+        return menu
 
     def close_remote_session(self):
         if not user_can_manage_sessions(self.current_user):
@@ -22181,10 +22258,20 @@ class HistoryDialog(QDialog):
         self._load_worker = None
         self._pending_history_request = None
         self.setWindowTitle("Historial de acciones")
-        self.setMinimumSize(1180, 680)
+        fit_admin_dialog(self, (1280, 740))
+        is_dark = bool(getattr(main_window, "is_dark_mode", False))
         lay = QVBoxLayout(self)
+        lay.addWidget(
+            admin_heading(
+                "Historial de acciones",
+                "Acota el período y selecciona un registro para consultar sus detalles.",
+            )
+        )
 
-        filters = QGridLayout()
+        filters_card = QWidget()
+        filters_card.setObjectName("AdminToolbar")
+        filters = QGridLayout(filters_card)
+        filters.setContentsMargins(12, 8, 12, 8)
         self.date_from = QDateEdit()
         self.date_from.setCalendarPopup(True)
         self.date_from.setDisplayFormat("dd-MM-yyyy")
@@ -22196,62 +22283,63 @@ class HistoryDialog(QDialog):
         self.user_filter = QComboBox()
         self.module_filter = QComboBox()
         self.action_filter = QComboBox()
-        options = {"users": [], "modules": [], "actions": []}
         self.user_filter.addItem("Todos los usuarios", "")
         self.module_filter.addItem("Todos los módulos", "")
         self.action_filter.addItem("Todas las acciones", "")
-        for value in options["users"]:
-            self.user_filter.addItem(value, value)
-        for value in options["modules"]:
-            self.module_filter.addItem(value, value)
-        for value in options["actions"]:
-            self.action_filter.addItem(value, value)
         self.btn_apply = QPushButton("Aplicar filtros")
         self.btn_reset_filters = QPushButton("Restablecer")
-        set_button_role(self.btn_apply, "info")
-        set_button_role(self.btn_reset_filters, "neutral")
-        filters.addWidget(QLabel("Desde:"), 0, 0)
-        filters.addWidget(self.date_from, 0, 1)
-        filters.addWidget(QLabel("Hasta:"), 0, 2)
-        filters.addWidget(self.date_to, 0, 3)
-        filters.addWidget(QLabel("Usuario:"), 1, 0)
-        filters.addWidget(self.user_filter, 1, 1)
-        filters.addWidget(QLabel("Módulo:"), 1, 2)
-        filters.addWidget(self.module_filter, 1, 3)
-        filters.addWidget(QLabel("Acción:"), 2, 0)
-        filters.addWidget(self.action_filter, 2, 1, 1, 2)
-        filters.addWidget(self.btn_apply, 2, 3)
-        filters.addWidget(self.btn_reset_filters, 2, 4)
-        filters.setColumnStretch(1, 1)
-        filters.setColumnStretch(3, 1)
-        lay.addLayout(filters)
+        set_button_role(self.btn_apply, "info", is_dark=is_dark)
+        set_button_role(self.btn_reset_filters, "neutral", is_dark=is_dark)
+        for index, (caption, control) in enumerate(
+            (
+                ("Desde", self.date_from),
+                ("Hasta", self.date_to),
+                ("Usuario", self.user_filter),
+                ("Módulo", self.module_filter),
+                ("Acción", self.action_filter),
+            )
+        ):
+            row, column = divmod(index, 3)
+            label = QLabel(caption)
+            label.setBuddy(control)
+            filters.addWidget(label, row * 2, column)
+            filters.addWidget(control, row * 2 + 1, column)
+            filters.setColumnStretch(column, 1)
+            if isinstance(control, QComboBox):
+                control.setSizeAdjustPolicy(
+                    QComboBox.AdjustToMinimumContentsLengthWithIcon
+                )
+                control.setMinimumContentsLength(12)
+        filter_actions = QHBoxLayout()
+        filter_actions.addWidget(self.btn_reset_filters)
+        filter_actions.addWidget(self.btn_apply)
+        filters.addLayout(filter_actions, 3, 2)
+        lay.addWidget(filters_card)
 
         self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels([
             "Fecha y hora", "Usuario", "Rol", "Módulo", "Acción",
             "Tipo de entidad", "ID de entidad", "ARS", "Descripción",
         ])
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
-        self.table.setColumnWidth(0, 155)
-        self.table.setColumnWidth(1, 135)
-        self.table.setColumnWidth(2, 170)
-        self.table.setColumnWidth(3, 130)
-        self.table.setColumnWidth(4, 220)
-        self.table.setColumnWidth(5, 125)
-        self.table.setColumnWidth(6, 100)
-        self.table.setColumnWidth(7, 130)
+        admin_table(
+            self.table,
+            {0: 162, 1: 157, 3: 126, 4: 235},
+            stretch=4,
+            hidden=(2, 5, 6, 7, 8),
+        )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        lay.addWidget(self.table)
+        self.action_inspector = RecordInspector(
+            self.table, "Detalle del registro", "Selecciona una acción del historial."
+        )
+        lay.addWidget(AdminSplit(self.table, self.action_inspector), 1)
 
         bottom = QHBoxLayout()
-        self.count_label = QLabel("")
+        self.count_label = admin_label(role="Status")
         self.btn_more = QPushButton("Cargar más")
-        set_button_role(self.btn_more, "info")
+        self.btn_more.setEnabled(False)
+        set_button_role(self.btn_more, "info", is_dark=is_dark)
         bottom.addWidget(self.count_label)
         bottom.addWidget(self.btn_more)
         bottom.addStretch(1)
@@ -22259,10 +22347,12 @@ class HistoryDialog(QDialog):
             bottom, main_window, "Historial de acciones"
         )
         btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.button(QDialogButtonBox.Close).setText("Cerrar")
+        set_button_role(btns.button(QDialogButtonBox.Close), "neutral", is_dark=is_dark)
         btns.rejected.connect(self.reject)
         bottom.addWidget(btns)
         lay.addLayout(bottom)
-        for btn in btns.buttons(): set_button_role(btn, 'neutral')
+        self.setStyleSheet(get_stylesheet(is_dark) + admin_styles(is_dark))
         self.btn_apply.clicked.connect(lambda: self.load_rows(reset=True))
         self.btn_reset_filters.clicked.connect(self.reset_filters)
         self.btn_more.clicked.connect(lambda: self.load_rows(reset=False))
@@ -22294,6 +22384,7 @@ class HistoryDialog(QDialog):
             self._pending_history_request = request
             return
         self.count_label.setText("Actualizando historial...")
+        self.btn_more.setEnabled(False)
         worker = ActionHistoryLoadWorker(
             query, include_options=include_options,
             parent=QApplication.instance(),
@@ -22343,9 +22434,19 @@ class HistoryDialog(QDialog):
             for column, value in enumerate(values):
                 self.table.setItem(table_row, column, QTableWidgetItem(str(value)))
         self._offset += len(rows)
-        self.count_label.setText(f"Mostrando {self.table.rowCount()} acciones")
+        self._show_history_count()
         self.btn_more.setEnabled(len(rows) == self.PAGE_SIZE)
         self._run_pending_history_request()
+
+    def _show_history_count(self):
+        count = self.table.rowCount()
+        if count == 0:
+            message = "No hay acciones para estos filtros."
+        elif count == 1:
+            message = "1 acción cargada"
+        else:
+            message = f"{count:,} acciones cargadas"
+        self.count_label.setText(message)
 
     @Slot(str)
     def _history_load_failed(self, error_type: str):
@@ -22653,6 +22754,23 @@ class ReceiptTrashDialog(QDialog):
 class BillingStatusDialog(QDialog):
     """Confirmación explícita para una transición de estado financiero."""
 
+    @staticmethod
+    def _receipt_summary(receipt):
+        summary = QLabel(
+            f"Recibo: {receipt.get('numero', '')}\n"
+            f"Paciente: {receipt.get('nombre', '')}\n"
+            f"ARS: {receipt.get('ars') or 'Sin ARS'}\n"
+            f"Total: RD$ {float(receipt.get('total') or 0):,.2f}\n"
+            f"Estado actual: {billing_status_label(receipt.get('estado_facturacion'))}\n"
+            f"Documento: {document_state_label(receipt.get('estado_documento'))}\n"
+            f"Autorización: {receipt.get('numero_autorizacion') or 'Pendiente'}\n"
+            f"Diagnóstico: {receipt.get('dx') or 'Pendiente'}"
+        )
+        summary.setTextFormat(Qt.TextFormat.PlainText)
+        summary.setWordWrap(True)
+        summary.setObjectName("AuditSummary")
+        return summary
+
     def __init__(self, receipt: dict, target_status: str, actor=None, parent=None):
         super().__init__(parent)
         self.receipt = receipt
@@ -22668,18 +22786,7 @@ class BillingStatusDialog(QDialog):
         title = QLabel(self.windowTitle().upper())
         title.setStyleSheet("font-size: 16pt; font-weight: 900; color: #123F83;")
         root.addWidget(title)
-        summary = QLabel(
-            f"Recibo: {receipt.get('numero', '')}\n"
-            f"Paciente: {receipt.get('nombre', '')}\n"
-            f"ARS: {receipt.get('ars') or 'Sin ARS'}\n"
-            f"Total: RD$ {float(receipt.get('total') or 0):,.2f}\n"
-            f"Estado actual: {billing_status_label(receipt.get('estado_facturacion'))}\n"
-            f"Documento: {document_state_label(receipt.get('estado_documento'))}\n"
-            f"Autorización: {receipt.get('numero_autorizacion') or 'Pendiente'}"
-        )
-        summary.setWordWrap(True)
-        summary.setObjectName("AuditSummary")
-        root.addWidget(summary)
+        root.addWidget(self._receipt_summary(receipt))
         self.preflight = get_receipt_audit_preflight(
             int(receipt["id"]), self.actor
         )
@@ -22764,6 +22871,8 @@ class BillingStatusDialog(QDialog):
         }.get(target_status, "Aplicar"))
         buttons.button(QDialogButtonBox.Cancel).setText("Cancelar")
         set_button_role(ok, "success" if target_status == BILLING_INVOICED else "warning")
+        if target_status == BILLING_INVOICED and self.preflight["blockers"]:
+            ok.setEnabled(False)
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
@@ -24250,6 +24359,24 @@ def filter_monthly_batch_candidates(
     return filter_candidates(candidates, search_mode, term)
 
 
+def run_billing_status_dialog(parent, receipt, target, actor):
+    try:
+        dialog = BillingStatusDialog(receipt, target, actor=actor, parent=parent)
+    except Exception as exc:
+        QMessageBox.critical(parent, "Prevalidación de auditoría", str(exc))
+        return False
+    if dialog.exec() != QDialog.Accepted:
+        return False
+    try:
+        change_receipt_billing_status(
+            int(receipt["id"]), target, actor, **dialog.values()
+        )
+    except Exception as exc:
+        QMessageBox.critical(parent, "Estado de facturación", str(exc))
+        return False
+    return True
+
+
 class MonthlyBatchCandidateSelectionDialog(QDialog):
     """Local candidate finder with selection persisted by candidate_key."""
 
@@ -24264,9 +24391,9 @@ class MonthlyBatchCandidateSelectionDialog(QDialog):
     def __init__(self, candidates, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Añadir pacientes de la ARS")
-        self.resize(1120, 640)
-        self.setMinimumSize(860, 460)
+        fit_admin_dialog(self, (1260, 700))
         self.setSizeGripEnabled(True)
+        self.billing_actor = getattr(parent, "current_user", None) or {}
         self._candidates = [
             dict(candidate) for candidate in candidates
             if monthly_batch_candidate_key(candidate)
@@ -24276,6 +24403,7 @@ class MonthlyBatchCandidateSelectionDialog(QDialog):
             for candidate in self._candidates
         }
         self.selected_candidate_keys: set[str] = set()
+        self.confirmed_receipt_ids: set[int] = set()
         self._show_selected_only = False
         self._updating_checkboxes = False
 
@@ -24304,26 +24432,43 @@ class MonthlyBatchCandidateSelectionDialog(QDialog):
         summary_layout.addWidget(self.clear_selection_button)
         layout.addLayout(summary_layout)
 
-        self.table = QTableWidget(0, 11)
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels([
             "ID", "Seleccionar", "Recibo", "Paciente", "ARS", "Fecha",
-            "NSS", "Cédula", "Autorización", "Especialidad", "Monto",
+            "NSS", "Cédula", "Autorización", "Especialidad", "Monto", "Facturación",
         ])
         self.table.setColumnHidden(0, True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        admin_table(
+            self.table,
+            {
+                1: 85,
+                2: 84,
+                3: 215,
+                4: 115,
+                5: 99,
+                6: 106,
+                7: 106,
+                8: 108,
+                9: 122,
+                10: 103,
+                11: 155,
+            },
+        )
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        for column, width in {
-            1: 90, 2: 88, 4: 130, 5: 96, 6: 118, 7: 118,
-            8: 115, 9: 135, 10: 105,
-        }.items():
-            self.table.setColumnWidth(column, width)
+        header.moveSection(header.visualIndex(11), header.visualIndex(3) + 1)
         layout.addWidget(self.table, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
         self.add_selected_button = buttons.button(QDialogButtonBox.Ok)
+        buttons.button(QDialogButtonBox.Cancel).setText("Cerrar")
+        self.invoice_button = QPushButton("Revisar y confirmar como facturado")
+        self.invoice_button.setAutoDefault(False)
+        set_button_role(self.invoice_button, "success")
+        self.invoice_button.clicked.connect(self._invoice_current)
+        buttons.addButton(self.invoice_button, QDialogButtonBox.ActionRole)
         buttons.accepted.connect(self._accept_selected)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -24336,6 +24481,8 @@ class MonthlyBatchCandidateSelectionDialog(QDialog):
         self.show_selected_button.clicked.connect(self._toggle_selected_view)
         self.clear_selection_button.clicked.connect(self._clear_selection)
         self.table.itemChanged.connect(self._checkbox_changed)
+        self.table.itemSelectionChanged.connect(self._update_invoice_action)
+        self._update_invoice_action()
         self._search_mode_changed()
         self._apply_filter()
 
@@ -24365,9 +24512,12 @@ class MonthlyBatchCandidateSelectionDialog(QDialog):
                     data.get("authorization_snapshot", ""),
                     data.get("specialty_snapshot", ""),
                     f"RD$ {float(data.get('total_snapshot') or data.get('total') or 0):,.2f}",
+                    billing_status_label(data.get("estado_facturacion"))
+                    if candidate_key.startswith("R:")
+                    else "Sin recibo",
                 ]
                 for column, value in enumerate(values):
-                    item = QTableWidgetItem(str(value))
+                    item = QTableWidgetItem(str(value) if value not in (None, "") else "")
                     if column == 1:
                         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                         item.setCheckState(Qt.Unchecked)
@@ -24398,6 +24548,47 @@ class MonthlyBatchCandidateSelectionDialog(QDialog):
             key_item = self.table.item(row, 0)
             self.table.setRowHidden(row, not key_item or key_item.text() not in matching_keys)
         self._update_summary(len(matching_keys), message)
+        self._update_invoice_action()
+
+    def _selected_invoice_candidate(self):
+        row = selected_table_row(self.table)
+        if row is None:
+            return None
+        key = self.table.item(row, 0).text()
+        candidate = self._candidate_by_key[key]
+        status = candidate.get("estado_facturacion") or BILLING_UNCLASSIFIED
+        if key.startswith("R:") and status in (BILLING_PENDING, BILLING_UNCLASSIFIED):
+            return row, key, candidate
+        return None
+
+    def _update_invoice_action(self):
+        allowed = user_has_permission(self.billing_actor, PERMISSION_VALIDATE_RECEIPT)
+        self.invoice_button.setVisible(allowed)
+        self.invoice_button.setEnabled(
+            allowed and self._selected_invoice_candidate() is not None
+        )
+
+    def _invoice_current(self):
+        selected = self._selected_invoice_candidate()
+        if selected is None or not user_has_permission(
+            self.billing_actor, PERMISSION_VALIDATE_RECEIPT
+        ):
+            return
+        row, key, candidate = selected
+        try:
+            receipt = get_recibo_data(int(key[2:]))
+        except Exception as exc:
+            QMessageBox.critical(self, "Consultar recibo", str(exc))
+            return
+        if not run_billing_status_dialog(
+            self, receipt, BILLING_INVOICED, self.billing_actor
+        ):
+            return
+        self.confirmed_receipt_ids.add(int(key[2:]))
+        candidate["estado_facturacion"] = BILLING_INVOICED
+        self.table.item(row, 11).setText(billing_status_label(BILLING_INVOICED))
+        self._update_invoice_action()
+        FloatingToast("Recibo confirmado como facturado", self).show()
 
     def _update_summary(self, visible_count: int, message: str | None = None):
         selected_count = len(self.selected_candidate_keys)
@@ -26264,7 +26455,11 @@ class MonthlyBillingListsPage(QWidget):
             ).show()
             return
         dialog = MonthlyBatchCandidateSelectionDialog(self.available_receipts, self)
-        if dialog.exec() != QDialog.Accepted:
+        result = dialog.exec()
+        for candidate in self.available_receipts:
+            if candidate.get("recibo_id") in dialog.confirmed_receipt_ids:
+                candidate["estado_facturacion"] = BILLING_INVOICED
+        if result != QDialog.Accepted:
             return
         try:
             candidate_keys = dialog.selected_keys_in_source_order()
@@ -27623,23 +27818,11 @@ class ReceiptHistoryDialog(QDialog):
         if not receipt:
             FloatingToast("Selecciona un recibo", self, is_error=True).show()
             return
-        try:
-            dialog = BillingStatusDialog(
-                receipt,
-                target_status,
-                actor=self.main_window.current_user,
-                parent=self,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Prevalidación de auditoría", str(exc))
-            return
-        if dialog.exec() != QDialog.Accepted:
+        if not run_billing_status_dialog(
+            self, receipt, target_status, self.main_window.current_user
+        ):
             return
         try:
-            change_receipt_billing_status(
-                int(receipt["id"]), target_status, self.main_window.current_user,
-                **dialog.values(),
-            )
             self.load_rows()
             if target_status == BILLING_PENDING:
                 if self.main_window.open_receipt_in_billing(int(receipt["id"])):
@@ -28726,47 +28909,25 @@ class ReportsDialog(LegacyReportsDialog):
         self._dashboard_worker = None
         self._dashboard_export_worker = None
         self._report_generation_in_progress = False
-        self._reports_tab_pages = []
         self._reports_hint_labels = []
         self._dashboard_state_kind = "info"
         self.setWindowTitle("Centro de Reportes y Estadísticas")
-        self.setMinimumSize(860, 680)
-        self.resize(1320, 880)
+        fit_admin_dialog(self, (1370, 860))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(12)
 
-        header = QWidget()
-        header.setObjectName("ReportsHeaderCard")
-        self.reports_header = header
-        header.setStyleSheet(
-            "QWidget { background: #123F83; border-radius: 12px; } "
-            "QLabel { color: white; background: transparent; }"
-        )
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(22, 15, 22, 15)
-        header_icon = QLabel()
-        header_icon.setObjectName("ModernHeaderIcon")
-        header_icon.setAlignment(Qt.AlignCenter)
-        header_icon.setPixmap(
-            self.style().standardIcon(QStyle.SP_FileDialogDetailedView).pixmap(27, 27)
-        )
-        header_text = QVBoxLayout()
-        title = QLabel("CENTRO DE REPORTES Y ESTADÍSTICAS")
-        title.setObjectName("ReportsHeaderTitle")
-        subtitle = QLabel("Análisis por fecha real de generación del recibo")
-        subtitle.setObjectName("ReportsHeaderSubtitle")
-        header_text.addWidget(title)
-        header_text.addWidget(subtitle)
-        header_layout.addWidget(header_icon)
-        header_layout.addLayout(header_text, 1)
         self.btn_logout = None
         close_top = QPushButton("Cerrar")
         close_top.clicked.connect(self.close)
         set_button_role(close_top, "neutral")
-        header_layout.addWidget(close_top)
-        root.addWidget(header)
+        self.reports_header = admin_heading(
+            "Centro de reportes y estadísticas",
+            "Analiza un período, genera un PDF o recupera un reporte guardado.",
+            close_top,
+        )
+        root.addWidget(self.reports_header)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("ReportsMainTabs")
@@ -28817,27 +28978,19 @@ class ReportsDialog(LegacyReportsDialog):
         )
         self.setStyleSheet(
             get_stylesheet(bool(is_dark)) + modern_module_stylesheet(bool(is_dark))
+            + admin_styles(bool(is_dark))
         )
         self.tabs.setStyleSheet(
             f"QTabWidget#ReportsMainTabs::pane {{ background: {surface}; "
             f"border: 1px solid {border}; border-radius: 7px; }} "
-            f"QTabWidget#ReportsMainTabs QTabBar::tab {{ min-width: 190px; "
-            f"padding: 11px 18px; font-weight: 800; color: {text}; "
+            f"QTabWidget#ReportsMainTabs QTabBar::tab {{ min-width: 112px; "
+            f"padding: 9px 14px; font-weight: 800; color: {text}; "
             f"background: {alt}; border: 1px solid {border}; }} "
             f"QTabWidget#ReportsMainTabs QTabBar::tab:hover {{ background: {theme['sel_bg']}; "
             f"color: {theme['sel_text']}; }} "
             f"QTabWidget#ReportsMainTabs QTabBar::tab:selected {{ background: {surface}; "
             f"color: {title}; border-bottom: 3px solid {title}; }}"
         )
-        self.reports_header.setStyleSheet(
-            f"QWidget#ReportsHeaderCard {{ background: {surface}; border: 1px solid {border}; "
-            "border-radius: 11px; } "
-            f"QLabel#ReportsHeaderTitle {{ color: {title}; font-size: 18pt; font-weight: 900; "
-            "background: transparent; } "
-            f"QLabel#ReportsHeaderSubtitle {{ color: {muted}; font-size: 10.5pt; background: transparent; }}"
-        )
-        for page in self._reports_tab_pages:
-            page.setStyleSheet(f"background: {surface}; color: {text};")
         if hasattr(self, "dashboard_scroll"):
             self.dashboard_scroll.setStyleSheet(
                 f"QScrollArea {{ background: {surface}; border: none; }} "
@@ -28937,7 +29090,6 @@ class ReportsDialog(LegacyReportsDialog):
         if not self._ensure_panel_access(show_message=False):
             return
         tab = QWidget()
-        self._reports_tab_pages.append(tab)
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(4, 10, 4, 4)
 
@@ -28955,14 +29107,14 @@ class ReportsDialog(LegacyReportsDialog):
 
         self._updating_dashboard_dates = False
 
-        self.dashboard_period_box = QGroupBox("1. Seleccione el período")
+        self.dashboard_period_box = QGroupBox("Período de consulta")
         self.dashboard_period_box.setObjectName("ModernCard")
         self.dashboard_period_layout = QGridLayout(self.dashboard_period_box)
         self.dashboard_period_selector = PeriodSelectorWidget()
         self.dashboard_period_layout.addWidget(self.dashboard_period_selector, 0, 0)
         self.dashboard_period_fields = []
 
-        self.dashboard_main_box = QGroupBox("2. ¿Qué información desea analizar?")
+        self.dashboard_main_box = QGroupBox("Criterios de análisis")
         self.dashboard_main_box.setObjectName("ModernCard")
         self.dashboard_main_layout = QGridLayout(self.dashboard_main_box)
         self.dashboard_ars = MultiSelectFilter(
@@ -29085,17 +29237,33 @@ class ReportsDialog(LegacyReportsDialog):
                 field.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
                 field.setMinimumContentsLength(12)
         self._arrange_dashboard_filters(False)
-        layout.addWidget(self.dashboard_period_box)
-        layout.addWidget(self.dashboard_main_box)
-        layout.addWidget(self.dashboard_advanced_box)
-
         self.dashboard_filter_summary = QLabel()
         self.dashboard_filter_summary.setWordWrap(True)
         self.dashboard_filter_summary.setStyleSheet(
             "background: #EDF4FD; color: #24415F; border: 1px solid #C4D7EF; "
             "border-radius: 9px; padding: 9px 13px; font-weight: 700;"
         )
-        layout.addWidget(self.dashboard_filter_summary)
+        self.btn_dashboard_filters = QPushButton("Editar filtros")
+        set_button_role(
+            self.btn_dashboard_filters,
+            "secondary",
+            is_dark=bool(getattr(self.parent(), "is_dark_mode", False)),
+        )
+        self.btn_dashboard_filters.setCheckable(True)
+        self.btn_dashboard_filters.setAutoDefault(False)
+        filter_bar = QHBoxLayout()
+        filter_bar.addWidget(self.dashboard_filter_summary, 1)
+        filter_bar.addWidget(self.btn_dashboard_filters)
+        layout.addLayout(filter_bar)
+        self.dashboard_filter_options = QWidget()
+        options = QVBoxLayout(self.dashboard_filter_options)
+        options.setContentsMargins(0, 0, 0, 0)
+        options.addWidget(self.dashboard_period_box)
+        options.addWidget(self.dashboard_main_box)
+        options.addWidget(self.dashboard_advanced_box)
+        self.dashboard_filter_options.hide()
+        self.btn_dashboard_filters.toggled.connect(self._show_dashboard_filters)
+        layout.addWidget(self.dashboard_filter_options)
         layout.addWidget(self.dashboard_actions_widget)
 
         self.dashboard_status = QLabel("Preparando estadísticas...")
@@ -29140,6 +29308,7 @@ class ReportsDialog(LegacyReportsDialog):
         self.dashboard_evolution_layout.setSpacing(8)
         self.dashboard_comparison_page_layout = QVBoxLayout(self.dashboard_comparison_page)
         self.dashboard_detail_layout = QVBoxLayout(self.dashboard_detail_page)
+        self._add_dashboard_section_titles()
         self.dashboard_summary_tab_index = self.dashboard_results_tabs.addTab(
             self.dashboard_summary_page, "Resumen"
         )
@@ -29183,7 +29352,7 @@ class ReportsDialog(LegacyReportsDialog):
         )
         shift_layout.addWidget(self.shift_summary_text)
         self.shift_summary_table = QTableWidget(0, 5)
-        self.shift_summary_table.setObjectName("ModernDataTable")
+        admin_table(self.shift_summary_table, {}, stretch=0)
         self.shift_summary_table.setHorizontalHeaderLabels(
             ["ARS", "Admitidos", "Facturados", "Pendientes", "Requieren corrección"]
         )
@@ -29210,7 +29379,7 @@ class ReportsDialog(LegacyReportsDialog):
         comparison_panel_layout.addWidget(self.dashboard_comparison_periods)
 
         self.dashboard_comparison_table = QTableWidget(0, 5)
-        self.dashboard_comparison_table.setObjectName("ModernDataTable")
+        admin_table(self.dashboard_comparison_table, {}, stretch=0)
         self.dashboard_comparison_table.setHorizontalHeaderLabels(
             ["Indicador", "Actual", "Anterior", "Diferencia", "Variación"]
         )
@@ -29229,7 +29398,7 @@ class ReportsDialog(LegacyReportsDialog):
         self.dashboard_categories_comparison_box = categories_comparison_box
         categories_comparison_layout = QVBoxLayout(categories_comparison_box)
         self.dashboard_categories_comparison = QTableWidget(0, 2)
-        self.dashboard_categories_comparison.setObjectName("ModernDataTable")
+        admin_table(self.dashboard_categories_comparison, {}, stretch=0)
         self.dashboard_categories_comparison.setHorizontalHeaderLabels(["Categoría", "Variación"])
         self.dashboard_categories_comparison.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.dashboard_categories_comparison.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -29327,11 +29496,11 @@ class ReportsDialog(LegacyReportsDialog):
         self.dashboard_distribution_layout.addLayout(charts)
         self.dashboard_evolution_layout.addWidget(line_box, 1)
 
-        table_box = QGroupBox("Tabla resumen de los datos mostrados")
+        table_box = QGroupBox("Resultados por ARS")
         self.dashboard_table_box = table_box
         table_layout = QVBoxLayout(table_box)
         self.dashboard_table = QTableWidget(0, 6)
-        self.dashboard_table.setObjectName("ModernDataTable")
+        admin_table(self.dashboard_table, {0: 190, 1: 130, 2: 75, 3: 98, 4: 98, 5: 130}, stretch=0)
         self.dashboard_table.setHorizontalHeaderLabels(
             ["ARS", "Total emitido", "Recibos", "% del dinero", "% de recibos", "Promedio / recibo"]
         )
@@ -29377,6 +29546,43 @@ class ReportsDialog(LegacyReportsDialog):
         self.btn_print_comparison.clicked.connect(self.print_dashboard_comparison)
         self.update_dashboard_period(refresh=False)
 
+    def _show_dashboard_filters(self, visible):
+        self.dashboard_filter_options.setVisible(visible)
+        self.btn_dashboard_filters.setText(
+            "Ocultar filtros" if visible else "Editar filtros"
+        )
+
+    def _add_dashboard_section_titles(self):
+        for section, heading, hint in (
+            (
+                self.dashboard_summary_layout,
+                "Indicadores del período",
+                "Totales de la consulta y seguimiento del turno.",
+            ),
+            (
+                self.dashboard_distribution_layout,
+                "Composición del total",
+                "Consulta la participación por categoría, ARS y cobertura.",
+            ),
+            (
+                self.dashboard_evolution_layout,
+                "Tendencia del período",
+                "Cambia el indicador para explorar la serie.",
+            ),
+            (
+                self.dashboard_comparison_page_layout,
+                "Variación entre períodos",
+                "Revisa el cambio por indicador y por categoría.",
+            ),
+            (
+                self.dashboard_detail_layout,
+                "Detalle por aseguradora",
+                "Consulta montos, cantidad de recibos y participación.",
+            ),
+        ):
+            section.addWidget(admin_label(heading, "Section"))
+            section.addWidget(admin_label(hint))
+
     def _create_kpi_card(self, grid, column, title, initial, color):
         card = QWidget()
         card.setStyleSheet(
@@ -29406,17 +29612,20 @@ class ReportsDialog(LegacyReportsDialog):
         self.dashboard_actions_layout.removeWidget(self.dashboard_action_docs_label)
         for column in range(7):
             self.dashboard_actions_layout.setColumnStretch(column, 0)
+        self.dashboard_action_query_label.setVisible(not compact)
+        self.dashboard_action_docs_label.setVisible(not compact)
         if compact:
-            self.dashboard_actions_layout.addWidget(self.dashboard_action_query_label, 0, 0, 1, 2)
-            self.dashboard_actions_layout.addWidget(self.btn_dashboard_refresh, 1, 0)
-            self.dashboard_actions_layout.addWidget(self.btn_dashboard_compare, 1, 1)
-            self.dashboard_actions_layout.addWidget(self.btn_dashboard_clear, 2, 0, 1, 2)
-            self.dashboard_actions_layout.addWidget(self.dashboard_action_docs_label, 3, 0, 1, 2)
-            self.dashboard_actions_layout.addWidget(self.btn_print_comparison, 4, 0, 1, 2)
-            self.dashboard_actions_layout.addWidget(self.btn_dashboard_export, 5, 0, 1, 2)
-            self.dashboard_actions_layout.addWidget(self.dashboard_compare_summary, 6, 0, 1, 2)
-            self.dashboard_actions_layout.setColumnStretch(0, 1)
-            self.dashboard_actions_layout.setColumnStretch(1, 1)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_refresh, 0, 0)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_compare, 0, 1)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_clear, 0, 2)
+            self.dashboard_actions_layout.addWidget(
+                self.btn_print_comparison, 1, 0, 1, 2, Qt.AlignLeft
+            )
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_export, 1, 2)
+            self.dashboard_actions_layout.addWidget(
+                self.dashboard_compare_summary, 2, 0, 1, 4
+            )
+            self.dashboard_actions_layout.setColumnStretch(3, 1)
         else:
             self.dashboard_actions_layout.addWidget(self.dashboard_action_query_label, 0, 0, 1, 3)
             self.dashboard_actions_layout.addWidget(self.dashboard_action_docs_label, 0, 4, 1, 3)
@@ -29466,19 +29675,16 @@ class ReportsDialog(LegacyReportsDialog):
 
     def _build_generation_tab(self):
         tab = QWidget()
-        self._reports_tab_pages.append(tab)
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(10, 14, 10, 10)
-        intro = QLabel(
-            "Genera documentos oficiales con una base financiera explícita. Por defecto solo se "
-            "incluyen recibos confirmados como facturados y se usa su fecha de validación."
+        intro = admin_label(
+            "Elige el período y revisa el resumen antes de generar el documento.",
+            "Section",
         )
-        intro.setWordWrap(True)
         self.report_intro = intro
-        intro.setStyleSheet("background: #EDF4FD; padding: 13px; border-radius: 9px; color: #24415F;")
         layout.addWidget(intro)
 
-        config_box = QGroupBox("Configuración del reporte PDF")
+        config_box = QGroupBox("Período y alcance")
         config_box.setObjectName("ModernCard")
         cfg = QGridLayout(config_box)
         self.report_period_selector = PeriodSelectorWidget()
@@ -29497,8 +29703,8 @@ class ReportsDialog(LegacyReportsDialog):
         self.btn_generate.setMinimumHeight(44)
         set_button_role(self.btn_generate, "report")
         report_filter_hint = QLabel(
-            "Abre cada filtro para incluir o excluir varias opciones. Los cambios se confirmarán "
-            "solo al pulsar Aplicar filtro."
+            "Aplica la selección dentro de cada filtro de ARS o facturadores. "
+            "El análisis elegido determina qué recibos y fechas usa el PDF."
         )
         report_filter_hint.setWordWrap(True)
         self.report_filter_hint = report_filter_hint
@@ -29506,28 +29712,37 @@ class ReportsDialog(LegacyReportsDialog):
             "background: #F7FAFE; color: #52657A; border-radius: 7px; padding: 8px 10px;"
         )
 
-        cfg.addWidget(self.report_period_selector, 0, 0, 1, 4)
-        cfg.addWidget(QLabel("Tipo de análisis:"), 1, 0)
-        cfg.addWidget(self.report_analysis, 1, 1, 1, 3)
-        cfg.addWidget(QLabel("ARS:"), 2, 0)
-        cfg.addWidget(self.ars_filter, 2, 1)
-        cfg.addWidget(QLabel("Facturador:"), 2, 2)
-        cfg.addWidget(self.user_filter, 2, 3)
-        cfg.addWidget(QLabel("Cobertura:"), 3, 0)
-        cfg.addWidget(self.report_coverage, 3, 1, 1, 3)
-        cfg.addWidget(report_filter_hint, 4, 0, 1, 4)
-        cfg.addWidget(self.btn_generate, 5, 0, 1, 4)
-        layout.addWidget(config_box)
+        cfg.addWidget(self.report_period_selector, 0, 0, 1, 2)
+        for index, (caption, control) in enumerate(
+            (
+                ("Tipo de análisis", self.report_analysis),
+                ("Cobertura", self.report_coverage),
+                ("ARS", self.ars_filter),
+                ("Facturadores", self.user_filter),
+            )
+        ):
+            row, column = divmod(index, 2)
+            label = QLabel(caption)
+            label.setBuddy(control)
+            cfg.addWidget(label, 1 + row * 2, column)
+            cfg.addWidget(control, 2 + row * 2, column)
+            cfg.setColumnStretch(column, 1)
+        cfg.addWidget(report_filter_hint, 5, 0, 1, 2)
+        cfg.setRowStretch(6, 1)
 
         preview = QGroupBox("Resumen antes de generar")
         preview.setObjectName("ModernCard")
         preview_layout = QVBoxLayout(preview)
-        self.report_preview = QLabel()
-        self.report_preview.setWordWrap(True)
-        self.report_preview.setStyleSheet("font-size: 11pt; padding: 12px; color: #31475F;")
+        self.report_preview = admin_label()
         preview_layout.addWidget(self.report_preview)
-        layout.addWidget(preview)
-        layout.addStretch(1)
+        preview_layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setObjectName("AdminScroll")
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(AdminSplit(config_box, preview))
+        layout.addWidget(scroll, 1)
+        layout.addWidget(self.btn_generate, 0, Qt.AlignRight)
         self.tabs.addTab(tab, "Generar reporte PDF")
 
         self.report_period_selector.periodChanged.connect(self.update_report_preview)
@@ -29540,7 +29755,6 @@ class ReportsDialog(LegacyReportsDialog):
 
     def _build_history_tab(self):
         tab = QWidget()
-        self._reports_tab_pages.append(tab)
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(10, 14, 10, 10)
         tools_card = QWidget()
@@ -29548,41 +29762,43 @@ class ReportsDialog(LegacyReportsDialog):
         tools = QHBoxLayout(tools_card)
         tools.setContentsMargins(12, 9, 12, 9)
         self.search_edit = QLineEdit()
-        self.search_edit.setObjectName("ModernSearch")
+        self.search_edit.setObjectName("AdminSearch")
         self.search_edit.setPlaceholderText("Buscar por tipo, fecha, usuario o archivo...")
-        self.history_count = QLabel("0 reportes")
-        self.history_count.setStyleSheet("font-weight: 800; color: #123F83;")
+        self.search_edit.setClearButtonEnabled(True)
+        search_label = QLabel("Buscar reporte")
+        search_label.setBuddy(self.search_edit)
+        self.history_count = admin_label("0 reportes", "Status")
         self.btn_history_refresh = QPushButton("Actualizar")
         set_button_role(self.btn_history_refresh, "neutral")
+        tools.addWidget(search_label)
         tools.addWidget(self.search_edit, 1)
         tools.addWidget(self.history_count)
         tools.addWidget(self.btn_history_refresh)
         layout.addWidget(tools_card)
 
         self.table = QTableWidget(0, 11)
-        self.table.setObjectName("ModernDataTable")
         self.table.setHorizontalHeaderLabels(
             ["Tipo", "Desde", "Hasta", "Generado el", "Por", "Archivo", "JSON", "ID", "Tabla",
              "Período actual", "Comparado con"]
         )
-        for column in (5, 6, 7, 8):
-            self.table.setColumnHidden(column, True)
+        admin_table(
+            self.table,
+            {0: 116, 3: 150, 4: 142, 9: 245},
+            stretch=9,
+            hidden=(1, 2, 5, 6, 7, 8, 10),
+        )
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
         header.moveSection(header.visualIndex(9), 1)
-        header.moveSection(header.visualIndex(10), 2)
-        header.setSectionResizeMode(9, QHeaderView.Stretch)
-        header.setSectionResizeMode(10, QHeaderView.Stretch)
-        self.table.setColumnWidth(0, 125)
-        self.table.setColumnWidth(1, 100)
-        self.table.setColumnWidth(2, 100)
-        self.table.setColumnWidth(3, 135)
-        self.table.setColumnWidth(4, 130)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        layout.addWidget(self.table, 1)
+        self.report_inspector = RecordInspector(
+            self.table,
+            "Ficha del reporte",
+            "Selecciona un reporte para consultar su período.",
+            columns=(9, 10, 0, 1, 2, 3, 4),
+        )
+        layout.addWidget(AdminSplit(self.table, self.report_inspector), 1)
 
         buttons_card = QWidget()
         buttons_card.setObjectName("ModernActionBar")
@@ -29617,6 +29833,19 @@ class ReportsDialog(LegacyReportsDialog):
         self.table.itemDoubleClicked.connect(self.open_selected)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
+        self.table.itemSelectionChanged.connect(self._update_report_history_actions)
+        self._update_report_history_actions()
+
+    def _update_report_history_actions(self):
+        enabled = selected_table_row(self.table) is not None
+        for button in (
+            self.btn_open,
+            self.btn_history_save,
+            self.btn_history_xlsx,
+            self.btn_history_print,
+            self.btn_delete,
+        ):
+            button.setEnabled(enabled)
 
     def update_dashboard_period(self, _definition=None, refresh=True):
         self._update_dashboard_compare_summary()
@@ -30184,12 +30413,9 @@ class ReportsDialog(LegacyReportsDialog):
         self._arrange_dashboard_filters(compact)
         for card in self.dashboard_kpi_cards:
             self.dashboard_kpi_layout.removeWidget(card)
-        if compact:
-            for row, card in enumerate(self.dashboard_kpi_cards):
-                self.dashboard_kpi_layout.addWidget(card, row, 0)
-        else:
-            for column, card in enumerate(self.dashboard_kpi_cards):
-                self.dashboard_kpi_layout.addWidget(card, 0, column)
+        for index, card in enumerate(self.dashboard_kpi_cards):
+            row, column = divmod(index, 2 if compact else 4)
+            self.dashboard_kpi_layout.addWidget(card, row, column)
         self._arrange_dashboard_charts()
 
     def shutdown_for_logout(self):
@@ -30295,7 +30521,14 @@ class ReportsDialog(LegacyReportsDialog):
             self._report_generation_in_progress = False
 
     def load_rows(self):
-        super().load_rows()
+        try:
+            super().load_rows()
+        except Exception as exc:
+            self.history_count.setText(
+                "No se pudo cargar el historial. Pulsa Actualizar."
+            )
+            write_runtime_log(f"Historial de reportes error={type(exc).__name__}")
+            return
         for row in range(self.table.rowCount()):
             raw_type = self.table.item(row, 0).text() if self.table.item(row, 0) else "Reporte PDF"
             raw_json = self.table.item(row, 6).text() if self.table.item(row, 6) else "{}"
@@ -30320,8 +30553,7 @@ class ReportsDialog(LegacyReportsDialog):
             self.table.setItem(row, 9, current_item)
             self.table.setItem(row, 10, compared_item)
             self.table.setRowHeight(row, 34)
-        if hasattr(self, "history_count"):
-            self.history_count.setText(f"{self.table.rowCount():,} reportes")
+        self.filter_history(self.search_edit.text())
 
     def _selected_report_path(self, action="open"):
         row = self.table.currentRow()
@@ -30429,7 +30661,13 @@ class ReportsDialog(LegacyReportsDialog):
     def filter_history(self, text):
         filter_table_widget(self.table, text)
         visible = sum(not self.table.isRowHidden(row) for row in range(self.table.rowCount()))
-        self.history_count.setText(f"{visible:,} de {self.table.rowCount():,} reportes")
+        self.history_count.setText(
+            f"{visible:,} de {self.table.rowCount():,} reportes"
+            if visible
+            else "No hay reportes que coincidan."
+        )
+        self.report_inspector.refresh()
+        self._update_report_history_actions()
 
     def export_dashboard_excel(self):
         if not self._ensure_panel_access() or not self.dashboard_data:

@@ -137,7 +137,7 @@ class MonthlyArsCandidateSelectionTests(unittest.TestCase):
         )
 
     def test_checkbox_columns_and_no_initial_functional_selection(self):
-        self.assertEqual(self.dialog.table.columnCount(), 11)
+        self.assertEqual(self.dialog.table.columnCount(), 12)
         self.assertTrue(self.dialog.table.isColumnHidden(0))
         self.assertEqual(self.dialog.selected_candidate_keys, set())
         self.assertFalse(self.dialog.add_selected_button.isEnabled())
@@ -198,6 +198,8 @@ class MonthlyArsCandidateSelectionTests(unittest.TestCase):
         calls = []
 
         class FakeDialog:
+            confirmed_receipt_ids = set()
+
             def __init__(self, _candidates, _parent):
                 pass
 
