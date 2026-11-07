@@ -625,7 +625,7 @@ def test_report_window_and_themed_icons_follow_the_host_theme_in_place(
             controls["ars_mode"].itemText(i)
             for i in range(controls["ars_mode"].count())
         } == {
-            "TODAS", "INCLUIR", "EXCLUIR"
+            "Todas las ARS", "Incluir seleccionadas", "Excluir seleccionadas"
         }
         assert controls["preview"].columnCount() == 6
         assert "#EEF2F6" in app.reporte_win.styleSheet()
@@ -787,7 +787,7 @@ def test_report_window_generates_cards_and_preview_from_one_filtered_dataset(
         app = widget.admission
         app.abrir_ventana_reporte()
         controls = app.reporte_win.report_controls
-        controls["ars_mode"].set("INCLUIR")
+        controls["ars_mode"].set("Incluir seleccionadas")
         controls["ars_vars"]["HUMANO"].set(True)
         controls["generate"]()
         for _ in range(30):

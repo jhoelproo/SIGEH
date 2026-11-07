@@ -42,8 +42,8 @@ class AdmissionTurnHistoryDialog(QDialog):
         title.setObjectName("TurnHistoryTitle")
         title.setStyleSheet("font-size: 18pt; font-weight: 800;")
         intro = QLabel(
-            "Busca el turno por fecha o por la persona que realizó las admisiones. "
-            "Selecciona una fila para usar sus pacientes en el reporte estadístico."
+            "Busca por fecha o por usuario de Admisión. Abre el reporte del turno "
+            "para consultar sus atenciones y filtrarlas por ARS."
         )
         intro.setWordWrap(True)
         intro.setObjectName("TurnHistoryIntro")
@@ -96,7 +96,7 @@ class AdmissionTurnHistoryDialog(QDialog):
         actions = QHBoxLayout()
         self.previous = QPushButton("Anterior")
         self.next = QPushButton("Siguiente")
-        self.use = QPushButton("Usar turno seleccionado")
+        self.use = QPushButton("Abrir reporte del turno")
         self.previous.setEnabled(False)
         self.next.setEnabled(False)
         self.use.setEnabled(False)

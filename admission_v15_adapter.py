@@ -3796,6 +3796,27 @@ class _HybridDatabaseProxy:
             turns=[selected], selected_turn=selected, records=records,
         )
 
+    def adjacent_report_turn(self, turn, direction):
+        from admission_turn_history import adjacent_turn
+
+        if bool(getattr(self._runtime, "offline", False)):
+            raise RuntimeError("Conecte la estación para consultar otro turno.")
+        with self._runtime.host.connection_factory() as connection:
+            return adjacent_turn(connection, turn, direction)
+
+    def report_billing_followup(self, records):
+        from admission_report_tools import load_billing_followup
+
+        if bool(getattr(self._runtime, "offline", False)):
+            raise RuntimeError(
+                "Conecte la estación para actualizar el estado de facturación."
+            )
+        with self._runtime.host.connection_factory() as connection:
+            return load_billing_followup(connection, records)
+
+    def open_report_receipt(self, receipt_id):
+        self._runtime.host.event_bus.billing_requested.emit({"receipt_id": int(receipt_id)})
+
     def list_statistical_report_turns(
         self,
         *,

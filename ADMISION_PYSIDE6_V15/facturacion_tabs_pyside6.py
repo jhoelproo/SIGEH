@@ -9966,41 +9966,76 @@ class App:
     def abrir_ventana_reporte(self):
         if not self._exigir_permiso(CAP_VIEW_REPORTS, "consultar reportes administrativos"):
             return
-        win = self._crear_toplevel_estable("Reporte estadístico", "1240x850", "reporte_win")
+        from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QPushButton, QScrollArea, QVBoxLayout, QWidget
+
+        from admin_workspace_design import (
+            admin_heading,
+            admin_label,
+            admin_styles,
+            admin_table,
+        )
+        from admission_history_layout import fit_history_dialog
+        from admission_report_panels import AdmissionReportPanels, ReportViewsMenu
+
+        win = self._crear_toplevel_estable("Reporte estadístico", "1240x800", "reporte_win")
         if win is None:
             return
         self._bind_esc_cerrar(win)
-        cont = tb.Frame(win, padding=14, style="Root.TFrame")
+        fit_history_dialog(win)
+        win.setMinimumHeight(min(580, win.height()))
+        cont = tb.Frame(win, style="Root.TFrame")
         cont.pack(fill="both", expand=True)
-        self._crear_header_ventana(
-            cont,
+        layout = QVBoxLayout(cont)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+        history_button = tb.Button(
+            cont, text="Historial de turnos", bootstyle=SECONDARY
+        )
+        navigation = QWidget()
+        navigation_layout = QHBoxLayout(navigation)
+        navigation_layout.setContentsMargins(0, 0, 0, 0)
+        previous_turn = QPushButton("Anterior")
+        next_turn = QPushButton("Siguiente")
+        previous_turn.setAccessibleName("Abrir el turno anterior")
+        next_turn.setAccessibleName("Abrir el turno siguiente")
+        for button in (previous_turn, history_button, next_turn):
+            navigation_layout.addWidget(button)
+        heading = admin_heading(
             "Reporte estadístico",
-            "Genera reportes por turno, período, ARS, especialidad y cobertura.",
-            "📊"
+            "Admisión · Atenciones por turno y período",
+            navigation,
         )
-        try:
-            win.minsize(1120, 760)
-            win.resizable(True, True)
-        except Exception:
-            pass
-        barra = tb.Frame(cont, padding=(8, 8), style="Card.TFrame")
-        barra.pack(side="bottom", fill="x", pady=(8, 0))
-        panel = tb.Frame(cont, padding=12, style="Card.TFrame")
-        panel.pack(fill="x", pady=(0, 8))
-        panel.columnconfigure(0, weight=3)
-        panel.columnconfigure(1, weight=0)
-        panel.columnconfigure(2, weight=2)
+        heading.layout().setContentsMargins(14, 7, 14, 7)
+        layout.addWidget(heading)
+        panel = tb.Frame(cont, style="Card.TFrame")
+        panel.setObjectName("AdminToolbar")
+        layout.addWidget(panel)
+        panel_layout = QHBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 8, 12, 8)
+        panel_layout.setSpacing(18)
 
-        filtros = tb.Frame(panel, style="Card.TFrame")
-        filtros.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        filtros.columnconfigure(1, weight=1)
-        filtros.columnconfigure(3, weight=1)
-        tb.Label(filtros, text="⚲  Filtros", font=("Arial", 11, "bold")).grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 8)
-        )
+        filtros = tb.Frame(panel)
+        panel_layout.addWidget(filtros, 3)
+        form = QGridLayout(filtros)
+        form.setAlignment(Qt.AlignTop)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(4)
+        form.setColumnStretch(1, 1)
+        form.setColumnStretch(3, 1)
+        form.addWidget(admin_label("Alcance y filtros", "Section"), 0, 0, 1, 4)
+
+        def add_field(label, control, row, column):
+            caption = admin_label(label)
+            caption.setBuddy(control)
+            control.setAccessibleName(label)
+            form.addWidget(caption, row, column)
+            form.addWidget(control, row, column + 1)
+            return caption, control
+
         periodo_var = tk.StringVar(value="Diario")
         turno_var = tk.StringVar(value="Turno actual")
-        historical_turn = {"selection": None, "dialog": None}
+        historical_turn = {"selection": None, "catalog": None}
         especialidad_var = tk.StringVar(value=SPECIALTY_ALL)
         cobertura_var = tk.StringVar(value=COVERAGE_ALL)
         fecha_inicio = crear_selector_fecha(filtros, width=14)
@@ -10009,166 +10044,207 @@ class App:
         establecer_fecha_selector(fecha_inicio, fecha_base)
         establecer_fecha_selector(fecha_fin, fecha_base)
 
-        tb.Label(filtros, text="Tipo de período").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         combo_periodo = tb.Combobox(
             filtros,
             textvariable=periodo_var,
             state="readonly",
             values=["Diario", "Semanal", "Mensual", "Anual", "Rango"],
-            width=22,
         )
-        combo_periodo.grid(row=1, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
-        tb.Label(filtros, text="Turno").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        period_fields = add_field("Período", combo_periodo, 2, 0)
         combo_turno = tb.Combobox(
             filtros,
             textvariable=turno_var,
             state="readonly",
-            values=["Turno actual", "Turno anterior", "Todos los turnos", "Turno seleccionado"],
-            width=22,
+            values=[
+                "Turno actual",
+                "Turno anterior",
+                "Todos los turnos",
+                "Turno seleccionado",
+            ],
         )
-        combo_turno.grid(row=2, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        turno_label = admin_label("Turno")
+        turno_label.setBuddy(combo_turno)
+        combo_turno.setAccessibleName("Turno")
+        form.addWidget(turno_label, 1, 0)
+        form.addWidget(combo_turno, 1, 1, 1, 3)
 
         def select_historical_turn(turn):
+            _reset_ars_filter()
             historical_turn["selection"] = turn
+            historical_turn["catalog"] = None
             turno_var.set("Turno seleccionado")
-            _mark_snapshot_stale()
-            estado_var.set(f"Turno #{turn['turn_id']} · {turn['display_name']}. Pulse Generar reporte.")
+            _refresh_turn_controls()
+            generar()
 
         def open_turn_history():
             from admission_turn_history_dialog import AdmissionTurnHistoryDialog
 
             dialog = AdmissionTurnHistoryDialog(self, select_historical_turn, win)
-            historical_turn["dialog"] = dialog
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
             dialog.open()
             dialog.user.setFocus()
 
-        tb.Label(filtros, text="Desde").grid(row=3, column=0, sticky="w", padx=4, pady=4)
-        fecha_inicio.grid(row=3, column=1, sticky="ew", padx=4, pady=4)
-        tb.Label(filtros, text="Hasta").grid(row=3, column=2, sticky="w", padx=4, pady=4)
-        fecha_fin.grid(row=3, column=3, sticky="ew", padx=4, pady=4)
-        tb.Label(filtros, text="Especialidad").grid(row=4, column=0, sticky="w", padx=4, pady=4)
-        tb.Combobox(
+        period_fields += add_field("Desde", fecha_inicio, 3, 0)
+        period_fields += add_field("Hasta", fecha_fin, 3, 2)
+        specialty_combo = tb.Combobox(
             filtros,
             textvariable=especialidad_var,
             state="readonly",
             values=[SPECIALTY_ALL, "GENERAL", "PEDIATRIA", "GINECOLOGIA", "OTRAS"],
-            width=22,
-        ).grid(row=4, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
-        tb.Label(filtros, text="Cobertura").grid(row=5, column=0, sticky="w", padx=4, pady=4)
-        tb.Combobox(
+        )
+        coverage_combo = tb.Combobox(
             filtros,
             textvariable=cobertura_var,
             state="readonly",
             values=[COVERAGE_ALL, COVERAGE_INSURED, COVERAGE_UNINSURED],
-            width=22,
-        ).grid(row=5, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        )
+        add_field("Especialidad", specialty_combo, 4, 0)
+        add_field("Cobertura", coverage_combo, 4, 2)
+        turn_context = admin_label()
+        form.addWidget(turn_context, 5, 0, 1, 4)
 
-        ttk.Separator(panel, orient="vertical").grid(
-            row=0, column=1, sticky="ns", padx=(0, 12)
-        )
-        ars_panel = tb.Frame(panel, style="Card.TFrame")
-        ars_panel.grid(row=0, column=2, sticky="nsew")
-        ars_panel.columnconfigure(0, weight=1)
-        tb.Label(ars_panel, text="ARS", font=("Arial", 11, "bold")).grid(
-            row=0, column=0, sticky="w", padx=4, pady=(0, 8)
-        )
+        ars_panel = tb.Frame(panel)
+        panel_layout.addWidget(ars_panel, 2)
+        ars_layout = QVBoxLayout(ars_panel)
+        ars_layout.setContentsMargins(0, 0, 0, 0)
+        ars_layout.setSpacing(4)
+        ars_heading = admin_label("Aseguradoras", "Section")
+        ars_layout.addWidget(ars_heading)
         ars_mode_var = tk.StringVar(value=ARS_ALL)
         ars_search_var = tk.StringVar(value="")
-        tb.Label(ars_panel, text="Modo ARS").grid(row=1, column=0, sticky="w", padx=4)
+        ars_modes = (ARS_ALL, ARS_INCLUDE, ARS_EXCLUDE)
         ars_mode_combo = tb.Combobox(
             ars_panel,
-            textvariable=ars_mode_var,
             state="readonly",
-            values=[ARS_ALL, ARS_INCLUDE, ARS_EXCLUDE],
-            width=20,
+            values=["Todas las ARS", "Incluir seleccionadas", "Excluir seleccionadas"],
         )
-        ars_mode_combo.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 6))
+        ars_mode_combo.currentIndexChanged.connect(
+            lambda index: ars_mode_var.set(ars_modes[index])
+        )
+        ars_mode_var.changed.connect(
+            lambda mode: ars_mode_combo.setCurrentIndex(ars_modes.index(mode))
+        )
+        ars_heading.setBuddy(ars_mode_combo)
+        ars_mode_combo.setAccessibleName("Modo del filtro de ARS")
+        ars_layout.addWidget(ars_mode_combo)
         ars_search = tb.Entry(ars_panel, textvariable=ars_search_var)
-        ars_search.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 6))
-        try:
-            ars_search.insert(0, "")
-            ars_search.setPlaceholderText("Buscar ARS…")
-        except Exception:
-            pass
-        ars_canvas = tk.Canvas(ars_panel, height=110)
-        try:
-            ars_canvas.setMinimumHeight(120)
-            ars_canvas.setMaximumHeight(120)
-            ars_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        except Exception:
-            pass
-        ars_canvas.grid(row=4, column=0, sticky="nsew", padx=4)
+        ars_search.setObjectName("AdminSearch")
+        ars_search.setAccessibleName("Buscar aseguradora")
+        ars_search.setPlaceholderText("Buscar ARS…")
+        ars_search.setClearButtonEnabled(True)
+        ars_layout.addWidget(ars_search)
+        ars_canvas = QScrollArea(ars_panel)
+        ars_canvas.setWidgetResizable(True)
+        ars_canvas.setMinimumHeight(52)
+        ars_canvas.setMaximumHeight(96)
+        ars_canvas.setObjectName("AdminScroll")
+        ars_layout.addWidget(ars_canvas, 1)
         ars_checks_frame = tb.Frame(ars_canvas, style="Card.TFrame")
-        ars_canvas.create_window((0, 0), window=ars_checks_frame, anchor="nw")
-        ars_catalog = sorted(set(self._obtener_catalogo_ars()) | {"SIN SEGURO"})
+        ars_canvas.setWidget(ars_checks_frame)
+        checks_layout = QVBoxLayout(ars_checks_frame)
+        checks_layout.setContentsMargins(4, 0, 4, 0)
+        checks_layout.setSpacing(0)
+        checks_layout.addStretch()
+        ars_summary = admin_label()
+        ars_selection = QWidget()
+        ars_selection_layout = QHBoxLayout(ars_selection)
+        ars_selection_layout.setContentsMargins(0, 0, 0, 0)
+        select_all_ars = QPushButton("Todas")
+        select_none_ars = QPushButton("Ninguna")
+        select_all_ars.setAccessibleName("Seleccionar todas las ARS visibles")
+        select_none_ars.setAccessibleName("Quitar la selección de ARS")
+        ars_selection_layout.addWidget(ars_summary, 1)
+        ars_selection_layout.addWidget(select_all_ars)
+        ars_selection_layout.addWidget(select_none_ars)
+        ars_layout.insertWidget(2, ars_selection)
+        ars_layout.addStretch()
+        full_ars_catalog = tuple(sorted(set(self._obtener_catalogo_ars()) | {"SIN SEGURO"}))
         ars_vars = {}
         ars_checks = {}
-        for row_index, ars_name in enumerate(ars_catalog):
-            variable = tk.BooleanVar(value=False)
-            checkbox = tb.Checkbutton(
-                ars_checks_frame,
-                text=ars_name,
-                variable=variable,
-                bootstyle=INFO,
-            )
-            checkbox.grid(row=row_index, column=0, sticky="w", padx=3, pady=1)
-            ars_vars[ars_name] = variable
-            ars_checks[ars_name] = checkbox
-
-        tb.Label(
-            panel,
-            text="ⓘ Los turnos usan identidad operacional persistida y una ventana de 8:00 AM a 8:00 AM.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=4, pady=(10, 0))
-
-        cards = tb.Frame(cont, style="Root.TFrame")
-        cards.pack(fill="x", pady=(0, 8))
+        cards = tb.Frame(cont, style="Card.TFrame")
+        cards.setObjectName("AdminToolbar")
+        layout.addWidget(cards)
+        metrics = QHBoxLayout(cards)
+        metrics.setContentsMargins(12, 6, 12, 6)
+        metrics.setSpacing(12)
         card_specs = (
-            ("total", "👥", "Total pacientes"),
-            ("insured", "🛡", "Asegurados"),
-            ("uninsured", "👤", "Sin seguro"),
-            ("general", "⚕", "General"),
-            ("pediatric", "🧒", "Pediatría"),
-            ("gynecology", "♀", "Ginecología"),
+            ("total", "Pacientes"),
+            ("insured", "Asegurados"),
+            ("uninsured", "Sin seguro"),
+            ("general", "General"),
+            ("pediatric", "Pediatría"),
+            ("gynecology", "Ginecología"),
         )
         card_vars = {}
-        for column, (key, icon, title) in enumerate(card_specs):
-            cards.columnconfigure(column, weight=1)
-            card = tb.Frame(cards, padding=10, style="Card.TFrame")
-            card.grid(row=0, column=column, sticky="nsew", padx=3)
+        for key, title in card_specs:
+            metric = QVBoxLayout()
+            metric.setSpacing(1)
             value_var = tk.StringVar(value="0")
-            detail_var = tk.StringVar(value="0% del total")
-            tb.Label(card, text=f"{icon}  {title}", anchor="center").pack(fill="x")
-            tb.Label(card, textvariable=value_var, font=("Arial", 18, "bold"), anchor="center").pack(fill="x")
-            tb.Label(card, textvariable=detail_var, style="Muted.TLabel", anchor="center").pack(fill="x")
+            detail_var = tk.StringVar(value="0%")
+            value = admin_label(value_var.get(), "Title")
+            value_var.changed.connect(value.setText)
+            detail = admin_label(detail_var.get())
+            detail_var.changed.connect(detail.setText)
+            detail.setAccessibleName("Porcentaje del total")
+            detail.setToolTip("Porcentaje del total de pacientes")
+            amount = QHBoxLayout()
+            amount.setSpacing(4)
+            amount.addWidget(value)
+            amount.addWidget(detail, 1, Qt.AlignVCenter)
+            metric.addWidget(admin_label(title))
+            metric.addLayout(amount)
+            metrics.addLayout(metric, 1)
             card_vars[key] = (value_var, detail_var)
 
-        preview_card = tb.Frame(cont, padding=6, style="Card.TFrame")
-        preview_card.pack(fill="both", expand=True)
-        tb.Label(preview_card, text="◉  Vista previa del reporte", font=("Arial", 11, "bold")).pack(
-            anchor="w", padx=4, pady=(0, 5)
-        )
+        preview_card = tb.Frame(cont)
+        layout.addWidget(preview_card, 1)
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(5)
+        results_heading = QHBoxLayout()
+        results_heading.addWidget(admin_label("Resultados del reporte", "Section"), 1)
+        toggle_filters = QPushButton("Ocultar filtros")
+        toggle_filters.setCheckable(True)
+        toggle_filters.setChecked(True)
+        toggle_filters.setAccessibleName("Mostrar u ocultar los filtros del reporte")
+        results_heading.addWidget(toggle_filters)
+        preview_layout.addLayout(results_heading)
+        applied_scope = admin_label()
+        applied_scope.hide()
+        preview_layout.addWidget(applied_scope)
         vista = ttk.Treeview(
             preview_card,
             columns=("seccion", "concepto", "cantidad", "ars", "turno", "observacion"),
             show="headings",
-            height=7,
             style="Modern.Treeview",
         )
-        vista.pack(fill="both", expand=True)
+        vista.setMinimumHeight(112)
+        report_panels = AdmissionReportPanels(self, vista, lambda: generar(), win)
+
+        def _show_report_filters(visible):
+            panel.setVisible(visible)
+            toggle_filters.setText("Ocultar filtros" if visible else "Mostrar filtros")
+            layout.activate()
+
+        def _report_tab_changed(index):
+            cards.setVisible(index == 0)
+            toggle_filters.setChecked(index == 0)
+            layout.activate()
+
+        toggle_filters.toggled.connect(_show_report_filters)
+        report_panels.currentChanged.connect(_report_tab_changed)
+        preview_layout.addWidget(report_panels, 1)
         vista.heading("seccion", text="Sección")
         vista.heading("concepto", text="Concepto")
         vista.heading("cantidad", text="Cantidad")
         vista.heading("ars", text="ARS")
         vista.heading("turno", text="Turno")
         vista.heading("observacion", text="Observación")
-        for column, width in (
-            ("seccion", 145), ("concepto", 245), ("cantidad", 90),
-            ("ars", 120), ("turno", 160), ("observacion", 260),
-        ):
-            vista.column(column, width=width, anchor="center" if column in {"cantidad", "ars"} else "w")
+        vista.column("cantidad", anchor="center")
+        admin_table(vista, {0: 145, 2: 86, 5: 204}, stretch=1, hidden=(3, 4))
+        vista.setAccessibleName("Resultados del reporte estadístico")
 
-        estado_var = tk.StringVar(value="Seleccione filtros y presione Generar reporte.")
+        estado_var = tk.StringVar(value="Elige el alcance y genera el reporte para ver los resultados.")
         snapshot_store = ReportSnapshotStore()
         ultimo = {
             "dataset": None,
@@ -10178,6 +10254,11 @@ class App:
         }
         pdf_button = None
         excel_button = None
+        query_revision = 0
+        source_cache = {}
+        filter_timer = QTimer(win)
+        filter_timer.setSingleShot(True)
+        filter_timer.setInterval(200)
 
         def _selected_ars():
             return tuple(name for name, variable in ars_vars.items() if variable.get())
@@ -10188,12 +10269,84 @@ class App:
             return build_operational_period(periodo_var.get(), first, last)
 
         def _refresh_ars_search(*_):
-            visible = set(search_ars_catalog(ars_catalog, ars_search_var.get()))
+            historical_catalog = (
+                historical_turn["catalog"]
+                if turno_var.get() == "Turno seleccionado"
+                else None
+            )
+            catalog = (
+                full_ars_catalog if historical_catalog is None else historical_catalog
+            )
+            mode = ars_mode_var.get()
+            filter_enabled = mode != ARS_ALL
+            visible = set(search_ars_catalog((*catalog, *_selected_ars()), ars_search_var.get()))
             for name, checkbox in ars_checks.items():
-                if name in visible:
-                    checkbox.grid()
-                else:
-                    checkbox.grid_remove()
+                checkbox.setVisible(name in visible)
+            ars_search.setVisible(filter_enabled)
+            ars_canvas.setVisible(filter_enabled and bool(visible))
+            select_all_ars.setVisible(filter_enabled)
+            select_none_ars.setVisible(filter_enabled)
+            if filter_enabled:
+                selected_count = len(_selected_ars())
+                note = f"{selected_count} elegida(s)"
+                if not visible:
+                    note += (
+                        " · Sin coincidencias"
+                        if ars_search_var.get()
+                        else " · Sin ARS en el turno"
+                    )
+            else:
+                note = "Puedes incluir o excluir aseguradoras."
+                if historical_catalog is not None:
+                    note = f"{len(historical_catalog)} ARS registradas en este turno"
+            ars_summary.setText(note)
+
+        def _select_ars_visible(selected):
+            for name, checkbox in ars_checks.items():
+                if not selected or checkbox.isVisible():
+                    ars_vars[name].set(selected)
+
+        def _add_ars_options(names):
+            for name in names:
+                if name in ars_vars:
+                    continue
+                variable = tk.BooleanVar(value=False)
+                checkbox = tb.Checkbutton(
+                    ars_checks_frame, text=name, variable=variable, bootstyle=INFO
+                )
+                checks_layout.insertWidget(checks_layout.count() - 1, checkbox)
+                ars_vars[name] = variable
+                ars_checks[name] = checkbox
+                variable.changed.connect(_ars_filter_changed)
+
+        def _ars_filter_changed(*_):
+            _refresh_ars_search()
+            _mark_snapshot_stale()
+
+        def _reset_ars_filter():
+            ars_mode_var.set(ARS_ALL)
+            ars_search_var.set("")
+            for variable in ars_vars.values():
+                variable.set(False)
+
+        def _refresh_turn_controls(*_):
+            scope = turno_var.get()
+            use_dates = scope == "Todos los turnos"
+            for field in period_fields:
+                field.setVisible(use_dates)
+            selected = (
+                historical_turn["selection"] if scope == "Turno seleccionado" else None
+            )
+            if selected:
+                note = f"Turno #{selected['turn_id']} · {selected['display_name']} · Horario real del turno"
+            elif scope == "Turno seleccionado":
+                note = "Elige un turno en Historial de turnos."
+            else:
+                note = "Día operativo de 8:00 a. m. a 8:00 a. m."
+            turn_context.setText(note)
+            previous_turn.setEnabled(bool(selected))
+            next_turn.setEnabled(bool(selected))
+            _refresh_ars_search()
 
         def _load_dataset_into_ui(dataset):
             vista.delete(*vista.get_children())
@@ -10211,7 +10364,20 @@ class App:
             }
             for key, (count, percentage) in values.items():
                 card_vars[key][0].set(f"{int(count):,}")
-                card_vars[key][1].set(f"{float(percentage):.2f}% del total")
+                card_vars[key][1].set(f"{float(percentage):.2f}%")
+            mode = dataset.filters.ars_mode
+            selected = dataset.filters.selected_ars
+            ars_note = (
+                "Todas las ARS"
+                if mode == ARS_ALL
+                else f"{mode.capitalize()} {', '.join(selected)}"
+            )
+            scope = dataset.filters.period_label
+            applied_scope.setToolTip(f"{scope} · {ars_note}")
+            if mode != ARS_ALL and len(selected) > 3:
+                ars_note = f"{mode.capitalize()} {len(selected)} ARS"
+            applied_scope.setText(f"{scope} · {ars_note}")
+            applied_scope.show()
 
         def _set_export_enabled(enabled):
             state = "normal" if enabled else "disabled"
@@ -10220,10 +10386,18 @@ class App:
                     button.configure(state=state)
 
         def _mark_snapshot_stale(*_):
+            nonlocal query_revision
+            query_revision += 1
+            generate_button.setEnabled(True)
+            _refresh_turn_controls()
+            report_panels.invalidate()
             if not snapshot_store.mark_stale():
+                estado_var.set("Genera el reporte para aplicar los filtros.")
                 return
             _set_export_enabled(False)
             estado_var.set("Filtros modificados · genere nuevamente antes de exportar.")
+            if source_cache:
+                filter_timer.start()
 
         def _friendly_turn_label(scope, selected_turn, turn_period):
             if selected_turn is None:
@@ -10257,35 +10431,60 @@ class App:
                 "No fue posible generar el archivo solicitado.",
             )
 
-        def generar():
+        def _read_report_source(historical, scope, period):
+            identity = historical or self.db.get_operational_station_snapshot() or {}
+            source_id = str(identity.get("operational_source_id") or "").strip()
+            if not source_id:
+                raise RuntimeError(
+                    "No existe una identidad operacional central activa."
+                )
+            if historical:
+                return source_id, self.db.load_historical_turn_report(historical)
+
+            current_turn_id = int(identity.get("turn_id") or 0)
+            if current_turn_id <= 0:
+                raise RuntimeError(
+                    "No existe un turno central activo para la consulta."
+                )
+            return source_id, self.db.load_statistical_report_source(
+                operational_source_id=source_id,
+                turn_scope=scope,
+                current_turn_id=current_turn_id,
+                start_at=period.start_at,
+                end_at=period.end_at,
+            )
+
+        def generar(use_cache=False):
             try:
                 period = _period_from_controls()
                 scope = turno_var.get()
-                historical = dict(historical_turn["selection"] or {}) if scope == "Turno seleccionado" else {}
+                historical = (
+                    dict(historical_turn["selection"] or {})
+                    if scope == "Turno seleccionado"
+                    else {}
+                )
                 if scope == "Turno seleccionado" and not historical:
                     raise ValueError("Seleccione un turno desde Historial de turnos.")
                 ars_mode = ars_mode_var.get()
-                selected_ars = _selected_ars()
+                selected_ars = _selected_ars() if ars_mode != ARS_ALL else ()
+                if ars_mode != ARS_ALL and not selected_ars:
+                    ars_search.setFocus()
+                    raise ValueError(
+                        "Seleccione al menos una ARS para incluir o excluir."
+                    )
                 specialty = especialidad_var.get()
                 coverage = cobertura_var.get()
-                snapshot = dict(self.db.get_operational_station_snapshot() or {})
+                _mark_snapshot_stale()
+                filter_timer.stop()
+                request_revision = query_revision
+                generate_button.setEnabled(False)
                 estado_var.set("Cargando datos del reporte…")
                 self.set_status("Generando reporte en segundo plano…", "process")
-                win.update_idletasks()
+                cache_key = (scope, str(historical), period.start_at, period.end_at)
+                cached = source_cache.get(cache_key) if use_cache else None
+
                 def _trabajo():
-                    source_id = str(historical.get("operational_source_id") or snapshot.get("operational_source_id") or "").strip()
-                    current_turn_id = int(snapshot.get("turn_id") or 0)
-                    if not source_id or (current_turn_id <= 0 and not historical):
-                        raise RuntimeError(
-                            "No existe una identidad operacional central activa."
-                        )
-                    source = self.db.load_historical_turn_report(historical) if historical else self.db.load_statistical_report_source(
-                        operational_source_id=source_id,
-                        turn_scope=scope,
-                        current_turn_id=current_turn_id,
-                        start_at=period.start_at,
-                        end_at=period.end_at,
-                    )
+                    source_id, source = cached or _read_report_source(historical, scope, period)
                     turn_id = source.get("turn_id")
                     selected_turn = source.get("selected_turn")
                     if historical:
@@ -10330,17 +10529,35 @@ class App:
                         len(dataset.records),
                         dict(dataset.diagnostics),
                     )
-                    return dataset
+                    return dataset, source_id, source
 
-                def _ok(dataset):
+                def _ok(result):
+                    if not win.winfo_exists() or request_revision != query_revision:
+                        return
+                    dataset, source_id, source = result
+                    source_cache.clear()
+                    source_cache[cache_key] = (source_id, source)
+                    generate_button.setEnabled(True)
+                    if historical:
+                        historical_turn["catalog"] = dataset.available_ars
+                        _add_ars_options(dataset.available_ars)
+                        _refresh_ars_search()
                     snapshot_store.replace(dataset)
                     ultimo.update({"dataset": dataset, "pdf": "", "excel": ""})
                     _load_dataset_into_ui(dataset)
+                    report_panels.set_dataset(dataset, source.get("records") or ())
                     _set_export_enabled(bool(dataset.records))
                     total = int(dataset.summary["total_patients"])
-                    estado_var.set(f"Reporte listo · {total:,} paciente(s) del dataset canónico.")
+                    estado_var.set(
+                        f"{total:,} paciente(s) en el reporte."
+                        if total
+                        else "No hay pacientes para los filtros aplicados."
+                    )
                     self.set_status("Reporte cargado", "ok")
                 def _error(e):
+                    if not win.winfo_exists() or request_revision != query_revision:
+                        return
+                    generate_button.setEnabled(True)
                     code = getattr(e, "code", None) or (
                         "REPORT_DATA_ERROR"
                         if isinstance(e, (TypeError, ValueError))
@@ -10354,6 +10571,7 @@ class App:
                     )
                 self._ejecutar_en_segundo_plano("Generando reporte…", _trabajo, _ok, _error)
             except Exception as e:
+                generate_button.setEnabled(True)
                 estado_var.set("Error al generar reporte.")
                 messagebox.showerror("Reporte", f"No se pudo generar el reporte:\n{str(e)}", parent=win)
 
@@ -10407,25 +10625,85 @@ class App:
             self._ejecutar_en_segundo_plano("Exportando Excel…", _trabajo, _ok, _error)
 
         def limpiar_filtros():
-            historical_turn["selection"] = None
+            _mark_snapshot_stale()
+            selected_turn = historical_turn["selection"]
             periodo_var.set("Diario")
-            turno_var.set("Turno actual")
+            turno_var.set("Turno seleccionado" if selected_turn else "Turno actual")
             especialidad_var.set(SPECIALTY_ALL)
             cobertura_var.set(COVERAGE_ALL)
-            ars_mode_var.set(ARS_ALL)
-            ars_search_var.set("")
+            _reset_ars_filter()
             establecer_fecha_selector(fecha_inicio, fecha_base_operativa_actual())
             establecer_fecha_selector(fecha_fin, fecha_base_operativa_actual())
-            for variable in ars_vars.values():
-                variable.set(False)
             snapshot_store.clear()
             ultimo.update({"dataset": None, "pdf": "", "excel": ""})
             _set_export_enabled(False)
             vista.delete(*vista.get_children())
+            applied_scope.hide()
+            _refresh_turn_controls()
+            filter_timer.stop()
             for value_var, detail_var in card_vars.values():
                 value_var.set("0")
-                detail_var.set("0% del total")
+                detail_var.set("0%")
             estado_var.set("Filtros restablecidos.")
+
+        def _apply_cached_filters():
+            if ars_mode_var.get() != ARS_ALL and not _selected_ars():
+                estado_var.set("Selecciona al menos una ARS para aplicar el filtro.")
+                return
+            generar(use_cache=True)
+
+        def _navigate_turn(direction):
+            selected = historical_turn["selection"]
+            if not selected:
+                return
+            revision = query_revision
+            previous_turn.setEnabled(False)
+            next_turn.setEnabled(False)
+            estado_var.set("Buscando el turno vecino…")
+
+            def loaded(turn):
+                if not win.winfo_exists() or revision != query_revision:
+                    return
+                _refresh_turn_controls()
+                if turn is None:
+                    estado_var.set("No hay otro turno en esa dirección.")
+                    (
+                        previous_turn if direction == "previous" else next_turn
+                    ).setEnabled(False)
+                    return
+                select_historical_turn(turn)
+
+            def failed(error):
+                if win.winfo_exists() and revision == query_revision:
+                    _refresh_turn_controls()
+                    estado_var.set(f"No se pudo consultar otro turno. {error}")
+
+            self._ejecutar_en_segundo_plano(
+                "Consultando otro turno…",
+                lambda: self.db.adjacent_report_turn(selected, direction),
+                loaded,
+                failed,
+            )
+
+        def _capture_view():
+            return dict(
+                period=periodo_var.get(),
+                specialty=especialidad_var.get(),
+                coverage=cobertura_var.get(),
+                ars_mode=ars_mode_var.get(),
+                selected_ars=list(_selected_ars()),
+            )
+
+        def _apply_view(view):
+            _reset_ars_filter()
+            _add_ars_options(view["selected_ars"])
+            periodo_var.set(view["period"])
+            especialidad_var.set(view["specialty"])
+            cobertura_var.set(view["coverage"])
+            for name in view["selected_ars"]:
+                ars_vars[name].set(True)
+            ars_mode_var.set(view["ars_mode"])
+            _apply_cached_filters()
 
         def _actualizar_fechas_por_periodo(*_):
             modo = periodo_var.get()
@@ -10467,43 +10745,180 @@ class App:
         fecha_inicio.bind("<KeyRelease>", _marcar_rango)
         fecha_fin.bind("<<DateEntrySelected>>", _marcar_rango)
         fecha_fin.bind("<KeyRelease>", _marcar_rango)
-        ars_search_var.changed.connect(lambda _value: _refresh_ars_search())
+        ars_search_var.changed.connect(_refresh_ars_search)
+        turno_var.changed.connect(_refresh_turn_controls)
+        ars_mode_var.changed.connect(_ars_filter_changed)
         for filter_variable in (
             periodo_var,
             turno_var,
             especialidad_var,
             cobertura_var,
-            ars_mode_var,
-            *ars_vars.values(),
         ):
-            filter_variable.changed.connect(lambda _value: _mark_snapshot_stale())
-        button_row = tb.Frame(barra, style="Card.TFrame")
-        button_row.pack(fill="x")
-        tb.Button(button_row, text="📊  Generar reporte", bootstyle=PRIMARY, command=generar, width=20).pack(side="left", padx=5, ipady=5)
-        history_button = tb.Button(
-            button_row,
-            text="Historial de turnos",
-            bootstyle=INFO,
-            command=open_turn_history,
-            width=20,
+            filter_variable.changed.connect(_mark_snapshot_stale)
+        history_button.configure(command=open_turn_history)
+        previous_turn.clicked.connect(lambda: _navigate_turn("previous"))
+        next_turn.clicked.connect(lambda: _navigate_turn("next"))
+        select_all_ars.clicked.connect(lambda: _select_ars_visible(True))
+        select_none_ars.clicked.connect(lambda: _select_ars_visible(False))
+        filter_timer.timeout.connect(_apply_cached_filters)
+        win.closing.connect(filter_timer.stop)
+
+        barra = tb.Frame(cont, style="Card.TFrame")
+        barra.setObjectName("AdminToolbar")
+        layout.addWidget(barra)
+        footer = QVBoxLayout(barra)
+        footer.setContentsMargins(10, 6, 10, 6)
+        footer.setSpacing(5)
+        status = admin_label(estado_var.get(), "Status")
+        estado_var.changed.connect(status.setText)
+        footer.addWidget(status)
+        actions = QHBoxLayout()
+        footer.addLayout(actions)
+        generate_button = tb.Button(
+            barra, text="Generar reporte", bootstyle=PRIMARY, command=generar
         )
-        history_button.pack(side="left", padx=5, ipady=5)
-        pdf_button = tb.Button(button_row, text="📄  Crear / abrir PDF", bootstyle=SUCCESS, command=guardar_pdf, width=20)
-        pdf_button.pack(side="left", padx=5, ipady=5)
-        excel_button = tb.Button(button_row, text="📗  Exportar Excel", bootstyle=INFO, command=guardar_excel_reporte, width=18)
-        excel_button.pack(side="left", padx=5, ipady=5)
+        clear_button = tb.Button(
+            barra, text="Limpiar filtros", bootstyle=SECONDARY, command=limpiar_filtros
+        )
+        pdf_button = tb.Button(
+            barra, text="Abrir PDF", bootstyle=SECONDARY, command=guardar_pdf
+        )
+        excel_button = tb.Button(
+            barra,
+            text="Exportar Excel",
+            bootstyle=SECONDARY,
+            command=guardar_excel_reporte,
+        )
+        close_button = tb.Button(
+            barra, text="Cerrar", bootstyle=SECONDARY, command=win.destroy
+        )
+        views_button = QPushButton("Vistas", barra)
+        views_button.setMenu(ReportViewsMenu(self, _capture_view, _apply_view, views_button))
+        for button in (generate_button, clear_button, pdf_button, excel_button):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        actions.addWidget(views_button)
+        actions.addWidget(close_button)
+        for button in (
+            history_button,
+            generate_button,
+            clear_button,
+            pdf_button,
+            excel_button,
+            close_button,
+            previous_turn,
+            next_turn,
+            select_all_ars,
+            select_none_ars,
+            views_button,
+            toggle_filters,
+        ):
+            button.setMinimumHeight(32)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setAutoDefault(False)
+            button.show()
+        # The Tk compatibility widgets start hidden until placed in a layout.
+        for widget in (
+            panel,
+            filtros,
+            combo_turno,
+            combo_periodo,
+            fecha_inicio,
+            fecha_fin,
+            specialty_combo,
+            coverage_combo,
+            ars_panel,
+            ars_mode_combo,
+            ars_checks_frame,
+            cards,
+            preview_card,
+            vista,
+            barra,
+        ):
+            widget.show()
+        for surface in (panel, cards, barra):
+            surface.setAttribute(Qt.WA_StyledBackground)
         _set_export_enabled(False)
-        tb.Button(button_row, text="Limpiar filtros", bootstyle=SECONDARY, command=limpiar_filtros, width=16).pack(side="left", padx=5, ipady=5)
-        tb.Button(button_row, text="Cerrar", bootstyle=SECONDARY, command=win.destroy, width=12).pack(side="right", padx=5, ipady=5)
-        tb.Label(barra, textvariable=estado_var, style="Muted.TLabel").pack(
-            fill="x", padx=5, pady=(6, 0)
-        )
+        _add_ars_options(full_ars_catalog)
+        _refresh_turn_controls()
+
+        def _refresh_report_theme():
+            palette = self._paleta_visual_actual()
+            dark = palette["mode"].startswith("oscuro")
+            for frame in (
+                panel,
+                filtros,
+                ars_panel,
+                ars_checks_frame,
+                cards,
+                preview_card,
+                barra,
+            ):
+                frame.setStyleSheet("")
+            buttons = (
+                history_button,
+                generate_button,
+                clear_button,
+                pdf_button,
+                excel_button,
+                close_button,
+            )
+            for button in buttons:
+                button.setStyleSheet("")
+            ars_search.setStyleSheet("")
+            cont.setStyleSheet(
+                admin_styles(dark)
+                + f"""
+                QTabWidget::pane {{
+                    background: {palette["card"]}; border: 1px solid {palette["border"]};
+                }}
+                QTabBar::tab {{
+                    background: {palette["card2"]}; color: {palette["text"]};
+                    border: 1px solid {palette["border"]}; padding: 6px 10px;
+                }}
+                QTabBar::tab:selected {{
+                    background: {palette["card"]}; border-bottom: 2px solid {palette["accent"]};
+                }}
+                QComboBox {{
+                    background: {palette["entry"]}; color: {palette["text"]};
+                    border: 1px solid {palette["border"]}; padding: 4px;
+                }}
+                QComboBox QAbstractItemView, QMenu {{
+                    background: {palette["card"]}; color: {palette["text"]};
+                    selection-background-color: {palette["selected_bg"]};
+                    selection-color: {palette["selected_fg"]};
+                }}
+                QLineEdit#AdminSearch {{
+                    background: {palette["entry"]}; color: {palette["text"]};
+                    border: 1px solid {palette["border"]}; border-radius: 4px;
+                    padding: 4px 8px;
+                }}
+                QLineEdit#AdminSearch:focus {{ border: 1px solid {palette["border_focus"]}; }}
+                QPushButton {{
+                    background: {palette["card2"]}; color: {palette["text"]};
+                    border: 1px solid {palette["border"]}; border-radius: 5px;
+                    padding: 4px 10px; font-weight: 600;
+                }}
+                QPushButton#StatReportGenerate {{ background: #1769AA; color: #FFFFFF; }}
+                QPushButton:enabled:hover, QPushButton:focus {{
+                    border: 2px solid {palette["border_focus"]}; padding: 3px 9px;
+                }}
+                QPushButton:disabled, QPushButton#StatReportGenerate:disabled {{
+                    background: {palette["card"]}; color: {palette["muted"]};
+                }}
+            """
+            )
+
+        generate_button.setObjectName("StatReportGenerate")
+        win._admission_theme_refresh = _refresh_report_theme
+        _refresh_report_theme()
         win.report_controls = {
             "period": combo_periodo,
             "turn": combo_turno,
             "specialty_var": especialidad_var,
             "coverage_var": cobertura_var,
             "ars_mode": ars_mode_combo,
+            "ars_mode_var": ars_mode_var,
             "ars_search": ars_search,
             "ars_vars": ars_vars,
             "cards": card_vars,
@@ -10515,7 +10930,19 @@ class App:
             "cards_frame": cards,
             "preview_card": preview_card,
             "generate": generar,
+            "panels": report_panels,
+            "toggle_filters": toggle_filters,
+            "previous_turn": previous_turn,
+            "next_turn": next_turn,
+            "select_all_ars": select_all_ars,
+            "select_none_ars": select_none_ars,
+            "views_button": views_button,
+            "generate_button": generate_button,
             "turn_history_button": history_button,
+            "turn_context": turn_context,
+            "applied_scope": applied_scope,
+            "ars_summary": ars_summary,
+            "status": status,
             "clear": limpiar_filtros,
             "pdf_button": pdf_button,
             "excel_button": excel_button,

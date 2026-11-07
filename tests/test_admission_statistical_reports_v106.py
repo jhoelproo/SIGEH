@@ -227,6 +227,28 @@ def test_cancelled_deleted_wrong_turn_and_wrong_source_are_excluded():
     assert [row["attention_id"] for row in dataset.records] == [1]
 
 
+def test_available_ars_respects_the_shift_before_narrowing_the_results():
+    historical_ars = "ARS HISTÓRICA"
+    rows = (
+        _row(1),
+        _row(2, ars=historical_ars, specialty="PEDIATRIA"),
+        _row(3, ars="SIN SEGURO"),
+        _row(4, ars="OTRO TURNO", turn_id=999),
+        _row(5, ars="ANULADA", status="ANULADA"),
+        _row(6, ars="OTRA ESTACIÓN", source_id="elsewhere"),
+    )
+    filters = _filters(
+        ars_mode=ARS_EXCLUDE,
+        selected_ars=("HUMANO",),
+        specialty="GENERAL",
+        coverage=COVERAGE_INSURED,
+    )
+    dataset = build_admission_report_dataset(rows, filters)
+    assert dataset.records == ()
+    assert dataset.available_ars == (historical_ars, "HUMANO", "SIN SEGURO")
+    assert build_admission_report_dataset((), filters).available_ars == ()
+
+
 def test_specialty_and_coverage_filters_normalize_real_world_values():
     rows = [
         _row(1, specialty="MEDICINA GENERAL", ars="HUMANO"),

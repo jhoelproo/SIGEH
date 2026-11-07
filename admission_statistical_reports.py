@@ -256,6 +256,7 @@ class AdmissionReportDataset:
     generated_at: datetime
     filter_signature: tuple[Any, ...]
     export_metadata: Mapping[str, Any]
+    available_ars: tuple[str, ...]
 
     def matches_filters(self, filters: AdmissionReportFilters) -> bool:
         return self.filter_signature == report_filter_signature(filters)
@@ -456,9 +457,8 @@ def _ars_exclusion_reason(
     return ""
 
 
-def _matches_filters(record: Mapping[str, Any], filters: AdmissionReportFilters) -> str:
+def _attribute_exclusion_reason(record: Mapping[str, Any], filters: AdmissionReportFilters) -> str:
     for exclusion in (
-        _scope_exclusion_reason,
         _specialty_exclusion_reason,
         _coverage_exclusion_reason,
         _ars_exclusion_reason,
@@ -466,7 +466,7 @@ def _matches_filters(record: Mapping[str, Any], filters: AdmissionReportFilters)
         reason = exclusion(record, filters)
         if reason:
             return reason
-    return "INCLUDED"
+    return ""
 
 
 def _percentage(value: int, total: int) -> float:
@@ -628,7 +628,7 @@ def _build_preview(
             int(summary["total_patients"]),
             mode,
             turn,
-            "Dataset filtrado",
+            "Pacientes en el reporte",
         ),
         (
             "COBERTURA",
@@ -674,14 +674,18 @@ def build_admission_report_dataset(
 ) -> AdmissionReportDataset:
     diagnostics: Counter[str] = Counter()
     selected: list[dict[str, Any]] = []
+    available_ars: set[str] = set()
     for raw in rows or ():
         normalized = _normalize_record(dict(raw or {}))
         if normalized is None:
             diagnostics["INVALID_TIMESTAMP"] += 1
             continue
-        reason = _matches_filters(normalized, filters)
-        diagnostics[reason] += 1
-        if reason == "INCLUDED":
+        reason = _scope_exclusion_reason(normalized, filters)
+        if not reason:
+            available_ars.add(normalized["canonical_ars"])
+            reason = _attribute_exclusion_reason(normalized, filters)
+        diagnostics[reason or "INCLUDED"] += 1
+        if not reason:
             selected.append(normalized)
     selected.sort(
         key=lambda row: (
@@ -714,6 +718,7 @@ def build_admission_report_dataset(
         representatives=representatives,
         generated_at=effective_generated_at,
         filter_signature=signature,
+        available_ars=tuple(sorted(available_ars)),
         export_metadata=MappingProxyType(
             {
                 "patient_count": len(immutable_records),
