@@ -1,0 +1,241 @@
+{
+  "product": "SIGEH",
+  "version": "1.3.8",
+  "published": true,
+  "release_url": "https://github.com/jhoelproo/SIGEH/releases/tag/v1.3.8",
+  "published_at": "2026-11-07T05:25:28Z",
+  "source_commit": "c04e3092e306226b9a04bc5aeb697e4d712afcc4",
+  "release_source_files": [
+    "ADMISION_PYSIDE6_V15/facturacion_tabs_pyside6.py",
+    "admission_report_favorites.py",
+    "admission_report_panels.py",
+    "admission_report_tools.py",
+    "admission_statistical_reports.py",
+    "admission_turn_history.py",
+    "admission_turn_history_dialog.py",
+    "admission_v15_adapter.py",
+    "build_app.spec",
+    "docs/RELEASE_1.3.8.md",
+    "sigeh_product.py",
+    "tests/test_admission_initial_layout_20260822.py",
+    "tests/test_admission_report_favorites.py",
+    "tests/test_admission_report_panels.py",
+    "tests/test_admission_report_postgres.py",
+    "tests/test_admission_report_tools.py",
+    "tests/test_admission_statistical_reports_v106.py",
+    "tests/test_sigeh_update.py",
+    "tests/test_turn_history_report_flow.py",
+    "version_config.json"
+  ],
+  "channel": {
+    "status": "PASS",
+    "client_source": "published 1.3.7 compiled module",
+    "client_version": "1.3.7",
+    "latest_version": "1.3.8",
+    "public_latest_api": "https://api.github.com/repos/jhoelproo/SIGEH/releases/latest",
+    "public_manifest_and_checksum": "PASS",
+    "selected_delta": "https://github.com/jhoelproo/SIGEH/releases/download/v1.3.8/SIGEH-1.3.8-from-1.3.7-delta.zip",
+    "full_sha256": "233f83a74009e0f1f8066feeb2868bd0dc944da60efb5dcb1afcdf9c6a0443df",
+    "delta_sha256": "39263ae433114c59b3ae0c933cc7e61a6e36a9d85e25829b521626122bc3ab02"
+  },
+  "assets": [
+    {
+      "name": "SIGEH-1.3.8-files-manifest.json",
+      "size": 378305,
+      "sha256": "fbdd1478ce713ace68f5c5b264dbddba3af913e9adfc4a190eced7fea7da11a4"
+    },
+    {
+      "name": "SIGEH-1.3.8-from-1.3.7-delta.zip",
+      "size": 20249679,
+      "sha256": "39263ae433114c59b3ae0c933cc7e61a6e36a9d85e25829b521626122bc3ab02"
+    },
+    {
+      "name": "SIGEH-1.3.8-manifest.json",
+      "size": 1022,
+      "sha256": "4e4e6f94295b408a9df01b91ef788182664a316583f770150176a8a1ad3701c5"
+    },
+    {
+      "name": "SIGEH-1.3.8-windows-x64.zip",
+      "size": 311135897,
+      "sha256": "233f83a74009e0f1f8066feeb2868bd0dc944da60efb5dcb1afcdf9c6a0443df"
+    },
+    {
+      "name": "SIGEH-1.3.8-windows-x64.zip.sha256",
+      "size": 95,
+      "sha256": "ff7dd3206f02ed60afc183b7d04beb28c1c4aeda6f522d8df323cdd726962901"
+    }
+  ],
+  "package_validation": {
+    "status": "PASS",
+    "full_sha256": "233f83a74009e0f1f8066feeb2868bd0dc944da60efb5dcb1afcdf9c6a0443df",
+    "delta_sha256": "39263ae433114c59b3ae0c933cc7e61a6e36a9d85e25829b521626122bc3ab02",
+    "files_verified": 1823,
+    "full_size": 311135897,
+    "delta_size": 20249679,
+    "incremental_reconstruction": "PASS",
+    "actual_update": "PASS",
+    "packaged_health_check": "PASS",
+    "preserved_files_checked": 8,
+    "derived_shift_summary_only_refreshed_timestamp": "PASS",
+    "custom_logo_hospital_hours_users_history": "PASS",
+    "production_access": false
+  },
+  "build_command": "python -m PyInstaller --noconfirm --distpath output/release-138-app --workpath output/release-138-work output/nov07-report-preview.spec",
+  "build_validation": {
+    "status": "PASS",
+    "compiled_sources": [
+      "CALCULOS_QT",
+      "sigeh_product",
+      "ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6",
+      "admission_statistical_reports",
+      "admission_turn_history_dialog",
+      "admin_workspace_design",
+      "admission_report_tools",
+      "admission_report_favorites",
+      "admission_report_panels",
+      "admission_turn_history",
+      "admission_v15_adapter"
+    ],
+    "version": "1.3.8",
+    "smokes": [
+      {
+        "executable": "SIGEH.exe",
+        "command": "--self-test",
+        "exit_code": 0
+      },
+      {
+        "executable": "SIGEH_Updater.exe",
+        "command": "--help",
+        "exit_code": 0
+      },
+      {
+        "executable": "CALCULOS_QT.exe",
+        "command": "--check-v15-package",
+        "exit_code": 0
+      },
+      {
+        "executable": "CALCULOS_QT.exe",
+        "command": "--self-test-pdf",
+        "exit_code": 0
+      },
+      {
+        "executable": "CALCULOS_QT.exe",
+        "command": "--self-test-report-viewer",
+        "exit_code": 0
+      },
+      {
+        "executable": "CALCULOS_QT.exe",
+        "command": "--self-test-reports",
+        "exit_code": 0
+      }
+    ],
+    "sha256": "7ae6fbb01d29be9115f9b8a5fae3303213e1aa7dc3663163fe0d09d38d2d69fa",
+    "production_connections": false,
+    "distribution_clean": true
+  },
+  "tests": {
+    "related_regression": {
+      "passed": 249,
+      "subtests_passed": 42,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "feature_final": {
+      "passed": 91,
+      "subtests_passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "feature_additional": {
+      "passed": 50,
+      "subtests_passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "updater_and_version": {
+      "passed": 217,
+      "subtests_passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "packaged_smokes": {
+      "passed": 6,
+      "failed": 0,
+      "skipped": 0
+    },
+    "scopes_can_overlap": true
+  },
+  "coverage": {
+    "report_enhancements": {
+      "lines_covered": 610,
+      "lines_total": 612,
+      "line_percent": 99.67,
+      "branches_covered": 146,
+      "branches_total": 150,
+      "branch_percent": 97.33
+    },
+    "initial_report_redesign": {
+      "lines_covered": 298,
+      "lines_total": 299,
+      "line_percent": 99.67,
+      "branches_covered": 55,
+      "branches_total": 56,
+      "branch_percent": 98.21
+    },
+    "critical_logic": {
+      "lines_covered": 130,
+      "lines_total": 130,
+      "line_percent": 100.0,
+      "branches_covered": 52,
+      "branches_total": 52,
+      "branch_percent": 100.0
+    },
+    "version_constant": {
+      "lines": "1/1",
+      "branches": "N/A"
+    }
+  },
+  "quality_gates": {
+    "functionality": "PASS",
+    "unit": "PASS",
+    "integration": "PASS",
+    "regression": "PASS",
+    "boundaries": "PASS",
+    "coverage": "PASS",
+    "formatter": "PASS",
+    "lint": "PASS",
+    "types": "PASS",
+    "static_analysis": "PASS",
+    "complexity": "PASS",
+    "duplication": "PASS",
+    "build": "PASS",
+    "smoke": "PASS",
+    "security": "PASS",
+    "final_qa": "PASS"
+  },
+  "quality_details": {
+    "max_cyclomatic_complexity_modified_production": 10,
+    "new_duplicate_blocks": 0
+  },
+  "visual_qa": {
+    "window_widths": [
+      760,
+      960,
+      1180
+    ],
+    "themes": [
+      "claro",
+      "oscuro"
+    ],
+    "contrast_pairs_passed": 24
+  },
+  "limitations": [
+    "El aviso heredado de deprecación de PyPDF2 sigue presente.",
+    "Instalación comprobada con datos ficticios en una copia aislada. Instalación en equipos del hospital NO VERIFICADA.",
+    "Los favoritos se guardan por usuario en cada computadora; no se sincronizan entre estaciones."
+  ]
+}
