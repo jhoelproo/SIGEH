@@ -13,10 +13,35 @@ from typing import Any
 
 PRODUCT_NAME = "SIGEH"
 PRODUCT_ID = "SIGEH"
-APP_VERSION = "1.3.9"
+APP_VERSION = "1.3.10"
 GITHUB_OWNER = "jhoelproo"
 GITHUB_REPOSITORY = f"{GITHUB_OWNER}/SIGEH"
 PRODUCTION_BOOTSTRAP_VERSION = "SIGEH_PRODUCTION_BOOTSTRAP_V1"
+
+_PRODUCTION_SCHEMA_READY_SQL = """
+SELECT to_regclass('public.sigeh_product_state') IS NOT NULL
+ AND (
+     SELECT COUNT(*) = 2
+     FROM pg_attribute
+     WHERE attrelid IN (
+         to_regclass('public.admission_operational_sessions'),
+         to_regclass('public.admission_operational_turn_intervals')
+     )
+       AND attname='production_epoch_id' AND NOT attisdropped
+ )
+ AND EXISTS (
+     SELECT 1 FROM pg_index
+     WHERE indexrelid=to_regclass('public.idx_admission_operational_production_active')
+       AND indisvalid
+ )
+ AND EXISTS (
+     SELECT 1 FROM pg_trigger
+     WHERE tgrelid=to_regclass('public.admission_operational_sessions')
+       AND tgname='trg_sigeh_bind_active_epoch'
+       AND tgfoid=to_regprocedure('public.sigeh_bind_active_operational_epoch()')
+       AND tgenabled IN ('O','A')
+ )
+"""
 
 
 @dataclass(frozen=True)
@@ -30,8 +55,28 @@ class ProductionBootstrapResult:
     production_initialized_at: str | None
 
 
+def _production_schema_ready(connection: Any) -> bool:
+    row = connection.execute(_PRODUCTION_SCHEMA_READY_SQL).fetchone()
+    return bool(row and row[0])
+
+
+def _lock_production_bootstrap(connection: Any) -> None:
+    connection.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (PRODUCTION_BOOTSTRAP_VERSION,),
+    )
+
+
 def ensure_sigeh_production_schema(connection: Any) -> None:
-    """Converge instalaciones viejas/nuevas sin borrar historia."""
+    """Instala el esquema operativo una vez, sin DDL en arranques compatibles."""
+    if _production_schema_ready(connection):
+        return
+    _lock_production_bootstrap(connection)
+    if not _production_schema_ready(connection):
+        _install_sigeh_production_schema(connection)
+
+
+def _install_sigeh_production_schema(connection: Any) -> None:
     connection.execute(
         """CREATE TABLE IF NOT EXISTS sigeh_product_state(
                singleton SMALLINT PRIMARY KEY CHECK(singleton=1),
@@ -147,11 +192,9 @@ def prepare_sigeh_production_bootstrap(
             ).fetchone()
             if existing:
                 return _bootstrap_result(existing, applied=False)
-        connection.execute(
-            "SELECT pg_advisory_xact_lock(hashtext(%s))",
-            (PRODUCTION_BOOTSTRAP_VERSION,),
-        )
-        ensure_sigeh_production_schema(connection)
+        _lock_production_bootstrap(connection)
+        if not _production_schema_ready(connection):
+            _install_sigeh_production_schema(connection)
         existing = connection.execute(
             "SELECT * FROM sigeh_product_state WHERE singleton=1 FOR UPDATE"
         ).fetchone()

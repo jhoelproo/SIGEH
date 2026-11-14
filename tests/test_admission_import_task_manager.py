@@ -198,9 +198,12 @@ def test_import_progress_is_monotonic_and_apply_reuses_the_same_task(tmp_path):
     database = tmp_path / "patients.db"
     database.touch()
     percentages = {"ANALYZE": [], "APPLY": []}
-    manager.task_state_changed.connect(
-        lambda state: percentages.setdefault(state["operation"], []).append(state["percent"])
-    )
+    update_threads = []
+    def record_state(state):
+        update_threads.append(threading.get_ident())
+        percentages.setdefault(state["operation"], []).append(state["percent"])
+
+    manager.task_state_changed.connect(record_state)
     manager.start_analysis(database, "MERGE")
     _wait_until(lambda: manager.snapshot()["status"] == "ANALYZED")
     _wait_until(lambda: not manager.is_running())
@@ -212,6 +215,7 @@ def test_import_progress_is_monotonic_and_apply_reuses_the_same_task(tmp_path):
     assert percentages["ANALYZE"] == sorted(percentages["ANALYZE"])
     assert percentages["APPLY"] == sorted(percentages["APPLY"])
     assert percentages["APPLY"][-1] == 100
+    assert set(update_threads) == {gui_thread_id}
     assert importer.progress_updates
     assert importer.analyze_thread_id != gui_thread_id
     assert importer.apply_thread_id != gui_thread_id

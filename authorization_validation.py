@@ -1,6 +1,7 @@
 """One ASCII authorization format for interactive and durable writes."""
 
 MAX_AUTHORIZATION_LENGTH = 40
+MIN_BILLING_AUTHORIZATION_LENGTH = 4
 
 
 def numeric_authorization(value, *, allow_empty=True, minimum=1):
@@ -12,10 +13,21 @@ def numeric_authorization(value, *, allow_empty=True, minimum=1):
         or not text.isdigit()
         or not minimum <= len(text) <= MAX_AUTHORIZATION_LENGTH
     ):
+        if minimum > 1:
+            raise ValueError(
+                f"La autorización debe contener entre {minimum} y "
+                f"{MAX_AUTHORIZATION_LENGTH} dígitos."
+            )
         raise ValueError(
             "La autorización debe contener únicamente dígitos numéricos (máximo 40)."
         )
     return text
+
+
+def billing_authorization(value, *, allow_empty=True):
+    return numeric_authorization(
+        value, allow_empty=allow_empty, minimum=MIN_BILLING_AUTHORIZATION_LENGTH
+    )
 
 
 def install_authorization_validator(control):

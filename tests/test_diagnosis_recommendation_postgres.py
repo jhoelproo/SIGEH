@@ -326,9 +326,12 @@ def test_private_schema_is_not_available_to_an_unprivileged_role(learning):
 
 
 def test_administrator_gui_loads_and_saves_real_shared_configuration(learning):
+    from PySide6.QtWidgets import QApplication, QDialog
+
     from diagnosis_recommendation_admin import RecommendationAdminDialog
     from tests.test_diagnosis_recommendation_runtime import wait_task
 
+    qt_app = QApplication.instance() or QApplication([])
     with app.db_connect() as con:
         con.execute(
             "INSERT INTO universal_items(categoria,nombre,precio,is_active) VALUES('Medicamentos','MED GUI',10,1) ON CONFLICT DO NOTHING"
@@ -348,13 +351,12 @@ def test_administrator_gui_loads_and_saves_real_shared_configuration(learning):
     )
     dialog.save()
     wait_task(dialog.worker)
-    from PySide6.QtWidgets import QDialog
-
     assert dialog.result() == QDialog.Accepted
     with app.db_connect() as con:
         value = load_config(con)
     assert value["version"] == 1 and value["rules"][0]["item"] == "MED GUI"
     dialog.deleteLater()
+    qt_app.processEvents()
 
 
 def test_unrecognized_specialty_and_ambiguous_diagnosis_do_not_train(learning):

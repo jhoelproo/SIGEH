@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
+    QLabel,
+    QPushButton,
     QStackedWidget,
     QTableWidget,
     QVBoxLayout,
@@ -72,6 +75,72 @@ def _build_admission_widget(tmp_path, monkeypatch, *, host_theme_is_dark=None):
     stack.addWidget(admission)
     shell_layout.addWidget(stack)
     return application, shell, stack, billing, admission
+
+
+@pytest.mark.parametrize("has_cache", (False, True))
+def test_representatives_use_cache_offline_and_retry_after_reconnection(
+    tmp_path, monkeypatch, has_cache
+):
+    app, shell, stack, _billing, widget = _build_admission_widget(
+        tmp_path, monkeypatch, host_theme_is_dark=True
+    )
+    try:
+        stack.setCurrentWidget(widget)
+        shell.show()
+        admission = widget.admission
+        runtime = admission.db._runtime
+        gateway = admission.main_app_gateway
+        cached = SimpleNamespace(
+            username="cached-user", full_name="Representante de prueba", role="administrador"
+        )
+        queries = []
+        monkeypatch.setattr(gateway, "cached_representatives", lambda: [cached] if has_cache else [])
+        monkeypatch.setattr(gateway, "list_representatives", lambda: queries.append(True) or [cached])
+        admission._abrir_configuracion_interna()
+        dialog = admission.configuracion_interna_win
+        for _ in range(60):
+            app.processEvents()
+            if getattr(dialog, "_config_content_ready", False):
+                break
+            QTest.qWait(25)
+        assert dialog._config_content_ready
+        tabs = dialog.findChild(compat.Notebook)
+        index = next(i for i in range(tabs.count()) if tabs.tabText(i) == "Representante del turno")
+        runtime.offline = True
+        tabs.setCurrentIndex(index)
+        page = tabs.widget(index)
+        status = "los últimos usuarios consultados" if has_cache else "Pulsa Reintentar"
+        assert any(
+            label.text().startswith("Sin conexión central") and status in label.text()
+            for label in page.findChildren(QLabel)
+        )
+        assert not queries
+        buttons = {button.text(): button for button in page.findChildren(QPushButton)}
+        assert buttons["Reintentar"].isEnabled()
+        assert not buttons["Confirmar y corregir representante"].isEnabled()
+        if has_cache:
+            table = next(
+                table
+                for table in page.findChildren(QTableWidget)
+                if table.rowCount() == 1 and table.columnCount() == 3
+            )
+            table.selectRow(0)
+            assert any(
+                "requiere conexión central" in label.text() for label in page.findChildren(QLabel)
+            )
+            assert not buttons["Confirmar y corregir representante"].isEnabled()
+        runtime.offline = False
+        buttons["Reintentar"].click()
+        for _ in range(60):
+            if queries:
+                break
+            QTest.qWait(25)
+        assert len(queries) == 1
+    finally:
+        widget.shutdown()
+        shell.close()
+        shell.deleteLater()
+        app.processEvents()
 
 
 def _geometry_snapshot(widget):

@@ -67,8 +67,15 @@ def test_unknown_abbreviations_and_internal_words_are_not_expanded():
         ("ALTRALGIA DE BRAZO IZQUIERDO", "ARTRALGIA"),
         ("ARTRALGIA PIERNA IZQUIERDA", "ARTRALGIA"),
         ("ARTROSIS DE RODILLA DERECHA", "ARTROSIS"),
-        ("TRAUMA CERRADO DE BRAZO IZQUIERDO", "TRAUMA CERRADO"),
-        ("TRAUMATISMO EN LA MANO DERECHA", "TRAUMATISMO"),
+        ("TRAUMA CERRADO DE BRAZO IZQUIERDO", "TRAUMA"),
+        ("TRAUMA ABIERTO DE BRAZO IZQUIERDO", "TRAUMA ABIERTO"),
+        ("TRAUMATISMO EN LA MANO DERECHA", "TRAUMA"),
+        ("TRAUMATISMO", "TRAUMA"),
+        ("TRAUMA CERRADO", "TRAUMA"),
+        ("TRAUMA EN LA CABEZA", "TRAUMA"),
+        ("TRAUMA EN REGIÓN DEL CRÁNEO", "TRAUMA"),
+        ("ARTRALGIA (HOMBRO DERECHO)", "ARTRALGIA"),
+        ("ARTRALGIA, PIERNA IZQUIERDA", "ARTRALGIA"),
         ("TRAUMA CRANEOENCEFALICO", "TRAUMA CRANEOENCEFALICO"),
         ("TRAUMA DE BRAZO CON FRACTURA", "TRAUMA DE BRAZO CON FRACTURA"),
         ("DOLOR DE PIERNA IZQUIERDA", "DOLOR DE PIERNA IZQUIERDA"),
@@ -105,6 +112,33 @@ def test_localized_receipt_text_is_retained_while_learning_collapses_body_sites(
     assert catalog.choices("ALTRALGIA DE BRAZO IZQUIERDO") == [
         "ARTRALGIA DE BRAZO IZQUIERDO"
     ]
+
+
+def test_trauma_locations_share_one_rule_without_losing_the_location():
+    model = {
+        "config": normalize_config(
+            {
+                "diagnoses": [{"name": "TRAUMA"}],
+                "rules": [
+                    {
+                        "diagnosis": "TRAUMATISMO DE PIERNA",
+                        "specialty": "GENERAL",
+                        "category": "Medicamentos",
+                        "item": "ÍTEM DE PRUEBA",
+                        "mode": "pin",
+                    }
+                ],
+            }
+        )
+    }
+    catalog = model_catalog(model)
+    available = {"Medicamentos": {"ÍTEM DE PRUEBA": 1}}
+    for text in ("TRAUMA DE CABEZA", "TRAUMATISMO DE PIERNA", "TRAUMA CERRADO DE TÓRAX"):
+        assert catalog.normalize(text) == text
+        assert catalog.first_two(text) == ["trauma"]
+        assert recommendations(model, text, "GENERAL", available)["Medicamentos"] == [
+            {"item": "ÍTEM DE PRUEBA", "diagnoses": ["TRAUMA"], "origin": "manual"}
+        ]
 
 
 def test_spaced_slash_in_investigation_is_not_a_diagnosis_separator():

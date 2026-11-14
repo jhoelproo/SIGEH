@@ -37,6 +37,7 @@ from time import perf_counter
 from urllib.parse import urlparse
 
 from database_config import resolve_database_url
+from authorization_validation import billing_authorization, numeric_authorization
 from billing_item_rules import honorarium_policy_snapshot
 from admission_billing_consistency import (
     CURRENT_OPERATIONAL_SHIFT_SQL,
@@ -523,12 +524,15 @@ AUTH_REVIEW_STATES = (
 
 
 def authorization_min_digits() -> int:
-    """Configured minimum; six preserves every numeric production format found."""
+    """Audit settings may require more digits than billing's shared minimum."""
+    from authorization_validation import MIN_BILLING_AUTHORIZATION_LENGTH
+
+    minimum = MIN_BILLING_AUTHORIZATION_LENGTH
     try:
-        configured = int(os.environ.get("SIGEH_AUTHORIZATION_MIN_DIGITS", "6"))
+        configured = int(os.environ.get("SIGEH_AUTHORIZATION_MIN_DIGITS", minimum))
     except (TypeError, ValueError):
-        return 6
-    return min(20, max(1, configured))
+        return minimum
+    return min(20, max(minimum, configured))
 
 
 def classify_privileged_bypass_authorization(
@@ -7451,22 +7455,26 @@ class AdmissionDatabaseImportTaskManager(QObject):
             total=total,
         )
 
-    def _start_worker(self, operation, task_id, worker_operation):
+    def _start_worker(self, worker_operation):
         self._remote_poll.stop()
         self._worker = AdmissionDatabaseImportWorker(worker_operation, self)
-        self._worker.progress.connect(
-            lambda phase, current, total: self._progress_received(
-                operation, phase, current, total
-            )
-        )
-        self._worker.completed.connect(
-            lambda result: self._operation_completed(operation, result)
-        )
-        self._worker.failed.connect(
-            lambda error: self._operation_failed(task_id, error)
-        )
+        self._worker.progress.connect(self._worker_progress)
+        self._worker.completed.connect(self._worker_completed)
+        self._worker.failed.connect(self._worker_failed)
         self._worker.finished.connect(self._worker_finished)
         self._worker.start()
+
+    @Slot(str, int, int)
+    def _worker_progress(self, phase, current, total):
+        self._progress_received(self._snapshot.operation, phase, current, total)
+
+    @Slot(object)
+    def _worker_completed(self, result):
+        self._operation_completed(self._snapshot.operation, result)
+
+    @Slot(str)
+    def _worker_failed(self, error):
+        self._operation_failed(self._snapshot.import_batch_id, error)
 
     def start_analysis(self, sqlite_path, mode):
         if self.is_running():
@@ -7503,7 +7511,7 @@ class AdmissionDatabaseImportTaskManager(QObject):
                 import_batch_id=task_id, progress=progress,
             )
 
-        self._start_worker("ANALYZE", task_id, run)
+        self._start_worker(run)
 
     def start_apply(self):
         if self.is_running():
@@ -7544,7 +7552,7 @@ class AdmissionDatabaseImportTaskManager(QObject):
                 progress=progress,
             )
 
-        self._start_worker("APPLY", task_id, run)
+        self._start_worker(run)
 
     def _progress_received(self, operation, phase, current, total):
         self._snapshot.operation = operation
@@ -7613,9 +7621,10 @@ class AdmissionDatabaseImportTaskManager(QObject):
     @Slot()
     def _worker_finished(self):
         worker = self._worker
-        self._worker = None
         if worker is not None:
+            worker.wait()
             worker.deleteLater()
+            self._worker = None
 
 
 class HonorariumSettingsWorker(QThread):
@@ -11433,9 +11442,9 @@ def save_receipt_with_items(
     """Guarda cabecera, ítems, historial y snapshot con un solo commit."""
     from receipt_edit_integrity import receipt_service_date, require_same_insurance
     fecha = receipt_service_date(fecha)
-    from authorization_validation import numeric_authorization
-
-    authorization_number = numeric_authorization(authorization_number)
+    # Already queued offline receipts keep their original authorization on replay.
+    validate_authorization = numeric_authorization if local_request_id else billing_authorization
+    authorization_number = validate_authorization(authorization_number)
     self_pay = is_self_pay(coverage)
     tariff_name = tariff_ars(coverage, ars)
     if self_pay:
@@ -17933,6 +17942,7 @@ class PDFDatabaseWorker(threading.Thread):
         local_request_id = ""
         local_request_hash = ""
         try:
+            billing_authorization(authorization)
             require_preliminary_authorization_for_user(current_user, authorization, coverage)
             validate_receipt_job_date(job)
             local_request_id, local_request_hash, handled = self._prepare_local_job(job)
@@ -31451,6 +31461,7 @@ class EmergencyWorkspacePage(QWidget):
                 device_id=device_id,
                 device_name=device_name,
                 current_shift=bootstrap_shift,
+                prepare_central_schema=prepare_database_schema,
                 configuration={
                     "bootstrap_operational_snapshot": bootstrap_snapshot,
                     "central_schema_ready": not CENTRAL_OFFLINE_BOOT,
@@ -37745,6 +37756,7 @@ class MainWindow(QMainWindow):
         try:
             from diagnosis_recommendation_ui import normalize_receipt_diagnosis
 
+            billing_authorization(self.authorization_edit.text())
             require_preliminary_authorization_for_user(self.current_user, self.authorization_edit.text(), form_coverage(self))
             normalize_receipt_diagnosis(self)
             dx_raw = self.dx_edit.text().strip()

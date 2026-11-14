@@ -18,6 +18,13 @@ def test_individual_deny_blocks_local_preliminary_before_enqueue():
         receipt_command(job)
 
 
+def test_short_authorization_is_rejected_even_with_permission_for_preliminary():
+    job = receipt_job()
+    job["authorization_number"] = "123"
+    with pytest.raises(ValueError, match="entre 4 y 40"):
+        receipt_command(job)
+
+
 def test_live_individual_deny_blocks_central_save(monkeypatch):
     monkeypatch.setattr(
         app,
@@ -63,13 +70,14 @@ def test_self_pay_and_authorized_receipts_are_exempt(coverage, authorization):
     assert receipt_command(job)
 
 
-def test_ui_denial_prevents_worker_submission(main_window, monkeypatch):
+@pytest.mark.parametrize("authorization", ["", "123"])
+def test_ui_rejects_missing_or_short_authorization(main_window, monkeypatch, authorization):
     window = main_window
     window.name_edit.setText("PACIENTE QA")
     window.current_user["permission_overrides"] = {
         app.PERMISSION_SAVE_PRELIMINARY_WITHOUT_AUTHORIZATION: False
     }
-    window.authorization_edit.clear()
+    window.authorization_edit.setText(authorization)
     window._last_generate_time = 0
     submit = Mock()
     worker = Mock(submit=submit, can_contact_central=False)

@@ -16,6 +16,7 @@ from diagnosis_recommendation_store import (
     synchronize,
 )
 from diagnosis_recommendations import DiagnosisCatalog
+from diagnosis_text import NORMALIZATION_VERSION
 from tests.test_billing_consistency_postgres import server as server
 from tests.test_diagnosis_recommendation_postgres import drain, learning as learning
 from tests.test_receipt_optional_uuid_postgres import receipts as receipts, save
@@ -48,8 +49,8 @@ def test_learning_labels_use_administrator_vocabulary_for_known_spelling_edits()
 
 def test_rebuild_merges_old_groups_and_preserves_receipt_history(learning):
     diagnoses = [
-        "ALTRAGIA DE BRAZO IZQUIERDO.",
-        "ARTRALGIA DE RODILLA DERECHA",
+        "TRAUMA CERRADO DE TÓRAX.",
+        "TRAUMATISMO DE PIERNA DERECHA",
         "ABORTO IMCOMPLETO",
         "ABORTO INCOMPLETO.",
     ]
@@ -73,19 +74,19 @@ def test_rebuild_merges_old_groups_and_preserves_receipt_history(learning):
         con.execute(
             "INSERT INTO sigeh_recommendations.changes(change_key,payload) VALUES(%s,%s::jsonb)",
             (
-                "group:altragia de brazo izquierdo::EMERGENCIOLOGÍA",
-                '{"diagnosis":"ALTRAGIA DE BRAZO IZQUIERDO.","specialty":"EMERGENCIOLOGÍA","receipts":1,"items":[]}',
+                "group:trauma cerrado::EMERGENCIOLOGÍA",
+                '{"diagnosis":"TRAUMA CERRADO DE TÓRAX.","specialty":"EMERGENCIOLOGÍA","receipts":1,"items":[]}',
             ),
         )
         con.execute(
             "INSERT INTO sigeh_recommendations.observations(receipt_id,diagnoses,specialty,status) "
-            "SELECT id,'{\"altragia de brazo izquierdo\":\"ALTRAGIA DE BRAZO IZQUIERDO.\"}'::jsonb,'EMERGENCIOLOGÍA','PENDIENTE' "
+            "SELECT id,'{\"trauma cerrado\":\"TRAUMA CERRADO DE TÓRAX.\"}'::jsonb,'EMERGENCIOLOGÍA','PENDIENTE' "
             "FROM recibos WHERE numero=1"
         )
     old = apply_changes({}, [])
     model = drain(old)
     assert set(model["groups"]) == {
-        "artralgia::EMERGENCIOLOGÍA",
+        "trauma::EMERGENCIOLOGÍA",
         "aborto incompleto::EMERGENCIOLOGÍA",
     }
     assert all(row["receipts"] == 2 for row in model["groups"].values())
@@ -137,7 +138,7 @@ def test_older_client_evidence_is_reprocessed_after_initial_upgrade(learning):
                 "SELECT normalization_version FROM sigeh_recommendations.observations WHERE receipt_id=%s",
                 (identity,),
             ).fetchone()[0]
-            == 1
+            == NORMALIZATION_VERSION
         )
     assert drain(updated) == updated
 

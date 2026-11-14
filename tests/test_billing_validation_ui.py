@@ -117,7 +117,7 @@ class BillingValidationUiTests(unittest.TestCase):
             (app.DOCUMENT_READY, app.AUTH_REVIEW_CLEAR, ""),
         )
         self.assertEqual(
-            app.classify_privileged_bypass_authorization("12345"),
+            app.classify_privileged_bypass_authorization("123"),
             (
                 app.DOCUMENT_READY,
                 app.AUTH_REVIEW_PENDING,
@@ -157,7 +157,7 @@ class BillingValidationUiTests(unittest.TestCase):
         with patch.dict(os.environ, {"SIGEH_AUTHORIZATION_MIN_DIGITS": "7"}):
             self.assertEqual(app.authorization_min_digits(), 7)
         with patch.dict(os.environ, {"SIGEH_AUTHORIZATION_MIN_DIGITS": "invalid"}):
-            self.assertEqual(app.authorization_min_digits(), 6)
+            self.assertEqual(app.authorization_min_digits(), 4)
 
     def test_bypass_review_migration_is_idempotent_and_non_destructive(self):
         sql = (

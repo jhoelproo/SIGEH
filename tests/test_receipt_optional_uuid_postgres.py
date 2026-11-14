@@ -97,7 +97,7 @@ def test_bypass_valid_authorization_without_admission_is_null(receipts):
             app.AUTH_REVIEW_NOT_APPLICABLE,
             "AUTHORIZATION_MISSING",
         ),
-        ("1", app.DOCUMENT_READY, app.AUTH_REVIEW_PENDING, "AUTHORIZATION_TOO_SHORT"),
+        ("0123", app.DOCUMENT_READY, app.AUTH_REVIEW_CLEAR, None),
     ],
 )
 def test_bypass_authorization_variants(receipts, authorization, state, review, reason):
@@ -111,6 +111,13 @@ def test_bypass_authorization_variants(receipts, authorization, state, review, r
         ) == (state, review, reason)
         assert row["admission_global_attention_id"] is None
         assert row["numero_autorizacion"] == authorization
+
+
+def test_short_billing_authorization_does_not_create_receipt(receipts):
+    with pytest.raises(ValueError, match="entre 4 y 40"):
+        save(authorization_number="123")
+    with app.db_connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM recibos").fetchone()[0] == 0
 
 
 def test_edit_bypass_preserves_null_and_updates_items(receipts):
@@ -202,7 +209,7 @@ def test_legacy_and_valid_uuid_persistence_boundary(receipts, monkeypatch, ident
 
 
 def test_invalid_new_authorization_is_rejected_without_receipt(receipts):
-    with pytest.raises(ValueError, match="numéricos"):
+    with pytest.raises(ValueError, match="entre 4 y 40"):
         save(authorization_number="ABC123")
     with app.db_connect() as con:
         assert con.execute("SELECT COUNT(*) FROM recibos").fetchone()[0] == 0

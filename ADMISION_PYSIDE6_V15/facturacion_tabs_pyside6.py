@@ -16140,7 +16140,7 @@ class App:
                 tab_usuarios.rowconfigure(1, weight=1)
 
                 usuarios_estado = tk.StringVar(
-                    value="Cargando usuarios activos del sistema…"
+                    value=""
                 )
                 tb.Label(
                     tab_usuarios,
@@ -16472,6 +16472,12 @@ class App:
                         and str(representante.username or "").casefold()
                         == str(actual.get("username") or "").casefold()
                     )
+                    if sin_conexion_representantes():
+                        seleccion_var.set(
+                            "La corrección del representante requiere conexión central."
+                        )
+                        corregir_turno_btn.configure(state="disabled")
+                        return
                     if not es_admin:
                         seleccion_var.set(
                             "Solo un Administrador puede corregir el representante del turno."
@@ -16522,6 +16528,15 @@ class App:
                         )
                     actualizar_seleccion()
 
+                def sin_conexion_representantes():
+                    runtime = getattr(self.db, "_runtime", None)
+                    if runtime is not None:
+                        return bool(runtime.offline)
+                    return (
+                        os.environ.get("HOSPITAL_OFFLINE", "").strip().casefold()
+                        in {"1", "true", "yes", "si", "sí", "on"}
+                    )
+
                 def cargar_usuarios():
                     if rep_load_state["in_flight"]:
                         APP_LOG.info(
@@ -16558,6 +16573,17 @@ class App:
                         self.main_app_gateway, "cached_representatives", None
                     )
                     cached = list(cache_provider() or ()) if callable(cache_provider) else []
+                    if sin_conexion_representantes():
+                        rep_load_state["finished"] = True
+                        rep_load_state["in_flight"] = False
+                        _mostrar_representantes(cached)
+                        usuarios_estado.set(
+                            "Sin conexión central. Se muestran los últimos usuarios consultados."
+                            if cached
+                            else "Sin conexión central. Pulsa Reintentar cuando se restablezca."
+                        )
+                        rep_retry_button.configure(state="normal")
+                        return
                     if cached:
                         APP_LOG.info(
                             "CONFIG_USERS_CACHE_USED count=%s thread=%s",
@@ -16579,11 +16605,7 @@ class App:
                             (_time.perf_counter() - started) * 1000.0,
                             threading.current_thread().name,
                         )
-                        if os.environ.get("HOSPITAL_OFFLINE", "").strip().casefold() in {
-                            "1", "true", "yes", "si", "sí", "on",
-                        }:
-                            if cached:
-                                return cached
+                        if sin_conexion_representantes():
                             raise RuntimeError("Sin conexión para actualizar los usuarios del sistema.")
                         representatives = list(self.main_app_gateway.list_representatives())
                         APP_LOG.info(
@@ -16634,7 +16656,9 @@ class App:
                             exc_info=(type(exc), exc, exc.__traceback__),
                         )
                         usuarios_estado.set(
-                            "No fue posible cargar los usuarios del sistema."
+                            "Sin conexión central. Pulsa Reintentar cuando se restablezca."
+                            if sin_conexion_representantes()
+                            else "No fue posible cargar los usuarios del sistema."
                         )
                         rep_retry_button.configure(state="normal")
 

@@ -17,6 +17,7 @@ from database_config import (
     SEALED_DATABASE_FILE,
     describe_database_configuration,
     install_database_url_for_child,
+    read_sealed_database_url,
     recover_database_url_from_existing_install,
     write_sealed_database_url,
 )
@@ -38,6 +39,62 @@ def _persist_recovered_configuration(root: Path, database_url: str) -> None:
         )
         return
     _write_bootstrap_event(root, "CONFIG_PERSISTENCE", status="PASS", error_code="")
+
+
+def _connection_backup(environment: dict[str, str]) -> Path | None:
+    local_data = environment.get("LOCALAPPDATA")
+    if not local_data:
+        return None
+    return Path(local_data) / "SIGEH" / SEALED_DATABASE_FILE
+
+
+def _remember_file_configuration(root: Path, backup: Path, database_url: str) -> None:
+    if read_sealed_database_url(backup) == database_url:
+        return
+    try:
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        write_sealed_database_url(backup, database_url)
+    except (OSError, RuntimeError, ValueError) as error:
+        _write_bootstrap_event(
+            root, "CONFIG_BACKUP", status="FAIL", error_type=type(error).__name__
+        )
+
+
+def _prepare_connection(
+    root: Path, environment: dict[str, str]
+) -> tuple[bool, dict[str, object]]:
+    description = describe_database_configuration(root, environment=environment)
+    database_url = install_database_url_for_child(environment, base_dir=root)
+    backup = _connection_backup(environment)
+    if not database_url:
+        return _recover_connection(root, environment, backup, description)
+    if backup and description["config_source"] in {
+        "portable_bundle",
+        "dpapi_protected",
+        "local_env_file",
+    }:
+        _remember_file_configuration(root, backup, database_url)
+    return True, description
+
+
+def _recover_connection(root, environment, backup, description):
+    recovered = read_sealed_database_url(backup) if backup else ""
+    source = "user_protected_backup" if recovered else "existing_install"
+    database_url = recovered or recover_database_url_from_existing_install(
+        root, environment=environment
+    )
+    if not database_url:
+        return False, description
+    _persist_recovered_configuration(root, database_url)
+    if backup and not recovered:
+        _remember_file_configuration(root, backup, database_url)
+    environment[CANONICAL_DATABASE_KEY] = database_url
+    description = describe_database_configuration(root, environment=environment)
+    description["config_source"] = source
+    _write_bootstrap_event(
+        root, "CONFIG_RECOVERY", status="PASS", error_code="", **description
+    )
+    return True, description
 
 
 def portable_root() -> Path:
@@ -116,27 +173,8 @@ def main() -> int:
         _write_bootstrap_event(
             root, "LAUNCH_BOOTSTRAP", step="prepare_runtime", status="PASS"
         )
-        description = describe_database_configuration(root, environment=environment)
-        database_url = install_database_url_for_child(environment, base_dir=root)
-        if not database_url:
-            database_url = recover_database_url_from_existing_install(
-                root, environment=environment
-            )
-            if database_url:
-                _persist_recovered_configuration(root, database_url)
-                environment[CANONICAL_DATABASE_KEY] = database_url
-                description = describe_database_configuration(
-                    root, environment=environment
-                )
-                description["config_source"] = "existing_install"
-                _write_bootstrap_event(
-                    root,
-                    "CONFIG_RECOVERY",
-                    status="PASS",
-                    error_code="",
-                    **description,
-                )
-        if not database_url:
+        config_ready, description = _prepare_connection(root, environment)
+        if not config_ready:
             _write_bootstrap_event(
                 root,
                 "BACKEND_BOOTSTRAP",

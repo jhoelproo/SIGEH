@@ -424,7 +424,10 @@ class _HybridAdmissionRuntime:
     def _attach_remote_if_needed(self) -> None:
         """Initial central attachment is performed only from a pool worker."""
         if not self._central_schema_ready:
-            self.session_service.ensure_schema()
+            prepare_schema = getattr(self.host, "prepare_central_schema", None)
+            if prepare_schema is None:
+                prepare_schema = self.session_service.ensure_schema
+            prepare_schema()
             self._central_schema_ready = True
         if not self.app_user_can_operate_admission:
             session = self.session_service.get_operational_session()

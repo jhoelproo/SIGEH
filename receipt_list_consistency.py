@@ -52,10 +52,9 @@ def normalize_list_metadata(
 
 
 def validate_authorization(value):
-    value = str(value or "").strip()
-    if not value.isascii() or not value.isdigit() or not 4 <= len(value) <= 40:
-        raise ValueError("La autorización debe contener entre 4 y 40 dígitos.")
-    return value
+    from authorization_validation import billing_authorization
+
+    return billing_authorization(value, allow_empty=False)
 
 
 def _timestamp(value):

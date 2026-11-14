@@ -176,6 +176,34 @@ def test_correct_schedule_then_handoff_closes_entire_cohort_once(database):
         )
 
 
+def test_product_schema_check_does_not_block_an_active_station(database):
+    with database() as con:
+        ensure_sigeh_production_schema(con)
+
+    with database() as busy:
+        busy.execute("LOCK TABLE admission_operational_sessions IN ROW EXCLUSIVE MODE")
+        with database() as startup:
+            startup.execute("SET LOCAL lock_timeout='250ms'")
+            startup.execute("SET TRANSACTION READ ONLY")
+            ensure_sigeh_production_schema(startup)
+
+
+def test_product_schema_check_repairs_a_missing_trigger(database):
+    with database() as con:
+        ensure_sigeh_production_schema(con)
+        con.execute(
+            "DROP TRIGGER trg_sigeh_bind_active_epoch ON admission_operational_sessions"
+        )
+        ensure_sigeh_production_schema(con)
+        trigger = con.execute("""
+            SELECT tgenabled
+            FROM pg_trigger
+            WHERE tgrelid='admission_operational_sessions'::regclass
+              AND tgname='trg_sigeh_bind_active_epoch'
+        """).fetchone()
+        assert trigger[0] == "O"
+
+
 def test_bootstrap_on_configured_installation_avoids_busy_operational_tables(database):
     with database() as con:
         con.execute("DROP TABLE sigeh_product_state")

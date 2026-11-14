@@ -41,9 +41,9 @@ def receipt_command(job: dict[str, Any]) -> tuple[str, str]:
     if job.get("editing_id") is not None:
         raise ValueError("Los recibos centrales no se editan sin conexión.")
     payload = {field: job.get(field) for field in JOB_FIELDS}
-    from authorization_validation import numeric_authorization
+    from authorization_validation import billing_authorization
 
-    payload["authorization_number"] = numeric_authorization(
+    payload["authorization_number"] = billing_authorization(
         payload["authorization_number"]
     )
     user = dict(job.get("current_user") or {})

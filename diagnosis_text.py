@@ -5,7 +5,7 @@ import unicodedata
 from functools import lru_cache
 
 
-NORMALIZATION_VERSION = 1
+NORMALIZATION_VERSION = 2
 BUILTIN_DIAGNOSES = (
     "CEFALEA",
     "CEFALEA MIGRAÑOSA",
@@ -58,15 +58,19 @@ ANATOMICAL_WORDS = frozenset(
     "HOMBRO HOMBROS DEDO DEDOS PIERNA PIERNAS MUSLO MUSLOS RODILLA RODILLAS "
     "TOBILLO TOBILLOS PIE PIES CADERA CADERAS EXTREMIDAD EXTREMIDADES "
     "MIEMBRO MIEMBROS TORAX TÓRAX CUELLO ESPALDA LUMBAR COLUMNA "
+    "CABEZA CRÁNEO CRANEO CARA ABDOMEN PELVIS COSTILLA COSTILLAS "
     "TIBIA PERONÉ PERONE FÉMUR FEMUR HÚMERO HUMERO RADIO CÚBITO CUBITO "
     "FALANGE FALANGES METACARPO METATARSO TALÓN TALON PANTORRILLA".split()
 )
 LOCATION_WORDS = ANATOMICAL_WORDS | frozenset(
     "IZQUIERDO IZQUIERDA IZQUIERDOS IZQUIERDAS DERECHO DERECHA DERECHOS DERECHAS "
     "AMBOS AMBAS BILATERAL BILATERALES SUPERIOR SUPERIORES INFERIOR INFERIORES "
-    "DE DEL EN EL LA LOS LAS Y A NIVEL".split()
+    "DE DEL EN EL LA LOS LAS Y A NIVEL REGIÓN REGION ZONA".split()
 )
 LOCATION_TYPOS = {"IZUIRDO": "IZQUIERDO", "IZURDO": "IZQUIERDO"}
+LOCATION_CONNECTORS = frozenset(
+    "DE DEL EN EL LA LOS LAS A NIVEL REGIÓN REGION ZONA".split()
+)
 MUSCULOSKELETAL_ROOTS = frozenset(
     {
         "ARTRALGIA",
@@ -156,7 +160,7 @@ def _expand_investigation(text):
 def learning_diagnosis(value):
     """Keep the clinical diagnosis while excluding a plain anatomical suffix."""
     text = canonical_diagnosis(value)
-    words = re.split(r"[\s/]+", text)
+    words = re.split(r"[\s/,()\-]+", text.rstrip(")"))
     if words[0] not in MUSCULOSKELETAL_ROOTS:
         return text
     start = next(
@@ -164,14 +168,22 @@ def learning_diagnosis(value):
         len(words),
     )
     if start == len(words):
-        return text
+        return _learning_prefix(text.split())
     suffix = words[start:]
     if not all(word in LOCATION_WORDS for word in suffix):
         return text
     prefix = words[:start]
-    while prefix and prefix[-1] in {"DE", "DEL", "EN", "EL", "LA", "LOS", "LAS"}:
+    while prefix[-1] in LOCATION_CONNECTORS:
         prefix.pop()
-    return " ".join(prefix)
+    return _learning_prefix(prefix)
+
+
+def _learning_prefix(words):
+    if words[:1] == ["TRAUMATISMO"]:
+        words = ["TRAUMA", *words[1:]]
+    if words == ["TRAUMA", "CERRADO"]:
+        return "TRAUMA"
+    return " ".join(words)
 
 
 def receipt_diagnosis(value):

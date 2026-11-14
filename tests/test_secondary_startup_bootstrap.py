@@ -217,6 +217,27 @@ def test_secondary_is_seeded_from_central_before_v15_mirror():
     assert attached == [True]
 
 
+def test_admission_reconnect_checks_host_schema_instead_of_reinstalling(monkeypatch):
+    checks = []
+    host = SimpleNamespace(
+        connection_factory=lambda: None,
+        configuration={"central_schema_ready": False},
+        prepare_central_schema=lambda: checks.append("verified"),
+        user={"role": "administrador"},
+    )
+    runtime = _HybridAdmissionRuntime(host)
+    runtime.attachment = object()
+    runtime._attachment_from_cache = False
+
+    def unexpected_install():
+        raise AssertionError("Admisión intentó reinstalar el esquema durante la reconexión")
+
+    monkeypatch.setattr(runtime.session_service, "ensure_schema", unexpected_install)
+    runtime._attach_remote_if_needed()
+    runtime._attach_remote_if_needed()
+    assert checks == ["verified"]
+
+
 def test_central_snapshot_is_one_lightweight_query(monkeypatch):
     row = {
         "operational_session_id": "op-1",

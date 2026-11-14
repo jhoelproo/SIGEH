@@ -11,6 +11,52 @@ from database_config import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_connection_backup(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "profile"))
+
+
+def test_launcher_restores_protected_connection_after_install_moves(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    first = tmp_path / "original"
+    second = tmp_path / "replacement"
+    for root in (first, second):
+        (root / "_internal").mkdir(parents=True)
+        (root / "CALCULOS_QT.exe").write_bytes(b"synthetic")
+    bundle = first / "_internal" / BUNDLED_DATABASE_FILE
+    url = "postgresql://synthetic:synthetic@central.example/hospital"
+    write_bundled_database_url(bundle, url)
+    calls = []
+    monkeypatch.setattr(
+        portable_launcher.subprocess, "Popen", lambda *a, **kw: calls.append(kw)
+    )
+    monkeypatch.setattr(portable_launcher, "portable_root", lambda: first)
+    assert portable_launcher.main() == 0
+    bundle.unlink()
+    monkeypatch.setattr(portable_launcher, "portable_root", lambda: second)
+    assert portable_launcher.main() == 0
+    assert calls[-1]["env"]["DATABASE_URL"] == url
+    assert read_sealed_database_url(second / SEALED_DATABASE_FILE) == url
+    assert "user_protected_backup" in (second / "lanzador_log.txt").read_text(encoding="utf8")
+
+
+def test_existing_bundle_still_launches_when_local_profile_is_unavailable(
+    tmp_path,
+):
+    url = "postgresql://synthetic:synthetic@central.example/hospital"
+    bundle = tmp_path / BUNDLED_DATABASE_FILE
+    write_bundled_database_url(bundle, url)
+    for profile in ("", str(bundle)):
+        environment = {"LOCALAPPDATA": profile}
+        ready, source = portable_launcher._prepare_connection(tmp_path, environment)
+        assert ready
+        assert source["config_source"] == "portable_bundle"
+        assert environment["DATABASE_URL"] == url
+    assert "CONFIG_BACKUP" in (tmp_path / "lanzador_log.txt").read_text(encoding="utf8")
+
+
 def test_launcher_uses_bundled_database_configuration_without_env_file(
     tmp_path, monkeypatch
 ):

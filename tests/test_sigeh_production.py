@@ -8,6 +8,7 @@ import pytest
 
 from sigeh_product import (
     PRODUCTION_BOOTSTRAP_VERSION,
+    ensure_sigeh_production_schema,
     mark_production_session_started,
     prepare_sigeh_production_bootstrap,
     reset_local_operational_pointers,
@@ -65,6 +66,20 @@ class ProductConnection:
 @contextmanager
 def factory(connection):
     yield connection
+
+
+def test_schema_rechecks_after_another_station_finishes(monkeypatch):
+    import sigeh_product
+
+    connection = ProductConnection()
+    observations = iter([False, True])
+    monkeypatch.setattr(
+        sigeh_product, "_production_schema_ready", lambda _connection: next(observations)
+    )
+    ensure_sigeh_production_schema(connection)
+    assert connection.executed == [
+        ("SELECT pg_advisory_xact_lock(hashtext(%s))", (PRODUCTION_BOOTSTRAP_VERSION,))
+    ]
 
 
 def test_bootstrap_closes_authority_once_and_is_idempotent():
