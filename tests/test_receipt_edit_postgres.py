@@ -29,7 +29,7 @@ def test_legacy_edit_preserves_creator_timestamp_and_insurance(database):
     with patch.object(
         app, "get_user", return_value={"username": "editor", "role": app.ROLE_ADMIN}
     ):
-        for authorization in ("19", "123", "1234", "3901505"):
+        for authorization in ("0019", "0123", "1234", "3901505"):
             app.save_receipt_with_items(
                 receipt_id,
                 999001,
@@ -52,6 +52,7 @@ def test_legacy_edit_preserves_creator_timestamp_and_insurance(database):
                     "SELECT * FROM recibos WHERE id=%s", (receipt_id,)
                 ).fetchone()
                 snapshot = load_current_receipt_snapshot(connection, receipt_id)
+            assert row["numero_autorizacion"] == authorization
             assert row["fecha"] == "2026-09-13"
             assert row["username"] == "original"
             assert row["created_at"] == "2026-09-12 10:00:00"
