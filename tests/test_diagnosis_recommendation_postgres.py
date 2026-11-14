@@ -1,6 +1,7 @@
 """Learning uses actual saved receipts in a disposable PostgreSQL instance."""
 
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 import CALCULOS_QT as app
@@ -208,6 +209,39 @@ def test_concurrent_processors_do_not_duplicate_evidence(learning):
             ).fetchone()[0]
             == 10
         )
+
+
+def test_stale_snapshot_after_normalization_can_retry(learning):
+    medication_receipt(1)
+    snapshot_ready = Event()
+    normalization_committed = Event()
+
+    class DelayedLock:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, query, params=()):
+            if "pg_try_advisory_xact_lock" in query:
+                snapshot_ready.set()
+                assert normalization_committed.wait(10)
+            return self.connection.execute(query, params)
+
+    def synchronize_stale_station():
+        with app.db_connect() as con:
+            return synchronize(DelayedLock(con))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        stale_result = pool.submit(synchronize_stale_station)
+        try:
+            assert snapshot_ready.wait(10)
+            with app.db_connect() as con:
+                synchronize(con)
+        finally:
+            normalization_committed.set()
+        response = stale_result.result(timeout=10)
+
+    assert response["installed"] and response["more"]
+    assert drain()["groups"][group_key("DIAGNÓSTICO ALFA", "GENERAL")]["receipts"] == 1
 
 
 def test_eligible_legacy_purge_removes_its_observation(learning):

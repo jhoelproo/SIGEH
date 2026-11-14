@@ -342,7 +342,7 @@ def test_gui_time_budget_can_yield_after_one_row(dialog, monkeypatch):
 
 def test_empty_admin_snapshot_is_ready_for_manual_configuration(dialog):
     dialog._loaded(bulk_data(0))
-    assert dialog.search_results.text() == "0 de 0"
+    assert dialog.search_results.text() == "Sin coincidencias"
     assert not dialog._populating
     assert not dialog.population_timer.isActive()
     assert dialog.save_button.isEnabled()

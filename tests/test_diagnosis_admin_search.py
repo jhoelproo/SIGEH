@@ -85,7 +85,7 @@ def test_search_finds_aliases_and_ignores_case_accents_and_token_order(editor):
     assert editor.search_results.text() == "1 de 1"
     editor.search.setText("NO EXISTE")
     assert editor.rules.isRowHidden(0)
-    assert editor.search_results.text() == "0 de 1"
+    assert editor.search_results.text() == "Sin coincidencias"
 
 
 def test_searches_current_combobox_values_and_pending_items(editor):
@@ -124,9 +124,12 @@ def test_hidden_stale_selection_is_not_removed_or_reviewed(editor):
     assert shown_names(editor.diagnoses) == []
     assert editor.diagnoses.rowCount() == 1
     assert editor.diagnoses.item(0, 0).text() == "ARTRALGIA"
-    assert editor.search_results.text() == "0 de 1"
+    assert editor.search_results.text() == "Sin coincidencias"
+    editor.tabs.setCurrentIndex(2)
+    assert not editor.pending.isRowHidden(0)
     editor.pending.selectRow(0)
     editor.search.setText("NO EXISTE")
+    assert editor.pending.isRowHidden(0)
     before = editor.rules.rowCount()
     editor.review_pending("pin")
     assert editor.rules.rowCount() == before

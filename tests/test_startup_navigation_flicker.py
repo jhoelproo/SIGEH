@@ -67,9 +67,9 @@ def test_launcher_validates_updates_before_opening_the_application(monkeypatch):
 def test_launcher_self_test_fast_path_precedes_requests_and_qt_imports():
     source = inspect.getsource(lanzador)
     early_exit = source.index('if __name__ == "__main__" and _EARLY_ARGS == ["--self-test"]')
-    requests_import = source.index("import requests")
+    update_module_import = source.index("from sigeh_update import")
     qt_import = source.index("from PySide6.QtCore")
-    assert early_exit < requests_import
+    assert early_exit < update_module_import
     assert early_exit < qt_import
 
 

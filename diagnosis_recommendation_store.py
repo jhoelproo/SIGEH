@@ -2,6 +2,8 @@
 
 import json
 
+from psycopg2.errors import SerializationFailure
+
 from diagnosis_text import NORMALIZATION_VERSION
 from diagnosis_recommendations import (
     CATEGORIES,
@@ -466,9 +468,7 @@ def synchronize(con, cursor=0, *, generation=None, interrupted=lambda: False):
         "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0))", (LOCK_KEY,)
     ).fetchone()[0]
     _check_interrupted(interrupted)
-    if acquired:
-        _prepare_normalization(con)
-    processed = _process_jobs(con, interrupted) if acquired else False
+    processed = acquired and _process_pending_work(con, interrupted)
     _check_interrupted(interrupted)
     rows = con.execute(
         "SELECT change_key,revision,payload FROM sigeh_recommendations.changes WHERE revision>%s ORDER BY revision LIMIT %s",
@@ -481,6 +481,19 @@ def synchronize(con, cursor=0, *, generation=None, interrupted=lambda: False):
         "generation": current_generation,
         "reset": reset,
     }
+
+
+def _process_pending_work(con, interrupted):
+    con.execute("SAVEPOINT recommendation_processing")
+    try:
+        _prepare_normalization(con)
+        processed = _process_jobs(con, interrupted)
+    except SerializationFailure:
+        # Another transaction committed after this repeatable-read snapshot.
+        con.execute("ROLLBACK TO SAVEPOINT recommendation_processing")
+        processed = True
+    con.execute("RELEASE SAVEPOINT recommendation_processing")
+    return processed
 
 
 def _authoritative_changes(con, rows):
