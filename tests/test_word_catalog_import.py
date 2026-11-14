@@ -214,13 +214,11 @@ def test_closing_ars_manager_reloads_universal_only_when_changed(
         current_user={"username": "QA"},
         current_ars="ARS QA",
         universal={"old": {}},
-        ars_combo=Mock(),
-        on_ars_changed=Mock(),
+        _apply_shared_ars_names=Mock(),
     )
-    window.ars_combo.currentText.return_value = "ARS QA"
     app.MainWindow.open_ars_manager(window)
     assert ("Medicamentos" in window.universal) == changed
-    window.on_ars_changed.assert_called_once_with("ARS QA")
+    window._apply_shared_ars_names.assert_called_once_with(["ARS QA"])
 
 
 def test_failed_import_keeps_catalog_and_does_not_report_success(imports):
