@@ -129,12 +129,35 @@ def test_representatives_use_cache_offline_and_retry_after_reconnection(
                 "requiere conexión central" in label.text() for label in page.findChildren(QLabel)
             )
             assert not buttons["Confirmar y corregir representante"].isEnabled()
+        retry = buttons["Reintentar"]
+        original_background = admission._ejecutar_en_segundo_plano
+
+        def complete_representative_query(label, operation, finished, failed):
+            if label != "Cargando usuarios del sistema…":
+                return original_background(label, operation, finished, failed)
+            finished(operation())
+
+        def fail_representative_query(label, operation, finished, failed):
+            if label != "Cargando usuarios del sistema…":
+                return original_background(label, operation, finished, failed)
+            with monkeypatch.context() as fallback:
+                fallback.setenv("HOSPITAL_OFFLINE", "sí")
+                fallback.setattr(admission, "db", SimpleNamespace())
+                with pytest.raises(RuntimeError, match="Sin conexión"):
+                    operation()
+            failed(RuntimeError("Fallo de prueba"))
+
+        monkeypatch.setattr(admission, "_ejecutar_en_segundo_plano", fail_representative_query)
         runtime.offline = False
-        buttons["Reintentar"].click()
-        for _ in range(60):
-            if queries:
-                break
-            QTest.qWait(25)
+        retry.click()
+        assert any(
+            label.text() == "No fue posible cargar los usuarios del sistema."
+            for label in page.findChildren(QLabel)
+        )
+        assert retry.isEnabled()
+        assert not queries
+        monkeypatch.setattr(admission, "_ejecutar_en_segundo_plano", complete_representative_query)
+        retry.click()
         assert len(queries) == 1
     finally:
         widget.shutdown()

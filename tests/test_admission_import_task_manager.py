@@ -242,6 +242,13 @@ def test_seed_and_merge_complete_analyze_then_apply_without_an_operational_turn(
     assert qt_app is not None
 
 
+def test_idle_import_manager_ignores_worker_finished():
+    manager = _manager(_Importer())
+    manager._worker_finished()
+    assert not manager.is_running()
+    assert manager.snapshot()["status"] == "IDLE"
+
+
 def test_schema_setup_error_is_not_persisted_as_a_failed_import(tmp_path):
     class _SchemaFailingImporter(_Importer):
         def recover_stale_active_task(self):
