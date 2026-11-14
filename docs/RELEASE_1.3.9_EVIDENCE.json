@@ -1,0 +1,65 @@
+{
+  "release": {
+    "status": "PASS",
+    "draft": false,
+    "sha": "45743deaf9cae5385d9f00bb8081619e37f7d67b",
+    "url": "https://github.com/jhoelproo/SIGEH/releases/tag/v1.3.9",
+    "published_at": "2026-11-14T06:50:14Z",
+    "assets": [
+      {
+        "name": "SIGEH-1.3.9-files-manifest.json",
+        "size": 378305,
+        "sha256": "5e85b9380e9312f08ba9ccee0416affff8c79443b49ae5174eee67433bd093ac"
+      },
+      {
+        "name": "SIGEH-1.3.9-from-1.3.8-delta.zip",
+        "size": 37438825,
+        "sha256": "5b2040f7f4183d565d7c450ba43e0caeb59eff6742ee728a692e426346f6d257"
+      },
+      {
+        "name": "SIGEH-1.3.9-manifest.json",
+        "size": 1022,
+        "sha256": "7db77714b0d10baee1e2c3cfbe60acef72694a404663153a92b0326a6e2ddf50"
+      },
+      {
+        "name": "SIGEH-1.3.9-windows-x64.zip",
+        "size": 311136553,
+        "sha256": "c72481da7c2eaae6555f729f6e47f8a0e917dbb6d30b6c9f41d3c4e9ef3c1d18"
+      },
+      {
+        "name": "SIGEH-1.3.9-windows-x64.zip.sha256",
+        "size": 95,
+        "sha256": "fb0a6c79fcfdd304db691fe90f114a079864e78ecb0afded158fd1ec1a7fe1ab"
+      }
+    ]
+  },
+  "channel": {
+    "status": "PASS",
+    "client": "1.3.8",
+    "latest": "1.3.9",
+    "full_sha256": "c72481da7c2eaae6555f729f6e47f8a0e917dbb6d30b6c9f41d3c4e9ef3c1d18",
+    "delta_url": "https://github.com/jhoelproo/SIGEH/releases/download/v1.3.9/SIGEH-1.3.9-from-1.3.8-delta.zip",
+    "delta_sha256": "5b2040f7f4183d565d7c450ba43e0caeb59eff6742ee728a692e426346f6d257"
+  },
+  "package": {
+    "status": "PASS",
+    "full_sha256": "c72481da7c2eaae6555f729f6e47f8a0e917dbb6d30b6c9f41d3c4e9ef3c1d18",
+    "delta_sha256": "5b2040f7f4183d565d7c450ba43e0caeb59eff6742ee728a692e426346f6d257",
+    "delta_size": 37438825,
+    "files_verified": 1823,
+    "preserved_files_checked": 6,
+    "smoke_checks": 6,
+    "production_access": false
+  },
+  "coverage": {
+    "line_count": 13,
+    "missing_lines": [],
+    "branches": 8,
+    "missing_branches": []
+  },
+  "tests": {
+    "passed": 145,
+    "failed": 0,
+    "skipped": 0
+  }
+}
