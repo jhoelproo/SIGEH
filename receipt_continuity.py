@@ -29,6 +29,20 @@ def local_receipt_store() -> LocalReceiptStore:
     return _store_at(str(local_receipt_root() / "receipts.sqlite3"))
 
 
+def normalize_catalog_favorites(value: object) -> set[tuple[str, str]]:
+    """Restore favorite pairs after JSON turns tuples into lists."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return set()
+    favorites = set()
+    for entry in value:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        category, name = entry
+        if isinstance(category, str) and isinstance(name, str) and category and name:
+            favorites.add((category, name))
+    return favorites
+
+
 def remember_startup_catalog(data: dict[str, Any], username: str) -> None:
     store = local_receipt_store()
     store.cache("universal", data.get("universal") or {})

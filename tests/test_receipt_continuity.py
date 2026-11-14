@@ -13,11 +13,47 @@ from receipt_continuity import (
     local_receipt_pdf_data,
     local_receipt_root,
     local_receipt_store,
+    normalize_catalog_favorites,
     remember_startup_catalog,
     remember_tariff,
     render_local_receipt,
 )
 from tests.test_local_receipts import receipt_job
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, set()),
+        (46, set()),
+        ({"Materiales": "Guantes"}, set()),
+        ([], set()),
+        (
+            [
+                ["Materiales", "Guantes"],
+                ["Materiales", "Guantes"],
+                ["Imágenes", "Rayos X"],
+            ],
+            {("Materiales", "Guantes"), ("Imágenes", "Rayos X")},
+        ),
+        ({("Materiales", "Guantes")}, {("Materiales", "Guantes")}),
+        (
+            [
+                None,
+                "xx",
+                [1],
+                [1, 2],
+                ["Materiales", []],
+                ["", "Guantes"],
+                ["x", ""],
+                ["Materiales", "Guantes"],
+            ],
+            {("Materiales", "Guantes")},
+        ),
+    ],
+)
+def test_catalog_favorites_normalize_cached_and_online_formats(value, expected):
+    assert normalize_catalog_favorites(value) == expected
 
 
 @pytest.fixture

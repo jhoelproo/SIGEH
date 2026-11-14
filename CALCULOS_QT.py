@@ -80,6 +80,7 @@ from admin_workspace_design import (
     selected_table_row,
 )
 from offline_auth import OfflineAuthCache
+from receipt_continuity import normalize_catalog_favorites
 from password_secrets import hash_secret, public_user, verify_secret
 from update_controls import UpdateCheckControl
 from sigeh_visual_theme import visual_theme_tokens as shared_visual_theme_tokens
@@ -34249,8 +34250,8 @@ class MainWindow(QMainWindow):
         self.preferences.setdefault(
             "theme", "oscuro" if self.is_dark_mode else "claro"
         )
-        self.catalog_favorites = set(
-            startup_data.get("catalog_favorites") or set()
+        self.catalog_favorites = normalize_catalog_favorites(
+            startup_data.get("catalog_favorites")
         )
         device_id, _device_name = _local_device_identity()
         self.display_layout = DisplayLayoutManager(self, device_id, self)

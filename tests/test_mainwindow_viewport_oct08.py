@@ -16,6 +16,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel
 
 import CALCULOS_QT as app
+from receipt_continuity import local_catalog_startup, remember_startup_catalog
 
 
 class PhysicalMonitor(QObject):
@@ -40,7 +41,7 @@ class PhysicalMonitor(QObject):
 
 
 @pytest.fixture
-def main_window(tmp_path, monkeypatch):
+def main_window(tmp_path, monkeypatch, request):
     for variable in ("LOCALAPPDATA", "APPDATA", "PROGRAMDATA"):
         monkeypatch.setenv(variable, str(tmp_path / variable))
     monkeypatch.setenv("EMERGENCIAS_DATA_DIR", str(tmp_path / "admission"))
@@ -84,19 +85,27 @@ def main_window(tmp_path, monkeypatch):
         },
     }
     app.ARS_RUNTIME_CACHE.put("ARS DEMO", tariff)
+    offline_login = getattr(request, "param", False)
+    startup_data = {"preferences": {"theme": "oscuro"}, "universal": universal}
+    if offline_login:
+        remember_startup_catalog(
+            dict(
+                startup_data, catalog_favorites={("Medicamentos", "ÍTEM FICTICIO 00")}
+            ),
+            "viewport-qa",
+        )
+        startup_data = local_catalog_startup("viewport-qa")
+    startup_data["local_tariffs"] = {"ARS DEMO": tariff}
     window = app.MainWindow(
         {
             "id": 1,
             "username": "viewport-qa",
             "full_name": "QA LOCAL",
             "role": app.ROLE_ADMIN,
+            "_offline_login": offline_login,
         },
         session_id="viewport-qa-session",
-        startup_data={
-            "preferences": {"theme": "oscuro"},
-            "universal": universal,
-            "local_tariffs": {"ARS DEMO": tariff},
-        },
+        startup_data=startup_data,
     )
     window.module_tabs.setCurrentIndex(window.billing_module_index)
     window.resize(1280, 680)
@@ -104,7 +113,8 @@ def main_window(tmp_path, monkeypatch):
     QTest.qWait(500)
     assert window.module_tabs.count() == 3
     assert not isinstance(window.emergency_workspace.full_page, QLabel)
-    assert window.monthly_lists_page is not None
+    if not offline_login:
+        assert window.monthly_lists_page is not None
     try:
         yield window
     finally:
@@ -116,6 +126,14 @@ def main_window(tmp_path, monkeypatch):
         qt.setFont(original_font)
         qt.setStyleSheet(original_style)
         QSettings.setDefaultFormat(old_format)
+
+
+@pytest.mark.parametrize("main_window", [True], indirect=True)
+def test_offline_window_opens_with_favorites_from_sqlite(main_window):
+    assert main_window.isVisible()
+    assert main_window.offline_login
+    assert main_window.catalog_favorites == {("Medicamentos", "ÍTEM FICTICIO 00")}
+    assert main_window.module_tabs.isTabEnabled(main_window.emergency_module_index)
 
 
 def _resize(window, width, height):
