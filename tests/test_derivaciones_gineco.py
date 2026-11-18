@@ -551,3 +551,49 @@ def test_guardar_atencion_persiste_la_salida_y_el_estado_del_documento(
             enlace.requiere_envio(modo)
         )
     assert db.modo_salida_gineco(atencion) == modo
+
+
+@pytest.mark.parametrize(
+    ("hoja", "modo", "vinculada"),
+    [
+        ("GINECOLOGIA", enlace.SOLO_IMPRIMIR, False),
+        ("GINECOLOGIA", enlace.SOLO_ENVIAR, False),
+        ("GINECOLOGIA", enlace.ENVIAR_E_IMPRIMIR, True),
+        ("GENERAL", enlace.ENVIAR_E_IMPRIMIR, True),
+    ],
+)
+def test_el_formulario_guarda_el_modo_configurado_al_confirmar(
+    hoja, modo, vinculada, monkeypatch
+):
+    from ADMISION_PYSIDE6_V15 import facturacion_tabs_pyside6 as admision
+
+    app = Mock()
+    app.app_settings = {
+        enlace.PREFERENCIA: modo,
+        "validation_confirm_before_generate": True,
+    }
+    app._final_revalidation_ready = True
+    app._begin_sheet_operational_validation.return_value = False
+    app._generation_turn_config.return_value = {"turno": "QA"}
+    app._validar_campos_o_alertar.return_value = paciente(modo=None), hoja
+    app._validar_campos_o_alertar.return_value[0].pop(enlace.PREFERENCIA)
+    app._buscar_duplicado_turno_actual.return_value = None
+    app._confirmar_envio_ginecologia.return_value = True
+    app.db.guardar_atencion.return_value = 41
+    app.db.obtener_revision_nss_atencion.return_value = None
+    confirmar_local = Mock(return_value=True)
+    monkeypatch.setattr(enlace, "habilitada", lambda: vinculada)
+    monkeypatch.setattr(admision.messagebox, "askyesno", confirmar_local)
+
+    admision.App.generar_pdf(app)
+
+    app.db.guardar_atencion.assert_called_once()
+    datos = app.db.guardar_atencion.call_args.args[0]
+    assert datos.get(enlace.PREFERENCIA) == (modo if hoja == "GINECOLOGIA" else None)
+    app._iniciar_salida_atencion.assert_called_once()
+    if hoja == "GINECOLOGIA" and enlace.requiere_envio(modo):
+        assert (
+            "quedará pendiente" in app._confirmar_envio_ginecologia.call_args.args[1]
+        ) is (not vinculada)
+    else:
+        confirmar_local.assert_called_once()
