@@ -3908,6 +3908,21 @@ class _HybridDatabaseProxy:
             ),
         )
 
+    def obtener_atencion_documental(self, attention_id: int):
+        attention = self.obtener_atencion_por_id(attention_id)
+        if not attention or attention.get("edad_num") is not None:
+            return attention
+        try:
+            restored = self._runtime.get_attention_by_global_id(
+                attention["global_attention_id"], force_central=True
+            )
+        except Exception:
+            self._runtime.logger.warning("No se pudo recuperar el detalle central de la hoja.")
+            return attention
+        if restored and int(restored.get("id") or 0) == attention_id:
+            return restored
+        return attention
+
     def __getattr__(self, name: str):
         if name == "search_patient_directory":
             return self._runtime.search_patient_directory

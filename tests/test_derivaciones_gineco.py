@@ -329,29 +329,24 @@ def test_entrega_informa_error_recuperacion_y_bandeja_vacia():
     ]
 
 
-def test_ginecologia_electiva_conserva_la_seleccion_ordinaria(monkeypatch):
+@pytest.mark.parametrize(
+    ("sexo", "embarazada", "edad", "esperada"),
+    [
+        ("Femenino", True, "24", "GINECOLOGIA"),
+        ("Femenino", False, "24", "GENERAL"),
+        ("Masculino", True, "24", "GENERAL"),
+        ("Femenino", False, "15", "PEDIATRIA"),
+    ],
+)
+def test_solo_embarazada_activa_ginecologia(sexo, embarazada, edad, esperada):
     from ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6 import App
 
     app = Mock()
-    app.var_embarazada.get.return_value = False
-    app.var_sexo.get.return_value = "Femenino"
-    app.var_ginecologia.get.return_value = True
-    app.entry_edad.get.return_value = "24"
+    app.var_embarazada.get.return_value = embarazada
+    app.var_sexo.get.return_value = sexo
+    app.entry_edad.get.return_value = edad
     app.unidad_edad.get.return_value = "Años"
-    monkeypatch.setattr(enlace, "habilitada", lambda: True)
-    App.actualizar_embarazada(app)
-    app.check_ginecologia.pack.assert_called_once()
-    assert App.determinar_hoja(app) == "GINECOLOGIA"
-    app.var_sexo.get.return_value = "Masculino"
-    App.actualizar_embarazada(app)
-    app.var_ginecologia.set.assert_called_once_with(False)
-    assert App.determinar_hoja(app) == "GENERAL"
-    app.var_sexo.get.return_value = "Femenino"
-    monkeypatch.setattr(enlace, "habilitada", lambda: False)
-    assert App.determinar_hoja(app) == "GINECOLOGIA"
-    app.var_ginecologia.get.return_value = False
-    app.var_embarazada.get.return_value = True
-    assert App.determinar_hoja(app) == "GINECOLOGIA"
+    assert App.determinar_hoja(app) == esperada
 
 
 @pytest.mark.parametrize("etapa", ["PDF", "Impresión"])
@@ -458,6 +453,8 @@ def test_selector_de_admision_muestra_y_guarda_opciones(tmp_path, monkeypatch):
     ).create_widget()
     admision = widget.admission
     try:
+        assert admision.check_embarazada.text() == "Embarazada"
+        assert not hasattr(admision, "check_ginecologia")
         admision._abrir_configuracion_interna()
         ventana = admision.configuracion_interna_win
         loop = QEventLoop()

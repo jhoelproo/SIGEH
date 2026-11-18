@@ -7168,6 +7168,15 @@ class AdmissionDocumentResolver:
             raise DocumentIdentityMismatch(
                 "La identidad del documento no coincide con la atención seleccionada."
             )
+        from admission_demographics import ATTENTION_DEMOGRAPHIC_FIELDS, restore_attention_demographics
+        if resolved_identity.global_attention_id and any(
+            field not in payload for field in ATTENTION_DEMOGRAPHIC_FIELDS
+        ):
+            with self.connection_factory() as con:
+                payload = restore_attention_demographics(
+                    con, resolved_identity.global_attention_id, payload
+                )
+        age = payload.get("age", payload.get("edad_num"))
         sheet = str(
             payload.get("detail_sheet") or projection.get("specialty") or "GENERAL"
         ).strip().upper()
@@ -7180,7 +7189,7 @@ class AdmissionDocumentResolver:
             "Nombre": payload.get("name") or projection.get("patient_name") or "",
             "Sexo": payload.get("sex") or payload.get("sexo") or "",
             "Embarazada": bool(payload.get("pregnant") or payload.get("embarazada")),
-            "Edad_num": int(payload.get("age") or payload.get("edad_num") or 0),
+            "Edad_num": int(age) if age not in (None, "") else None,
             "Unidad": payload.get("age_unit") or payload.get("unidad") or "Años",
             "Cédula": payload.get("cedula") or projection.get("cedula_snapshot") or "",
             "Teléfono": payload.get("phone") or payload.get("telefono") or "",

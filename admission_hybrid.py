@@ -30,6 +30,7 @@ from admission_contract import (
     assess_coverage,
     normalize_service_type,
 )
+from admission_demographics import ATTENTION_DEMOGRAPHIC_FIELDS, restore_attention_demographics
 from patient_directory import (
     POSTGRES_PATIENT_DIRECTORY_SCHEMA,
     upsert_patient_from_attention_connection,
@@ -2472,6 +2473,10 @@ class OfflineAdmissionStore:
             from admission_reentry import reentry_payload
 
             payload = {
+                **{
+                    field: data.get(column)
+                    for field, column in ATTENTION_DEMOGRAPHIC_FIELDS.items()
+                },
                 **reentry_payload(con, data),
                 "event_type": "DETAIL_SHEET_GENERATED",
                 "attention_id": int(data.get("id") or 0),
@@ -3434,13 +3439,7 @@ class OfflineAdmissionStore:
                         **_remote_reentry_fields(con, payload, patient_id, int(existing[5])),
                         "nombre": str(payload.get("name") or "SIN NOMBRE"),
                         "admission_username": str(payload.get("admission_username") or ""),
-                        "sexo": str(payload.get("sex") or ""),
-                        "edad_num": _as_int_or_none(payload.get("age")),
-                        "unidad": str(payload.get("age_unit") or "Años"),
                         "cedula": str(payload.get("cedula") or ""),
-                        "telefono": str(payload.get("phone") or ""),
-                        "direccion": str(payload.get("address") or ""),
-                        "nacionalidad": str(payload.get("nationality") or ""),
                         "ars": str(payload.get("ars") or ""),
                         "nss": str(payload.get("nss") or ""),
                         "hoja": str(payload.get("detail_sheet") or ""),
@@ -3487,6 +3486,12 @@ class OfflineAdmissionStore:
                         ),
                         "reconciliation_status": reconciliation_status,
                     }
+                    updates.update({
+                        column: (_as_int_or_none(payload[field]) if field == "age"
+                                 else str(payload[field] or ""))
+                        for field, column in ATTENTION_DEMOGRAPHIC_FIELDS.items()
+                        if field in payload
+                    })
                     selected = [
                         (key, value) for key, value in updates.items() if key in attention_columns
                     ]
@@ -7628,10 +7633,14 @@ class AdmissionCloudRepository:
                     LIMIT 1""",
                 (normalized, bool(include_deleted)),
             ).fetchone()
-        if not row:
-            return None
-        result = _mapping(row)
-        result["event"] = self._readthrough_event(result)
+            if not row:
+                return None
+            result = _mapping(row)
+            event = self._readthrough_event(result)
+            event["payload_json"] = restore_attention_demographics(
+                con, normalized, event["payload_json"]
+            )
+        result["event"] = event
         return result
 
     def current_turn_attention_events(
@@ -7997,7 +8006,7 @@ class AdmissionCloudRepository:
         )
         is_restore = operation == "RESTORE_ATTENTION"
         existing_tombstone = con.execute(
-            """SELECT is_deleted,server_revision,turn_id,original_turn_id
+            """SELECT is_deleted,server_revision,turn_id,original_turn_id,latest_payload_json
                FROM admission_attention_projection
                WHERE global_attention_id=%s""",
             (global_attention_id,),
@@ -8009,6 +8018,12 @@ class AdmissionCloudRepository:
                     ensure_ascii=False,
                 )
             )
+        previous_payload = (existing_tombstone[4] or {}) if existing_tombstone else {}
+        payload.update({
+            field: previous_payload[field]
+            for field in ATTENTION_DEMOGRAPHIC_FIELDS
+            if field in previous_payload and field not in payload
+        })
         global_patient_id = str(payload.get("global_patient_id") or "").strip() or None
         operational_source_id = str(
             payload.get("operational_source_id") or ""

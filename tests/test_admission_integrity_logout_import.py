@@ -438,7 +438,7 @@ class _DocumentConnection:
     def execute(self, query, params):
         self.query = query
         self.params = params
-        return _Cursor([self.row])
+        return _Cursor([] if "AS requested(field)" in query else [self.row])
 
 
 def test_document_resolution_uses_uuid_and_rejects_payload_identity_mismatch(monkeypatch, tmp_path):

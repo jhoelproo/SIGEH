@@ -70,7 +70,10 @@ def _database(path: Path) -> None:
         )
 
 
-def _create_attention(path: Path, number: int) -> None:
+def _create_attention(
+    path: Path, number: int, *, age=None, unit=None, phone=None,
+    address=None, nationality=None,
+) -> None:
     connection = connect_local_sqlite(path, operation="test-create-attention")
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -81,10 +84,11 @@ def _create_attention(path: Path, number: int) -> None:
         connection.execute(
             """INSERT INTO atenciones(
                  paciente_id,dia_operativo_id,turno_id,nombre,ars,hoja,fecha,hora,
-                 tipo_atencion,estado,nss
+                 tipo_atencion,estado,nss,edad_num,unidad,telefono,direccion,nacionalidad
                ) VALUES(?,1,1,?,'HUMANO','GENERAL','2026-08-14','12:00',
-                        'EMERGENCIA','ACTIVA',?)""",
-            (patient_id, f"P{number}", f"{number:09d}"),
+                        'EMERGENCIA','ACTIVA',?,?,?,?,?,?)""",
+            (patient_id, f"P{number}", f"{number:09d}", age, unit,
+             phone, address, nationality),
         )
         connection.commit()
     finally:
@@ -275,7 +279,10 @@ def test_secondary_detail_sheet_event_is_visible_on_primary(tmp_path: Path):
     cloud = _MemoryCloud()
     pc1, pc2 = _store(pc1_path, "PC-1"), _store(pc2_path, "PC-2")
     sync1, sync2 = AdmissionSyncService(pc1, cloud), AdmissionSyncService(pc2, cloud)
-    _create_attention(pc1_path, 1)
+    _create_attention(
+        pc1_path, 1, age=0, unit="Meses", phone="8090000000",
+        address="CALLE DE PRUEBA", nationality="DOMINICANA",
+    )
     sync1.synchronize_once()
     sync2.synchronize_once()
     with closing(sqlite3.connect(pc2_path)) as connection:
@@ -288,7 +295,16 @@ def test_secondary_detail_sheet_event_is_visible_on_primary(tmp_path: Path):
     sync1.synchronize_once()
     assert cloud.latest[entity_uuid]["operation"] == "DETAIL_SHEET_GENERATED"
     assert cloud.latest[entity_uuid]["payload_json"]["turn_id"] == 350
+    details = cloud.latest[entity_uuid]["payload_json"]
+    assert (details["age"], details["age_unit"]) == (0, "Meses")
+    assert (details["phone"], details["address"], details["nationality"]) == (
+        "8090000000", "CALLE DE PRUEBA", "DOMINICANA",
+    )
     with closing(sqlite3.connect(pc1_path)) as connection:
+        assert connection.execute(
+            "SELECT edad_num,unidad,telefono,direccion,nacionalidad FROM atenciones "
+            "WHERE global_attention_id=?", (entity_uuid,),
+        ).fetchone() == (0, "Meses", "8090000000", "CALLE DE PRUEBA", "DOMINICANA")
         assert connection.execute(
             "SELECT hoja,sync_state FROM atenciones WHERE global_attention_id=?",
             (entity_uuid,),

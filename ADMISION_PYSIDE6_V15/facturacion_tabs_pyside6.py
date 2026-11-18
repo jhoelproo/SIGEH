@@ -5425,12 +5425,14 @@ def preparar_datos_pdf(datos):
     modo_ars = str(app_setting("pdf_ars_display_mode", "Abreviada"))
     ars_display = ars_canon if modo_ars.lower().startswith("completa") else seguro_para_mostrar(ars_canon)
 
+    edad = datos.get("Edad_num")
+    unidad = str(datos.get("Unidad") or "Años")
     return {
         **datos,
         "Cédula": formatear_cedula(datos.get('Cédula', '')),
         "Teléfono": formatear_telefono(datos.get('Teléfono', '')),
         "NSS": formatear_nss_para_pdf(datos.get('NSS', ''), ars_canon) if usar_guiones else str(datos.get('NSS', '') or '').strip().upper(),
-        "Edad": f"{datos.get('Edad_num', 0)}{datos.get('Unidad', 'Años')[0].upper()}",
+        "Edad": f"{edad}{unidad[0].upper()}" if edad not in (None, "") else "",
         "ARS_CANONICO": ars_canon,
         "ARS_DISPLAY": ars_display,
     }
@@ -7026,9 +7028,6 @@ class App:
         self.lbl_sexo_f.pack(side="left", padx=(0, 10))
 
         self.check_embarazada = tb.Checkbutton(sexo_frame, text="Embarazada", variable=self.var_embarazada, bootstyle=INFO)
-        self.var_ginecologia = tk.BooleanVar(value=False)
-        self.check_ginecologia = tb.Checkbutton(
-            sexo_frame, text="Ginecología", variable=self.var_ginecologia, bootstyle=INFO)
 
         self.var_sexo.trace_add("write", lambda *args: self.actualizar_embarazada())
         self.var_embarazada.trace_add("write", lambda *args: self.actualizar_embarazada())
@@ -11772,22 +11771,17 @@ class App:
         try:
             es_femenino = (self.var_sexo.get() == "Femenino")
             if es_femenino:
-                self.check_ginecologia.pack(side="left", padx=(10, 0))
                 if not self.check_embarazada.winfo_ismapped():
                     self.check_embarazada.pack(side="left", padx=(10, 0))
             else:
                 if self.check_embarazada.winfo_ismapped():
                     self.check_embarazada.pack_forget()
                 self.var_embarazada.set(False)
-                self.check_ginecologia.pack_forget()
-                self.var_ginecologia.set(False)
         except Exception:
             pass
 
     def determinar_hoja(self):
-        if self.var_sexo.get() == "Femenino" and (
-            self.var_embarazada.get() or self.var_ginecologia.get()
-        ):
+        if self.var_sexo.get() == "Femenino" and self.var_embarazada.get():
             return "GINECOLOGIA"
 
         try:
@@ -12260,7 +12254,6 @@ class App:
                 "nss":         self.entry_nss.get(),
                 "sexo":        self.var_sexo.get(),
                 "embarazada":  self.var_embarazada.get(),
-                "ginecologia": self.var_ginecologia.get(),
                 "urgencia":    self.var_urgencia.get(),
                 "hoja":        self.determinar_hoja() or "GENERAL",
                 "_widget_foco": widget_con_foco,
@@ -12289,7 +12282,6 @@ class App:
             self.entry_nss.delete(0, tk.END);          self.entry_nss.insert(0, form.get("nss", ""))
             self.var_sexo.set(form.get("sexo") or "Femenino")
             self.var_embarazada.set(form.get("embarazada", False))
-            self.var_ginecologia.set(form.get("ginecologia", False))
             self.var_urgencia.set(form.get("urgencia", False))
 
             self._restore_all_styles()
@@ -12349,7 +12341,6 @@ class App:
         self._local_patient_revision = 0
         self._final_revalidation_ready = False
         self.var_sexo.set("Femenino")
-        self.var_ginecologia.set(False)
         self.var_embarazada.set(False)
         try:
             self.var_urgencia.set(False)
@@ -14209,7 +14200,7 @@ class App:
             "Hora": atencion["hora"],
             "Nombre": atencion["nombre"],
             "Sexo": atencion.get("sexo", "") or "Femenino",
-            "Edad_num": int(atencion.get("edad_num") or 0),
+            "Edad_num": atencion.get("edad_num"),
             "Unidad": atencion.get("unidad", "Años"),
             "Cédula": atencion.get("cedula", ""),
             "Teléfono": atencion.get("telefono", "") or "",
@@ -14222,7 +14213,10 @@ class App:
 
     def _crear_hoja_temporal_atencion(self, atencion_id, mostrar_error=True):
         """Reconstruye la hoja desde los datos actuales sin usar PDFs archivados."""
-        atencion = self.db.obtener_atencion_por_id(int(atencion_id))
+        leer_atencion = getattr(
+            self.db, "obtener_atencion_documental", self.db.obtener_atencion_por_id
+        )
+        atencion = leer_atencion(int(atencion_id))
         if not atencion:
             if mostrar_error:
                 messagebox.showerror("Historial", "No se encontró la atención seleccionada.")

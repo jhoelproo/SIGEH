@@ -4,6 +4,36 @@ import json
 from uuid import NAMESPACE_URL, uuid5
 
 
+ATTENTION_DEMOGRAPHIC_FIELDS = {
+    "sex": "sexo",
+    "age": "edad_num",
+    "age_unit": "unidad",
+    "phone": "telefono",
+    "address": "direccion",
+    "nationality": "nacionalidad",
+}
+
+
+def restore_attention_demographics(connection, attention_id, payload):
+    missing = [field for field in ATTENTION_DEMOGRAPHIC_FIELDS if field not in payload]
+    if not attention_id or not missing:
+        return payload
+    rows = connection.execute(
+        """SELECT requested.field, last_value.value
+             FROM unnest(%s::text[]) AS requested(field)
+             CROSS JOIN LATERAL (
+                 SELECT e.payload_json -> requested.field AS value
+                   FROM admission_sync_events e
+                  WHERE e.entity_type='attention' AND e.entity_uuid=%s::uuid
+                    AND e.payload_json ? requested.field
+                  ORDER BY e.resulting_version DESC, e.sequence DESC
+                  LIMIT 1
+             ) last_value""",
+        (missing, attention_id),
+    ).fetchall()
+    return {**{row["field"]: row["value"] for row in rows}, **payload}
+
+
 def demographic_patch(patient):
     fields = {
         "nombre": "name",
