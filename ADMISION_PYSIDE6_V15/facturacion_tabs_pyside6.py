@@ -115,6 +115,7 @@ from admission_statistical_reports import (  # noqa: E402 - PROJECT_ROOT bootstr
 # el subconjunto de Tk/ttkbootstrap utilizado por la aplicación sobre widgets Qt.
 try:
     from . import qt_compat
+    from . import derivaciones_gineco
     from .qt_compat import (
         tk, ttk, tb, messagebox, Toplevel, filedialog, simpledialog, TBDateEntry,
         PRIMARY, SECONDARY, SUCCESS, INFO, WARNING, DANGER, LIGHT, DARK,
@@ -122,6 +123,7 @@ try:
     )
 except ImportError:  # Ejecución directa del entrypoint standalone.
     import qt_compat
+    import derivaciones_gineco
     from qt_compat import (
         tk, ttk, tb, messagebox, Toplevel, filedialog, simpledialog, TBDateEntry,
         PRIMARY, SECONDARY, SUCCESS, INFO, WARNING, DANGER, LIGHT, DARK,
@@ -129,6 +131,7 @@ except ImportError:  # Ejecución directa del entrypoint standalone.
     )
 from PySide6.QtCore import Qt, QSize, QSignalBlocker, QTimer  # type: ignore
 from PySide6.QtWidgets import QSizePolicy  # type: ignore
+from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap  # type: ignore
 
 
@@ -672,6 +675,7 @@ DEFAULT_APP_SETTINGS = {
     "print_auto_reporte_turno": True,
     "print_auto_excel_turno": True,
     "print_copies_hoja": 1,
+    derivaciones_gineco.PREFERENCIA: derivaciones_gineco.SOLO_IMPRIMIR,
     "print_copies_reporte": 2,
     "print_copies_excel": 2,
     "print_pdf_orientation": "Horizontal",
@@ -1690,6 +1694,9 @@ class DatabaseManager:
     def _init_db(self):
         result = migrate_database(self.db_name, self.backup_manager, APP_LOG)
         journal_mode = prepare_sqlite_database(self.db_name)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            derivaciones_gineco.preparar_bandeja(conn)
         APP_LOG.info("Base de datos lista en esquema v%s: %s", self.SCHEMA_VERSION, result)
         APP_LOG.info(
             "SQLite local privado preparado journal_mode=%s busy_timeout_ms=5000",
@@ -2546,11 +2553,16 @@ class DatabaseManager:
                 snapshot,
                 self.session_context.role,
             )
+            imprime_gineco = (
+                hoja == "GINECOLOGIA"
+                and derivaciones_gineco.modo_configurado(datos) != derivaciones_gineco.SOLO_ENVIAR
+            )
+            estado_hoja = "PENDIENTE" if imprime_gineco else "NO_APLICA"
             cur.execute(
                 """INSERT INTO trabajos_salida(
                        atencion_id,pdf_estado,impresion_estado
-                   ) VALUES (?,'NO_APLICA','NO_APLICA')""",
-                (atencion_id,),
+                   ) VALUES (?,?,?)""",
+                (atencion_id, estado_hoja, estado_hoja),
             )
             event_ref = enqueue_billing_event(
                 conn,
@@ -2559,9 +2571,21 @@ class DatabaseManager:
                 actor_role=self.session_context.role,
                 session_id=self.session_context.session_id,
             )
+            derivaciones_gineco.encolar(conn, atencion_id, hoja, datos)
             conn.commit()
             self._emit_contract_event("attention_created", event_ref)
             return atencion_id
+
+    def modo_salida_gineco(self, atencion_id):
+        with closing(self._connect()) as conn:
+            fila = conn.execute(
+                "SELECT modo FROM gineco_envio WHERE visita=?", (atencion_id,)
+            ).fetchone()
+            return fila[0] if fila else None
+
+    def enviar_derivaciones_pendientes(self):
+        with closing(self._connect()) as conn:
+            return derivaciones_gineco.entregar_pendientes(conn)
 
     def obtener_revision_nss_atencion(self, atencion_id):
         with closing(self._connect()) as conn:
@@ -7000,6 +7024,9 @@ class App:
         self.lbl_sexo_f.pack(side="left", padx=(0, 10))
 
         self.check_embarazada = tb.Checkbutton(sexo_frame, text="Embarazada", variable=self.var_embarazada, bootstyle=INFO)
+        self.var_ginecologia = tk.BooleanVar(value=False)
+        self.check_ginecologia = tb.Checkbutton(
+            sexo_frame, text="Ginecología", variable=self.var_ginecologia, bootstyle=INFO)
 
         self.var_sexo.trace_add("write", lambda *args: self.actualizar_embarazada())
         self.var_embarazada.trace_add("write", lambda *args: self.actualizar_embarazada())
@@ -7167,6 +7194,7 @@ class App:
         self._output_payloads = {}
         self._output_inflight = set()
         self._output_lock = threading.Lock()
+        self._envio_gineco = None
 
         self.menu_contextual = tk.Menu(self.root, tearoff=0)
         self.menu_contextual.add_command(label="Copiar", command=self._copiar)
@@ -7225,6 +7253,8 @@ class App:
             self._summary_after_id = self.root.after(1800, self._programar_refresco_resumen_en_vivo)
             self._date_after_id = self.root.after(1000, self._actualizar_fecha_actual)
             self.root.after(2200, self._avisar_trabajos_salida_pendientes)
+            if derivaciones_gineco.habilitada():
+                self.root.after(1000, self._sincronizar_ginecologia)
             self.root.after(2600, self._retry_excel_export_jobs)
         except Exception:
             pass
@@ -11721,21 +11751,41 @@ class App:
         if len(current) > max_len:
             entry.delete(max_len, tk.END)
 
+    def _sincronizar_ginecologia(self):
+        if self._shutdown_complete:
+            return
+        if self._envio_gineco is None or not self._envio_gineco.is_alive():
+            self._envio_gineco = self._start_worker(self._entregar_ginecologia, name="envio-ginecologia")
+        self.root.after(5000, self._sincronizar_ginecologia)
+
+    def _entregar_ginecologia(self):
+        try:
+            if self.db.enviar_derivaciones_pendientes():
+                self._post_to_ui(lambda: self.set_status("Admisiones entregadas a Ginecología.", "ok"))
+        except (OSError, ValueError, sqlite3.Error):
+            self._post_to_ui(lambda: self.set_status(
+                "Envío a Ginecología pendiente. Se reintentará automáticamente.", "warning"))
+
     def actualizar_embarazada(self):
         try:
             es_femenino = (self.var_sexo.get() == "Femenino")
             if es_femenino:
+                self.check_ginecologia.pack(side="left", padx=(10, 0))
                 if not self.check_embarazada.winfo_ismapped():
                     self.check_embarazada.pack(side="left", padx=(10, 0))
             else:
                 if self.check_embarazada.winfo_ismapped():
                     self.check_embarazada.pack_forget()
                 self.var_embarazada.set(False)
+                self.check_ginecologia.pack_forget()
+                self.var_ginecologia.set(False)
         except Exception:
             pass
 
     def determinar_hoja(self):
-        if self.var_sexo.get() == "Femenino" and self.var_embarazada.get():
+        if self.var_sexo.get() == "Femenino" and (
+            self.var_embarazada.get() or self.var_ginecologia.get()
+        ):
             return "GINECOLOGIA"
 
         try:
@@ -12208,6 +12258,7 @@ class App:
                 "nss":         self.entry_nss.get(),
                 "sexo":        self.var_sexo.get(),
                 "embarazada":  self.var_embarazada.get(),
+                "ginecologia": self.var_ginecologia.get(),
                 "urgencia":    self.var_urgencia.get(),
                 "hoja":        self.determinar_hoja() or "GENERAL",
                 "_widget_foco": widget_con_foco,
@@ -12236,6 +12287,7 @@ class App:
             self.entry_nss.delete(0, tk.END);          self.entry_nss.insert(0, form.get("nss", ""))
             self.var_sexo.set(form.get("sexo") or "Femenino")
             self.var_embarazada.set(form.get("embarazada", False))
+            self.var_ginecologia.set(form.get("ginecologia", False))
             self.var_urgencia.set(form.get("urgencia", False))
 
             self._restore_all_styles()
@@ -12295,6 +12347,7 @@ class App:
         self._local_patient_revision = 0
         self._final_revalidation_ready = False
         self.var_sexo.set("Femenino")
+        self.var_ginecologia.set(False)
         self.var_embarazada.set(False)
         try:
             self.var_urgencia.set(False)
@@ -12357,7 +12410,10 @@ class App:
             if not (cedula.isdigit() and len(cedula) == 11):
                 self._highlight_error(self.entry_cedula, "La cédula debe tener 11 dígitos.")
                 return None
-        elif not bool(self.app_settings.get("validation_allow_missing_cedula", True)):
+        elif not bool(self.app_settings.get("validation_allow_missing_cedula", True)) and not (
+            derivaciones_gineco.requiere_envio(derivaciones_gineco.modo_configurado(self.app_settings))
+            and self.determinar_hoja() == "GINECOLOGIA"
+        ):
             self._highlight_error(self.entry_cedula, "La cédula es obligatoria según las preferencias actuales.")
             return None
 
@@ -12859,28 +12915,32 @@ class App:
         errores = {}
         trabajo = self._obtener_trabajo_salida_seguro(atencion_id)
         output = None
-        should_print = self._should_print_immediate_attention(trabajo)
-        try:
-            output = self._render_immediate_attention_pdf(
-                atencion_id,
-                hoja,
-                datos_pdf,
-                should_open=abrir_pdf_final,
-                should_print=should_print,
-                flow_started_at=flow_started_at,
-            )
-        except Exception as exc:
-            errores["PDF"] = str(exc)
-            APP_LOG.exception("PDF_RENDER_ERROR attention_id=%s", atencion_id)
-            self._actualizar_trabajo_salida_seguro(
-                atencion_id, "pdf", "FALLIDO", error=str(exc)
-            )
+        modo_gineco = self.db.modo_salida_gineco(atencion_id) if hoja == "GINECOLOGIA" else None
+        if modo_gineco != derivaciones_gineco.SOLO_ENVIAR:
+            should_print = self._should_print_immediate_attention(trabajo)
+            if modo_gineco in (derivaciones_gineco.SOLO_IMPRIMIR, derivaciones_gineco.ENVIAR_E_IMPRIMIR):
+                should_print = trabajo.get("impresion_estado") != "ENVIADO_A_IMPRESORA"
+            try:
+                output = self._render_immediate_attention_pdf(
+                    atencion_id,
+                    hoja,
+                    datos_pdf,
+                    should_open=abrir_pdf_final,
+                    should_print=should_print,
+                    flow_started_at=flow_started_at,
+                )
+            except Exception as exc:
+                errores["PDF"] = str(exc)
+                APP_LOG.exception("PDF_RENDER_ERROR attention_id=%s", atencion_id)
+                self._actualizar_trabajo_salida_seguro(
+                    atencion_id, "pdf", "FALLIDO", error=str(exc)
+                )
 
-        print_error = self._procesar_impresion_salida(
-            atencion_id, output, flow_started_at
-        )
-        if print_error:
-            errores["Impresión"] = print_error
+            print_error = self._procesar_impresion_salida(
+                atencion_id, output, flow_started_at
+            )
+            if print_error:
+                errores["Impresión"] = print_error
 
         if output:
             # ShellExecute may wait for a cold PDF viewer. Send the print job
@@ -12914,6 +12974,7 @@ class App:
             "errores": errores,
             "trabajo": trabajo,
             "output_created": bool(output),
+            "derivada": derivaciones_gineco.requiere_envio(modo_gineco),
         }
         APP_LOG.info(
             "PDF_OUTPUT_JOB_DONE attention_id=%s elapsed_ms=%.1f thread=%s",
@@ -12948,7 +13009,10 @@ class App:
             self._dialogo_salida_pendiente(atencion_id, None, errores)
         elif trabajo.get("excel_estado") == "COMPLETADO":
             self.db.notify_detail_sheet_generated(atencion_id)
-            if trabajo.get("impresion_estado") == "ENVIADO_A_IMPRESORA":
+            if resultado.get("derivada"):
+                self._notify_embedded_visual_event("pdf_complete")
+                self.set_status(f"Atención #{atencion_id} registrada para Ginecología.", "ok")
+            elif trabajo.get("impresion_estado") == "ENVIADO_A_IMPRESORA":
                 self.set_status("Hoja enviada a la impresora correctamente.", "ok")
             else:
                 self.set_status(
@@ -13182,6 +13246,33 @@ class App:
         )
         return config
 
+    def _confirmar_envio_ginecologia(self, datos, mensaje):
+        dialogo = QDialog(self.boton_generar_pdf.window())
+        dialogo.setWindowTitle("Enviar a Ginecología")
+        forma = QFormLayout(dialogo)
+        forma.addRow("Paciente", QLabel(datos["Nombre"]))
+        motivo = QLineEdit()
+        motivo.setMaxLength(1000)
+        forma.addRow("Motivo de consulta (opcional)", motivo)
+        prioridad = QComboBox()
+        prioridad.setEditable(True)
+        prioridad.lineEdit().setMaxLength(80)
+        prioridad.addItems(["", "Prioritaria", "Ordinaria"])
+        forma.addRow("Prioridad (opcional)", prioridad)
+        detalle = QLabel(mensaje)
+        detalle.setWordWrap(True)
+        forma.addRow(detalle)
+        botones = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        botones.button(QDialogButtonBox.Ok).setText("Registrar y enviar")
+        botones.button(QDialogButtonBox.Cancel).setText("Volver")
+        botones.accepted.connect(dialogo.accept)
+        botones.rejected.connect(dialogo.reject)
+        forma.addRow(botones)
+        if dialogo.exec() != QDialog.Accepted:
+            return False
+        datos.update(Motivo=motivo.text().strip(), Prioridad=prioridad.currentText().strip())
+        return True
+
     def generar_pdf(self):
         salida_iniciada = False
         flow_started_at = _time.perf_counter()
@@ -13259,11 +13350,19 @@ class App:
             else:
                 msg = "¿Guardar esta atención y actualizar el listado?"
 
-            if bool(self.app_settings.get("validation_confirm_before_generate", True)):
+            modo_gineco = derivaciones_gineco.modo_configurado(self.app_settings)
+            if hoja == "GINECOLOGIA" and derivaciones_gineco.requiere_envio(modo_gineco):
+                if not derivaciones_gineco.habilitada():
+                    msg += "\n\nEl envío quedará pendiente hasta vincular esta estación con Ginecología."
+                if not self._confirmar_envio_ginecologia(datos, msg):
+                    return
+            elif bool(self.app_settings.get("validation_confirm_before_generate", True)):
                 if not messagebox.askyesno("Confirmación", msg):
                     return
 
             datos_db = dict(datos)
+            if hoja == "GINECOLOGIA":
+                datos_db[derivaciones_gineco.PREFERENCIA] = modo_gineco
             if nombre_tiene_prefijo_rn(datos_db.get("Nombre", "")):
                 if bool(self.app_settings.get("rn_strip_db", True)):
                     datos_db["Nombre"] = limpiar_nombre_rn_para_db(datos_db.get("Nombre", ""))
@@ -16998,6 +17097,8 @@ class App:
                 excel_orientation_var = tk.StringVar(value=pref.get("print_excel_orientation", "Horizontal"))
                 print_behavior_var = tk.StringVar(value=pref.get("print_behavior_hoja", "Imprimir y abrir PDF"))
 
+                gineco_modo_var = tk.StringVar(value=derivaciones_gineco.modo_configurado(pref))
+
                 confirm_var = tk.BooleanVar(value=bool(pref.get("validation_confirm_before_generate", True)))
                 warn_nss_var = tk.BooleanVar(value=bool(pref.get("validation_warn_nss_incomplete", True)))
                 warn_ars_var = tk.BooleanVar(value=bool(pref.get("validation_warn_ars_sin_seguro", True)))
@@ -17054,6 +17155,19 @@ class App:
                 tb.Checkbutton(p_print, text="Imprimir Excel al cambiar turno", variable=print_auto_excel_var).grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=6)
                 add_labeled_entry(p_print, 8, "Copias (Excel):", copies_excel_var)
                 add_labeled_combo(p_print, 9, "Orientación Excel:", excel_orientation_var, ["Horizontal", "Vertical"], 18)
+
+                p_gineco = tb.Frame(pref_nb, padding=14, style="Card.TFrame")
+                pref_nb.add(p_gineco, text="Ginecología")
+                p_gineco.columnconfigure(1, weight=1)
+                add_labeled_combo(
+                    p_gineco, 0, "Al guardar una atención:", gineco_modo_var,
+                    derivaciones_gineco.MODOS, 26,
+                )
+                tb.Label(
+                    p_gineco,
+                    text="Para enviar, esta estación debe estar vinculada con Ginecología.",
+                    wraplength=440,
+                ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=8)
 
                 p_val = tb.Frame(pref_nb, padding=14, style="Card.TFrame")
                 pref_nb.add(p_val, text="Validación")
@@ -17154,6 +17268,7 @@ class App:
                         "print_pdf_orientation": pdf_orientation_var.get(),
                         "print_excel_orientation": excel_orientation_var.get(),
                         "print_behavior_hoja": print_behavior_var.get(),
+                        derivaciones_gineco.PREFERENCIA: gineco_modo_var.get(),
 
                         "validation_confirm_before_generate": bool(confirm_var.get()),
                         "validation_warn_nss_incomplete": bool(warn_nss_var.get()),

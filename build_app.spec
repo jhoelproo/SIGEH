@@ -31,6 +31,7 @@ V15_MODULE_FILES = tuple(
         "__init__.py",
         "admission_context.py",
         "admission_widget.py",
+        "derivaciones_gineco.py",
         "facturacion_tabs_pyside6.py",
         "project_bootstrap.py",
         "qt_compat.py",

@@ -39860,7 +39860,7 @@ def run_database_connection_check() -> int:
 def run_v15_packaging_check(output_path: str) -> int:
     """Verify the actual V15 module selected by source or a frozen build."""
     try:
-        from PySide6.QtCore import QEventLoop
+        from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QThreadPool
         from admission_v15_adapter import (
             _EXPECTED_V15_SOURCE_BUILD_ID,
             AdmissionV15EventBus,
@@ -39938,6 +39938,9 @@ def run_v15_packaging_check(output_path: str) -> int:
                 finally:
                     widget.shutdown()
                     widget.deleteLater()
+                    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+                    if not QThreadPool.globalInstance().waitForDone(10_000):
+                        raise TimeoutError("Admisión conserva tareas activas al cerrar la prueba.")
         finally:
             if original_data_dir is None:
                 os.environ.pop("EMERGENCIAS_DATA_DIR", None)

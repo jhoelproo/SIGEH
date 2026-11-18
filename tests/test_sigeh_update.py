@@ -53,7 +53,7 @@ def _release(repository=GITHUB_REPOSITORY, version="1.1.2"):
 
 def test_product_and_channel_are_sigeh_only():
     assert PRODUCT_ID == "SIGEH"
-    assert APP_VERSION == "1.3.10"
+    assert APP_VERSION == "1.3.11"
     assert LATEST_RELEASE_API.endswith(f"/{GITHUB_REPOSITORY}/releases/latest")
     assert "Hospital-Contreras-Facturacion1" not in LATEST_RELEASE_API
 
