@@ -25,8 +25,6 @@ import logging
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 
-from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit
-
 V15_SOURCE_BUILD_ID = "20260903_V112_TURN_CLOSURE_REPORTS_V1"
 from logging.handlers import RotatingFileHandler
 
@@ -678,6 +676,7 @@ DEFAULT_APP_SETTINGS = {
     "print_auto_excel_turno": True,
     "print_copies_hoja": 1,
     derivaciones_gineco.PREFERENCIA: derivaciones_gineco.SOLO_IMPRIMIR,
+    derivaciones_gineco.PREFERENCIA_ENVIO: False,
     "print_copies_reporte": 2,
     "print_copies_excel": 2,
     "print_pdf_orientation": "Horizontal",
@@ -2585,9 +2584,11 @@ class DatabaseManager:
             ).fetchone()
             return fila[0] if fila else None
 
-    def enviar_derivaciones_pendientes(self):
+    def enviar_derivaciones_pendientes(self, puede_entregar):
         with closing(self._connect()) as conn:
-            return derivaciones_gineco.entregar_pendientes(conn)
+            return derivaciones_gineco.entregar_pendientes(
+                conn, puede_entregar=puede_entregar
+            )
 
     def obtener_revision_nss_atencion(self, atencion_id):
         with closing(self._connect()) as conn:
@@ -11755,13 +11756,22 @@ class App:
     def _sincronizar_ginecologia(self):
         if self._shutdown_complete:
             return
-        if self._envio_gineco is None or not self._envio_gineco.is_alive():
-            self._envio_gineco = self._start_worker(self._entregar_ginecologia, name="envio-ginecologia")
+        if derivaciones_gineco.envio_activo(self.app_settings) and (
+            self._envio_gineco is None or not self._envio_gineco.is_alive()
+        ):
+            self._envio_gineco = self._start_worker(
+                self._entregar_ginecologia, name="envio-ginecologia"
+            )
         self.root.after(5000, self._sincronizar_ginecologia)
 
     def _entregar_ginecologia(self):
         try:
-            if self.db.enviar_derivaciones_pendientes():
+            if self.db.enviar_derivaciones_pendientes(
+                lambda: (
+                    not self._shutdown_complete
+                    and derivaciones_gineco.envio_activo(self.app_settings)
+                )
+            ):
                 self._post_to_ui(lambda: self.set_status("Admisiones entregadas a Ginecología.", "ok"))
         except (OSError, ValueError, sqlite3.Error):
             self._post_to_ui(lambda: self.set_status(
@@ -12404,7 +12414,7 @@ class App:
                 self._highlight_error(self.entry_cedula, "La cédula debe tener 11 dígitos.")
                 return None
         elif not bool(self.app_settings.get("validation_allow_missing_cedula", True)) and not (
-            derivaciones_gineco.requiere_envio(derivaciones_gineco.modo_configurado(self.app_settings))
+            derivaciones_gineco.requiere_envio(derivaciones_gineco.modo_efectivo(self.app_settings))
             and self.determinar_hoja() == "GINECOLOGIA"
         ):
             self._highlight_error(self.entry_cedula, "La cédula es obligatoria según las preferencias actuales.")
@@ -13239,33 +13249,6 @@ class App:
         )
         return config
 
-    def _confirmar_envio_ginecologia(self, datos, mensaje):
-        dialogo = QDialog(self.boton_generar_pdf.window())
-        dialogo.setWindowTitle("Enviar a Ginecología")
-        forma = QFormLayout(dialogo)
-        forma.addRow("Paciente", QLabel(datos["Nombre"]))
-        motivo = QLineEdit()
-        motivo.setMaxLength(1000)
-        forma.addRow("Motivo de consulta (opcional)", motivo)
-        prioridad = QComboBox()
-        prioridad.setEditable(True)
-        prioridad.lineEdit().setMaxLength(80)
-        prioridad.addItems(["", "Prioritaria", "Ordinaria"])
-        forma.addRow("Prioridad (opcional)", prioridad)
-        detalle = QLabel(mensaje)
-        detalle.setWordWrap(True)
-        forma.addRow(detalle)
-        botones = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        botones.button(QDialogButtonBox.Ok).setText("Registrar y enviar")
-        botones.button(QDialogButtonBox.Cancel).setText("Volver")
-        botones.accepted.connect(dialogo.accept)
-        botones.rejected.connect(dialogo.reject)
-        forma.addRow(botones)
-        if dialogo.exec() != QDialog.Accepted:
-            return False
-        datos.update(Motivo=motivo.text().strip(), Prioridad=prioridad.currentText().strip())
-        return True
-
     def generar_pdf(self):
         salida_iniciada = False
         flow_started_at = _time.perf_counter()
@@ -13343,13 +13326,12 @@ class App:
             else:
                 msg = "¿Guardar esta atención y actualizar el listado?"
 
-            modo_gineco = derivaciones_gineco.modo_configurado(self.app_settings)
+            modo_gineco = derivaciones_gineco.modo_efectivo(self.app_settings)
             if hoja == "GINECOLOGIA" and derivaciones_gineco.requiere_envio(modo_gineco):
+                msg += "\n\nLa atención se enviará a Ginecología."
                 if not derivaciones_gineco.habilitada():
-                    msg += "\n\nEl envío quedará pendiente hasta vincular esta estación con Ginecología."
-                if not self._confirmar_envio_ginecologia(datos, msg):
-                    return
-            elif bool(self.app_settings.get("validation_confirm_before_generate", True)):
+                    msg += " El envío quedará pendiente hasta vincular esta estación."
+            if bool(self.app_settings.get("validation_confirm_before_generate", True)):
                 if not messagebox.askyesno("Confirmación", msg):
                     return
 
@@ -17094,6 +17076,7 @@ class App:
                 print_behavior_var = tk.StringVar(value=pref.get("print_behavior_hoja", "Imprimir y abrir PDF"))
 
                 gineco_modo_var = tk.StringVar(value=derivaciones_gineco.modo_configurado(pref))
+                gineco_envio_var = tk.BooleanVar(value=derivaciones_gineco.envio_activo(pref))
 
                 confirm_var = tk.BooleanVar(value=bool(pref.get("validation_confirm_before_generate", True)))
                 warn_nss_var = tk.BooleanVar(value=bool(pref.get("validation_warn_nss_incomplete", True)))
@@ -17155,15 +17138,29 @@ class App:
                 p_gineco = tb.Frame(pref_nb, padding=14, style="Card.TFrame")
                 pref_nb.add(p_gineco, text="Ginecología")
                 p_gineco.columnconfigure(1, weight=1)
-                add_labeled_combo(
-                    p_gineco, 0, "Al guardar una atención:", gineco_modo_var,
+                tb.Checkbutton(
+                    p_gineco, text="Habilitar envío a Ginecología", variable=gineco_envio_var,
+                ).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=6)
+                selector_gineco = add_labeled_combo(
+                    p_gineco, 1, "Al guardar una atención:", gineco_modo_var,
                     derivaciones_gineco.MODOS, 26,
                 )
+
+                def actualizar_selector_gineco(*_args):
+                    selector_gineco.configure(
+                        state="readonly" if gineco_envio_var.get() else "disabled"
+                    )
+
+                gineco_envio_var.trace_add("write", actualizar_selector_gineco)
+                actualizar_selector_gineco()
                 tb.Label(
                     p_gineco,
-                    text="Para enviar, esta estación debe estar vinculada con Ginecología.",
+                    text=(
+                        "Con el envío apagado, las nuevas atenciones se imprimen y los envíos "
+                        "pendientes quedan en pausa. El envío requiere vincular esta estación con Ginecología."
+                    ),
                     wraplength=440,
-                ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=8)
+                ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=8)
 
                 p_val = tb.Frame(pref_nb, padding=14, style="Card.TFrame")
                 pref_nb.add(p_val, text="Validación")
@@ -17265,6 +17262,7 @@ class App:
                         "print_excel_orientation": excel_orientation_var.get(),
                         "print_behavior_hoja": print_behavior_var.get(),
                         derivaciones_gineco.PREFERENCIA: gineco_modo_var.get(),
+                        derivaciones_gineco.PREFERENCIA_ENVIO: bool(gineco_envio_var.get()),
 
                         "validation_confirm_before_generate": bool(confirm_var.get()),
                         "validation_warn_nss_incomplete": bool(warn_nss_var.get()),
@@ -17309,12 +17307,13 @@ class App:
                     if not self._host_theme_controlled:
                         updates["theme"] = theme_var.get()
                         updates["window_size"] = autosize_var.get()
-                    self.app_settings.update(updates)
+                    preferencias_actualizadas = {**self.app_settings, **updates}
 
-                    if not guardar_app_settings(self.app_settings):
+                    if not guardar_app_settings(preferencias_actualizadas):
                         messagebox.showwarning("Preferencias", "No se pudieron guardar las preferencias en disco.")
                         return
 
+                    self.app_settings.update(updates)
                     self._aplicar_preferencias_en_vivo(win)
                     self._actualizar_resumen_turno_panel()
                     pref_estado_var.set("Preferencias guardadas y aplicadas.")

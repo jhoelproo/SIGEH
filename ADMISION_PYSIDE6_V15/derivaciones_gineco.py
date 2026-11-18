@@ -28,11 +28,22 @@ SOLO_ENVIAR = "Solo enviar"
 ENVIAR_E_IMPRIMIR = "Enviar e imprimir"
 MODOS = (SOLO_IMPRIMIR, SOLO_ENVIAR, ENVIAR_E_IMPRIMIR)
 PREFERENCIA = "gineco_modo_salida"
+PREFERENCIA_ENVIO = "gineco_envio_activo"
 
 
 def modo_configurado(preferencias):
     modo = preferencias.get(PREFERENCIA)
     return modo if modo in MODOS else SOLO_IMPRIMIR
+
+
+def envio_activo(preferencias):
+    return preferencias.get(PREFERENCIA_ENVIO) is True
+
+
+def modo_efectivo(preferencias):
+    return (
+        modo_configurado(preferencias) if envio_activo(preferencias) else SOLO_IMPRIMIR
+    )
 
 
 def requiere_envio(modo):
@@ -80,7 +91,6 @@ def crear_sobre(visita, datos):
             ("telefono", "Teléfono"),
             ("direccion", "Dirección"),
             ("nacionalidad", "Nacionalidad"),
-            ("motivo", "Motivo"),
         )
     }
     nss = str(datos.get("NSS") or "").strip()
@@ -91,7 +101,7 @@ def crear_sobre(visita, datos):
         id=str(uuid.uuid4()),
         visita=visita,
         llegada=hora_de_llegada(datos),
-        prioridad=str(datos.get("Prioridad") or ""),
+        prioridad="",
         campos=campos,
     )
     return json.dumps(sobre, ensure_ascii=False)
@@ -107,9 +117,12 @@ def enviar(sobre):
         and token
     ):
         raise ValueError("Falta configurar el enlace con Ginecología.")
+    payload = json.loads(sobre)
+    payload.get("campos", {}).pop("motivo", None)
+    payload["prioridad"] = ""
     peticion = Request(
         f"https://{proyecto}.supabase.co/rest/v1/rpc/enviar_derivacion",
-        data=sobre.encode(),
+        data=json.dumps(payload, ensure_ascii=False).encode(),
         method="POST",
         headers={
             "Content-Type": "application/json",
@@ -124,13 +137,17 @@ def enviar(sobre):
             )
 
 
-def entregar_pendientes(conn, entregar=enviar):
+def entregar_pendientes(conn, entregar=enviar, *, puede_entregar=None):
     filas = conn.execute(
         """SELECT g.visita,g.sobre FROM gineco_envio g JOIN atenciones a ON a.id=g.visita
            WHERE g.sobre IS NOT NULL AND a.estado='ACTIVA' ORDER BY g.visita LIMIT 50"""
     ).fetchall()
+    entregadas = 0
     for visita, sobre in filas:
+        if puede_entregar is not None and not puede_entregar():
+            break
         entregar(sobre)
         conn.execute("UPDATE gineco_envio SET sobre=NULL WHERE visita=?", (visita,))
         conn.commit()
-    return len(filas)
+        entregadas += 1
+    return entregadas

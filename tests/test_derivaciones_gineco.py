@@ -25,7 +25,7 @@ def test_arranque_real_prepara_bandeja_para_una_base_nueva_y_una_existente(
     with closing(sqlite3.connect(gestor.db_name)) as db:
         db.execute("drop table gineco_envio")
     gestor._init_db()
-    assert gestor.enviar_derivaciones_pendientes() == 0
+    assert gestor.enviar_derivaciones_pendientes(lambda: True) == 0
 
 
 @pytest.fixture
@@ -92,8 +92,8 @@ def test_fallo_reintento_y_rollback(cola):
     registro = json.loads(enviar.call_args.args[0])
     assert "edad" not in registro["campos"]
     assert registro["campos"]["nss"] == p["NSS"]
-    assert registro["campos"]["motivo"] == "Consulta"
-    assert registro["prioridad"] == "Ordinaria"
+    assert "motivo" not in registro["campos"]
+    assert registro["prioridad"] == ""
     enviar.side_effect = None
     assert enlace.entregar_pendientes(cola, enviar) == 1
     assert enviar.call_args_list[0] == enviar.call_args_list[1]
@@ -158,10 +158,21 @@ def test_transporte_acotado(monkeypatch):
 
     salida.open.return_value = nullcontext(respuesta)
     monkeypatch.setattr(enlace, "build_opener", lambda *args: salida)
-    enlace.enviar("{}")
+    pendiente_antiguo = json.dumps(
+        {
+            "id": "estable",
+            "prioridad": "Ordinaria",
+            "campos": {"motivo": "Sintético", "nombre": "Prueba"},
+        }
+    )
+    enlace.enviar(pendiente_antiguo)
     peticion = salida.open.call_args.args[0]
     assert peticion.full_url.endswith(".supabase.co/rest/v1/rpc/enviar_derivacion")
-    assert peticion.data == b"{}"
+    assert json.loads(peticion.data) == {
+        "id": "estable",
+        "prioridad": "",
+        "campos": {"nombre": "Prueba"},
+    }
     assert peticion.get_header("X-gineco-estacion") == "ficticio"
     respuesta.status = 201
     with pytest.raises(HTTPError):
@@ -190,42 +201,6 @@ def test_dos_visitas_se_entregan_con_la_conexion_real_de_sigeh(tmp_path, monkeyp
         assert enlace.entregar_pendientes(db, enviadas.append) == 2
         assert [json.loads(s)["visita"] for s in enviadas] == [1, 2]
         assert enlace.entregar_pendientes(db, enviadas.append) == 0
-
-
-@pytest.mark.parametrize("aceptar", [True, False])
-def test_confirmacion_conserva_motivo_y_prioridad_solo_al_enviar(aceptar, monkeypatch):
-    from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QPushButton
-    from ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6 import App
-
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    qt = QApplication.instance() or QApplication([])
-    datos = paciente()
-
-    def decidir():
-        dialogo = qt.activeModalWidget()
-        dialogo.findChild(QLineEdit).setText("Motivo ficticio")
-        dialogo.findChild(QComboBox).setCurrentText("Prioritaria")
-        if aceptar:
-            dialogo.accept()
-        else:
-            dialogo.reject()
-
-    boton = QPushButton()
-    QTimer.singleShot(0, decidir)
-    assert (
-        App._confirmar_envio_ginecologia(
-            SimpleNamespace(boton_generar_pdf=boton), datos, "Confirmar visita"
-        )
-        is aceptar
-    )
-    if aceptar:
-        assert (datos["Motivo"], datos["Prioridad"]) == (
-            "Motivo ficticio",
-            "Prioritaria",
-        )
-    else:
-        assert "Motivo" not in datos
 
 
 @pytest.mark.parametrize("modo", [*enlace.MODOS, None])
@@ -278,19 +253,23 @@ def test_cancelar_la_confirmacion_deja_la_visita_sin_registrar(monkeypatch, hoja
     from ADMISION_PYSIDE6_V15 import facturacion_tabs_pyside6 as admision
 
     app = Mock()
-    app.app_settings = {enlace.PREFERENCIA: enlace.SOLO_ENVIAR}
+    app.app_settings = {
+        enlace.PREFERENCIA: enlace.SOLO_ENVIAR,
+        enlace.PREFERENCIA_ENVIO: True,
+    }
     app._final_revalidation_ready = True
     app._begin_sheet_operational_validation.return_value = False
     app._generation_turn_config.return_value = {"turno": "QA"}
     app._validar_campos_o_alertar.return_value = paciente(), hoja
     app._buscar_duplicado_turno_actual.return_value = None
-    app._confirmar_envio_ginecologia.return_value = False
     monkeypatch.setattr(enlace, "habilitada", lambda: True)
     confirmar_local = Mock(return_value=False)
     monkeypatch.setattr(admision.messagebox, "askyesno", confirmar_local)
     admision.App.generar_pdf(app)
-    assert app._confirmar_envio_ginecologia.call_count == int(hoja == "GINECOLOGIA")
-    assert confirmar_local.call_count == int(hoja == "GENERAL")
+    confirmar_local.assert_called_once()
+    assert ("enviará a Ginecología" in confirmar_local.call_args.args[1]) is (
+        hoja == "GINECOLOGIA"
+    )
     app.db.guardar_atencion.assert_not_called()
 
 
@@ -300,6 +279,10 @@ def test_consulta_programada_evita_solapamiento_y_respeta_cierre():
     app = Mock()
     app._shutdown_complete = False
     app._envio_gineco = None
+    app.app_settings = {enlace.PREFERENCIA_ENVIO: False}
+    App._sincronizar_ginecologia(app)
+    app._start_worker.assert_not_called()
+    app.app_settings[enlace.PREFERENCIA_ENVIO] = True
     App._sincronizar_ginecologia(app)
     app._start_worker.assert_called_once_with(
         app._entregar_ginecologia, name="envio-ginecologia"
@@ -312,7 +295,7 @@ def test_consulta_programada_evita_solapamiento_y_respeta_cierre():
     assert app._start_worker.call_count == 2
     app._shutdown_complete = True
     App._sincronizar_ginecologia(app)
-    assert app.root.after.call_count == 3
+    assert app.root.after.call_count == 4
 
 
 def test_entrega_informa_error_recuperacion_y_bandeja_vacia():
@@ -391,7 +374,8 @@ def test_cedula_ausente_solo_es_excepcion_si_se_deriva(
         "validation_allow_missing_phone": True,
         "validation_allow_missing_cedula": False,
         "validation_warn_ars_sin_seguro": False,
-        enlace.PREFERENCIA: enlace.SOLO_ENVIAR if habilitada else enlace.SOLO_IMPRIMIR,
+        enlace.PREFERENCIA: enlace.SOLO_ENVIAR,
+        enlace.PREFERENCIA_ENVIO: habilitada,
     }
     for field in ("telefono", "cedula", "nss", "direccion", "nacionalidad", "ars"):
         getattr(app, f"entry_{field}").get.return_value = ""
@@ -415,7 +399,13 @@ def test_cedula_ausente_solo_es_excepcion_si_se_deriva(
 
 def test_selector_de_admision_muestra_y_guarda_opciones(tmp_path, monkeypatch):
     from PySide6.QtCore import QEventLoop, QTimer
-    from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QTabWidget
+    from PySide6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QComboBox,
+        QPushButton,
+        QTabWidget,
+    )
 
     from admission_v15_adapter import (
         AdmissionV15EventBus,
@@ -486,6 +476,12 @@ def test_selector_de_admision_muestra_y_guarda_opciones(tmp_path, monkeypatch):
         preferencias.setCurrentIndex(indice)
         qt.processEvents()
         selector = preferencias.currentWidget().findChild(QComboBox)
+        interruptor = preferencias.currentWidget().findChild(QCheckBox)
+        assert interruptor.text() == "Habilitar envío a Ginecología"
+        assert not interruptor.isChecked()
+        assert not selector.isEnabled()
+        interruptor.click()
+        assert selector.isEnabled()
         assert not selector.isEditable()
         assert (
             tuple(selector.itemText(i) for i in range(selector.count())) == enlace.MODOS
@@ -498,12 +494,31 @@ def test_selector_de_admision_muestra_y_guarda_opciones(tmp_path, monkeypatch):
             if "Guardar preferencias" in boton.text()
         )
         guardar.click()
+        assert enlace.envio_activo(module.cargar_app_settings())
         assert (
             enlace.modo_configurado(module.cargar_app_settings())
             == enlace.ENVIAR_E_IMPRIMIR
         )
         assert (
             enlace.modo_configurado(admision.app_settings) == enlace.ENVIAR_E_IMPRIMIR
+        )
+        interruptor.click()
+        assert not selector.isEnabled()
+        guardar_original = module.guardar_app_settings
+        warning = Mock()
+        with monkeypatch.context() as failure:
+            failure.setattr(module, "guardar_app_settings", lambda _settings: False)
+            failure.setattr(module.messagebox, "showwarning", warning)
+            guardar.click()
+        warning.assert_called_once()
+        assert enlace.envio_activo(admision.app_settings)
+        assert enlace.envio_activo(module.cargar_app_settings())
+        assert module.guardar_app_settings is guardar_original
+        guardar.click()
+        assert not enlace.envio_activo(module.cargar_app_settings())
+        assert (
+            enlace.modo_configurado(module.cargar_app_settings())
+            == enlace.ENVIAR_E_IMPRIMIR
         )
         ventana.destroy()
     finally:
@@ -551,23 +566,27 @@ def test_guardar_atencion_persiste_la_salida_y_el_estado_del_documento(
 
 
 @pytest.mark.parametrize(
-    ("hoja", "modo", "vinculada"),
+    ("hoja", "modo", "vinculada", "activa", "confirmar"),
     [
-        ("GINECOLOGIA", enlace.SOLO_IMPRIMIR, False),
-        ("GINECOLOGIA", enlace.SOLO_ENVIAR, False),
-        ("GINECOLOGIA", enlace.ENVIAR_E_IMPRIMIR, True),
-        ("GENERAL", enlace.ENVIAR_E_IMPRIMIR, True),
+        ("GINECOLOGIA", enlace.SOLO_IMPRIMIR, False, True, True),
+        ("GINECOLOGIA", enlace.SOLO_ENVIAR, False, True, True),
+        ("GINECOLOGIA", enlace.ENVIAR_E_IMPRIMIR, True, True, True),
+        ("GENERAL", enlace.ENVIAR_E_IMPRIMIR, True, True, True),
+        ("GINECOLOGIA", enlace.SOLO_ENVIAR, True, False, True),
+        ("GINECOLOGIA", enlace.ENVIAR_E_IMPRIMIR, True, False, False),
+        ("GINECOLOGIA", enlace.SOLO_ENVIAR, True, True, False),
     ],
 )
 def test_el_formulario_guarda_el_modo_configurado_al_confirmar(
-    hoja, modo, vinculada, monkeypatch
+    hoja, modo, vinculada, activa, confirmar, monkeypatch
 ):
     from ADMISION_PYSIDE6_V15 import facturacion_tabs_pyside6 as admision
 
     app = Mock()
     app.app_settings = {
         enlace.PREFERENCIA: modo,
-        "validation_confirm_before_generate": True,
+        enlace.PREFERENCIA_ENVIO: activa,
+        "validation_confirm_before_generate": confirmar,
     }
     app._final_revalidation_ready = True
     app._begin_sheet_operational_validation.return_value = False
@@ -575,7 +594,6 @@ def test_el_formulario_guarda_el_modo_configurado_al_confirmar(
     app._validar_campos_o_alertar.return_value = paciente(modo=None), hoja
     app._validar_campos_o_alertar.return_value[0].pop(enlace.PREFERENCIA)
     app._buscar_duplicado_turno_actual.return_value = None
-    app._confirmar_envio_ginecologia.return_value = True
     app.db.guardar_atencion.return_value = 41
     app.db.obtener_revision_nss_atencion.return_value = None
     confirmar_local = Mock(return_value=True)
@@ -586,11 +604,75 @@ def test_el_formulario_guarda_el_modo_configurado_al_confirmar(
 
     app.db.guardar_atencion.assert_called_once()
     datos = app.db.guardar_atencion.call_args.args[0]
-    assert datos.get(enlace.PREFERENCIA) == (modo if hoja == "GINECOLOGIA" else None)
+    esperado = modo if activa else enlace.SOLO_IMPRIMIR
+    assert datos.get(enlace.PREFERENCIA) == (
+        esperado if hoja == "GINECOLOGIA" else None
+    )
+    assert "Motivo" not in datos and "Prioridad" not in datos
     app._iniciar_salida_atencion.assert_called_once()
-    if hoja == "GINECOLOGIA" and enlace.requiere_envio(modo):
-        assert (
-            "quedará pendiente" in app._confirmar_envio_ginecologia.call_args.args[1]
-        ) is (not vinculada)
-    else:
+    if confirmar:
         confirmar_local.assert_called_once()
+        aviso = "quedará pendiente" in confirmar_local.call_args.args[1]
+        assert aviso is (
+            hoja == "GINECOLOGIA" and enlace.requiere_envio(esperado) and not vinculada
+        )
+    else:
+        confirmar_local.assert_not_called()
+
+
+@pytest.mark.parametrize("switch", [None, False, True, "True", 1])
+def test_solo_una_preferencia_booleana_explicitamente_activa_envia(switch):
+    preferences = {enlace.PREFERENCIA: enlace.SOLO_ENVIAR}
+    if switch is not None:
+        preferences[enlace.PREFERENCIA_ENVIO] = switch
+    assert enlace.modo_efectivo(preferences) == (
+        enlace.SOLO_ENVIAR if switch is True else enlace.SOLO_IMPRIMIR
+    )
+
+
+def test_desactivar_pausa_el_lote_sin_perder_envios(cola):
+    cola.execute("UPDATE atenciones SET estado='ACTIVA' WHERE id=2")
+    for atencion in (1, 2):
+        enlace.encolar(cola, atencion, "GINECOLOGIA", paciente())
+    envio_activo = False
+    encomiendas = []
+
+    def enviar(sobre):
+        nonlocal envio_activo
+        encomiendas.append(json.loads(sobre)["visita"])
+        envio_activo = False
+
+    assert (
+        enlace.entregar_pendientes(cola, enviar, puede_entregar=lambda: envio_activo)
+        == 0
+    )
+    assert encomiendas == []
+    envio_activo = True
+    assert (
+        enlace.entregar_pendientes(cola, enviar, puede_entregar=lambda: envio_activo)
+        == 1
+    )
+    assert encomiendas == [1]
+    envio_activo = True
+    assert (
+        enlace.entregar_pendientes(cola, enviar, puede_entregar=lambda: envio_activo)
+        == 1
+    )
+    assert encomiendas == [1, 2]
+
+
+def test_worker_consulta_el_interruptor_y_el_cierre_antes_de_cada_envio():
+    from ADMISION_PYSIDE6_V15.facturacion_tabs_pyside6 import App
+
+    app = Mock()
+    app._shutdown_complete = False
+    app.app_settings = {enlace.PREFERENCIA_ENVIO: True}
+    app.db.enviar_derivaciones_pendientes.return_value = 0
+    App._entregar_ginecologia(app)
+    puede_entregar = app.db.enviar_derivaciones_pendientes.call_args.args[0]
+    assert puede_entregar()
+    app.app_settings[enlace.PREFERENCIA_ENVIO] = False
+    assert not puede_entregar()
+    app.app_settings[enlace.PREFERENCIA_ENVIO] = True
+    app._shutdown_complete = True
+    assert not puede_entregar()
