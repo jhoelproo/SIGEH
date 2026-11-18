@@ -105,7 +105,9 @@ def test_open_history_recovers_only_missing_fields_for_the_same_attention(
         def factory():
             return nullcontext(con)
 
-        central = AdmissionCloudRepository(factory).get_attention_by_global_id(selected)
+        repository = AdmissionCloudRepository(factory)
+        central = repository.get_attention_by_global_id(selected)
+        assert repository.get_attention_by_global_id(other) is None
         snapshot = central["event"]["payload_json"]
         assert snapshot["address"] == "CALLE CORREGIDA"
         assert snapshot["age"] == 0
@@ -253,3 +255,19 @@ def test_central_projection_preserves_demographics_on_legacy_sheet_event(previou
         assert persisted["phone"] == "8090000000"
     else:
         assert "age" not in persisted
+
+
+@pytest.mark.parametrize("identified", [False, True])
+def test_legacy_recovery_skips_database_for_complete_or_unidentified_snapshot(
+    identified,
+):
+    from admission_demographics import (
+        ATTENTION_DEMOGRAPHIC_FIELDS,
+        restore_attention_demographics,
+    )
+
+    connection = Mock()
+    identity = "22222222-2222-4222-8222-222222222222" if identified else ""
+    payload = dict.fromkeys(ATTENTION_DEMOGRAPHIC_FIELDS) if identified else {}
+    assert restore_attention_demographics(connection, identity, payload) is payload
+    connection.execute.assert_not_called()
