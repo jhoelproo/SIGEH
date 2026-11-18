@@ -43,7 +43,7 @@ class _ProjectionConnection:
     def execute(self, sql, params=()):
         normalized = " ".join(str(sql).split()).upper()
         if normalized.startswith("SELECT IS_DELETED,SERVER_REVISION,TURN_ID"):
-            return _Result((False, 1, 3946, 3946))
+            return _Result((False, 1, 3946, 3946, {}))
         if normalized.startswith("UPDATE ADMISSION_ATTENTION_PROJECTION SET PATIENT_ID"):
             self.projection_update_params = params
             return _Result((31,))
