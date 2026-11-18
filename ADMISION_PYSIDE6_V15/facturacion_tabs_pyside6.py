@@ -24,6 +24,9 @@ import threading
 import logging
 from dataclasses import dataclass, replace
 from types import MappingProxyType
+
+from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit
+
 V15_SOURCE_BUILD_ID = "20260903_V112_TURN_CLOSURE_REPORTS_V1"
 from logging.handlers import RotatingFileHandler
 
@@ -131,7 +134,6 @@ except ImportError:  # Ejecución directa del entrypoint standalone.
     )
 from PySide6.QtCore import Qt, QSize, QSignalBlocker, QTimer  # type: ignore
 from PySide6.QtWidgets import QSizePolicy  # type: ignore
-from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap  # type: ignore
 
 
