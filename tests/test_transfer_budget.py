@@ -1,9 +1,102 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+import sqlite3
 from unittest.mock import Mock
 
 import pytest
 
 from transfer_budget import AdaptivePoll, TransferMeter, MeasuredCursor, billing_period
+
+
+def test_batch_flushes_at_size_and_snapshot_without_losing_cycles(tmp_path):
+    meter = TransferMeter(tmp_path / "usage.db", batch_size=3)
+    previous, current = date(2026, 9, 30), date(2026, 10, 1)
+    meter.record("attention", requests=1, today=previous)
+    meter.record("patients", response_bytes=20, today=current)
+    assert not meter.path.exists()
+    meter.record("patients", response_bytes=30, today=current)
+
+    observer = TransferMeter(meter.path)
+    assert observer.snapshot(previous)["requests"] == 1
+    assert observer.snapshot(current)["response_bytes_estimated"] == 50
+    meter.record("unknown", response_bytes=7, today=current)
+    assert meter.snapshot(current)["streams"]["other"]["response_bytes_estimated"] == 7
+    assert observer.snapshot(current)["response_bytes_estimated"] == 57
+
+
+def test_small_batch_flushes_when_the_next_record_reaches_the_interval(tmp_path):
+    now = [0.0]
+    meter = TransferMeter(tmp_path / "usage.db", batch_size=20, clock=lambda: now[0])
+    meter.record("other")
+    now[0] = 29.99
+    meter.record("other", requests=1)
+    now[0] = 59.98
+    meter.record("other", requests=1)
+    assert not meter.path.exists()
+    now[0] = 60
+    meter.record("other", requests=1)
+    assert TransferMeter(meter.path).snapshot()["requests"] == 3
+
+
+def test_failed_flush_rolls_back_and_retries_all_counts(tmp_path, monkeypatch):
+    now = [0.0]
+    meter = TransferMeter(tmp_path / "usage.db", batch_size=2, clock=lambda: now[0])
+    original = meter._record_alert
+    fail = Mock(side_effect=sqlite3.OperationalError("synthetic disk I/O error"))
+    monkeypatch.setattr(meter, "_record_alert", fail)
+    meter.record("other", responses=1)
+    meter.record("other", responses=2)
+    assert TransferMeter(meter.path).snapshot()["responses"] == 0
+    meter.record("other", responses=4)
+    assert meter.snapshot()["available"] is False
+    assert fail.call_count == 1
+
+    monkeypatch.setattr(meter, "_record_alert", original)
+    now[0] = 60
+    meter.record("other", responses=8)
+    assert meter.flush() is True
+    assert meter.flush() is True
+    assert TransferMeter(meter.path).snapshot()["responses"] == 15
+
+
+def test_snapshot_retries_a_read_failure_only_after_backoff(tmp_path, monkeypatch):
+    now = [0.0]
+    meter = TransferMeter(tmp_path / "usage.db", clock=lambda: now[0])
+    original = meter._connect
+    failure = Mock(side_effect=OSError("synthetic read failure"))
+    monkeypatch.setattr(meter, "_connect", failure)
+    assert meter.snapshot()["available"] is False
+    now[0] = 59.99
+    assert meter.snapshot()["available"] is False
+    failure.assert_called_once()
+    monkeypatch.setattr(meter, "_connect", original)
+    now[0] = 60
+    assert meter.snapshot()["available"] is True
+
+
+def test_concurrent_records_keep_exact_totals(tmp_path):
+    meter = TransferMeter(tmp_path / "usage.db", batch_size=8)
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        list(workers.map(lambda _: meter.record("projection", rows=2), range(103)))
+    assert meter.snapshot()["rows"] == 206
+    assert TransferMeter(meter.path).snapshot()["rows"] == 206
+
+
+def test_production_meter_buffers_and_registers_normal_exit_flush(
+    tmp_path, monkeypatch
+):
+    import transfer_budget as module
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(module, "_METER", None)
+    register = Mock()
+    monkeypatch.setattr("atexit.register", register)
+    meter = module.get_transfer_meter()
+    meter.record("other", requests=1)
+    assert not meter.path.exists()
+    register.assert_called_once_with(meter.flush)
+    register.call_args.args[0]()
+    assert TransferMeter(meter.path).snapshot()["requests"] == 1
 
 
 @pytest.mark.parametrize(

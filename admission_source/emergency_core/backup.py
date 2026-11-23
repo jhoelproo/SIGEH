@@ -99,7 +99,6 @@ class BackupManager:
         try:
             with closing(sqlite3.connect(self.db_path)) as source, closing(sqlite3.connect(db_copy)) as target:
                 source.backup(target)
-            self.check_database(db_copy)
 
             files = []
             for source_path in existing_related:
@@ -128,8 +127,8 @@ class BackupManager:
                 "database": self.db_path.name,
                 "files": files,
             }
+            self._verify_manifest(folder, manifest)
             atomic_write_json(folder / "manifest.json", manifest)
-            self.verify(folder)
             self.prune()
             return folder
         except Exception:
@@ -168,6 +167,10 @@ class BackupManager:
     def verify(self, folder: str | os.PathLike[str]) -> dict:
         backup_dir = Path(folder)
         manifest = self._manifest(backup_dir)
+        self._verify_manifest(backup_dir, manifest)
+        return manifest
+
+    def _verify_manifest(self, backup_dir: Path, manifest: dict) -> None:
         files = manifest.get("files")
         if manifest.get("format") != 1 or not isinstance(files, list) or not files:
             raise BackupError("El manifiesto del respaldo no es valido")
@@ -175,29 +178,34 @@ class BackupManager:
         seen: set[str] = set()
         for item in files:
             if not isinstance(item, dict):
-                raise BackupError("El manifiesto contiene una entrada de archivo invalida")
+                raise BackupError(
+                    "El manifiesto contiene una entrada de archivo invalida"
+                )
             name = _safe_member_name(item.get("name"))
             if name in seen:
                 raise BackupError(f"El manifiesto repite el archivo {name}")
+            self._verify_member(backup_dir, name, item)
             seen.add(name)
-            path = backup_dir / name
-            try:
-                expected_bytes = int(item["bytes"])
-                expected_hash = str(item["sha256"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise BackupError(f"Los metadatos de {name} no son validos") from exc
-            if expected_bytes < 0 or len(expected_hash) != 64:
-                raise BackupError(f"Los metadatos de {name} no son validos")
-            if path.resolve().parent != backup_dir.resolve():
-                raise BackupError(f"El archivo {name} apunta fuera del respaldo")
-            if not path.is_file() or path.stat().st_size != expected_bytes:
-                raise BackupError(f"Falta o cambio el archivo {name}")
-            if _sha256(path) != expected_hash:
-                raise BackupError(f"El hash no coincide para {name}")
         if database_name not in seen:
             raise BackupError("La base de datos no figura en la lista de archivos")
         self.check_database(backup_dir / database_name)
-        return manifest
+
+    @staticmethod
+    def _verify_member(backup_dir: Path, name: str, item: dict) -> None:
+        try:
+            expected_bytes = int(item["bytes"])
+            expected_hash = str(item["sha256"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BackupError(f"Los metadatos de {name} no son validos") from exc
+        if expected_bytes < 0 or len(expected_hash) != 64:
+            raise BackupError(f"Los metadatos de {name} no son validos")
+        path = backup_dir / name
+        if path.resolve().parent != backup_dir.resolve():
+            raise BackupError(f"El archivo {name} apunta fuera del respaldo")
+        if not path.is_file() or path.stat().st_size != expected_bytes:
+            raise BackupError(f"Falta o cambio el archivo {name}")
+        if _sha256(path) != expected_hash:
+            raise BackupError(f"El hash no coincide para {name}")
 
     def restore_database(self, folder: str | os.PathLike[str]) -> Path:
         backup_dir = Path(folder)

@@ -17550,12 +17550,15 @@ def local_receipt_saved_message(message, number):
 
 
 class PDFDatabaseWorker(threading.Thread):
+    RENDERER_IDLE_SECONDS = 120
+
     def __init__(self, username="", session_id=""):
         super().__init__(name="PDFEngineThread", daemon=True)
         self.signals = PDFWorkerSignals()
         self.jobs = queue.Queue()
         self._running = True
         self.renderer = None
+        self._renderer_expires_at: float | None = None
         self.username = str(username)
         self.session_id = str(session_id)
         self._local_sync = None
@@ -17567,19 +17570,34 @@ class PDFDatabaseWorker(threading.Thread):
     def can_contact_central(self):
         return self._local_retry_gate.ready
 
-    def warm_up(self):
-        started = perf_counter()
-        try:
+    @contextmanager
+    def _using_receipt_renderer(self):
+        if self.renderer is None:
             from pdf_engine import ReceiptPDFRenderer
 
             self.renderer = ReceiptPDFRenderer(persistent=True)
-            self.renderer.start()
-            write_pdf_performance(
-                f"Motor PDF precargado en {perf_counter() - started:.3f}s"
-            )
-        except Exception as exc:
-            self.renderer = None
-            write_runtime_log(f"No se pudo precargar Chromium: {exc}")
+        try:
+            yield self.renderer
+        except Exception:
+            self._close_renderer()
+            raise
+        else:
+            self._renderer_expires_at = perf_counter() + self.RENDERER_IDLE_SECONDS
+
+    def _close_renderer(self):
+        renderer = self.renderer
+        self.renderer = None
+        self._renderer_expires_at = None
+        if renderer is not None:
+            renderer.close()
+
+    def _run_idle_maintenance(self):
+        if (
+            self._renderer_expires_at is not None
+            and perf_counter() >= self._renderer_expires_at
+        ):
+            self._close_renderer()
+        self._synchronize_local_receipts()
 
     def submit(self, job):
         self.jobs.put(dict(job))
@@ -17589,21 +17607,19 @@ class PDFDatabaseWorker(threading.Thread):
         self.jobs.put(None)
 
     def run(self):
-        self.warm_up()
         try:
             while self._running:
                 try:
                     job = self.jobs.get(timeout=10)
                 except queue.Empty:
-                    self._synchronize_local_receipts()
+                    self._run_idle_maintenance()
                     continue
                 if job is None:
                     break
                 self.process(job)
+                del job
         finally:
-            if self.renderer is not None:
-                self.renderer.close()
-                self.renderer = None
+            self._close_renderer()
 
     def _synchronize_local_receipts(self):
         if not self.username:
@@ -17640,10 +17656,8 @@ class PDFDatabaseWorker(threading.Thread):
         except Exception as exc:
             write_runtime_log(f"LOCAL_RECEIPT_BACKUP_FAILED error_type={type(exc).__name__}")
         try:
-            if self.renderer is None:
-                from pdf_engine import ReceiptPDFRenderer
-                self.renderer = ReceiptPDFRenderer()
-            pdf_path = render_local_receipt(job, request_id, self.renderer)
+            with self._using_receipt_renderer() as renderer:
+                pdf_path = render_local_receipt(job, request_id, renderer)
         except Exception as exc:
             pdf_path = ""
             write_runtime_log(f"LOCAL_RECEIPT_RENDER_FAILED error_type={type(exc).__name__}")
@@ -18016,6 +18030,13 @@ class PDFDatabaseWorker(threading.Thread):
         )
         return pdf_path, storage_mode
 
+    def _render_committed_receipt(self, receipt_id, document):
+        with self._using_receipt_renderer() as renderer:
+            if document:
+                path = render_receipt_snapshot_pdf(document, renderer=renderer)
+                return path, document["storage_mode"]
+            return self._render_saved_receipt(receipt_id)
+
     def _revalidate_receipt_edit(self, job):
         attention = job["admission_attention"]
         try:
@@ -18120,11 +18141,9 @@ class PDFDatabaseWorker(threading.Thread):
             database_elapsed = perf_counter() - database_started
             try:
                 render_started = perf_counter()
-                if committed_document:
-                    pdf_path = render_receipt_snapshot_pdf(committed_document, renderer=self.renderer)
-                    storage_mode = committed_document["storage_mode"]
-                else:
-                    pdf_path, storage_mode = self._render_saved_receipt(receipt_id)
+                pdf_path, storage_mode = self._render_committed_receipt(
+                    receipt_id, committed_document,
+                )
                 if storage_mode in (STORAGE_LEGACY, STORAGE_HYBRID):
                     legacy_filename = f"recibo_{int(receipt_number)}.pdf"
                     legacy_path = stable_storage_path(
@@ -34583,7 +34602,7 @@ class MainWindow(QMainWindow):
         )
 
     def _start_pdf_services(self):
-        """Precarga Chromium y mantiene una cola separada para la nube."""
+        """Inicia las colas de recibos y sincronización de PDF."""
         self.pdf_sync_worker = PDFStorageSyncWorker(self)
         self.pdf_sync_worker.start()
 

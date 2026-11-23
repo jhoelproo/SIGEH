@@ -1,14 +1,115 @@
+import json
+from pathlib import Path
 import sqlite3
 from unittest.mock import Mock
 import pytest
 
-from admission_source.emergency_core.backup import BackupManager, DailyBackupSchedule
+from admission_source.emergency_core.backup import (
+    BackupError,
+    BackupManager,
+    DailyBackupSchedule,
+)
 from tests.test_admission_hybrid_offline_sync import (
     create_v15_database,
     create_attention,
     operational_session,
 )
 from admission_hybrid import OfflineAdmissionStore
+
+
+@pytest.mark.parametrize("damaged", [False, True])
+def test_new_backup_runs_one_final_integrity_check(tmp_path, monkeypatch, damaged):
+    database = tmp_path / "admission.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE pending(id INTEGER PRIMARY KEY)")
+    manager = BackupManager(database, tmp_path / "backups")
+    original = manager.check_database
+    checked = []
+
+    def check_before_publishing(path):
+        checked.append(path)
+        assert not (path.parent / "manifest.json").exists()
+        if damaged:
+            raise BackupError("synthetic integrity failure")
+        original(path)
+
+    monkeypatch.setattr(manager, "check_database", check_before_publishing)
+    if damaged:
+        with pytest.raises(BackupError, match="synthetic integrity failure"):
+            manager.create("respaldo_manual")
+        assert manager.list_backups() == []
+    else:
+        folder = manager.create("respaldo_manual")
+        assert manager.list_backups() == [folder]
+    assert len(checked) == 1
+
+
+@pytest.mark.parametrize(
+    "case,message",
+    [
+        ("bad_format", "manifiesto del respaldo"),
+        ("bad_entry", "entrada de archivo"),
+        ("bad_size", "metadatos"),
+        ("negative_size", "metadatos"),
+        ("traversal", "fuera del respaldo"),
+        ("duplicate", "repite el archivo"),
+        ("wrong_database", "no figura"),
+        ("redirected_member", "apunta fuera"),
+        ("missing_member", "Falta o cambio"),
+        ("invalid_hash", "metadatos"),
+        ("hash_mismatch", "El hash no coincide"),
+    ],
+)
+def test_backup_verification_rejects_invalid_members(
+    tmp_path, monkeypatch, case, message
+):
+    database = tmp_path / "admission.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE pending(id INTEGER PRIMARY KEY)")
+    manager = BackupManager(database, tmp_path / "backups")
+    folder = manager.create("respaldo_manual")
+    metadata_path = folder / "manifest.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    item = metadata["files"][0]
+
+    match case:
+        case "bad_format":
+            metadata["format"] = 0
+        case "bad_entry":
+            metadata["files"] = [None]
+        case "bad_size":
+            item.pop("bytes")
+        case "negative_size":
+            item["bytes"] = -1
+        case "traversal":
+            item["name"] = "../outside.db"
+        case "duplicate":
+            metadata["files"].append(item)
+        case "wrong_database":
+            metadata["database"] = "missing.db"
+        case "redirected_member":
+            resolve = Path.resolve
+            monkeypatch.setattr(
+                Path,
+                "resolve",
+                lambda path, **kwargs: (
+                    tmp_path / "outside.db"
+                    if path == folder / database.name
+                    else resolve(path, **kwargs)
+                ),
+            )
+        case "missing_member":
+            (folder / database.name).unlink()
+        case "invalid_hash":
+            item["sha256"] = "invalid"
+        case "hash_mismatch":
+            copy = folder / database.name
+            data = copy.read_bytes()
+            copy.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(BackupError, match=message):
+        manager.verify(folder)
 
 
 def test_corrupted_daily_copy_is_replaced_with_verified_backup(tmp_path):

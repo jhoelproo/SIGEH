@@ -52,7 +52,6 @@ def test_publish_replay_does_not_allocate_another_number(monkeypatch):
 
 def test_worker_idle_loop_checks_pending_commands_and_closes_renderer(worker):
     renderer = worker.renderer
-    worker.warm_up = Mock()
     worker.jobs = Mock()
     worker.jobs.get.side_effect = [queue.Empty(), None]
     worker._synchronize_local_receipts = Mock()

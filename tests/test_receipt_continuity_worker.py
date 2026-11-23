@@ -1,6 +1,9 @@
 """Check the actual worker's offline boundary and retained failure states."""
 
+from queue import Empty
+from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
 import pytest
 
@@ -26,6 +29,92 @@ def job():
     value = receipt_job()
     value.update(editing_num=None, is_backdated=0)
     return value
+
+
+def test_idle_worker_syncs_without_starting_pdf_engine(monkeypatch):
+    worker = app.PDFDatabaseWorker("demo", "session-demo")
+    factory = Mock()
+    monkeypatch.setattr("pdf_engine.ReceiptPDFRenderer", factory)
+    worker.jobs = Mock()
+    worker.jobs.get.side_effect = [Empty(), None]
+    worker._synchronize_local_receipts = Mock()
+
+    worker.run()
+
+    factory.assert_not_called()
+    worker._synchronize_local_receipts.assert_called_once()
+    assert worker.renderer is None
+
+
+def test_worker_does_not_retain_last_receipt_while_waiting():
+    class ReceiptPayload(dict):
+        pass
+
+    worker = app.PDFDatabaseWorker("demo", "session-demo")
+    queued = [ReceiptPayload()]
+    payload = ref(queued[0])
+
+    def next_job(*, timeout):
+        if queued:
+            return queued.pop()
+        assert payload() is None
+        return None
+
+    worker.jobs = SimpleNamespace(get=next_job)
+    worker.process = lambda _job: None
+    worker.run()
+
+
+def test_worker_reuses_pdf_engine_then_releases_it_at_idle_boundary(monkeypatch):
+    worker = app.PDFDatabaseWorker("demo", "session-demo")
+    first, second = Mock(), Mock()
+    factory = Mock(side_effect=[first, second])
+    monkeypatch.setattr("pdf_engine.ReceiptPDFRenderer", factory)
+    clock = Mock(return_value=10.0)
+    monkeypatch.setattr(app, "perf_counter", clock)
+    worker._synchronize_local_receipts = Mock()
+
+    with worker._using_receipt_renderer() as renderer:
+        assert renderer is first
+    clock.return_value = 40.0
+    with worker._using_receipt_renderer() as renderer:
+        assert renderer is first
+        clock.return_value = 45.0
+    factory.assert_called_once_with(persistent=True)
+
+    clock.return_value = 45.0 + worker.RENDERER_IDLE_SECONDS - 0.01
+    worker._run_idle_maintenance()
+    first.close.assert_not_called()
+    clock.return_value += 0.01
+    worker._run_idle_maintenance()
+    first.close.assert_called_once()
+    assert worker.renderer is None
+    assert worker._synchronize_local_receipts.call_count == 2
+
+    with worker._using_receipt_renderer() as renderer:
+        assert renderer is second
+    worker.jobs = Mock()
+    worker.jobs.get.return_value = None
+    worker.run()
+    second.close.assert_called_once()
+    assert worker.renderer is None
+
+
+def test_failed_render_releases_engine_and_next_receipt_can_retry(monkeypatch):
+    worker = app.PDFDatabaseWorker("demo", "session-demo")
+    broken, healthy = Mock(), Mock()
+    monkeypatch.setattr(
+        "pdf_engine.ReceiptPDFRenderer", Mock(side_effect=[broken, healthy])
+    )
+    with pytest.raises(RuntimeError, match="synthetic engine failure"):
+        with worker._using_receipt_renderer() as renderer:
+            assert renderer is broken
+            raise RuntimeError("synthetic engine failure")
+    broken.close.assert_called_once()
+    assert worker.renderer is None
+
+    with worker._using_receipt_renderer() as renderer:
+        assert renderer is healthy
 
 
 @pytest.mark.parametrize("offline,forced", [(True, False), (False, True)])

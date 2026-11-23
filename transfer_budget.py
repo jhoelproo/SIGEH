@@ -6,6 +6,7 @@ Raw driver calls, TLS/protocol overhead and other cloud clients are excluded.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -16,11 +17,15 @@ from calendar import monthrange
 from contextlib import closing
 from datetime import date, datetime, timezone
 from pathlib import Path
+from time import monotonic
 
 LOG = logging.getLogger("hospital.transfer")
 DEFAULT_QUOTA_BYTES = 5_000_000_000
 DEFAULT_HOSPITAL_STATIONS = 3
 STREAMS = ("attention", "patients", "projection", "other")
+TRANSFER_BATCH_SIZE = 128
+TRANSFER_FLUSH_SECONDS = 30
+TRANSFER_RETRY_SECONDS = 60
 _METER = None
 _METER_LOCK = threading.Lock()
 
@@ -42,14 +47,19 @@ def get_transfer_meter():
                         **options,
                         **json.loads(config.read_text(encoding="utf-8")),
                     }
-                _METER = TransferMeter(root / "transfer.sqlite", **options)
+                _METER = TransferMeter(
+                    root / "transfer.sqlite", batch_size=TRANSFER_BATCH_SIZE, **options
+                )
             except (OSError, ValueError, TypeError):
                 LOG.warning(
                     "TRANSFER_BUDGET_CONFIG_INVALID: usando presupuesto predeterminado"
                 )
                 _METER = TransferMeter(
-                    root / "transfer.sqlite", stations=DEFAULT_HOSPITAL_STATIONS
+                    root / "transfer.sqlite",
+                    stations=DEFAULT_HOSPITAL_STATIONS,
+                    batch_size=TRANSFER_BATCH_SIZE,
                 )
+            atexit.register(_METER.flush)
         return _METER
 
 
@@ -92,7 +102,14 @@ class TransferMeter:
     """Durable per-station counters. Equal station allowances are configurable."""
 
     def __init__(
-        self, path, *, quota_bytes=DEFAULT_QUOTA_BYTES, stations=1, start_day=1
+        self,
+        path,
+        *,
+        quota_bytes=DEFAULT_QUOTA_BYTES,
+        stations=1,
+        start_day=1,
+        batch_size=1,
+        clock=monotonic,
     ):
         if quota_bytes <= 0 or stations < 1 or stations > quota_bytes:
             raise ValueError("Cuota y número de estaciones deben ser positivos.")
@@ -102,6 +119,13 @@ class TransferMeter:
         self.start_day = start_day
         self._ready = False
         self._warned = False
+        self._lock = threading.Lock()
+        self._batch_size = batch_size
+        self._clock = clock
+        self._pending: dict[tuple[str, str], list[int]] = {}
+        self._updates = 0
+        self._flush_at: float | None = None
+        self._retry_at = 0.0
 
     def _connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +151,7 @@ class TransferMeter:
         return connection
 
     def _unavailable(self):
+        self._retry_at = self._clock() + TRANSFER_RETRY_SECONDS
         if not self._warned:
             LOG.warning("TRANSFER_METER_UNAVAILABLE: atención y facturación continúan")
             self._warned = True
@@ -148,19 +173,49 @@ class TransferMeter:
             max(0, int(v))
             for v in (requests, responses, rows, request_bytes, response_bytes)
         )
+        if not any(values):
+            return
+        with self._lock:
+            totals = self._pending.setdefault((period, stream), [0] * len(values))
+            for index, value in enumerate(values):
+                totals[index] += value
+            self._updates += 1
+            now = self._clock()
+            if self._flush_at is None:
+                self._flush_at = now + TRANSFER_FLUSH_SECONDS
+            if now >= self._retry_at and (
+                self._updates >= self._batch_size or now >= self._flush_at
+            ):
+                self._flush_locked()
+
+    def flush(self) -> bool:
+        """Persist any remaining telemetry counters, including at normal exit."""
+        with self._lock:
+            return self._flush_locked()
+
+    def _flush_locked(self) -> bool:
+        if not self._pending:
+            return True
         try:
             with closing(self._connect()) as con, con:
-                con.execute(
+                con.executemany(
                     """INSERT INTO transfer_usage VALUES(?,?,?,?,?,?,?)
                     ON CONFLICT(period,stream) DO UPDATE SET
                     requests=requests+excluded.requests, responses=responses+excluded.responses,
                     rows=rows+excluded.rows, request_bytes=request_bytes+excluded.request_bytes,
                     response_bytes=response_bytes+excluded.response_bytes""",
-                    (period, stream, *values),
+                    ((*key, *values) for key, values in self._pending.items()),
                 )
-                self._record_alert(con, period)
+                for period in sorted({period for period, _stream in self._pending}):
+                    self._record_alert(con, period)
         except (OSError, sqlite3.Error):
             self._unavailable()
+            return False
+        self._pending.clear()
+        self._updates = 0
+        self._flush_at = None
+        self._retry_at = 0.0
+        return True
 
     def _record_alert(self, con, period):
         total = con.execute(
@@ -191,18 +246,22 @@ class TransferMeter:
 
     def snapshot(self, today=None):
         period = billing_period(today or date.today(), self.start_day)
-        try:
-            with closing(self._connect()) as con:
-                rows = con.execute(
-                    "SELECT stream,requests,responses,rows,request_bytes,response_bytes FROM transfer_usage WHERE period=?",
-                    (period,),
-                ).fetchall()
-                station_id = con.execute(
-                    "SELECT station_id FROM transfer_identity WHERE singleton=1"
-                ).fetchone()[0]
-        except (OSError, sqlite3.Error):
-            self._unavailable()
-            return {"available": False, "period": period, "alert_percent": 0}
+        unavailable = {"available": False, "period": period, "alert_percent": 0}
+        with self._lock:
+            if self._clock() < self._retry_at or not self._flush_locked():
+                return unavailable
+            try:
+                with closing(self._connect()) as con:
+                    rows = con.execute(
+                        "SELECT stream,requests,responses,rows,request_bytes,response_bytes FROM transfer_usage WHERE period=?",
+                        (period,),
+                    ).fetchall()
+                    station_id = con.execute(
+                        "SELECT station_id FROM transfer_identity WHERE singleton=1"
+                    ).fetchone()[0]
+            except (OSError, sqlite3.Error):
+                self._unavailable()
+                return unavailable
         names = (
             "requests",
             "responses",
