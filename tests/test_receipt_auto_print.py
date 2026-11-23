@@ -7,6 +7,38 @@ from unittest.mock import Mock
 import pytest
 
 import CALCULOS_QT as app
+from pdf_engine import renderer
+
+
+@pytest.mark.parametrize(
+    "media_failure", [None, RuntimeError("print media unavailable")]
+)
+def test_renderer_sets_print_media_once_and_closes_on_failure(
+    monkeypatch, media_failure
+):
+    playwright = Mock()
+    browser = playwright.chromium.launch.return_value
+    page = browser.new_page.return_value
+    page.emulate_media.side_effect = media_failure
+    monkeypatch.setattr(
+        "playwright.sync_api.sync_playwright",
+        Mock(return_value=Mock(start=Mock(return_value=playwright))),
+    )
+    monkeypatch.setattr(renderer, "_configure_playwright_browsers", Mock())
+    receipt_renderer = renderer.ReceiptPDFRenderer()
+
+    if media_failure:
+        with pytest.raises(RuntimeError, match="print media unavailable"):
+            receipt_renderer.start()
+        page.close.assert_called_once_with()
+        browser.close.assert_called_once_with()
+        playwright.stop.assert_called_once_with()
+    else:
+        receipt_renderer.start()
+        receipt_renderer.start()
+
+    playwright.chromium.launch.assert_called_once()
+    page.emulate_media.assert_called_once_with(media="print")
 
 
 @pytest.mark.parametrize(

@@ -257,17 +257,20 @@ class ReceiptPDFRenderer:
         _configure_playwright_browsers()
         from playwright.sync_api import sync_playwright
 
-        self._playwright = sync_playwright().start()
+        playwright = sync_playwright().start()
+        self._playwright = playwright
         try:
-            self._browser = self._playwright.chromium.launch(
+            browser = playwright.chromium.launch(
                 headless=True,
                 timeout=20_000,
             )
-            self._page = self._browser.new_page(
+            self._browser = browser
+            page = browser.new_page(
                 viewport={"width": 816, "height": 1056},
                 device_scale_factor=1,
             )
-            self._page.emulate_media(media="print")
+            self._page = page
+            page.emulate_media(media="print")
         except Exception:
             self.close()
             raise
