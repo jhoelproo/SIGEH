@@ -445,6 +445,12 @@ def test_updater_installs_without_previous_version_and_cli_delegates(
 
 def test_portable_launcher_missing_app_and_database_errors(tmp_path, monkeypatch):
     errors = []
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "profile"))
+    monkeypatch.setattr(
+        portable_launcher,
+        "recover_database_url_from_existing_install",
+        lambda *_args, **_kwargs: "",
+    )
     monkeypatch.setattr(portable_launcher, "portable_root", lambda: tmp_path)
     monkeypatch.setattr(portable_launcher, "show_error", errors.append)
     monkeypatch.setattr(portable_launcher.sys, "argv", ["SIGEH.exe"])
