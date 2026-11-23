@@ -212,3 +212,14 @@ def test_concurrent_stale_document_opens_append_only_one_final_version(receipts)
             ).fetchone()[0]
             == 1
         )
+
+
+def test_receipt_generation_reuses_the_snapshot_committed_to_postgres(receipts):
+    committed = {}
+    receipt_id = save(committed_document=committed)
+    with app.db_connect() as con:
+        persisted = receipt_documents.load_current_receipt_snapshot(con, receipt_id)
+    assert committed["receipt_number"] == persisted["receipt_number"]
+    assert committed["snapshot_hash"] == persisted["snapshot_hash"]
+    assert committed["storage_mode"] == persisted["storage_mode"]
+    assert committed["snapshot"] == persisted["snapshot"]

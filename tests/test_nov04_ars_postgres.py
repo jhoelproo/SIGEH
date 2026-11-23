@@ -307,3 +307,163 @@ def test_missing_current_patient_records_are_safe_and_empty_target_rejected(cata
             replace_current_insurer(
                 con, "NO EXISTE", "", ADMIN, allowed=app.user_is_admin
             )
+
+
+def add_inactive_medications():
+    with app.db_connect() as con:
+        return [
+            int(row["id"])
+            for row in con.execute(
+                """INSERT INTO universal_items(categoria,nombre,precio,is_active)
+                   VALUES('Medicamentos','MED INACTIVO UNO',1,0),
+                         ('Medicamentos','MED INACTIVO DOS',2,0) RETURNING id"""
+            ).fetchall()
+        ]
+
+
+def test_catalog_batch_physically_deletes_and_audits_each_medication(catalog):
+    _, ids = catalog
+    inactive = add_inactive_medications()
+    set_links(ids, {ids["MAT QA"]: 1})
+    receipt = insurer_pair()
+    with app.db_connect() as con:
+        con.execute(
+            """INSERT INTO recibo_items(recibo_id,categoria,nombre,precio_unit,cantidad,total,ars)
+               VALUES(%s,'Medicamentos','MED QA',10,1,10,'')""",
+            (receipt,),
+        )
+        before_version = con.execute(
+            "SELECT version FROM billing_pricing_settings"
+        ).fetchone()[0]
+
+    selected = [*inactive, ids["MED QA"]]
+    assert (
+        app.delete_universal_catalog_selection(
+            "Medicamentos",
+            selected,
+            current_user=ADMIN,
+            confirmed_active_ids=[ids["MED QA"]],
+        )
+        == 3
+    )
+
+    with app.db_connect() as another_station:
+        assert (
+            another_station.execute(
+                "SELECT id FROM universal_items WHERE id=ANY(%s)", (selected,)
+            ).fetchall()
+            == []
+        )
+        assert (
+            another_station.execute(
+                "SELECT count(*) FROM medication_material_links"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            another_station.execute(
+                "SELECT version FROM billing_pricing_settings"
+            ).fetchone()[0]
+            == before_version + 1
+        )
+        assert (
+            another_station.execute(
+                "SELECT total FROM recibo_items WHERE recibo_id=%s AND nombre='MED QA'",
+                (receipt,),
+            ).fetchone()[0]
+            == 10
+        )
+        audited = another_station.execute(
+            "SELECT entity_id FROM action_history WHERE action='CATALOG_DELETE' ORDER BY entity_id"
+        ).fetchall()
+        assert [row["entity_id"] for row in audited] == [
+            "Medicamentos|MED INACTIVO DOS",
+            "Medicamentos|MED INACTIVO UNO",
+            "Medicamentos|MED QA",
+        ]
+
+
+@pytest.mark.parametrize(
+    "reason", ["activated", "wrong_category", "missing", "forbidden", "audit_error"]
+)
+def test_catalog_batch_leaves_all_selected_rows_intact_if_validation_fails(
+    catalog, monkeypatch, reason
+):
+    _, ids = catalog
+    inactive = add_inactive_medications()
+    actor = ADMIN
+    selected = list(inactive)
+    if reason == "activated":
+        with app.db_connect() as con:
+            con.execute(
+                "UPDATE universal_items SET is_active=1 WHERE id=%s", (inactive[1],)
+            )
+    elif reason == "wrong_category":
+        selected.append(ids["MAT QA"])
+    elif reason == "missing":
+        selected.append(2147483647)
+    elif reason == "forbidden":
+        actor = dict(ADMIN, username="rules-aux")
+    else:
+
+        def fail_audit(*_args):
+            raise RuntimeError("Auditoría de prueba no disponible")
+
+        monkeypatch.setattr(app, "_audit_catalog_deletions", fail_audit)
+    with pytest.raises((PermissionError, ValueError, RuntimeError)):
+        app.delete_universal_catalog_selection(
+            "Medicamentos", selected, current_user=actor
+        )
+    with app.db_connect() as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM universal_items WHERE id=ANY(%s)", (inactive,)
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            con.execute(
+                "SELECT count(*) FROM action_history WHERE action='CATALOG_DELETE'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_catalog_deduplicates_ids_and_accepts_empty_selection(catalog):
+    inactive, _unused = add_inactive_medications()
+    assert (
+        app.delete_universal_catalog_selection("Medicamentos", [], current_user=ADMIN)
+        == 0
+    )
+    assert (
+        app.delete_universal_catalog_selection(
+            "Medicamentos", [inactive, inactive], current_user=ADMIN
+        )
+        == 1
+    )
+
+
+def test_database_suppressed_delete_rolls_back_the_entire_batch(catalog):
+    inactive = add_inactive_medications()
+    with app.db_connect() as con:
+        con.execute("""CREATE FUNCTION skip_synthetic_catalog_delete() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF OLD.nombre='MED INACTIVO DOS' THEN RETURN NULL; END IF;
+                    RETURN OLD;
+                END;
+            $$""")
+        con.execute("""CREATE TRIGGER suppress_one_catalog_delete BEFORE DELETE ON universal_items
+            FOR EACH ROW EXECUTE FUNCTION skip_synthetic_catalog_delete()""")
+
+    with pytest.raises(RuntimeError, match="no completó el borrado"):
+        app.delete_universal_catalog_selection(
+            "Medicamentos", inactive, current_user=ADMIN
+        )
+    with app.db_connect() as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM universal_items WHERE id=ANY(%s)", (inactive,)
+            ).fetchone()[0]
+            == 2
+        )

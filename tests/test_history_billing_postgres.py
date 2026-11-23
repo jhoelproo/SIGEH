@@ -65,3 +65,36 @@ def test_history_does_not_bypass_clinical_guards(inherited, mutation):
     assert billing_destination(evaluate()) == "blocked"
     with app.db_connect() as con:
         assert con.execute("SELECT COUNT(*) FROM recibos").fetchone()[0] == 0
+
+
+def test_uuid_lookup_uses_the_postgres_index(server):
+    from tests.test_billing_consistency_postgres import Connection
+
+    with Connection(server) as con:
+        con.execute("""CREATE TEMP TABLE admission_attention_projection (
+            global_attention_id UUID PRIMARY KEY, attention_id BIGINT,
+            source_instance_id TEXT
+        )""")
+        con.execute("""INSERT INTO admission_attention_projection
+            SELECT md5(n::text)::uuid, n, 'TEST'
+            FROM generate_series(1, 100000) n""")
+        con.execute(
+            "INSERT INTO admission_attention_projection VALUES (%s, 0, 'TEST')",
+            (GLOBAL,),
+        )
+        con.execute("ANALYZE admission_attention_projection")
+        predicate, parameters = app._billing_projection_lookup(0, "", GLOBAL)
+        query = """EXPLAIN (ANALYZE, FORMAT JSON) SELECT *
+            FROM admission_attention_projection p WHERE """
+        old_plan = con.execute(
+            query + "p.global_attention_id::text=%s", (GLOBAL,)
+        ).fetchone()["QUERY PLAN"][0]
+        new_plan = con.execute(query + predicate, parameters).fetchone()["QUERY PLAN"][
+            0
+        ]
+    print(
+        f"UUID, 100000 filas: anterior={old_plan['Execution Time']:.3f} ms, "
+        f"actual={new_plan['Execution Time']:.3f} ms"
+    )
+    assert "Index" in new_plan["Plan"]["Node Type"]
+    assert old_plan["Plan"]["Actual Rows"] == new_plan["Plan"]["Actual Rows"] == 1

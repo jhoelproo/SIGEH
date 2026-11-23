@@ -261,7 +261,9 @@ def test_catalog_context_actions_target_the_clicked_row(monkeypatch):
     delete = Mock()
     monkeypatch.setattr(dialog, "_delete_item", delete)
     dialog._show_catalog_menu("Materiales", position)
-    action = next(a for a in dialog._catalog_menu.actions() if a.text() == "Eliminar")
+    action = next(
+        a for a in dialog._catalog_menu.actions() if a.text() == "Eliminar selección"
+    )
     assert action.isEnabled()
     action.trigger()
     delete.assert_called_once_with("Materiales")

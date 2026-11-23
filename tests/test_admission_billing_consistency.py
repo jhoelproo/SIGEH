@@ -49,11 +49,6 @@ def test_cancel_has_owned_claim_release():
     assert "release" in source
 
 
-def test_save_uses_global_identity():
-    source = inspect.getsource(app.MainWindow.generate_pdf)
-    assert "global_attention_id=" in source
-
-
 def test_claim_override_cannot_steal_live_claim():
     source = inspect.getsource(app.claim_projected_billable_attention)
     assert "bool(allow_claim_override)" not in source
@@ -166,7 +161,9 @@ def test_cancel_form_expires_claim_but_reselect_same_attention_preserves_it(
 @pytest.mark.parametrize("editing", [None, 17])
 def test_refuse_replace_patient_releases_new_claim(monkeypatch, editing):
     attention = selected_attention()
-    window = Mock(editing_recibo_id=editing, session_id="A", current_admission_attention=None)
+    window = Mock(
+        editing_recibo_id=editing, session_id="A", current_admission_attention=None
+    )
     window.cart_table.rowCount.return_value = 1
     release = Mock()
     monkeypatch.setattr(app, "schedule_admission_claim_release", release)
@@ -180,7 +177,9 @@ def test_refuse_replace_patient_releases_new_claim(monkeypatch, editing):
 
 def test_accept_patient_preserves_new_claim_through_form_reset(monkeypatch):
     attention = selected_attention()
-    window = Mock(editing_recibo_id=None, session_id="A", current_admission_attention=None)
+    window = Mock(
+        editing_recibo_id=None, session_id="A", current_admission_attention=None
+    )
     window.cart_table.rowCount.return_value = 0
     window.name_edit.text.return_value = ""
     monkeypatch.setattr(app, "FloatingToast", Mock())
@@ -190,17 +189,17 @@ def test_accept_patient_preserves_new_claim_through_form_reset(monkeypatch):
 
 
 @pytest.mark.parametrize("case", ["excluded", "error", "eligible"])
-def test_receipt_save_revalidates_uuid_and_preserves_claim_token(monkeypatch, case):
+def test_receipt_edit_preflight_revalidates_uuid_and_preserves_claim_token(
+    monkeypatch, case
+):
     attention = selected_attention()
-    window = Mock(
-        receipt_read_only=False,
-        _pending_ars_correction=None,
-        editing_recibo_id=None,
-        current_admission_attention=attention.snapshot(),
-        current_user={},
-        session_id="A",
-    )
-    window.name_edit.text.return_value = ""  # stop before any receipt write
+    worker = app.PDFDatabaseWorker()
+    job = {
+        "editing_id": 14,
+        "admission_attention": attention.snapshot(),
+        "admission_session_id": "A",
+        "current_user": {},
+    }
     live = (
         selected_attention(billing_claim_acquired_at="") if case == "eligible" else None
     )
@@ -211,16 +210,18 @@ def test_receipt_save_revalidates_uuid_and_preserves_claim_token(monkeypatch, ca
     release = Mock()
     monkeypatch.setattr(app, "get_projected_billable_attention", query)
     monkeypatch.setattr(app, "schedule_admission_claim_release", release)
-    monkeypatch.setattr(app.QMessageBox, "critical", Mock())
-    monkeypatch.setattr(app.QMessageBox, "warning", Mock())
-    monkeypatch.setattr(app, "write_runtime_log", Mock())
-    monkeypatch.setattr(app, "FloatingToast", Mock())
-    app.MainWindow.generate_pdf(window)
+
+    if case == "eligible":
+        assert worker._revalidate_receipt_edit(job)["billing_claim_acquired_at"] == (
+            attention.billing_claim_acquired_at
+        )
+    else:
+        with pytest.raises(
+            RuntimeError if case == "error" else app.AdmissionAttentionUnavailableError
+        ):
+            worker._revalidate_receipt_edit(job)
+
     assert (
         query.call_args.kwargs["global_attention_id"] == attention.global_attention_id
     )
     assert release.call_count == int(case == "excluded")
-    assert (
-        window.current_admission_attention["billing_claim_acquired_at"]
-        == attention.billing_claim_acquired_at
-    )

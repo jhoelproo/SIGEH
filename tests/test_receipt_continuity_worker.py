@@ -194,15 +194,15 @@ def test_cached_catalog_restores_without_central_reads(monkeypatch):
 
 
 @pytest.mark.parametrize("central_available", [True, False])
-def test_cut_during_final_admission_check_submits_pending_local_copy(
-    monkeypatch, central_available
+def test_receipt_click_leaves_network_fallback_to_the_background_worker(
+    worker, monkeypatch, central_available
 ):
     from PySide6.QtCore import QDate
 
     snapshot = {
         "attention_id": 9,
         "source_instance_id": "SOURCE",
-        "global_attention_id": "global",
+        "global_attention_id": "11111111-1111-4111-8111-111111111111",
     }
     window = Mock(
         _pending_ars_correction=None,
@@ -210,7 +210,8 @@ def test_cut_during_final_admission_check_submits_pending_local_copy(
         editing_recibo_id=None,
         editing_recibo_numero=None,
         current_admission_attention=snapshot,
-        current_user={"role": app.ROLE_ADMIN},
+        current_verification_bypass=None,
+        current_user={"role": app.ROLE_ADMIN, "username": "demo"},
         session_id="session",
         _last_generate_time=0,
         current_ars="ARS DEMO",
@@ -231,10 +232,23 @@ def test_cut_during_final_admission_check_submits_pending_local_copy(
     )
     app.MainWindow.generate_pdf(window)
     submitted = window.pdf_worker.submit.call_args.args[0]
-    assert submitted["force_local"] is True
     assert submitted["admission_attention"] == snapshot
     assert submitted["total_general"] == 500
-    assert central.call_count == int(central_available)
+    central.assert_not_called()
+    window.btn_generate.setEnabled.assert_called_once_with(False)
+    window._last_generate_time = 0
+    app.MainWindow.generate_pdf(window)
+    window.pdf_worker.submit.assert_called_once()
+
+    number = Mock(side_effect=ConnectionError("server closed the connection"))
+    monkeypatch.setattr(app, "get_next_recibo_number", number)
+    if not central_available:
+        worker._local_retry_gate.failed(ConnectionError("server closed the connection"))
+    worker.process(submitted)
+
+    assert number.call_count == int(central_available)
+    assert local_receipt_store().rows("demo")[0]["state"] == "PENDING"
+    assert worker.signals.finished_signal.emit.call_args.args[0] is True
 
 
 def test_idle_sync_creates_service_but_empty_queue_never_contacts_central(

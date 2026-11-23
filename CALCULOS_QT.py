@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 import uuid
+from weakref import WeakValueDictionary
 import tempfile
 import logging
 from dataclasses import dataclass, field
@@ -30,7 +31,6 @@ try:
 except ImportError:
     requests = None
 
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
@@ -121,7 +121,7 @@ except ImportError:
     psycopg2 = None
     pool = None
 
-from PySide6.QtCore import Qt, QSize, QDate, QTimer, QObject, QEvent, Signal, Slot, QThread, QRect, QRectF, QPoint, QPointF, QLocale, QSignalBlocker, QSettings  # type: ignore
+from PySide6.QtCore import Qt, QSize, QDate, QTimer, QObject, QEvent, QItemSelectionModel, QThreadPool, Signal, Slot, QThread, QRect, QRectF, QPoint, QPointF, QLocale, QSignalBlocker, QSettings  # type: ignore
 from PySide6.QtGui import QPixmap, QColor, QAction, QCursor, QKeySequence, QShortcut, QPainter, QBrush, QPen, QPolygonF, QTextDocument, QTextCursor, QIcon, QPageLayout, QPageSize, QFontMetrics, QPalette, QFont  # type: ignore
 from PySide6.QtPdf import QPdfDocument  # type: ignore
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog, QPrintPreviewDialog  # type: ignore
@@ -5157,6 +5157,46 @@ def mutate_universal_catalog(
         )
 
 
+def delete_universal_catalog_selection(
+    category, item_ids, *, current_user, confirmed_active_ids=(),
+):
+    from billing_item_rule_store import _administrator
+    from catalog_removal import delete_catalog_items
+
+    if not user_is_admin(current_user):
+        raise PermissionError("Solo el administrador puede gestionar el catálogo.")
+    if category not in UNIVERSAL_CATEGORIES:
+        raise ValueError("Categoría universal inválida.")
+    device_id, device_name = _local_device_identity()
+    with db_connect() as con:
+        admin = _administrator(con, current_user, user_is_admin)
+        rows = delete_catalog_items(
+            con, category, item_ids, confirmed_active_ids=confirmed_active_ids,
+        )
+        if rows:
+            _audit_catalog_deletions(con, admin, category, rows, device_id, device_name)
+    return len(rows)
+
+
+def _audit_catalog_deletions(con, admin, category, rows, device_id, device_name):
+    names = [row["nombre"] for row in rows]
+    details = [
+        _sanitize_audit_details(
+            _catalog_mutation_details(category, name, "", "DELETE", 0, device_id, device_name)
+        )
+        for name in names
+    ]
+    con.execute(
+        """INSERT INTO action_history(
+               username,action,details,role_snapshot,module,entity_type,entity_id,ars_name,created_at
+           ) SELECT %s,'CATALOG_DELETE',deleted_item.details,%s,'Facturación','catálogo_universal',
+                    deleted_item.entity_id,'CATÁLOGO UNIVERSAL',%s
+             FROM unnest(%s::text[], %s::text[]) AS deleted_item(entity_id,details)""",
+        (admin["username"], admin["role"], now_str(),
+         [f"{category}|{name}" for name in names], details),
+    )
+
+
 def _catalog_mutation_details(
     category, name, new_name, action, base_price, device_id, device_name
 ):
@@ -5405,6 +5445,18 @@ def _apply_billing_projection_outcome(
         )
 
 
+def _billing_projection_lookup(attention_id, source, global_id):
+    if global_id:
+        try:
+            normalized_uuid = str(uuid.UUID(global_id))
+        except ValueError:
+            return "FALSE", ()
+        return "p.global_attention_id=%s::uuid", (normalized_uuid,)
+    if source:
+        return "p.attention_id=%s AND p.source_instance_id=%s", (attention_id, source)
+    return "p.attention_id=%s", (attention_id,)
+
+
 def evaluate_attention_billing_eligibility(
     attention_id: int,
     user_context=None,
@@ -5426,6 +5478,7 @@ def evaluate_attention_billing_eligibility(
         return _evaluate_hybrid_eligibility(None, dict(user_context or {}))
     source = str(source_instance_id or "").strip()
     global_id = str(global_attention_id or "").strip()
+    identity_sql, identity_params = _billing_projection_lookup(identity, source, global_id)
     receipt_identity = admission_receipt_identity_sql("receipt", "p")
     inherited_scope = inherited_attention_sql("p", "active", "inheritance")
     eligibility_sql = "".join((
@@ -5480,11 +5533,7 @@ def evaluate_attention_billing_eligibility(
                 AND inheritance.attention_id=p.attention_id
                 AND inheritance.turno_origen_id=p.turn_id
                 AND inheritance.estado='PENDIENTE'
-               WHERE (
-                       (%s<>'' AND p.global_attention_id::TEXT=%s)
-                    OR (%s='' AND p.attention_id=%s
-                        AND (%s='' OR p.source_instance_id=%s))
-               )
+               WHERE {identity_sql}
                ORDER BY p.synced_at DESC LIMIT 1""",
     ))
     params = (
@@ -5492,8 +5541,7 @@ def evaluate_attention_billing_eligibility(
                 str(os.environ.get("COMPUTERNAME") or "ESTACION"),
                 str(dict(user_context or {}).get("username") or ""),
                 receipt_id,
-                global_id, global_id, global_id,
-                identity, source, source,
+                *identity_params,
     )
     if connection is not None:
         rows = connection.execute(eligibility_sql, params).fetchall()
@@ -11172,13 +11220,13 @@ def _lock_and_validate_admission_processing(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
         (f"admission-billing:{source}:{attention_id}",),
     )
+    identity_sql, identity_params = _billing_projection_lookup(attention_id, source, global_id)
     locked = con.execute(
-        """SELECT p.attention_id,p.source_instance_id
-           FROM admission_attention_projection p
-           WHERE ((%s<>'' AND p.global_attention_id::TEXT=%s)
-              OR (%s='' AND p.attention_id=%s AND p.source_instance_id=%s))
-           FOR UPDATE OF p""",
-        (global_id, global_id, global_id, attention_id, source),
+        f"""SELECT p.attention_id,p.source_instance_id
+            FROM admission_attention_projection p
+            WHERE {identity_sql}
+            FOR UPDATE OF p""",
+        identity_params,
     ).fetchone()
     if not locked:
         raise AdmissionAttentionUnavailableError("ATTENTION_NOT_FOUND")
@@ -11447,6 +11495,7 @@ def save_receipt_with_items(
     exemption_reason="",
     local_request_id="",
     local_request_hash="",
+    committed_document=None,
 ):
     """Guarda cabecera, ítems, historial y snapshot con un solo commit."""
     from receipt_edit_integrity import receipt_service_date, require_same_insurance
@@ -11479,7 +11528,6 @@ def save_receipt_with_items(
     if self_pay and normalize_role(actor_user.get("role")) not in ROLE_PERMISSIONS:
         raise PermissionError("El usuario no está autorizado para registrar cobros.")
     if bypass_data and not admission_attention:
-        actor_user = get_user(str(username or "")) or actor_user
         bypass_reason = str(bypass_data.get("reason") or "").strip()
         if not can_bypass_patient_verification(actor_user):
             raise PermissionError(
@@ -11517,7 +11565,6 @@ def save_receipt_with_items(
             or str(attention_data.get("coverage_status") or "")
             == COVERAGE_UNINSURED_DECLARED
         ):
-            actor_user = get_user(str(username or "")) or actor_user
             if not can_view_uninsured_patients(actor_user):
                 raise PermissionError(
                     "Tu rol no puede facturar pacientes sin seguro."
@@ -12143,6 +12190,9 @@ def save_receipt_with_items(
             from receipt_command_sync import confirm_receipt_request
             confirm_receipt_request(con, local_request_id, local_request_hash, saved_id)
 
+    if committed_document is not None:
+        committed_document.update(document_version)
+        committed_document["receipt_number"] = document_version["snapshot"]["header"]["receipt_number"]
     return saved_id
 
 def _receipt_actor(actor):
@@ -16558,7 +16608,8 @@ def draw_footer(c, page_w, current_user):
     c.drawCentredString(page_w / 2, band_y + 0.03 * inch, "Gracias por confiar en nuestros servicios - Hospital Provincial Dr. Ángel Contreras Mejía")
 
 
-_receipt_render_lock = threading.RLock()
+_receipt_render_registry_lock = threading.Lock()
+_receipt_render_locks = WeakValueDictionary()
 
 
 def _receipt_snapshot_render_data(document_record):
@@ -16647,7 +16698,9 @@ def _receipt_snapshot_cache_path(document_record):
 
 def render_receipt_snapshot_pdf(document_record, renderer=None):
     output_path = _receipt_snapshot_cache_path(document_record)
-    with _receipt_render_lock:
+    with _receipt_render_registry_lock:
+        output_lock = _receipt_render_locks.setdefault(output_path, threading.Lock())
+    with output_lock:
         if output_path.exists() and output_path.stat().st_size > 0:
             return str(output_path)
         temporary_path = output_path.with_name(
@@ -17364,6 +17417,35 @@ class PDFStorageSyncWorker(QThread):
 class PDFWorkerSignals(QObject):
     finished_signal = Signal(bool, str, str, int)
     sync_requested = Signal(int, str, str)
+    print_failed = Signal()
+
+
+def _open_generated_receipt(pdf_path):
+    try:
+        if open_file_path(pdf_path):
+            return
+        import webbrowser
+
+        if webbrowser.open(Path(pdf_path).resolve().as_uri()):
+            return
+    except Exception:
+        pass
+    write_runtime_log("RECEIPT_PREVIEW_OPEN_FAILED")
+
+
+def _print_generated_receipt(pdf_path, on_failure):
+    started = perf_counter()
+    try:
+        v15 = load_v15_application_module()
+        if not v15.imprimir_pdf(pdf_path, copias=1, propagar_error=True):
+            raise RuntimeError("La impresora rechazó el recibo.")
+    except Exception as exc:
+        write_runtime_log(f"RECEIPT_PRINT_FAILED error_type={type(exc).__name__}")
+        on_failure()
+    else:
+        write_pdf_performance(
+            f"Impresión automática de recibo | enviado={(perf_counter() - started) * 1000:.1f}ms"
+        )
 
 
 def _local_receipt_actor(job):
@@ -17933,6 +18015,28 @@ class PDFDatabaseWorker(threading.Thread):
         )
         return pdf_path, storage_mode
 
+    def _revalidate_receipt_edit(self, job):
+        attention = job["admission_attention"]
+        try:
+            live = query_final_receipt_attention(
+                attention, job["current_user"], str(job.get("admission_session_id") or ""),
+                job["editing_id"],
+                global_attention_id=str(attention.get("global_attention_id") or ""),
+                central_available=self.can_contact_central,
+            )
+        except ValueError as exc:
+            raise AdmissionAttentionUnavailableError(
+                getattr(exc, "reason_code", "ADMISSION_DATA_CHANGED"), str(exc),
+            ) from exc
+        if not live:
+            schedule_admission_claim_release(
+                attention, session_id=str(job.get("admission_session_id") or ""),
+            )
+            raise AdmissionAttentionUnavailableError("ATTENTION_NOT_FOUND")
+        verified = live.snapshot()
+        verified["billing_claim_acquired_at"] = attention.get("billing_claim_acquired_at", "")
+        return verified
+
     def process(self, job):
         """Guarda el snapshot y reconstruye una copia temporal para abrir/imprimir."""
         patient = job["patient"]
@@ -17954,6 +18058,8 @@ class PDFDatabaseWorker(threading.Thread):
             billing_authorization(authorization)
             require_preliminary_authorization_for_user(current_user, authorization, coverage)
             validate_receipt_job_date(job)
+            if editing_id is not None and job.get("admission_attention"):
+                job = {**job, "admission_attention": self._revalidate_receipt_edit(job)}
             local_request_id, local_request_hash, handled = self._prepare_local_job(job)
             if handled:
                 return
@@ -17978,6 +18084,7 @@ class PDFDatabaseWorker(threading.Thread):
             )
             number_elapsed = perf_counter() - number_started
             database_started = perf_counter()
+            committed_document = {}
             receipt_id = save_receipt_with_items(
                 editing_id,
                 receipt_number,
@@ -18006,12 +18113,17 @@ class PDFDatabaseWorker(threading.Thread):
                 exemption_reason=str(job.get("exemption_reason") or ""),
                 local_request_id=local_request_id,
                 local_request_hash=local_request_hash,
+                committed_document=committed_document,
             )
             self._confirm_local_command(local_request_id, receipt_id, receipt_number)
             database_elapsed = perf_counter() - database_started
             try:
                 render_started = perf_counter()
-                pdf_path, storage_mode = self._render_saved_receipt(receipt_id)
+                if committed_document:
+                    pdf_path = render_receipt_snapshot_pdf(committed_document, renderer=self.renderer)
+                    storage_mode = committed_document["storage_mode"]
+                else:
+                    pdf_path, storage_mode = self._render_saved_receipt(receipt_id)
                 if storage_mode in (STORAGE_LEGACY, STORAGE_HYBRID):
                     legacy_filename = f"recibo_{int(receipt_number)}.pdf"
                     legacy_path = stable_storage_path(
@@ -20358,6 +20470,13 @@ class UniversalCatalogWorker(QThread):
                 result = set_medication_markup_percent(
                     self.payload["percent"], self.payload["current_user"]
                 )
+            elif self.operation == "DELETE_SELECTION":
+                deleted_count = delete_universal_catalog_selection(
+                    self.payload["category"], self.payload["ids"],
+                    current_user=self.payload["current_user"],
+                    confirmed_active_ids=self.payload["confirmed_active_ids"],
+                )
+                result = {"ids": self.payload["ids"], "count": deleted_count}
             else:
                 mutate_universal_catalog(
                     self.operation,
@@ -20384,6 +20503,7 @@ class UniversalCatalogAdminDialog(QDialog):
         self._worker = None
         self._catalog_data = {"items": [], "markup": DEFAULT_MEDICATION_MARKUP_PERCENT}
         self.catalog_changed = False
+        self._catalog_reload_status = ""
         self.setWindowTitle("Catálogo de Medicamentos y Materiales")
         from admission_history_layout import fit_history_dialog
 
@@ -20398,6 +20518,9 @@ class UniversalCatalogAdminDialog(QDialog):
         self.tables = {}
         self.searches = {}
         self.action_buttons = []
+        self.single_item_buttons = {}
+        self.delete_buttons = {}
+        self.selection_labels = {}
         self._build_category_tab("Medicamentos", layout_markup=True)
         self._build_category_tab("Materiales", layout_markup=False)
         layout.addWidget(self.tabs, 1)
@@ -20437,7 +20560,7 @@ class UniversalCatalogAdminDialog(QDialog):
         table = QTableWidget(0, len(columns))
         table.setHorizontalHeaderLabels(columns)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -20445,28 +20568,41 @@ class UniversalCatalogAdminDialog(QDialog):
             lambda position, c=category: self._show_catalog_menu(c, position)
         )
         page_layout.addWidget(table, 1)
+        selection_label = QLabel()
+        selection_label.setWordWrap(True)
+        page_layout.addWidget(selection_label)
+        self.selection_labels[category] = selection_label
         actions = QHBoxLayout()
-        for text, callback in (
-            ("Agregar", lambda _=False, c=category: self._add_item(c)),
-            ("Editar", lambda _=False, c=category: self._edit_item(c)),
-            ("Activar / desactivar", lambda _=False, c=category: self._toggle_item(c)),
-            ("Eliminar", lambda _=False, c=category: self._delete_item(c)),
+        self.single_item_buttons[category] = []
+        for text, callback, selection in (
+            ("Agregar", lambda _=False, c=category: self._add_item(c), "any"),
+            ("Editar", lambda _=False, c=category: self._edit_item(c), "single"),
+            ("Activar / desactivar", lambda _=False, c=category: self._toggle_item(c), "single"),
+            ("Eliminar selección", lambda _=False, c=category: self._delete_item(c), "multiple"),
         ):
             button = QPushButton(text)
             button.clicked.connect(callback)
             actions.addWidget(button)
             self.action_buttons.append(button)
+            if selection == "multiple":
+                self.delete_buttons[category] = button
+                set_button_role(button, "danger")
+            elif selection == "single":
+                self.single_item_buttons[category].append(button)
         if category == "Medicamentos":
             self.material_links_button = QPushButton("Materiales vinculados")
             self.material_links_button.clicked.connect(self._edit_material_links)
             actions.addWidget(self.material_links_button)
             self.action_buttons.append(self.material_links_button)
+            self.single_item_buttons[category].append(self.material_links_button)
         actions.addStretch(1)
         page_layout.addLayout(actions)
-        search.textChanged.connect(lambda text, t=table: filter_table_widget(t, text))
+        search.textChanged.connect(lambda text, c=category: self._filter_catalog(c, text))
         self.searches[category] = search
         self.tables[category] = table
+        table.itemSelectionChanged.connect(lambda c=category: self._update_catalog_selection(c))
         self.tabs.addTab(page, category)
+        self._update_catalog_selection(category)
 
     def _show_catalog_menu(self, category, position):
         if self._worker is not None:
@@ -20474,33 +20610,46 @@ class UniversalCatalogAdminDialog(QDialog):
         table = self.tables[category]
         index = table.indexAt(position)
         if index.isValid():
-            table.selectRow(index.row())
+            if not table.selectionModel().isRowSelected(index.row()):
+                table.setCurrentCell(
+                    index.row(), 0,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+                )
         else:
             table.clearSelection()
             table.setCurrentCell(-1, -1)
         menu = QMenu(table)
+        count = len(self._selected_catalog_rows(category))
         callbacks = (
-            ("Agregar", lambda: self._add_item(category)),
-            ("Editar", lambda: self._edit_item(category)),
-            ("Activar / desactivar", lambda: self._toggle_item(category)),
-            ("Eliminar", lambda: self._delete_item(category)),
+            ("Agregar", lambda: self._add_item(category), True),
+            ("Editar", lambda: self._edit_item(category), count == 1),
+            ("Activar / desactivar", lambda: self._toggle_item(category), count == 1),
+            ("Eliminar selección", lambda: self._delete_item(category), count > 0),
         )
-        for label, callback in callbacks:
-            action = menu.addAction(label, callback)
-            action.setEnabled(label == "Agregar" or index.isValid())
+        for label, callback, enabled in callbacks:
+            menu.addAction(label, callback).setEnabled(enabled)
         if category == "Medicamentos":
             action = menu.addAction("Materiales vinculados", self._edit_material_links)
-            action.setEnabled(index.isValid())
+            action.setEnabled(count == 1)
         self._catalog_menu = menu
         menu.aboutToHide.connect(menu.deleteLater)
         menu.popup(table.viewport().mapToGlobal(position))
 
-    def _selected(self, category: str):
+    def _filter_catalog(self, category, term):
         table = self.tables[category]
-        row = table.currentRow()
-        if row < 0:
-            FloatingToast("Selecciona un elemento.", self, is_error=True).show()
-            return None
+        table.clearSelection()
+        filter_table_widget(table, term)
+
+    def _selected_catalog_rows(self, category):
+        table = self.tables[category]
+        return [
+            self._catalog_selection_row(table, index.row())
+            for index in table.selectionModel().selectedRows()
+            if not table.isRowHidden(index.row())
+        ]
+
+    @staticmethod
+    def _catalog_selection_row(table, row):
         return {
             "name": table.item(row, 0).text(),
             "id": table.item(row, 0).data(Qt.ItemDataRole.UserRole),
@@ -20508,9 +20657,32 @@ class UniversalCatalogAdminDialog(QDialog):
             "active": table.item(row, table.columnCount() - 1).text() == "Activo",
         }
 
+    def _update_catalog_selection(self, category):
+        selected = self._selected_catalog_rows(category)
+        count = len(selected)
+        active = sum(item["active"] for item in selected)
+        summary = f"Seleccionados: {count}" if count else ""
+        if active:
+            summary += f" · Activos en la selección: {active}"
+        self.selection_labels[category].setText(summary)
+        available = self._worker is None
+        for button in self.single_item_buttons[category]:
+            button.setEnabled(available and count == 1)
+        self.delete_buttons[category].setEnabled(available and count > 0)
+
+    def _selected(self, category: str):
+        selected = self._selected_catalog_rows(category)
+        if len(selected) != 1:
+            FloatingToast("Selecciona un solo elemento.", self, is_error=True).show()
+            return None
+        return selected[0]
+
     def _set_busy(self, busy: bool, message=""):
         for button in self.action_buttons:
             button.setEnabled(not busy)
+        if not busy:
+            for category in self.tables:
+                self._update_catalog_selection(category)
         if message:
             self.status_label.setText(message)
 
@@ -20537,8 +20709,17 @@ class UniversalCatalogAdminDialog(QDialog):
             self._catalog_data = dict(result or {})
             self.markup_spin.setValue(float(self._catalog_data.get("markup") or 0.0))
             self._populate_tables()
-            self._set_busy(False, "Catálogo central actualizado.")
+            self._set_busy(False, self._catalog_reload_status or "Catálogo central actualizado.")
+            self._catalog_reload_status = ""
             return
+        if operation == "DELETE_SELECTION":
+            deleted_ids = set(result["ids"])
+            self._catalog_data["items"] = [
+                item for item in self._catalog_data.get("items", [])
+                if item["id"] not in deleted_ids
+            ]
+            self._populate_tables()
+            self._catalog_reload_status = f"Ítems eliminados del catálogo central: {result['count']}."
         self.catalog_changed = True
         ARS_RUNTIME_CACHE.invalidate()
         self._set_busy(False, "Cambio guardado correctamente.")
@@ -20554,6 +20735,8 @@ class UniversalCatalogAdminDialog(QDialog):
         if getattr(self, "_reload_catalog_after_write", False):
             self._reload_catalog_after_write = False
             self.reload_async()
+        else:
+            self._set_busy(False)
 
     def done(self, result):
         if self._worker is None:
@@ -20580,6 +20763,7 @@ class UniversalCatalogAdminDialog(QDialog):
                 for column, value in enumerate(values):
                     cell = self._catalog_cell(value, column, item, base)
                     table.setItem(row, column, cell)
+            self._filter_catalog(category, self.searches[category].text())
         self._update_markup_example()
 
     @staticmethod
@@ -20659,15 +20843,59 @@ class UniversalCatalogAdminDialog(QDialog):
             )
 
     def _delete_item(self, category: str):
-        selected = self._selected(category)
-        if not selected:
+        selected = self._selected_catalog_rows(category)
+        if not selected or self._worker is not None:
             return
-        answer = QMessageBox.question(
-            self, "Eliminar", f"¿Eliminar definitivamente '{selected['name']}' del catálogo?\nLos conceptos de los recibos guardados se conservan.",
+        active = [row for row in selected if row["active"]]
+        if active:
+            selected = self._confirm_active_catalog_deletion(selected, active)
+        elif QMessageBox.question(
+            self, "Eliminar ítems inactivos",
+            f"¿Eliminar definitivamente los {len(selected)} ítems seleccionados del catálogo central? "
+            "Los conceptos de los recibos guardados se conservan.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        if selected:
+            self._start_worker(
+                "DELETE_SELECTION",
+                {
+                    "category": category,
+                    "ids": [row["id"] for row in selected],
+                    "confirmed_active_ids": [row["id"] for row in selected if row["active"]],
+                    "current_user": self.current_user,
+                },
+                "Eliminando selección del catálogo central...",
+            )
+
+    def _confirm_active_catalog_deletion(self, selected, active):
+        box = QMessageBox(self)
+        box.setWindowTitle("La selección contiene activos")
+        box.setIcon(QMessageBox.Warning)
+        inactive_count = len(selected) - len(active)
+        box.setText(f"Activos: {len(active)} · Inactivos: {inactive_count}")
+        names = ", ".join(row["name"] for row in active[:5])
+        if len(active) > 5:
+            names += f" y {len(active) - 5} más"
+        box.setInformativeText(
+            f"Activos seleccionados: {names}. Se retirarán de Facturación si confirmas su borrado."
         )
-        if answer == QMessageBox.Yes:
-            self._mutate("DELETE", category, selected["name"], selected["name"], selected["price"])
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        delete_all = box.addButton("Eliminar incluidos los activos", QMessageBox.DestructiveRole)
+        delete_inactive = (
+            box.addButton("Eliminar solo inactivos", QMessageBox.ActionRole)
+            if inactive_count else None
+        )
+        cancel = box.addButton(QMessageBox.Cancel)
+        cancel.setText("Cancelar")
+        box.setDefaultButton(cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is delete_all:
+            return selected
+        if delete_inactive is not None and clicked is delete_inactive:
+            return [row for row in selected if not row["active"]]
+        return []
 
     def _mutate(self, operation, category, name, new_name, price):
         self._start_worker(
@@ -32611,23 +32839,25 @@ class AdmissionHistoryEligibilityWorker(QThread):
         self.session_id = str(session_id or "")
         self.projection_repair = projection_repair
 
+    def _evaluate_selection(self, global_attention_id):
+        return evaluate_attention_billing_eligibility(
+            int(self.row_data.get("attention_id") or 0),
+            self.current_user,
+            source_instance_id=str(self.row_data.get("source_instance_id") or "LEGACY"),
+            global_attention_id=global_attention_id,
+            session_id=self.session_id,
+        )
+
     def run(self):
         started = perf_counter()
         try:
             global_attention_id = str(
                 self.row_data.get("global_attention_id") or ""
             ).strip()
-            if global_attention_id and callable(self.projection_repair):
-                self.projection_repair(global_attention_id)
-            result = evaluate_attention_billing_eligibility(
-                int(self.row_data.get("attention_id") or 0),
-                self.current_user,
-                source_instance_id=str(
-                    self.row_data.get("source_instance_id") or "LEGACY"
-                ),
-                global_attention_id=global_attention_id,
-                session_id=self.session_id,
-            )
+            result = self._evaluate_selection(global_attention_id)
+            if not result.get("_projection") and global_attention_id and callable(self.projection_repair):
+                if self.projection_repair(global_attention_id):
+                    result = self._evaluate_selection(global_attention_id)
             self.resolved.emit(result, (perf_counter() - started) * 1000.0)
         except Exception as exc:
             elapsed_ms = (perf_counter() - started) * 1000.0
@@ -34361,6 +34591,7 @@ class MainWindow(QMainWindow):
         )
         self.pdf_worker.signals.finished_signal.connect(self.on_pdf_generated)
         self.pdf_worker.signals.sync_requested.connect(self.pdf_sync_worker.enqueue)
+        self.pdf_worker.signals.print_failed.connect(self._show_receipt_print_failure)
         self.pdf_worker.start()
 
     def _build_ui(self):
@@ -37653,10 +37884,11 @@ class MainWindow(QMainWindow):
         return True
 
     def generate_pdf(self):
+        if getattr(self, "_receipt_save_in_progress", False) is True:
+            return
         if getattr(self, "_pending_ars_correction", None):
             QMessageBox.information(self, "Cambio de ARS", "Espere a que se cargue y recalcule la nueva tarifa.")
             return
-        force_local = False
         self.mark_activity()
         if self.receipt_read_only:
             QMessageBox.information(
@@ -37699,58 +37931,6 @@ class MainWindow(QMainWindow):
                 ).show()
                 self.btn_validate_admission.setFocus()
                 return
-        if self.current_admission_attention:
-            try:
-                live_attention = query_final_receipt_attention(
-                    self.current_admission_attention, self.current_user,
-                    self.session_id, self.editing_recibo_id,
-                    global_attention_id=str(self.current_admission_attention.get("global_attention_id") or ""),
-                    central_available=getattr(getattr(self, "pdf_worker", None), "can_contact_central", True),
-                )
-            except ValueError as exc:
-                QMessageBox.warning(self, "Verificar Admisión", str(exc))
-                write_runtime_log(
-                    "BILLING_FINAL_ELIGIBILITY rejected "
-                    f"reason={getattr(exc, 'reason_code', 'ADMISSION_DATA_CHANGED')}"
-                )
-                return
-            except Exception as exc:
-                if self.editing_recibo_id is None and is_temporary_connection_error(exc):
-                    force_local = True
-                else:
-                    QMessageBox.critical(
-                        self, "Verificar Admisión",
-                        "No se pudo verificar la atención central. El recibo no se guardó.",
-                    )
-                    write_runtime_log(f"BILLING_FINAL_ELIGIBILITY query_failed exception_type={type(exc).__name__}")
-                    return
-            if not force_local:
-                if not live_attention:
-                    schedule_admission_claim_release(
-                        self.current_admission_attention, session_id=self.session_id,
-                    )
-                    QMessageBox.warning(
-                        self,
-                        "Atención excluida",
-                        "La atención fue anulada, cambió a Urgencia o dejó de estar "
-                        "disponible. El recibo no se guardó.",
-                    )
-                    return
-                claim_time = self.current_admission_attention.get("billing_claim_acquired_at", "")
-                self.current_admission_attention = live_attention.snapshot()
-                self.current_admission_attention["billing_claim_acquired_at"] = claim_time
-                live_ars = str(
-                    self.current_admission_attention.get("canonical_ars")
-                    or self.current_admission_attention.get("ars")
-                    or ""
-                )
-                if live_ars and not medication_ars_is_selectable(live_ars):
-                    QMessageBox.information(
-                        self,
-                        "Facturación de medicamentos",
-                        "SENASA SUBSIDIADO no se factura en este módulo.",
-                    )
-                    return
         patient = self.name_edit.text().strip()
         if not patient:
             FloatingToast("❌ El nombre del paciente es obligatorio", self, is_error=True).show()
@@ -37808,11 +37988,11 @@ class MainWindow(QMainWindow):
             FloatingToast("No hay ítems para facturar", self, is_error=True).show()
             return
 
+        self._receipt_save_in_progress = True
         self.btn_generate.setEnabled(False)
         self.btn_generate.setText("⏳ Generando y guardando...")
 
         self.pdf_worker.submit({
-            "force_local": force_local,
             "patient": patient,
             "date_str": date_str,
             "dx_raw": dx_raw,
@@ -37837,47 +38017,22 @@ class MainWindow(QMainWindow):
             "exemption_reason": self.exemption_reason_edit.text() if self_pay else "",
         })
 
-    def _send_ctrl_p(self):
-        try:
-            import time
-            time.sleep(0.6)
-            import ctypes
-            ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(0x50, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(0x50, 0, 2, 0)
-            ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)
-        except Exception as e:
-            print(f"[PDF] Error al enviar Ctrl+P: {e}")
+    @Slot()
+    def _show_receipt_print_failure(self):
+        FloatingToast(
+            "Recibo guardado. Revisa la cola de impresión antes de imprimirlo manualmente.",
+            self,
+            is_error=True,
+        ).show()
 
     def _open_pdf_after_generation(self, pdf_path: str, auto_print: bool = False):
-        try:
-            if not os.path.exists(pdf_path):
-                print(f"[PDF] Archivo no encontrado: {pdf_path}")
-                return
-            if sys.platform == "win32":
-                try:
-                    os.startfile(pdf_path)
-                except Exception as e:
-                    print(f"[PDF] os.startfile falló: {e}")
-                    try:
-                        startupinfo = subprocess.STARTUPINFO()
-                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                        subprocess.Popen(["cmd", "/c", "start", "", pdf_path], startupinfo=startupinfo)
-                    except Exception as e2:
-                        print(f"[PDF] Error al abrir PDF (fallback): {e2}")
-                        return
-                if auto_print:
-                    QTimer.singleShot(800, self._send_ctrl_p)
-                    FloatingToast("🖨️ Abriendo panel de impresión...", self).show()
-            else:
-                open_file_path(pdf_path)
-        except Exception as e:
-            print(f"[PDF] Error al abrir/Imprimir PDF: {e}")
-            try:
-                import webbrowser
-                webbrowser.open(f"file:///{pdf_path}")
-            except Exception as e2:
-                print(f"[PDF] Error al abrir PDF (fallback): {e2}")
+        if not os.path.isfile(pdf_path):
+            return
+        pool = QThreadPool.globalInstance()
+        if auto_print:
+            print_failed = self.pdf_worker.signals.print_failed
+            pool.start(lambda: _print_generated_receipt(pdf_path, print_failed.emit))
+        pool.start(lambda: _open_generated_receipt(pdf_path))
 
     def _handle_local_receipt_reopen(self, message, pdf_path):
         if str(message).startswith("__LOCAL_RECEIPT_REOPENED__:"):
@@ -37891,6 +38046,12 @@ class MainWindow(QMainWindow):
     def on_pdf_generated(self, success, message, pdf_path, recibo_number):
         if self._handle_local_receipt_reopen(message, pdf_path):
             return
+        self._receipt_save_in_progress = False
+        render_failed = str(message).startswith("__RECEIPT_SAVED_RENDER_ERROR__:")
+        if success and pdf_path and not render_failed:
+            self._open_pdf_after_generation(
+                pdf_path, auto_print=bool(self.preferences.get("auto_print"))
+            )
         selected_date_before_reset = self.date_edit.date()
 
         self.btn_generate.setEnabled(True)
@@ -37904,7 +38065,7 @@ class MainWindow(QMainWindow):
             FloatingToast(saved_message, self).show()
             if local_saved and not pdf_path:
                 QMessageBox.warning(self, "Recibo local guardado", "Los datos están guardados localmente, pero la copia PDF no pudo generarse. Puede recuperarla desde Recibos locales.")
-            if str(message).startswith("__RECEIPT_SAVED_RENDER_ERROR__:"):
+            if render_failed:
                 QMessageBox.warning(
                     self,
                     "Recibo guardado",
@@ -37912,9 +38073,6 @@ class MainWindow(QMainWindow):
                     "pero no fue posible generar la copia temporal:\n"
                     + str(message).split(":", 1)[1],
                 )
-            elif pdf_path:
-                auto_print = bool(self.preferences.get("auto_print"))
-                self._open_pdf_after_generation(pdf_path, auto_print=auto_print)
         else:
             if str(message).startswith("__ADMISSION_UNAVAILABLE__:"):
                 QMessageBox.warning(
@@ -38293,6 +38451,7 @@ class MainWindow(QMainWindow):
             return
         self._validation_flow_started_at = perf_counter()
         self.btn_validate_admission.setEnabled(False)
+        self.btn_validate_admission.setText("Consultando atención…")
         worker = AdmissionHistoryEligibilityWorker(
             identity,
             self.current_user,
@@ -39428,9 +39587,9 @@ class PreferencesDialog(QDialog):
         note_guantes.setWordWrap(True)
         note_guantes.setObjectName("PreferenceNote")
 
-        self.chk_auto_print = QCheckBox("Intentar imprimir automáticamente al generar el PDF")
+        self.chk_auto_print = QCheckBox("Imprimir el recibo automáticamente")
         self.chk_auto_print.setChecked(bool(current_prefs.get("auto_print", False)))
-        note_print = QLabel("Nota: abre el diálogo de impresión, solo presiona Enter para confirmar.")
+        note_print = QLabel("Envía una copia a la impresora predeterminada y abre el PDF.")
         note_print.setWordWrap(True)
         note_print.setObjectName("PreferenceNote")
 

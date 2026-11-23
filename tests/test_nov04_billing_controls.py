@@ -95,8 +95,9 @@ def test_catalog_delete_reloads_and_exposes_failure_without_freezing(
         if fails:
             raise ValueError("No se guardó")
         records.clear()
+        return 1
 
-    monkeypatch.setattr(app, "mutate_universal_catalog", delete)
+    monkeypatch.setattr(app, "delete_universal_catalog_selection", delete)
     dialog = app.UniversalCatalogAdminDialog({"role": app.ROLE_ADMIN, "username": "QA"})
     dialog.show()
     QApplication.processEvents()
@@ -174,3 +175,210 @@ def test_removed_automations_cannot_be_reenabled_in_preferences():
         assert not hasattr(app.MainWindow, "maybe_auto_add_bajante_cateter")
     finally:
         dialog.close()
+
+
+@pytest.fixture
+def selection_catalog(monkeypatch):
+    items = [
+        {
+            "id": 10,
+            "categoria": "Medicamentos",
+            "nombre": "MED ACTIVO",
+            "precio": 5,
+            "is_active": 1,
+        },
+        {
+            "id": 11,
+            "categoria": "Medicamentos",
+            "nombre": "MED UNO",
+            "precio": 8,
+            "is_active": 0,
+        },
+        {
+            "id": 12,
+            "categoria": "Medicamentos",
+            "nombre": "MED DOS",
+            "precio": 9,
+            "is_active": 0,
+        },
+    ]
+    monkeypatch.setattr(
+        app, "load_universal_catalog_admin_data", lambda: {"markup": 35, "items": items}
+    )
+    dialog = app.UniversalCatalogAdminDialog({"role": app.ROLE_ADMIN, "username": "QA"})
+    dialog.show()
+    QApplication.processEvents()
+    settle(dialog, "_worker")
+    yield dialog
+    dialog.close()
+
+
+def select_catalog_rows(table, *rows):
+    from PySide6.QtCore import QItemSelectionModel
+
+    for row in rows:
+        table.selectionModel().select(
+            table.model().index(row, 0),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+
+
+@pytest.mark.parametrize(
+    "choice,deleted,confirmed",
+    [
+        ("Cancelar", [], []),
+        ("Eliminar solo inactivos", [11, 12], []),
+        ("Eliminar incluidos los activos", [10, 11, 12], [10]),
+    ],
+)
+def test_mixed_medication_selection_warns_and_only_sends_confirmed_ids(
+    selection_catalog,
+    monkeypatch,
+    choice,
+    deleted,
+    confirmed,
+):
+    from PySide6.QtCore import QTimer
+
+    dialog = selection_catalog
+    category = "Medicamentos"
+    table = dialog.tables[category]
+    select_catalog_rows(table, 0, 1, 2)
+    assert table.selectionMode() == app.QAbstractItemView.ExtendedSelection
+    assert "Activos en la selección: 1" in dialog.selection_labels[category].text()
+    assert dialog.delete_buttons[category].isEnabled()
+    assert all(
+        not button.isEnabled() for button in dialog.single_item_buttons[category]
+    )
+    launch = Mock()
+    monkeypatch.setattr(dialog, "_start_worker", launch)
+    observed = {}
+
+    def choose():
+        warning = QApplication.activeModalWidget()
+        observed["default"] = warning.defaultButton().text()
+        observed["details"] = warning.informativeText()
+        next(button for button in warning.buttons() if button.text() == choice).click()
+
+    QTimer.singleShot(0, choose)
+    dialog._delete_item(category)
+    assert observed["default"] == "Cancelar"
+    assert "MED ACTIVO" in observed["details"]
+    if deleted:
+        operation, payload, _status = launch.call_args.args
+        assert operation == "DELETE_SELECTION"
+        assert sorted(payload["ids"]) == deleted
+        assert payload["confirmed_active_ids"] == confirmed
+    else:
+        launch.assert_not_called()
+
+
+def test_right_click_preserves_the_selected_batch_and_search_clears_it(
+    selection_catalog,
+):
+    dialog = selection_catalog
+    category = "Medicamentos"
+    table = dialog.tables[category]
+    select_catalog_rows(table, 1, 2)
+    point = table.visualItemRect(table.item(1, 0)).center()
+    dialog._show_catalog_menu(category, point)
+    assert {row["id"] for row in dialog._selected_catalog_rows(category)} == {11, 12}
+    assert next(
+        action
+        for action in dialog._catalog_menu.actions()
+        if action.text() == "Eliminar selección"
+    ).isEnabled()
+    assert not next(
+        action for action in dialog._catalog_menu.actions() if action.text() == "Editar"
+    ).isEnabled()
+    dialog._catalog_menu.hide()
+    point = table.visualItemRect(table.item(0, 0)).center()
+    dialog._show_catalog_menu(category, point)
+    assert [row["id"] for row in dialog._selected_catalog_rows(category)] == [10]
+    dialog._catalog_menu.hide()
+
+    dialog.searches[category].setText("MED UNO")
+    assert dialog._selected_catalog_rows(category) == []
+    assert table.isRowHidden(0) and table.isRowHidden(2)
+    assert not dialog.delete_buttons[category].isEnabled()
+
+
+def test_inactive_only_batch_requires_default_negative_confirmation(
+    selection_catalog, monkeypatch
+):
+    dialog = selection_catalog
+    category = "Medicamentos"
+    select_catalog_rows(dialog.tables[category], 1, 2)
+    question = Mock(return_value=app.QMessageBox.No)
+    launch = Mock()
+    monkeypatch.setattr(app.QMessageBox, "question", question)
+    monkeypatch.setattr(dialog, "_start_worker", launch)
+    dialog._delete_item(category)
+    launch.assert_not_called()
+    assert question.call_args.args[-1] == app.QMessageBox.No
+    question.return_value = app.QMessageBox.Yes
+    dialog._delete_item(category)
+    payload = launch.call_args.args[1]
+    assert sorted(payload["ids"]) == [11, 12]
+    assert payload["confirmed_active_ids"] == []
+
+
+def test_active_only_warning_offers_cancel_by_default(selection_catalog, monkeypatch):
+    from PySide6.QtCore import QTimer
+
+    dialog = selection_catalog
+    category = "Medicamentos"
+    select_catalog_rows(dialog.tables[category], 0)
+    launch = Mock()
+    monkeypatch.setattr(dialog, "_start_worker", launch)
+    observed = {}
+
+    def choose():
+        warning = QApplication.activeModalWidget()
+        observed["buttons"] = {button.text() for button in warning.buttons()}
+        warning.defaultButton().click()
+
+    QTimer.singleShot(0, choose)
+    dialog._delete_item(category)
+    assert observed["buttons"] == {"Cancelar", "Eliminar incluidos los activos"}
+    launch.assert_not_called()
+
+
+def test_catalog_can_select_a_range_with_shift(selection_catalog):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    dialog = selection_catalog
+    table = dialog.tables["Medicamentos"]
+    first = table.visualItemRect(table.item(0, 0)).center()
+    last = table.visualItemRect(table.item(2, 0)).center()
+    QTest.mouseClick(table.viewport(), Qt.MouseButton.LeftButton, Qt.NoModifier, first)
+    QTest.mouseClick(
+        table.viewport(), Qt.MouseButton.LeftButton, Qt.ShiftModifier, last
+    )
+    assert {row["id"] for row in dialog._selected_catalog_rows("Medicamentos")} == {
+        10,
+        11,
+        12,
+    }
+
+
+def test_long_active_selection_dialog_lists_examples_and_remaining_count(
+    selection_catalog,
+):
+    from PySide6.QtCore import QTimer
+
+    dialog = selection_catalog
+    active = [{"name": f"MED {i}", "active": True} for i in range(7)]
+    observed = {}
+
+    def cancel():
+        warning = QApplication.activeModalWidget()
+        observed["details"] = warning.informativeText()
+        warning.defaultButton().click()
+
+    QTimer.singleShot(0, cancel)
+    assert dialog._confirm_active_catalog_deletion(active, active) == []
+    assert "y 2 más" in observed["details"]
+    assert "MED 6" not in observed["details"]

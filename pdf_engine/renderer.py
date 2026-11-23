@@ -267,6 +267,7 @@ class ReceiptPDFRenderer:
                 viewport={"width": 816, "height": 1056},
                 device_scale_factor=1,
             )
+            self._page.emulate_media(media="print")
         except Exception:
             self.close()
             raise
@@ -472,7 +473,6 @@ class ReceiptPDFRenderer:
 
         def create_pdf(page) -> None:
             page.set_content(html_content, wait_until="domcontentloaded", timeout=15_000)
-            page.emulate_media(media="print")
             page.pdf(
                 path=str(output_path),
                 format="Letter",

@@ -299,3 +299,87 @@ def test_individual_restriction_stops_the_remaining_admission_uploads():
     with pytest.raises(RuntimeError, match="Payment Required"):
         service.push_outbox()
     assert cloud.push_event.call_count == 1
+
+
+def test_worker_renders_the_committed_snapshot_without_rereading_central(
+    worker, monkeypatch
+):
+    snapshot = {"receipt_number": 11, "storage_mode": app.STORAGE_SNAPSHOT}
+
+    def save(*_args, committed_document, **_kwargs):
+        committed_document.update(snapshot)
+        return 7
+
+    monkeypatch.setattr(app, "get_next_recibo_number", Mock(return_value=11))
+    monkeypatch.setattr(app, "save_receipt_with_items", save)
+    render = Mock(return_value="central.pdf")
+    monkeypatch.setattr(app, "render_receipt_snapshot_pdf", render)
+    monkeypatch.setattr(app, "write_pdf_performance", Mock())
+    worker._render_saved_receipt = Mock(
+        side_effect=AssertionError("unexpected receipt lookup")
+    )
+
+    worker.process(job())
+
+    render.assert_called_once_with(snapshot, renderer=worker.renderer)
+    worker._render_saved_receipt.assert_not_called()
+    assert worker.signals.finished_signal.emit.call_args.args == (
+        True,
+        "Éxito",
+        "central.pdf",
+        11,
+    )
+
+
+@pytest.mark.parametrize("reply", ["updated", "missing", "changed"])
+def test_legacy_edit_preflight_retains_the_claim_and_rejects_stale_edits(
+    worker, monkeypatch, reply
+):
+    from types import SimpleNamespace
+
+    payload = job()
+    payload.update(
+        editing_id=7,
+        admission_session_id="SESSION",
+        admission_attention={
+            "global_attention_id": "11111111-1111-4111-8111-111111111111",
+            "billing_claim_acquired_at": "claim-start",
+        },
+    )
+    query = Mock(return_value=None)
+    if reply == "updated":
+        query.return_value = SimpleNamespace(snapshot=lambda: {"attention_id": 41})
+    elif reply == "changed":
+        query.side_effect = ValueError("Atención modificada")
+    monkeypatch.setattr(app, "query_final_receipt_attention", query)
+    monkeypatch.setattr(app, "schedule_admission_claim_release", Mock())
+    if reply == "updated":
+        assert worker._revalidate_receipt_edit(payload) == {
+            "attention_id": 41,
+            "billing_claim_acquired_at": "claim-start",
+        }
+    else:
+        with pytest.raises(app.AdmissionAttentionUnavailableError):
+            worker._revalidate_receipt_edit(payload)
+    query.assert_called_once()
+
+
+def test_worker_uses_refreshed_admission_snapshot_for_edit(worker, monkeypatch):
+    payload = job()
+    payload.update(
+        editing_id=7, editing_num=11, admission_attention={"attention_id": 41}
+    )
+    verified = {"attention_id": 41, "billing_claim_acquired_at": "current"}
+    worker._revalidate_receipt_edit = Mock(return_value=verified)
+    saved = Mock(return_value=7)
+    monkeypatch.setattr(app, "db_connect", MagicMock())
+    monkeypatch.setattr(app, "save_receipt_with_items", saved)
+    monkeypatch.setattr(app, "write_pdf_performance", Mock())
+    worker._render_saved_receipt = Mock(
+        return_value=("saved.pdf", app.STORAGE_SNAPSHOT)
+    )
+
+    worker.process(payload)
+
+    assert saved.call_args.args[15] == verified
+    assert payload["admission_attention"] == {"attention_id": 41}

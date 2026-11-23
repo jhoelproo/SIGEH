@@ -219,3 +219,60 @@ def test_real_history_window_contains_billing_action(tmp_path, monkeypatch):
     monkeypatch.setattr(module.App, "abrir_historial", inspect_history)
     assert app.run_v15_packaging_check(str(tmp_path / "package.json")) == 0
     assert found == [True]
+
+
+@pytest.mark.parametrize(
+    "first_result,repaired,lookups",
+    [
+        ({"_projection": {"attention_id": 41}}, None, 1),
+        ({"_projection": {"is_deleted": True}}, None, 1),
+        ({"eligible": False}, False, 1),
+        ({"eligible": False}, True, 2),
+    ],
+)
+def test_history_only_repairs_a_missing_projection(
+    monkeypatch, first_result, repaired, lookups
+):
+    import CALCULOS_QT as app
+
+    recovered = {"_projection": {"attention_id": 41}}
+    evaluate = Mock(side_effect=[first_result, recovered])
+    monkeypatch.setattr(app, "evaluate_attention_billing_eligibility", evaluate)
+    repair = Mock(return_value=repaired)
+    worker = app.AdmissionHistoryEligibilityWorker(
+        {"global_attention_id": GLOBAL},
+        {"username": "qa"},
+        "SESSION",
+        projection_repair=repair,
+    )
+    results = []
+    worker.resolved.connect(lambda result, _elapsed: results.append(result))
+
+    worker.run()
+
+    assert evaluate.call_count == lookups
+    assert results == [recovered if lookups == 2 else first_result]
+    if repaired is None:
+        repair.assert_not_called()
+    else:
+        repair.assert_called_once_with(GLOBAL)
+
+
+@pytest.mark.parametrize(
+    "source, global_id, expected",
+    [
+        ("", "", ("p.attention_id=%s", (41,))),
+        (
+            "CENTRAL",
+            "",
+            ("p.attention_id=%s AND p.source_instance_id=%s", (41, "CENTRAL")),
+        ),
+        ("CENTRAL", "malformed", ("FALSE", ())),
+    ],
+)
+def test_projection_lookup_never_uses_a_local_number_for_an_invalid_uuid(
+    source, global_id, expected
+):
+    import CALCULOS_QT as app
+
+    assert app._billing_projection_lookup(41, source, global_id) == expected
