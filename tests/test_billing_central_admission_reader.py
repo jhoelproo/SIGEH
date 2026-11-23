@@ -852,19 +852,43 @@ def test_billing_workers_emit_safe_categories_on_failures():
         worker.run()
     assert eligibility_failures == ["QUERY_ERROR"]
 
-def test_history_eligibility_repairs_selected_projection_before_query(monkeypatch):
-    repaired = []
-    evaluated = []
+def test_history_eligibility_rechecks_same_identity_after_repair(monkeypatch):
+    global_id = "ea15f2b6-3050-4f7e-afcc-4c400effe946"
+    calls = []
+
+    def evaluate(attention_id, user, **identity):
+        calls.append(("lookup", attention_id, identity))
+        if len(calls) == 1:
+            return {"eligible": False}
+        return {"eligible": True, "_projection": {"attention_id": attention_id}}
+
+    def repair(identity):
+        calls.append(("repair", identity))
+        return True
+
     monkeypatch.setattr(
         app,
         "evaluate_attention_billing_eligibility",
-        lambda *args, **kwargs: evaluated.append((args, kwargs)) or {"eligible": True},
+        evaluate,
     )
     worker = app.AdmissionHistoryEligibilityWorker(
-        {"attention_id": 468, "global_attention_id": "global-468"},
+        {
+            "attention_id": 468,
+            "global_attention_id": global_id,
+            "source_instance_id": "CENTRAL",
+        },
         {"role": app.ROLE_AUX},
-        projection_repair=lambda value: repaired.append(value) or True,
+        session_id="test-session",
+        projection_repair=repair,
     )
     worker.run()
-    assert repaired == ["global-468"]
-    assert len(evaluated) == 1
+    lookup = (
+        "lookup",
+        468,
+        {
+            "global_attention_id": global_id,
+            "source_instance_id": "CENTRAL",
+            "session_id": "test-session",
+        },
+    )
+    assert calls == [lookup, ("repair", global_id), lookup]

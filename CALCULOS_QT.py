@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 import uuid
+from _thread import LockType
 from weakref import WeakValueDictionary
 import tempfile
 import logging
@@ -16609,7 +16610,7 @@ def draw_footer(c, page_w, current_user):
 
 
 _receipt_render_registry_lock = threading.Lock()
-_receipt_render_locks = WeakValueDictionary()
+_receipt_render_locks: WeakValueDictionary[Path, LockType] = WeakValueDictionary()
 
 
 def _receipt_snapshot_render_data(document_record):
@@ -20501,7 +20502,7 @@ class UniversalCatalogAdminDialog(QDialog):
         super().__init__(parent)
         self.current_user = dict(current_user or {})
         self._worker = None
-        self._catalog_data = {"items": [], "markup": DEFAULT_MEDICATION_MARKUP_PERCENT}
+        self._catalog_data: dict = {"items": [], "markup": DEFAULT_MEDICATION_MARKUP_PERCENT}
         self.catalog_changed = False
         self._catalog_reload_status = ""
         self.setWindowTitle("Catálogo de Medicamentos y Materiales")
@@ -20518,9 +20519,9 @@ class UniversalCatalogAdminDialog(QDialog):
         self.tables = {}
         self.searches = {}
         self.action_buttons = []
-        self.single_item_buttons = {}
-        self.delete_buttons = {}
-        self.selection_labels = {}
+        self.single_item_buttons: dict[str, list[QPushButton]] = {}
+        self.delete_buttons: dict[str, QPushButton] = {}
+        self.selection_labels: dict[str, QLabel] = {}
         self._build_category_tab("Medicamentos", layout_markup=True)
         self._build_category_tab("Materiales", layout_markup=False)
         layout.addWidget(self.tabs, 1)
